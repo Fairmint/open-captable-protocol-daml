@@ -1,0 +1,118 @@
+version: 2.1
+
+jobs:
+  daml-build:
+    docker:
+      - image: cimg/openjdk:23.0.2
+    steps:
+      - run:
+          name: Setup Git LFS authentication
+          command: |
+            # Validate that GITHUB_TOKEN is set
+            if [ -z "$GITHUB_TOKEN" ]; then
+              echo "Error: GITHUB_TOKEN environment variable is not set"
+              echo "Please add GITHUB_TOKEN to your CircleCI project environment variables"
+              exit 1
+            fi
+
+            # Install Git LFS if not already available
+            curl -s https://packagecloud.io/install/repositories/github/git-lfs/script.deb.sh | sudo bash
+            sudo apt-get install git-lfs
+
+            # Configure Git LFS authentication using GitHub token
+            git config --global credential.helper store
+            echo "https://$GITHUB_TOKEN:x-oauth-basic@github.com" > ~/.git-credentials
+
+            # Alternative SSH-based authentication (uncomment if using SSH keys):
+            # mkdir -p ~/.ssh
+            # echo "$SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/id_rsa
+            # chmod 600 ~/.ssh/id_rsa
+            # ssh-keyscan github.com >> ~/.ssh/known_hosts
+            # git config --global url."git@github.com:".insteadOf "https://github.com/"
+
+            # Initialize Git LFS
+            git lfs install
+      - checkout:
+          path: .
+          submodules: false
+      - run:
+          name: Initialize submodules with LFS
+          command: |
+            # Ensure Git LFS is configured for submodules
+            git config --global credential.helper store
+            echo "https://$GITHUB_TOKEN:x-oauth-basic@github.com" > ~/.git-credentials
+
+            # Debug: Check Git LFS configuration
+            echo "Git LFS version:"
+            git lfs version
+
+            echo "Git credential configuration:"
+            git config --global --list | grep credential
+
+            # Initialize and update submodules with LFS support
+            git submodule update --init
+
+            # Debug: Check if LFS files were downloaded
+            echo "Checking for LFS files in submodules:"
+            find . -name "*.png" -exec git lfs ls-files {} \; 2>/dev/null || echo "No LFS files found or LFS not tracking PNG files"
+      - run:
+          name: Install DAML
+          command: |
+            curl -sSL https://get.daml.com/ | sh -s 3.3.0-snapshot.20250507.0
+            echo 'export PATH=$HOME/.daml/bin:$PATH' >> "$BASH_ENV"
+      - run:
+          name: Build DAML
+          command: |
+            cd daml && daml build --all
+            cd OpenCapTable-v01 && daml codegen js .daml/dist/OpenCapTable-v01-0.0.1.dar -o ../../scripts/libs/daml.js
+      - run:
+          name: Test DAML
+          command: |
+            cd daml/Test && daml test
+      - run:
+          name: Check for changes and commit
+          command: |
+            # Configure git user for commits
+            git config user.name "CircleCI Bot"
+            git config user.email "circleci-bot@example.com"
+
+            # Configure Git authentication using GitHub token (same as daml-build job)
+            git config --global credential.helper store
+            echo "https://$GITHUB_TOKEN:x-oauth-basic@github.com" > ~/.git-credentials
+
+            # Add GitHub to known hosts to avoid SSH host key verification prompt
+            mkdir -p ~/.ssh
+            ssh-keyscan -H github.com >> ~/.ssh/known_hosts
+
+            # Check if there are any changes
+            if git diff --exit-code --quiet && git diff --cached --exit-code --quiet; then
+              echo "No changes detected from lint/format. Build continues successfully."
+            else
+              echo "Changes detected from lint/format. Committing and pushing changes..."
+              
+              # Display the diff before committing
+              echo "=== DIFF OF CHANGES ==="
+              git diff --cached || git diff
+              echo "=== END DIFF ==="
+              
+              # Add all changes
+              git add .
+              
+              # Commit with descriptive message
+              git commit -m "Auto-fix: lint and format changes"
+              
+              # Push changes using HTTPS authentication
+              git push origin $CIRCLE_BRANCH
+              
+              echo "Changes have been committed and pushed."
+              echo "Failing the build to indicate that changes were made."
+              exit 1
+            fi
+
+workflows:
+  build-and-test-workflow:
+    jobs:
+      - daml-build
+      - build-and-test:
+          requires:
+            - daml-build
