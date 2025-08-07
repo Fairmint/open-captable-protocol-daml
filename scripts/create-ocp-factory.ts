@@ -35,8 +35,6 @@ async function main() {
       commands: [{
         CreateCommand: createCommand
       }],
-      commandId: `create-ocp-factory-${Date.now()}`,
-      actAs: [client.getPartyId()],
     });
 
     // Extract the contract ID from the response
