@@ -3,7 +3,7 @@
 import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../generated/js/OpenCapTable-v01-0.0.1/lib';
+import { Fairmint } from '../generated/js/OpenCapTable-v02-0.0.1/lib';
 
 async function main() {
   console.log('Creating OcpFactory contract...');
