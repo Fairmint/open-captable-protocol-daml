@@ -7,7 +7,7 @@ async function main() {
   console.log('Uploading DAR file...');
   
   const client = new LedgerJsonApiClient();
-  await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v02', '.daml', 'dist', 'OpenCapTable-v02-0.0.1.dar') });
+  await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v02', '.daml', 'dist', 'OpenCapTable-v02-0.0.2.dar') });
 
   console.log('✅ DAR file uploaded successfully');
 }
