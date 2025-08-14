@@ -5,8 +5,64 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { Fairmint } from '../generated/js/OpenCapTable-v02-0.0.2/lib';
 
+// Define the contract ID file structure
+interface ContractIdData {
+  mainnet?: {
+    ocpFactoryContractId: string;
+    templateId: string;
+  };
+  devnet?: {
+    ocpFactoryContractId: string;
+    templateId: string;
+  };
+}
+
+function getNetworkFromArgs(): string {
+  const args = process.argv.slice(2);
+  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
+  
+  if (networkIndex === -1 || networkIndex === args.length - 1) {
+    console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
+    process.exit(1);
+  }
+  
+  const network = args[networkIndex + 1].toLowerCase();
+  if (network !== 'mainnet' && network !== 'devnet') {
+    console.error('❌ Network must be either "mainnet" or "devnet"');
+    process.exit(1);
+  }
+  
+  return network;
+}
+
+function loadExistingContractIds(outputPath: string): ContractIdData {
+  try {
+    if (fs.existsSync(outputPath)) {
+      const existingData = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
+      
+      // Handle legacy format (single contract ID)
+      if (existingData.ocpFactoryContractId && !existingData.mainnet && !existingData.devnet) {
+        console.log('⚠️  Found legacy format, converting to new multi-network format...');
+        return {
+          mainnet: {
+            ocpFactoryContractId: existingData.ocpFactoryContractId,
+            templateId: existingData.templateId
+          }
+        };
+      }
+      
+      return existingData;
+    }
+  } catch (error) {
+    console.warn('⚠️  Could not read existing contract ID file, starting fresh');
+  }
+  
+  return {};
+}
+
 async function main() {
-  console.log('Creating OcpFactory contract...');
+  const network = getNetworkFromArgs();
+  console.log(`Creating OcpFactory contract for ${network}...`);
   
   // Validate that the generated types are available
   if (!Fairmint?.OpenCapTable?.OcpFactory?.OcpFactory) {
@@ -64,18 +120,33 @@ async function main() {
 
     console.log(`✅ OcpFactory contract created with ID: ${contractId}`);
 
-    // Create the contract ID data
-    const contractIdData = {
-      ocpFactoryContractId: contractId,
-      templateId: Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId,
+    // Load existing contract IDs
+    const outputPath = path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
+    const existingData = loadExistingContractIds(outputPath);
+
+    // Update only the specified network
+    const updatedData: ContractIdData = {
+      ...existingData,
+      [network]: {
+        ocpFactoryContractId: contractId,
+        templateId: Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId,
+      }
     };
 
-    // Write the contract ID to a JSON file
-    const outputPath = path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
-    fs.writeFileSync(outputPath, JSON.stringify(contractIdData, null, 2));
+    // Write the updated contract ID data to the JSON file
+    fs.writeFileSync(outputPath, JSON.stringify(updatedData, null, 2));
 
-    console.log(`✅ Contract ID saved to: ${outputPath}`);
-    console.log('✅ OcpFactory contract creation completed successfully');
+    console.log(`✅ Contract ID for ${network} saved to: ${outputPath}`);
+    console.log(`✅ OcpFactory contract creation for ${network} completed successfully`);
+    
+    // Show current state
+    console.log('\n📋 Current contract IDs:');
+    if (updatedData.mainnet) {
+      console.log(`  Mainnet: ${updatedData.mainnet.ocpFactoryContractId}`);
+    }
+    if (updatedData.devnet) {
+      console.log(`  Devnet:  ${updatedData.devnet.ocpFactoryContractId}`);
+    }
   } catch (error) {
     console.error('❌ Failed to create OcpFactory contract:', error);
     process.exit(1);
