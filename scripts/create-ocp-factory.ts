@@ -66,7 +66,7 @@ async function main() {
   console.log(`Creating OcpFactory contract for ${network}...`);
   
   // Create client using EnvLoader
-  const client = createLedgerJsonApiClient(network, '5n');
+  const client = createLedgerJsonApiClient(network, 'intellect');
   
   // Validate that the generated types are available
   if (!Fairmint?.OpenCapTable?.OcpFactory?.OcpFactory) {
