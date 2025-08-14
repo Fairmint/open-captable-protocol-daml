@@ -4,6 +4,7 @@ import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 import { Fairmint } from '../generated/js/OpenCapTable-v02-0.0.2/lib';
+import { createLedgerJsonApiClient } from './utils';
 
 // Define the contract ID file structure
 interface ContractIdData {
@@ -64,12 +65,13 @@ async function main() {
   const network = getNetworkFromArgs();
   console.log(`Creating OcpFactory contract for ${network}...`);
   
+  // Create client using EnvLoader
+  const client = createLedgerJsonApiClient(network, '5n');
+  
   // Validate that the generated types are available
   if (!Fairmint?.OpenCapTable?.OcpFactory?.OcpFactory) {
     throw new Error('Generated DAML types not found. Please run "npm run codegen" first.');
   }
-  
-  const client = new LedgerJsonApiClient();
     
   console.log(`Template ID: ${Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId}`);
   
