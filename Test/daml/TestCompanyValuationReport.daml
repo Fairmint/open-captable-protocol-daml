@@ -1,0 +1,86 @@
+module TestCompanyValuationReport where
+
+import Daml.Script
+import DA.Time
+import qualified DA.Set as Set
+
+import Fairmint.OpenCapTable.CompanyValuationReport
+
+-- Create a report, add observers (with duplicates), update valuation, and confirm current timestamp
+happyPath : Script ()
+happyPath = script do
+  system_operator <- allocateParty "SystemOperator"
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+
+  -- Create initial report
+  t0 <- getTime
+  reportCid <- submit system_operator do
+    createCmd CompanyValuationReport with
+      company_id = "co-1"
+      company_valuation = 100
+      last_update_at = t0
+      observers = []
+      system_operator
+
+  -- Add observers with duplicates; expect dedup
+  reportCid1 <- submit system_operator do
+    exerciseCmd reportCid AddObservers with added = [alice, bob, alice]
+
+  report1Opt <- queryContractId system_operator reportCid1
+  case report1Opt of
+    None -> abort "Report not found after AddObservers"
+    Some report1 -> assert (Set.fromList report1.observers == Set.fromList [alice, bob])
+
+  -- Advance time, update valuation
+  passTime (minutes 10)
+  t1 <- getTime
+  reportCid2 <- submit system_operator do
+    exerciseCmd reportCid1 SetCompanyValuation with new_company_valuation = 200
+
+  report2Opt <- queryContractId system_operator reportCid2
+  case report2Opt of
+    None -> abort "Report not found after SetCompanyValuation"
+    Some report2 -> do
+      assert (report2.company_valuation == 200)
+      assert (report2.last_update_at == t1)
+      assert (Set.fromList report2.observers == Set.fromList [alice, bob])
+
+  -- Advance time and confirm current without changing valuation
+  passTime (minutes 10)
+  t2 <- getTime
+  reportCid3 <- submit system_operator do
+    exerciseCmd reportCid2 ConfirmCurrent
+
+  report3Opt <- queryContractId system_operator reportCid3
+  case report3Opt of
+    None -> abort "Report not found after ConfirmCurrent"
+    Some report3 -> do
+      assert (report3.company_valuation == 200)
+      assert (report3.last_update_at == t2)
+      assert (Set.fromList report3.observers == Set.fromList [alice, bob])
+
+-- Only the system operator can exercise choices; and negative valuations are rejected by ensure
+accessControlAndValidation : Script ()
+accessControlAndValidation = script do
+  system_operator <- allocateParty "SystemOperator"
+  alice <- allocateParty "Alice"
+
+  t0 <- getTime
+  reportCid <- submit system_operator do
+    createCmd CompanyValuationReport with
+      company_id = "co-2"
+      company_valuation = 50
+      last_update_at = t0
+      observers = []
+      system_operator
+
+  -- Non-operator cannot add observers
+  submitMustFail alice do
+    exerciseCmd reportCid AddObservers with added = [alice]
+
+  -- Negative valuation update must fail (template ensure enforces non-negative)
+  submitMustFail system_operator do
+    exerciseCmd reportCid SetCompanyValuation with new_company_valuation = -1
+
+  pure () 
