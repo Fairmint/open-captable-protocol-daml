@@ -8,7 +8,7 @@ const path = require('path');
  * This eliminates the local file dependency that prevents publishing to npm
  */
 
-const PACKAGE_DIR = path.join(__dirname, '../generated/js/OpenCapTable-v02-0.0.3');
+const PACKAGE_DIR = path.join(__dirname, '../generated/js/OpenCapTable-v02-0.0.4');
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 
 function createDirectoryIfNotExists(dirPath) {

@@ -5,6 +5,7 @@ import DA.Time
 import qualified DA.Set as Set
 
 import Fairmint.OpenCapTable.CompanyValuationReport
+import Fairmint.OpenCapTable.OcpFactory
 
 -- Create a report, add observers (with duplicates), update valuation, and confirm current timestamp
 happyPath : Script ()
@@ -15,13 +16,13 @@ happyPath = script do
 
   -- Create initial report
   t0 <- getTime
+  factoryCid <- submit system_operator do
+    createCmd OcpFactory with system_operator
   reportCid <- submit system_operator do
-    createCmd CompanyValuationReport with
+    exerciseCmd factoryCid CreateCompanyValuationReport with
       company_id = "co-1"
       company_valuation = 100
-      last_update_at = t0
       observers = []
-      system_operator
 
   -- Add observers with duplicates; expect dedup
   reportCid1 <- submit system_operator do
@@ -67,13 +68,13 @@ accessControlAndValidation = script do
   alice <- allocateParty "Alice"
 
   t0 <- getTime
+  factoryCid <- submit system_operator do
+    createCmd OcpFactory with system_operator
   reportCid <- submit system_operator do
-    createCmd CompanyValuationReport with
+    exerciseCmd factoryCid CreateCompanyValuationReport with
       company_id = "co-2"
       company_valuation = 50
-      last_update_at = t0
       observers = []
-      system_operator
 
   -- Non-operator cannot add observers
   submitMustFail alice do
@@ -84,3 +85,80 @@ accessControlAndValidation = script do
     exerciseCmd reportCid SetCompanyValuation with new_company_valuation = -1
 
   pure () 
+
+-- AddObservers with an empty list should revert
+addObserversEmptyList : Script ()
+addObserversEmptyList = script do
+  system_operator <- allocateParty "SystemOperator"
+  alice <- allocateParty "Alice"
+
+  t0 <- getTime
+  factoryCid <- submit system_operator do
+    createCmd OcpFactory with system_operator
+  reportCid <- submit system_operator do
+    exerciseCmd factoryCid CreateCompanyValuationReport with
+      company_id = "co-empty-observers"
+      company_valuation = 0
+      observers = [alice]
+
+  submitMustFail system_operator do
+    exerciseCmd reportCid AddObservers with added = []
+
+-- Very large valuation numbers (boundary of Int64)
+largeValuationNumbers : Script ()
+largeValuationNumbers = script do
+  system_operator <- allocateParty "SystemOperator"
+
+  let big : Int = 9223372036854775807 -- 2^63 - 1
+
+  t0 <- getTime
+  factoryCid <- submit system_operator do
+    createCmd OcpFactory with system_operator
+  reportCid <- submit system_operator do
+    exerciseCmd factoryCid CreateCompanyValuationReport with
+      company_id = "co-big"
+      company_valuation = big
+      observers = []
+
+  passTime (minutes 1)
+  t1 <- getTime
+  reportCid' <- submit system_operator do
+    -- Set again to the same big value to ensure it's accepted in updates too
+    exerciseCmd reportCid SetCompanyValuation with new_company_valuation = big
+
+  reportOpt <- queryContractId system_operator reportCid'
+  case reportOpt of
+    None -> abort "Report not found after setting big valuation"
+    Some report -> do
+      assert (report.company_valuation == big)
+      assert (report.last_update_at == t1)
+
+-- company_id edge cases: empty should fail; special characters should be accepted
+companyIdEdgeCases : Script ()
+companyIdEdgeCases = script do
+  system_operator <- allocateParty "SystemOperator"
+
+  t0 <- getTime
+  -- Empty company_id should fail due to ensure
+  factoryCid <- submit system_operator do
+    createCmd OcpFactory with system_operator
+  submitMustFail system_operator do
+    exerciseCmd factoryCid CreateCompanyValuationReport with
+      company_id = ""
+      company_valuation = 1
+      observers = []
+
+  let specialId = "co-!@#$%^&*()_+=/\\:;,.?<>[]{}|~"
+  t1 <- getTime
+  factoryCid2 <- submit system_operator do
+    createCmd OcpFactory with system_operator
+  specialCid <- submit system_operator do
+    exerciseCmd factoryCid2 CreateCompanyValuationReport with
+      company_id = specialId
+      company_valuation = 2
+      observers = []
+
+  specialOpt <- queryContractId system_operator specialCid
+  case specialOpt of
+    None -> abort "Special company_id report not found"
+    Some report -> assert (report.company_id == specialId) 

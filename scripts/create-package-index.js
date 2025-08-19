@@ -3,7 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.3');
+const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4');
 
 // Create index.js that re-exports from lib/index.js
 const indexJsContent = `"use strict";
