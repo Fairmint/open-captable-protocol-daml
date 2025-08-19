@@ -8,7 +8,7 @@ const rootPackagePath = path.join(__dirname, '..', 'package.json');
 const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8'));
 
 // Read the generated package.json
-const generatedPackagePath = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.2', 'package.json');
+const generatedPackagePath = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4', 'package.json');
 const generatedPackage = JSON.parse(fs.readFileSync(generatedPackagePath, 'utf8'));
 
 // Update the version and name
@@ -27,7 +27,7 @@ if (!generatedPackage.publishConfig) {
 fs.writeFileSync(generatedPackagePath, JSON.stringify(generatedPackage, null, 4) + '\n');
 
 // Create index files
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.2');
+const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4');
 
 // Create index.js that re-exports from lib/index.js
 const indexJsContent = `"use strict";

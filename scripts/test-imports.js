@@ -7,7 +7,7 @@ try {
     // This would be the actual import when the package is published
     // For now, we'll test the local structure
     const path = require('path');
-    const packagePath = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.2');
+    const packagePath = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4');
     
     // Test the main entry point
     const main = require(path.join(packagePath, 'index.js'));
