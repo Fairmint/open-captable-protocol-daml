@@ -131,7 +131,7 @@ async function main() {
       ...existingData,
       [network]: {
         ocpFactoryContractId: contractId,
-        templateId: Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId,
+        templateId: createdTreeEvent.value.templateId,
       }
     };
 
