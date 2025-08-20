@@ -250,18 +250,31 @@ function replaceDependencyReferences() {
 }
 
 function removeLocalDependency() {
-  console.log('🗑️  Removing local dependency from package.json...');
+  console.log('🗑️  Removing local dependencies from package.json...');
   
   const packageJsonPath = path.join(PACKAGE_DIR, 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
   
-  // Remove the local file dependency
-  if (packageJson.dependencies && packageJson.dependencies['@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0']) {
-    delete packageJson.dependencies['@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0'];
+  // Remove local file dependencies
+  const localDependencies = [
+    '@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+    '@daml.js/splice-api-featured-app-v1-1.0.0'
+  ];
+  
+  let removedCount = 0;
+  for (const dep of localDependencies) {
+    if (packageJson.dependencies && packageJson.dependencies[dep]) {
+      delete packageJson.dependencies[dep];
+      removedCount++;
+      console.log(`✅ Removed local dependency: ${dep}`);
+    }
+  }
+  
+  if (removedCount > 0) {
     fs.writeFileSync(packageJsonPath, JSON.stringify(packageJson, null, 4));
-    console.log('✅ Removed local dependency from package.json');
+    console.log(`✅ Removed ${removedCount} local dependencies from package.json`);
   } else {
-    console.log('ℹ️  Local dependency not found in package.json');
+    console.log('ℹ️  No local dependencies found in package.json');
   }
 }
 
