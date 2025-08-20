@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v03-0.0.1');
+const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v04-0.0.1');
 
 // Create index.js that re-exports from lib/index.js
 const indexJsContent = `"use strict";
@@ -31,4 +31,4 @@ export { lib };
 fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
 fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
 
-console.log('Created package index files (index.js and index.d.ts)'); 
+console.log('Created package index files (index.js and index.d.ts)');

@@ -1,7 +1,7 @@
 import path from 'path';
 
 try {
-	const pkg = require(path.join('..', 'generated', 'js', 'OpenCapTable-v03-0.0.1'));
+	const pkg = require(path.join('..', 'generated', 'js', 'OpenCapTable-v04-0.0.1'));
 	if (!pkg || !pkg.Fairmint || !pkg.DA) {
 		throw new Error('Entry exports missing expected namespaces');
 	}
@@ -9,4 +9,4 @@ try {
 } catch (e: any) {
 	console.error('Import test failed:', e?.message || e);
 	process.exit(1);
-} 
+}
