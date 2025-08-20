@@ -1,35 +1,57 @@
-#!/usr/bin/env node
-
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
 // Read the root package.json
 const rootPackagePath = path.join(__dirname, '..', 'package.json');
-const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8'));
+const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as {
+	name: string;
+	version: string;
+	peerDependencies?: Record<string, string>;
+};
 
 // Read the generated package.json
-const generatedPackagePath = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4', 'package.json');
-const generatedPackage = JSON.parse(fs.readFileSync(generatedPackagePath, 'utf8'));
+const generatedPackagePath = path.join(
+	__dirname,
+	'..',
+	'generated',
+	'js',
+	'OpenCapTable-v03-0.0.1',
+	'package.json',
+);
+const generatedPackage = JSON.parse(fs.readFileSync(generatedPackagePath, 'utf8')) as any;
 
 // Update the version and name
 generatedPackage.version = rootPackage.version;
 generatedPackage.name = rootPackage.name;
+// Ensure the package can be published
 delete generatedPackage.private;
 
-// Add publishConfig if not present
+// Ensure publishConfig exists
 if (!generatedPackage.publishConfig) {
-    generatedPackage.publishConfig = {
-        access: "public"
-    };
+	generatedPackage.publishConfig = { access: 'public' };
+}
+
+// Normalize peerDependencies: move from non-standard 'peer-dependencies' to 'peerDependencies'
+if (generatedPackage['peer-dependencies']) {
+	generatedPackage.peerDependencies = {
+		...(generatedPackage.peerDependencies || {}),
+		...generatedPackage['peer-dependencies'],
+	};
+	delete generatedPackage['peer-dependencies'];
+}
+
+// If root specifies peerDependencies, prefer those (so the published package matches repo policy)
+if (rootPackage.peerDependencies) {
+	generatedPackage.peerDependencies = { ...rootPackage.peerDependencies };
 }
 
 // Write back the generated package.json
 fs.writeFileSync(generatedPackagePath, JSON.stringify(generatedPackage, null, 4) + '\n');
 
-// Create index files
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v02-0.0.4');
+// Create index files in generated dir
+const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v03-0.0.1');
 
-// Create index.js that re-exports from lib/index.js
+// index.js that re-exports from lib/index.js
 const indexJsContent = `"use strict";
 
 // Re-export everything from the lib directory
@@ -44,7 +66,7 @@ Object.keys(lib).forEach(key => {
 exports.lib = lib;
 `;
 
-// Create index.d.ts that re-exports from lib/index.d.ts
+// index.d.ts that re-exports from lib/index.d.ts
 const indexDtsContent = `// Re-export everything from the lib directory
 export * from './lib/index';
 
@@ -53,17 +75,8 @@ import * as lib from './lib/index';
 export { lib };
 `;
 
-// Write the files
 fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
 fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
-
-// Copy README if it exists
-const readmePath = path.join(generatedDir, 'README.md');
-if (fs.existsSync(readmePath)) {
-    console.log('README.md already exists in generated directory');
-} else {
-    console.log('README.md will be created by the daml codegen process');
-}
 
 console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
 console.log('Created package index files (index.js and index.d.ts)'); 

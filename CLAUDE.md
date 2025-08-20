@@ -37,13 +37,13 @@ npm run codegen    # Generate JavaScript bindings from DAML
 This is a DAML implementation of the Open Cap Table (OCP) protocol for managing equity cap tables on-chain.
 
 ### Package Structure
-- **OpenCapTable-v02/**: Core protocol implementation
+- **OpenCapTable-v03/**: Core protocol implementation
   - Contains the main contracts and types for the OCP protocol
   - All modules are under `Fairmint.OpenCapTable` namespace
   
 - **Test/**: Test suite
   - Contains test modules and integration tests
-  - Depends on the OpenCapTable-v02 package and Splice integration
+  - Depends on the OpenCapTable-v03 package and Splice integration
 
 ### Core Contracts
 1. **OcpFactory**: System-level contract for authorizing issuers

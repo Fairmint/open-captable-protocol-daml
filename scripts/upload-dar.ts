@@ -31,17 +31,12 @@ async function main() {
   for (const provider of providers) {
     console.log(`📤 Uploading to ${provider} provider...`);
     
-    try {
-      // Create client using EnvLoader
-      const client = createLedgerJsonApiClient(network, provider);
-      
-      await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v02', '.daml', 'dist', 'OpenCapTable-v02-0.0.4.dar') });
-      
-      console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
-    } catch (error) {
-      console.error(`❌ Failed to upload to ${provider}:`, error);
-      // Continue with other providers even if one fails
-    }
+    // Create client using EnvLoader
+    const client = createLedgerJsonApiClient(network, provider);
+    
+    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v03', '.daml', 'dist', 'OpenCapTable-v03-0.0.1.dar') });
+    
+    console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
   }
   
   console.log(`🎉 DAR upload process completed for ${network}`);
