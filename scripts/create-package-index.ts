@@ -1,7 +1,5 @@
-#!/usr/bin/env node
-
-const fs = require('fs');
-const path = require('path');
+import fs from 'fs';
+import path from 'path';
 
 const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v03-0.0.1');
 
