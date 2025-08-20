@@ -15,7 +15,7 @@ const generatedPackagePath = path.join(
 	'..',
 	'generated',
 	'js',
-	'OpenCapTable-v03-0.0.1',
+	'OpenCapTable-v04-0.0.1',
 	'package.json',
 );
 const generatedPackage = JSON.parse(fs.readFileSync(generatedPackagePath, 'utf8')) as any;
@@ -49,7 +49,7 @@ if (rootPackage.peerDependencies) {
 fs.writeFileSync(generatedPackagePath, JSON.stringify(generatedPackage, null, 4) + '\n');
 
 // Create index files in generated dir
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v03-0.0.1');
+const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v04-0.0.1');
 
 // index.js that re-exports from lib/index.js
 const indexJsContent = `"use strict";
@@ -79,4 +79,4 @@ fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
 fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
 
 console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
-console.log('Created package index files (index.js and index.d.ts)'); 
+console.log('Created package index files (index.js and index.d.ts)');

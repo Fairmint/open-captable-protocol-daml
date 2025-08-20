@@ -3,7 +3,7 @@
 import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../generated/js/OpenCapTable-v03-0.0.1/lib';
+import { Fairmint } from '../generated/js/OpenCapTable-v04-0.0.1/lib';
 import { createLedgerJsonApiClient } from './utils';
 
 // Define the contract ID file structure
@@ -21,18 +21,18 @@ interface ContractIdData {
 function getNetworkFromArgs(): string {
   const args = process.argv.slice(2);
   const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
-  
+
   if (networkIndex === -1 || networkIndex === args.length - 1) {
     console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
     process.exit(1);
   }
-  
+
   const network = args[networkIndex + 1].toLowerCase();
   if (network !== 'mainnet' && network !== 'devnet') {
     console.error('❌ Network must be either "mainnet" or "devnet"');
     process.exit(1);
   }
-  
+
   return network;
 }
 
@@ -40,7 +40,7 @@ function loadExistingContractIds(outputPath: string): ContractIdData {
   try {
     if (fs.existsSync(outputPath)) {
       const existingData = JSON.parse(fs.readFileSync(outputPath, 'utf8'));
-      
+
       // Handle legacy format (single contract ID)
       if (existingData.ocpFactoryContractId && !existingData.mainnet && !existingData.devnet) {
         console.log('⚠️  Found legacy format, converting to new multi-network format...');
@@ -51,35 +51,35 @@ function loadExistingContractIds(outputPath: string): ContractIdData {
           }
         };
       }
-      
+
       return existingData;
     }
   } catch (error) {
     console.warn('⚠️  Could not read existing contract ID file, starting fresh');
   }
-  
+
   return {};
 }
 
 async function main() {
   const network = getNetworkFromArgs();
   console.log(`Creating OcpFactory contract for ${network}...`);
-  
+
   // Create client using EnvLoader
   const client = createLedgerJsonApiClient(network, 'intellect');
-  
+
   // Validate that the generated types are available
   if (!Fairmint?.OpenCapTable?.OcpFactory?.OcpFactory) {
     throw new Error('Generated DAML types not found. Please run "npm run codegen" first.');
   }
-    
+
   console.log(`Template ID: ${Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId}`);
-  
+
   // Use the generated OcpFactory type for type safety
   const ocpFactoryData: Fairmint.OpenCapTable.OcpFactory.OcpFactory = {
     system_operator: client.getPartyId()
   };
-  
+
   const createCommand = {
     templateId: Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId,
     createArguments: ocpFactoryData
@@ -87,7 +87,7 @@ async function main() {
 
   try {
     console.log('Submitting contract creation transaction...');
-    
+
     // Create the correct structure for the API call
     const response = await client.submitAndWaitForTransactionTree({
       commands: [{
@@ -97,7 +97,7 @@ async function main() {
 
     // Extract the contract ID from the response
     console.log('Transaction submitted successfully. Processing response...');
-    
+
     // The response structure has events in transactionTree.eventsById
     const eventsById = response.transactionTree?.eventsById;
     if (!eventsById || Object.keys(eventsById).length === 0) {
@@ -140,7 +140,7 @@ async function main() {
 
     console.log(`✅ Contract ID for ${network} saved to: ${outputPath}`);
     console.log(`✅ OcpFactory contract creation for ${network} completed successfully`);
-    
+
     // Show current state
     console.log('\n📋 Current contract IDs:');
     if (updatedData.mainnet) {
@@ -155,4 +155,4 @@ async function main() {
   }
 }
 
-main(); 
+main();
