@@ -4,7 +4,7 @@ import fs from 'fs';
 import path from 'path';
 
 // Paths
-const PACKAGE_DIR = path.join(__dirname, '../generated/js/OpenCapTable-v04-0.0.1');
+const PACKAGE_DIR = path.join(__dirname, '../generated/js/OpenCapTable-v05-0.0.1');
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
 

@@ -3,7 +3,7 @@
 import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../generated/js/OpenCapTable-v04-0.0.1/lib';
+import { Fairmint } from '../generated/js/OpenCapTable-v05-0.0.1/lib';
 import { createLedgerJsonApiClient } from './utils';
 
 // Define the contract ID file structure
