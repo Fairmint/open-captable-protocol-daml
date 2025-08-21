@@ -3,8 +3,8 @@
 import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../generated/js/OpenCapTable-v04-0.0.1/lib';
-import { createLedgerJsonApiClient } from './utils';
+import { Fairmint } from '../generated/js/OpenCapTable-v05-0.0.1/lib';
+import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 
 // Define the contract ID file structure
 interface ContractIdData {
@@ -75,9 +75,28 @@ async function main() {
 
   console.log(`Template ID: ${Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId}`);
 
-  // Use the generated OcpFactory type for type safety
+  // Create validator client to lookup featured app right
+  const validatorClient = createValidatorApiClient(network, 'intellect');
+  const intellectPartyId = client.getPartyId();
+
+  // Lookup featured app right for intellect party
+  console.log('Looking up existing FeaturedAppRight contract...');
+  const featuredAppRight = await validatorClient.lookupFeaturedAppRight({ partyId: intellectPartyId });
+  if (!featuredAppRight || !featuredAppRight.featured_app_right) {
+    throw new Error(`No featured app right found for party ${intellectPartyId}`);
+  }
+
+  // Extract the contract ID - it might be nested in the response
+  const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string' 
+    ? featuredAppRight.featured_app_right 
+    : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
+
+  console.log(`✅ Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
+
+  // Now create the OcpFactory with the featured_app_right field
   const ocpFactoryData: Fairmint.OpenCapTable.OcpFactory.OcpFactory = {
-    system_operator: client.getPartyId()
+    system_operator: intellectPartyId,
+    featured_app_right: featuredAppRightContractId
   };
 
   const createCommand = {
@@ -86,7 +105,7 @@ async function main() {
   };
 
   try {
-    console.log('Submitting contract creation transaction...');
+    console.log('Submitting OcpFactory contract creation transaction...');
 
     // Create the correct structure for the API call
     const response = await client.submitAndWaitForTransactionTree({
