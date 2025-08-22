@@ -1,9 +1,12 @@
 import fs from 'fs';
 import path from 'path';
 
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v05-0.0.1');
+const packageDirs = [
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v06-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.1'),
+];
 
-// Create index.js that re-exports from lib/index.js
+// Create index.js and index.d.ts that re-export from lib/index.js if the directory exists
 const indexJsContent = `"use strict";
 
 // Re-export everything from the lib directory
@@ -18,7 +21,6 @@ Object.keys(lib).forEach(key => {
 exports.lib = lib;
 `;
 
-// Create index.d.ts that re-exports from lib/index.d.ts
 const indexDtsContent = `// Re-export everything from the lib directory
 export * from './lib/index';
 
@@ -27,8 +29,9 @@ import * as lib from './lib/index';
 export { lib };
 `;
 
-// Write the files
-fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
-fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
-
-console.log('Created package index files (index.js and index.d.ts)');
+for (const generatedDir of packageDirs) {
+  if (!fs.existsSync(generatedDir)) continue;
+  fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
+  fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
+  console.log(`Created package index files (index.js and index.d.ts) in ${generatedDir}`);
+}
