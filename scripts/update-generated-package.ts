@@ -9,50 +9,49 @@ const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as {
 	peerDependencies?: Record<string, string>;
 };
 
-// Read the generated package.json
-const generatedPackagePath = path.join(
-	__dirname,
-	'..',
-	'generated',
-	'js',
-	'OpenCapTable-v05-0.0.1',
-	'package.json',
-);
-const generatedPackage = JSON.parse(fs.readFileSync(generatedPackagePath, 'utf8')) as any;
+const packages = [
+  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v06-0.0.1'), name: rootPackage.name },
+  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.1'), name: `${rootPackage.name}-reports` },
+];
 
-// Update the version and name
-generatedPackage.version = rootPackage.version;
-generatedPackage.name = rootPackage.name;
-// Ensure the package can be published
-delete generatedPackage.private;
+for (const { dir, name } of packages) {
+  const packageJsonPath = path.join(dir, 'package.json');
+  if (!fs.existsSync(packageJsonPath)) continue;
+  const generatedPackage = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as any;
 
-// Ensure publishConfig exists
-if (!generatedPackage.publishConfig) {
-	generatedPackage.publishConfig = { access: 'public' };
-}
+  // Update the version and name
+  generatedPackage.version = rootPackage.version;
+  generatedPackage.name = name;
+  // Ensure the package can be published
+  delete generatedPackage.private;
 
-// Normalize peerDependencies: move from non-standard 'peer-dependencies' to 'peerDependencies'
-if (generatedPackage['peer-dependencies']) {
-	generatedPackage.peerDependencies = {
-		...(generatedPackage.peerDependencies || {}),
-		...generatedPackage['peer-dependencies'],
-	};
-	delete generatedPackage['peer-dependencies'];
-}
+  // Ensure publishConfig exists
+  if (!generatedPackage.publishConfig) {
+    generatedPackage.publishConfig = { access: 'public' };
+  }
 
-// If root specifies peerDependencies, prefer those (so the published package matches repo policy)
-if (rootPackage.peerDependencies) {
-	generatedPackage.peerDependencies = { ...rootPackage.peerDependencies };
-}
+  // Normalize peerDependencies: move from non-standard 'peer-dependencies' to 'peerDependencies'
+  if (generatedPackage['peer-dependencies']) {
+    generatedPackage.peerDependencies = {
+      ...(generatedPackage.peerDependencies || {}),
+      ...generatedPackage['peer-dependencies'],
+    };
+    delete generatedPackage['peer-dependencies'];
+  }
 
-// Write back the generated package.json
-fs.writeFileSync(generatedPackagePath, JSON.stringify(generatedPackage, null, 4) + '\n');
+  // If root specifies peerDependencies, prefer those (so the published package matches repo policy)
+  if (rootPackage.peerDependencies) {
+    generatedPackage.peerDependencies = { ...rootPackage.peerDependencies };
+  }
 
-// Create index files in generated dir
-const generatedDir = path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v05-0.0.1');
+  // Write back the generated package.json
+  fs.writeFileSync(packageJsonPath, JSON.stringify(generatedPackage, null, 4) + '\n');
 
-// index.js that re-exports from lib/index.js
-const indexJsContent = `"use strict";
+  // Create index files in generated dir
+  const generatedDir = dir;
+
+  // index.js that re-exports from lib/index.js
+  const indexJsContent = `"use strict";
 
 // Re-export everything from the lib directory
 const lib = require('./lib/index.js');
@@ -66,8 +65,8 @@ Object.keys(lib).forEach(key => {
 exports.lib = lib;
 `;
 
-// index.d.ts that re-exports from lib/index.d.ts
-const indexDtsContent = `// Re-export everything from the lib directory
+  // index.d.ts that re-exports from lib/index.d.ts
+  const indexDtsContent = `// Re-export everything from the lib directory
 export * from './lib/index';
 
 // Also export the lib object itself for backward compatibility
@@ -75,8 +74,9 @@ import * as lib from './lib/index';
 export { lib };
 `;
 
-fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
-fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
+  fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
+  fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
 
-console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
-console.log('Created package index files (index.js and index.d.ts)');
+  console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
+  console.log(`Created package index files (index.js and index.d.ts) in ${generatedDir}`);
+}

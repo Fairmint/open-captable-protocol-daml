@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 
-import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as path from 'path';
 import { createLedgerJsonApiClient } from './utils';
 
@@ -24,22 +23,21 @@ function getNetworkFromArgs(): string {
 
 async function main() {
   const network = getNetworkFromArgs();
-  console.log(`Uploading DAR file to ${network}...`);
+  console.log(`Uploading Reports DAR file to ${network}...`);
 
   const providers = ['intellect', '5n'];
 
   for (const provider of providers) {
     console.log(`📤 Uploading to ${provider} provider...`);
 
-    // Create client using EnvLoader
     const client = createLedgerJsonApiClient(network, provider);
 
-    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v06', '.daml', 'dist', 'OpenCapTable-v06-0.0.1.dar') });
+    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTableReports-v01', '.daml', 'dist', 'OpenCapTableReports-v01-0.0.1.dar') });
 
-    console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
+    console.log(`✅ Reports DAR file uploaded successfully to ${provider} on ${network}`);
   }
 
-  console.log(`🎉 DAR upload process completed for ${network}`);
+  console.log(`🎉 Reports DAR upload process completed for ${network}`);
 }
 
-main();
+main(); 

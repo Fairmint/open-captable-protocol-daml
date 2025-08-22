@@ -4,7 +4,10 @@ import fs from 'fs';
 import path from 'path';
 
 // Paths
-const PACKAGE_DIR = path.join(__dirname, '../generated/js/OpenCapTable-v05-0.0.1');
+const PACKAGE_DIRS = [
+	path.join(__dirname, '../generated/js/OpenCapTable-v06-0.0.1'),
+	path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.1'),
+];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
 
@@ -37,9 +40,9 @@ function copyDirectory(src: string, dest: string): void {
 	}
 }
 
-function createBundledFiles(): void {
+function createBundledFiles(targetDir: string): void {
 	console.log('📦 Bundling DA.Internal.Template dependency...');
-	const templateDir = path.join(PACKAGE_DIR, 'lib/DA/Internal/Template');
+	const templateDir = path.join(targetDir, 'lib/DA/Internal/Template');
 	createDirectoryIfNotExists(templateDir);
 
 	const moduleSrc = path.join(DEPENDENCY_DIR, 'lib/DA/Internal/Template/module.js');
@@ -118,7 +121,7 @@ __export(require('./module'));
 `;
 	fs.writeFileSync(path.join(templateDir, 'index.d.ts'), templateIndexDts);
 
-	const internalDir = path.join(PACKAGE_DIR, 'lib/DA/Internal');
+	const internalDir = path.join(targetDir, 'lib/DA/Internal');
 	createDirectoryIfNotExists(internalDir);
 	const internalIndex = `"use strict";
 /* eslint-disable-next-line no-unused-vars */
@@ -136,7 +139,7 @@ exports.Template = Template;
 `;
 	fs.writeFileSync(path.join(internalDir, 'index.d.ts'), internalIndexDts);
 
-	const daDir = path.join(PACKAGE_DIR, 'lib/DA');
+	const daDir = path.join(targetDir, 'lib/DA');
 	createDirectoryIfNotExists(daDir);
 	const daIndex = `"use strict";
 /* eslint-disable-next-line no-unused-vars */
@@ -157,9 +160,9 @@ exports.Internal = Internal;
 	console.log('✅ Created bundled DA.Internal.Template structure');
 }
 
-function createBundledSpliceFiles(): void {
+function createBundledSpliceFiles(targetDir: string): void {
 	console.log('📦 Bundling splice-api-featured-app-v1 dependency...');
-	const spliceDir = path.join(PACKAGE_DIR, 'lib/Splice/Api/FeaturedAppRightV1');
+	const spliceDir = path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1');
 	createDirectoryIfNotExists(spliceDir);
 
 	const moduleSrc = path.join(SPLICE_DEPENDENCY_DIR, 'lib/Splice/Api/FeaturedAppRightV1/module.js');
@@ -238,7 +241,7 @@ __export(require('./module'));
 `;
 	fs.writeFileSync(path.join(spliceDir, 'index.d.ts'), spliceIndexDts);
 
-	const apiDir = path.join(PACKAGE_DIR, 'lib/Splice/Api');
+	const apiDir = path.join(targetDir, 'lib/Splice/Api');
 	createDirectoryIfNotExists(apiDir);
 	const apiIndex = `"use strict";
 /* eslint-disable-next-line no-unused-vars */
@@ -256,7 +259,7 @@ exports.FeaturedAppRightV1 = FeaturedAppRightV1;
 `;
 	fs.writeFileSync(path.join(apiDir, 'index.d.ts'), apiIndexDts);
 
-	const spliceMainDir = path.join(PACKAGE_DIR, 'lib/Splice');
+	const spliceMainDir = path.join(targetDir, 'lib/Splice');
 	createDirectoryIfNotExists(spliceMainDir);
 	const spliceMainIndex = `"use strict";
 /* eslint-disable-next-line no-unused-vars */
@@ -277,10 +280,10 @@ exports.Api = Api;
 	console.log('✅ Created bundled splice-api-featured-app-v1 structure');
 }
 
-function updateMainIndex(): void {
+function updateMainIndex(targetDir: string): void {
 	console.log('📝 Updating main index files...');
 
-	const mainIndexPath = path.join(PACKAGE_DIR, 'lib/index.js');
+	const mainIndexPath = path.join(targetDir, 'lib/index.js');
 	let mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
 
 	if (!mainIndex.includes("var DA = require('./DA')")) {
@@ -306,7 +309,7 @@ function updateMainIndex(): void {
 		}
 	}
 
-	const mainIndexDtsPath = path.join(PACKAGE_DIR, 'lib/index.d.ts');
+	const mainIndexDtsPath = path.join(targetDir, 'lib/index.d.ts');
 	let mainIndexDts = fs.readFileSync(mainIndexDtsPath, 'utf8');
 
 	if (!mainIndexDts.includes("import * as DA from './DA'")) {
@@ -334,7 +337,7 @@ function updateMainIndex(): void {
 	}
 }
 
-function replaceDependencyReferences(): void {
+function replaceDependencyReferences(targetDir: string): void {
 	console.log('🔄 Replacing dependency references in generated files...');
 
 	const filesToProcess: string[] = [];
@@ -351,7 +354,7 @@ function replaceDependencyReferences(): void {
 		}
 	};
 
-	findFiles(path.join(PACKAGE_DIR, 'lib'));
+	findFiles(path.join(targetDir, 'lib'));
 
 	let replacedCount = 0;
 	for (const filePath of filesToProcess) {
@@ -361,9 +364,9 @@ function replaceDependencyReferences(): void {
 
 		if (content.includes('@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')) {
 			const relativePath = path
-				.relative(path.dirname(filePath), path.join(PACKAGE_DIR, 'lib/DA/Internal/Template'))
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Internal/Template'))
 				.replace(/\\/g, '/');
-			console.log(`  Updating ${path.relative(PACKAGE_DIR, filePath)} with DA path: ${relativePath}`);
+			console.log(`  Updating ${path.relative(targetDir, filePath)} with DA path: ${relativePath}`);
 			if (isDts) {
 				content = content.replace(
 					/from '@daml\.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0';/g,
@@ -379,9 +382,9 @@ function replaceDependencyReferences(): void {
 
 		if (content.includes('@daml.js/splice-api-featured-app-v1-1.0.0')) {
 			const relativePath = path
-				.relative(path.dirname(filePath), path.join(PACKAGE_DIR, 'lib/Splice/Api/FeaturedAppRightV1'))
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'))
 				.replace(/\\/g, '/');
-			console.log(`  Updating ${path.relative(PACKAGE_DIR, filePath)} with Splice path: ${relativePath}`);
+			console.log(`  Updating ${path.relative(targetDir, filePath)} with Splice path: ${relativePath}`);
 			if (isDts) {
 				content = content.replace(
 					/from '@daml\.js\/splice-api-featured-app-v1-1\.0\.0';/g,
@@ -404,9 +407,9 @@ function replaceDependencyReferences(): void {
 	console.log(`✅ Replaced dependency references in ${replacedCount} files`);
 }
 
-function removeLocalDependency(): void {
+function removeLocalDependency(targetDir: string): void {
 	console.log('🗑️  Removing local dependencies from package.json...');
-	const packageJsonPath = path.join(PACKAGE_DIR, 'package.json');
+	const packageJsonPath = path.join(targetDir, 'package.json');
 	const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as any;
 	const localDependencies = [
 		'@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
@@ -431,11 +434,18 @@ function removeLocalDependency(): void {
 function main(): void {
 	try {
 		console.log('🚀 Starting dependency bundling process (TS)...');
-		createBundledFiles();
-		createBundledSpliceFiles();
-		updateMainIndex();
-		replaceDependencyReferences();
-		removeLocalDependency();
+		for (const targetDir of PACKAGE_DIRS) {
+			if (!fs.existsSync(targetDir)) {
+				console.log(`ℹ️  Skipping missing package dir: ${targetDir}`);
+				continue;
+			}
+			console.log(`📦 Processing package: ${targetDir}`);
+			createBundledFiles(targetDir);
+			createBundledSpliceFiles(targetDir);
+			updateMainIndex(targetDir);
+			replaceDependencyReferences(targetDir);
+			removeLocalDependency(targetDir);
+		}
 		console.log('✅ Dependency bundling completed successfully (TS)!');
 		console.log('📦 Package is now ready for publishing to npm');
 	} catch (error: any) {
