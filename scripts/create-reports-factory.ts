@@ -50,8 +50,8 @@ async function main() {
   const network = getNetworkFromArgs();
   console.log(`Creating ReportsFactory contract for ${network}...`);
 
-  // Dynamic import to avoid TS compile error before codegen
-  const { Fairmint } = await import('../generated/js/OpenCapTableReports-v01-0.0.1/lib');
+  // Import from the combined lib built by scripts/create-root-index.ts
+  const { Fairmint } = await import('../lib');
 
   const client = createLedgerJsonApiClient(network, 'intellect');
 
@@ -126,4 +126,4 @@ async function main() {
   }
 }
 
-main(); 
+main();

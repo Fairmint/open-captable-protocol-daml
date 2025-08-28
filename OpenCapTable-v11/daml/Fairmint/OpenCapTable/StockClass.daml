@@ -1,9 +1,147 @@
 module Fairmint.OpenCapTable.StockClass where
 
-import Fairmint.OpenCapTable.StockPosition
 import Fairmint.OpenCapTable.Types
+-- Time imported implicitly via DA.Time usage in choices/events
 import Splice.Api.FeaturedAppRightV1 as Featured
 import Fairmint.OpenCapTable.Shared.Helpers (createActivityMarker)
+
+-- Helper to process position list during stock splits
+-- Iterates provided positions, archives them, and recreates on the new class with multiplied quantity.
+processPositionsForSplit
+  : Party                                   -- system_operator
+  -> Party                                   -- issuer
+  -> ContractId Featured.FeaturedAppRight    -- featured_app_right
+  -> ContractId StockClass                   -- old class
+  -> ContractId StockClass                   -- new class
+  -> Decimal                                 -- split_ratio
+  -> [ContractId StockPosition]
+  -> Update ()
+processPositionsForSplit system_operator issuer featured_app_right oldClass newClass split_ratio positions =
+  case positions of
+    [] -> pure ()
+    p :: rest -> do
+      pos <- fetch p
+      assertMsg "Position must belong to this class" (pos.stock_class == oldClass)
+      _ <- exercise p Archive
+      _ <- create StockPosition with
+        system_operator = system_operator
+        issuer = issuer
+        owner = pos.owner
+        quantity = pos.quantity * split_ratio
+        stock_class = newClass
+        featured_app_right = featured_app_right
+      processPositionsForSplit system_operator issuer featured_app_right oldClass newClass split_ratio rest
+
+-- Position templates colocated to avoid module import cycles when referencing parent ContractId
+template StockPosition
+  with
+    system_operator: Party
+    issuer: Party
+    owner: Party
+    quantity: Decimal
+    stock_class: ContractId StockClass  -- Parent reference by ContractId
+    featured_app_right: ContractId Featured.FeaturedAppRight
+  where
+    signatory issuer, system_operator
+    observer owner
+
+    ensure
+      quantity > 0.0
+
+    nonconsuming choice ProposeTransfer : ContractId StockTransferProposal
+      with
+        transfer: TransferOperation
+      controller owner
+      do
+        assertMsg "Cannot transfer to self" (transfer.recipient /= owner)
+        assertMsg "Cannot transfer more than owned" (transfer.quantity <= quantity)
+        create StockTransferProposal with
+          system_operator = system_operator
+          issuer = issuer
+          owner = owner
+          recipient = transfer.recipient
+          quantity = transfer.quantity
+          stock_class = stock_class
+          from_position = self
+          featured_app_right = featured_app_right
+
+    choice ReduceQuantity : ContractId StockPosition
+      with
+        amount: Decimal
+      controller issuer
+      do
+        assertMsg "amount must be positive" (amount > 0.0)
+        assertMsg "amount must be less than quantity" (amount < quantity)
+        create this with quantity = quantity - amount
+
+template StockTransferProposal
+  with
+    system_operator: Party
+    issuer: Party
+    owner: Party
+    recipient: Party
+    quantity: Decimal
+    stock_class: ContractId StockClass
+    from_position: ContractId StockPosition
+    featured_app_right: ContractId Featured.FeaturedAppRight
+  where
+    signatory issuer, system_operator, owner
+    observer recipient
+
+    ensure
+      quantity > 0.0
+
+    choice AcceptTransfer : ContractId StockPosition
+      with
+        date: Time
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        fromPos <- fetch from_position
+        assertMsg "Mismatched stock class" (fromPos.stock_class == stock_class)
+        assertMsg "Owner must match" (fromPos.owner == owner)
+        assertMsg "Cannot transfer more than owned" (quantity <= fromPos.quantity)
+        -- Create recipient position
+        newPos <- create StockPosition with
+          system_operator = system_operator
+          issuer = issuer
+          owner = recipient
+          quantity = quantity
+          stock_class = stock_class
+          featured_app_right = featured_app_right
+        -- Reduce or archive sender's position
+        if quantity == fromPos.quantity then do
+          exercise from_position Archive
+        else do
+          _ <- exercise from_position ReduceQuantity with amount = quantity
+          pure ()
+        -- Emit transfer event
+        _ <- create StockTransferEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = stock_class
+          from_owner = owner
+          to_owner = recipient
+          quantity = quantity
+          date = date
+        pure newPos
+
+    choice RetractTransfer : ()
+      with
+        date: Time
+      controller owner
+      do
+        _ <- create StockRetractionEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = stock_class
+          from_owner = owner
+          to_owner = recipient
+          quantity = quantity
+          date = date
+        pure ()
 
 template StockClass
   with
@@ -15,7 +153,7 @@ template StockClass
   where
     signatory issuer, system_operator
 
-    ensure 
+    ensure
       issued_shares >= 0.0 &&
       stock_class_data.name /= "" &&
       stock_class_data.default_id_prefix /= "" &&
@@ -53,24 +191,249 @@ template StockClass
       controller issuer
       do
         assertMsg "Quantity must be positive" (transfer.quantity > 0.0)
-        
+
         -- Validate against authorized shares
         let newIssuedTotal = issued_shares + transfer.quantity
         case stock_class_data.initial_shares_authorized of
-          OcfInitialSharesNumeric authorized -> 
-            assertMsg "Cannot issue more than authorized shares" 
+          OcfInitialSharesNumeric authorized ->
+            assertMsg "Cannot issue more than authorized shares"
               (newIssuedTotal <= authorized)
           OcfInitialSharesEnum _ -> pure ()
-        
+
         _ <- createActivityMarker system_operator featured_app_right
+
+        newClassCid <- create this with issued_shares = newIssuedTotal
 
         stockPosition <- create StockPosition with
           owner = transfer.recipient
           quantity = transfer.quantity
-          stock_class_id = stock_class_data.name  -- Use stock class name as ID
+          stock_class = newClassCid
           ..
 
-        create this with
-          issued_shares = newIssuedTotal
+        -- Emit issuance event
+        now <- getTime
+        _ <- create StockIssuanceEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = newClassCid
+          recipient = transfer.recipient
+          quantity = transfer.quantity
+          date = now
 
         return stockPosition
+
+    -- Repurchase stock from a position
+    choice RepurchaseStock : ContractId StockClass
+      with
+        position: ContractId StockPosition
+        quantity: Decimal
+        date: Time
+      controller issuer
+      do
+        pos <- fetch position
+        -- Allow repurchase even if StockClass was versioned; we don't require exact cid match
+        assertMsg "Cannot repurchase more than owned" (quantity > 0.0 && quantity <= pos.quantity)
+        let newIssued = issued_shares - quantity
+        assertMsg "Issued shares cannot go negative" (newIssued >= 0.0)
+        _ <- createActivityMarker system_operator featured_app_right
+        newClassCid <- create this with issued_shares = newIssued
+        if quantity == pos.quantity then do
+          exercise position Archive
+        else do
+          _ <- exercise position ReduceQuantity with amount = quantity
+          pure ()
+        _ <- create StockRepurchaseEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = newClassCid
+          owner = pos.owner
+          quantity = quantity
+          date = date
+        pure newClassCid
+
+    -- Reissue previously repurchased shares
+    choice ReissueStock : ContractId StockPosition
+      with
+        transfer: TransferOperation
+        date: Time
+      controller issuer
+      do
+        -- Authorized shares constraint applies the same as IssueStock
+        let newIssuedTotal = issued_shares + transfer.quantity
+        case stock_class_data.initial_shares_authorized of
+          OcfInitialSharesNumeric authorized ->
+            assertMsg "Cannot issue more than authorized shares"
+              (newIssuedTotal <= authorized)
+          OcfInitialSharesEnum _ -> pure ()
+        _ <- createActivityMarker system_operator featured_app_right
+        newClassCid <- create this with issued_shares = newIssuedTotal
+        pos <- create StockPosition with
+          owner = transfer.recipient
+          quantity = transfer.quantity
+          stock_class = newClassCid
+          ..
+        _ <- create StockReissuanceEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = newClassCid
+          recipient = transfer.recipient
+          quantity = transfer.quantity
+          date = date
+        return pos
+
+    -- Stock class split: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/split/StockClassSplit.schema.json
+    choice SplitStockClass : ContractId StockClass
+      with
+        split_ratio: Decimal
+        positions: [ContractId StockPosition]
+        date: Time
+      controller issuer
+      do
+        assertMsg "split_ratio must be > 0" (split_ratio > 0.0)
+        let newIssued = issued_shares * split_ratio
+        case stock_class_data.initial_shares_authorized of
+          OcfInitialSharesNumeric authorized ->
+            assertMsg "Issued after split exceeds authorized" (newIssued <= authorized)
+          OcfInitialSharesEnum _ -> pure ()
+        _ <- createActivityMarker system_operator featured_app_right
+        newClassCid <- create this with issued_shares = newIssued
+        -- Adjust all provided positions to the new class with multiplied quantities
+        processPositionsForSplit system_operator issuer featured_app_right self newClassCid split_ratio positions
+        _ <- create StockClassSplitEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = newClassCid
+          split_ratio = split_ratio
+          date = date
+        pure newClassCid
+
+    -- Authorized shares adjustment: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/adjustment/StockClassAuthorizedSharesAdjustment.schema.json
+    choice AdjustAuthorizedShares : ContractId StockClass
+      with
+        new_authorized: Decimal
+        date: Time
+      controller issuer
+      do
+        assertMsg "new_authorized must be >= issued_shares" (new_authorized >= issued_shares)
+        case stock_class_data.initial_shares_authorized of
+          OcfInitialSharesNumeric _ -> pure ()
+          OcfInitialSharesEnum _ -> abort "Authorized shares must be numeric to adjust"
+        _ <- createActivityMarker system_operator featured_app_right
+        let newData = stock_class_data with initial_shares_authorized = OcfInitialSharesNumeric new_authorized
+        newClassCid <- create this with stock_class_data = newData
+        _ <- create StockClassAuthorizedSharesAdjustmentEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = newClassCid
+          new_authorized = new_authorized
+          date = date
+        pure newClassCid
+
+-- OCF Transaction event templates (links to schemas)
+-- Stock Issuance: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/issuance/StockIssuance.schema.json
+template StockIssuanceEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    recipient: Party
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer recipient
+    ensure quantity > 0.0
+
+-- Stock Transfer: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/transfer/StockTransfer.schema.json
+template StockTransferEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    from_owner: Party
+    to_owner: Party
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer from_owner, to_owner
+    ensure quantity > 0.0 && from_owner /= to_owner
+
+-- Stock Repurchase: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/repurchase/StockRepurchase.schema.json
+template StockRepurchaseEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    owner: Party
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer owner
+    ensure quantity > 0.0
+
+-- Stock Reissuance: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/reissuance/StockReissuance.schema.json
+template StockReissuanceEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    recipient: Party
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer recipient
+    ensure quantity > 0.0
+
+-- Stock Retraction: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/retraction/StockRetraction.schema.json
+template StockRetractionEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    from_owner: Party
+    to_owner: Party
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer from_owner, to_owner
+    ensure quantity > 0.0 && from_owner /= to_owner
+
+-- StockClass Split Event
+template StockClassSplitEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    split_ratio: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    ensure split_ratio > 0.0
+
+-- Authorized Shares Adjustment Event
+template StockClassAuthorizedSharesAdjustmentEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_class: ContractId StockClass
+    new_authorized: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    ensure new_authorized >= 0.0

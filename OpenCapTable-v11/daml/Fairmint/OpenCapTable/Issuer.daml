@@ -1,6 +1,11 @@
 module Fairmint.OpenCapTable.Issuer where
 
 import Fairmint.OpenCapTable.StockClass
+import Fairmint.OpenCapTable.Stakeholder
+import Fairmint.OpenCapTable.Valuation
+import Fairmint.OpenCapTable.StockLegendTemplate
+import Fairmint.OpenCapTable.StockPlan
+import Fairmint.OpenCapTable.VestingTerms
 import Fairmint.OpenCapTable.Types
 import Splice.Api.FeaturedAppRightV1 as Featured
 import Fairmint.OpenCapTable.Shared.Helpers (createActivityMarker)
@@ -14,7 +19,7 @@ template Issuer
   where
     signatory issuer, system_operator
 
-    ensure 
+    ensure
       validateOcfLegalName issuer_data.legal_name &&
       validateOcfCountryCode issuer_data.country_of_formation &&
       optional True validateOcfCountrySubdivisionCode issuer_data.country_subdivision_of_formation &&
@@ -29,9 +34,75 @@ template Issuer
       controller issuer
       do
         _ <- createActivityMarker system_operator featured_app_right
-        create StockClass with
+        stockClassCid <- create StockClass with
           issued_shares = 0.0
           ..
+        return stockClassCid
+
+    nonconsuming choice CreateStakeholder : ContractId Stakeholder
+      with
+        stakeholder: Party
+        stakeholder_data: OcfStakeholderData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create Stakeholder with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          ..
+
+    nonconsuming choice CreateValuation : ContractId Valuation
+      with
+        stock_class: ContractId StockClass
+        valuation_data: OcfValuationData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create Valuation with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_class = stock_class
+          valuation_data = valuation_data
+
+    nonconsuming choice CreateStockLegendTemplate : ContractId StockLegendTemplate
+      with
+        template_data: OcfStockLegendTemplateData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create StockLegendTemplate with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          template_data = template_data
+
+    nonconsuming choice CreateStockPlan : ContractId StockPlan
+      with
+        stock_classes: [ContractId StockClass]
+        plan_data: OcfStockPlanData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create StockPlan with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_classes = stock_classes
+          plan_data = plan_data
+
+    nonconsuming choice CreateVestingTerms : ContractId VestingTerms
+      with
+        vesting_terms_data: OcfVestingTermsData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create VestingTerms with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          vesting_terms_data = vesting_terms_data
 
     choice UpdateIssuerData : ContractId Issuer
       with
@@ -41,3 +112,155 @@ template Issuer
         _ <- createActivityMarker system_operator featured_app_right
         create this with
           issuer_data = new_issuer_data
+
+    -- Convertible issuance (minimal scaffold)
+    -- Creates a Convertible object with strict validation of issuance data.
+    nonconsuming choice IssueConvertible : ContractId Convertible
+      with
+        stakeholder: Party
+        issuance_data: OcfConvertibleIssuanceData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create Convertible with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stakeholder = stakeholder
+          issuance_data = issuance_data
+
+    -- Warrant issuance (minimal scaffold)
+    -- Requires target stock_class for exercise; validates issuance data.
+    nonconsuming choice IssueWarrant : ContractId Warrant
+      with
+        stakeholder: Party
+        stock_class: ContractId StockClass
+        issuance_data: OcfWarrantIssuanceData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create Warrant with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stakeholder = stakeholder
+          stock_class = stock_class
+          issuance_data = issuance_data
+
+-- Convertible object template (strict validation, scaffold)
+-- Spec: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/issuance/ConvertibleIssuance.schema.json
+template Convertible
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stakeholder: Party
+    issuance_data: OcfConvertibleIssuanceData
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+    ensure
+      validateOcfConvertibleIssuanceData issuance_data
+
+    -- Convert into stock
+    -- Minimal conversion: directly issues stock into the target class for stakeholder.
+    nonconsuming choice Convert : ContractId StockPosition
+      with
+        stock_class: ContractId StockClass
+        quantity: Decimal
+        date: Time
+      controller issuer
+      do
+        assertMsg "quantity must be > 0" (quantity > 0.0)
+        _ <- createActivityMarker system_operator featured_app_right
+        posCid <- exercise stock_class IssueStock with
+          transfer = TransferOperation with
+            recipient = stakeholder
+            quantity = quantity
+        _ <- create ConvertibleConversionEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          convertible = self
+          stakeholder = stakeholder
+          stock_class = stock_class
+          quantity = quantity
+          date = date
+        pure posCid
+
+-- Warrant object template (strict validation, scaffold)
+-- Spec: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/issuance/WarrantIssuance.schema.json
+template Warrant
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stakeholder: Party
+    stock_class: ContractId StockClass
+    issuance_data: OcfWarrantIssuanceData
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+    ensure
+      validateOcfWarrantIssuanceData issuance_data
+
+    -- Exercise warrant into underlying stock class
+    -- Minimal exercise: directly issues stock into the associated stock_class for stakeholder.
+    nonconsuming choice ExerciseWarrant : ContractId StockPosition
+      with
+        quantity: Decimal
+        date: Time
+      controller issuer
+      do
+        assertMsg "quantity must be > 0" (quantity > 0.0)
+        _ <- createActivityMarker system_operator featured_app_right
+        posCid <- exercise stock_class IssueStock with
+          transfer = TransferOperation with
+            recipient = stakeholder
+            quantity = quantity
+        _ <- create WarrantExerciseEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          warrant = self
+          stakeholder = stakeholder
+          stock_class = stock_class
+          quantity = quantity
+          date = date
+        pure posCid
+
+-- Convertible Conversion Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/conversion/ConvertibleConversion.schema.json
+template ConvertibleConversionEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    convertible: ContractId Convertible
+    stakeholder: Party
+    stock_class: ContractId StockClass
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+    ensure quantity > 0.0
+
+-- Warrant Exercise Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/exercise/WarrantExercise.schema.json
+template WarrantExerciseEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    warrant: ContractId Warrant
+    stakeholder: Party
+    stock_class: ContractId StockClass
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+    ensure quantity > 0.0
