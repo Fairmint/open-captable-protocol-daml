@@ -287,16 +287,22 @@ data OcfInitialSharesAuthorized =
   deriving (Eq, Show)
 
 -- Conversion mechanism enumeration
--- OCF Specification: https://schema.opencaptablecoalition.com/v/1.2.0/primitives/types/conversion_rights/ConversionRight.schema.json
+-- Source: OCF primitives conversion rights (mechanisms listed under ConversionRight)
+-- https://schema.opencaptablecoalition.com/v/1.2.0/primitives/types/conversion_rights/ConversionRight.schema.json
 data OcfConversionMechanism =
-    OcfConversionMechanismRatioConversion       -- Sets forth inputs and conversion mechanism of a ratio conversion (primarily used to describe conversion from one stock class (e.g. Preferred) into another (e.g. Common))
-  | OcfConversionMechanismPercentConversion     -- Sets forth inputs and conversion mechanism of a percentage-based conversion
-  | OcfConversionMechanismFixedAmountConversion -- Sets forth inputs and conversion mechanism of a fixed amount conversion
+    OcfConversionMechanismRatioConversion                -- Ratio-based conversion (requires 'ratio')
+  | OcfConversionMechanismPercentCapitalizationConversion -- Fixed percent of capitalization conversion (requires 'percent_of_capitalization')
+  | OcfConversionMechanismFixedAmountConversion           -- Fixed amount conversion (requires 'conversion_price')
+  | OcfConversionMechanismValuationBasedConversion        -- Valuation-based conversion (not yet implemented)
+  | OcfConversionMechanismSharePriceBasedConversion       -- Price-per-share based conversion (not yet implemented)
+  | OcfConversionMechanismSAFEConversion                  -- SAFE-specific conversion (not yet implemented)
+  | OcfConversionMechanismNoteConversion                  -- Convertible note-specific conversion (not yet implemented)
+  | OcfConversionMechanismCustomConversion                -- Custom conversion (not yet implemented)
   deriving (Eq, Show)
 
 -- Conversion trigger enumeration
--- OCF Specification: https://schema.opencaptablecoalition.com/v/1.2.0/enums/ConversionTrigger.schema.json
--- Enumeration of conversion triggers that determine when a conversion can occur
+-- Triggers associated with conversion/exercise rights; see OCF primitives for context.
+-- Reference context: https://schema.opencaptablecoalition.com/v/1.2.0/primitives/types/conversion_rights/ConversionRight.schema.json
 data OcfConversionTrigger =
     OcfConversionTriggerAutomatic              -- Conversion happens automatically when trigger conditions are met
   | OcfConversionTriggerOptional               -- Conversion is at the holder's discretion when conditions are met
@@ -307,13 +313,25 @@ data OcfConversionTrigger =
 -- Abstract object describing fields common to all conversion rights that apply to a stock class
 -- Note: The OCF RatioConversionMechanism schema also includes a rounding_type field for fractional share rounding,
 -- which is not currently implemented in this DAML version but could be added if needed for precise conversions
+-- OCF Ratio type (required numerator and denominator, both positive)
+-- https://schema.opencaptablecoalition.com/v/1.2.0/types/Ratio.schema.json
+data OcfRatio = OcfRatio
+  with
+    numerator: Decimal
+    denominator: Decimal
+  deriving (Eq, Show)
+
+validateOcfRatio : OcfRatio -> Bool
+validateOcfRatio r = r.numerator > (0.0 : Decimal) && r.denominator > (0.0 : Decimal)
+
 data OcfStockClassConversionRight = OcfStockClassConversionRight
   with
     type_: Text                           -- Type identifier for the conversion right (e.g. "STOCK_CLASS_CONVERSION_RIGHT")
     conversion_mechanism: OcfConversionMechanism  -- The conversion mechanism that determines how conversions are calculated
     conversion_trigger: OcfConversionTrigger      -- When the conversion can occur (automatic or optional/at holder's discretion)
     converts_to_stock_class_id: Text             -- ID of the target stock class that this converts into
-    conversion_rate: Optional Decimal            -- One share of this stock class converts into this many target stock class shares (equivalent to OCF 'ratio' field)
+    ratio: Optional OcfRatio                     -- Ratio of conversion (OCF 'ratio' field)
+    percent_of_capitalization: Optional Decimal  -- Percent used for percent-of-capitalization conversions (0 < p <= 1)
     conversion_price: Optional OcfMonetary       -- What is the effective conversion price per share of this stock class? (for price-based conversions)
     expires_at: Optional Time                    -- Expiration timestamp after which the conversion right is no longer valid
   deriving (Eq, Show)
@@ -326,17 +344,23 @@ validateOcfStockClassConversionRight conversionRight =
   -- Mechanism-specific constraints
   (case conversionRight.conversion_mechanism of
      OcfConversionMechanismRatioConversion ->
-       case conversionRight.conversion_rate of
-         Some rate -> rate > (0.0 : Decimal)
+       case conversionRight.ratio of
+         Some r -> validateOcfRatio r
          None -> False
-     OcfConversionMechanismPercentConversion ->
-       case conversionRight.conversion_rate of
-         Some rate -> rate > (0.0 : Decimal) && rate <= (1.0 : Decimal)
+     OcfConversionMechanismPercentCapitalizationConversion ->
+       case conversionRight.percent_of_capitalization of
+         Some p -> p > (0.0 : Decimal) && p <= (1.0 : Decimal)
          None -> False
      OcfConversionMechanismFixedAmountConversion ->
        case conversionRight.conversion_price of
          Some price -> validateOcfMonetary price
-         None -> False) &&
+         None -> False
+     -- Not yet implemented mechanisms are rejected by validation for now
+     OcfConversionMechanismValuationBasedConversion -> False
+     OcfConversionMechanismSharePriceBasedConversion -> False
+     OcfConversionMechanismSAFEConversion -> False
+     OcfConversionMechanismNoteConversion -> False
+     OcfConversionMechanismCustomConversion -> False) &&
   -- If price is provided, it must be valid
   (case conversionRight.conversion_price of
      None -> True
@@ -514,14 +538,19 @@ data OcfVestingCondition = OcfVestingCondition
     next_condition_ids: [Text]
   deriving (Eq, Show)
 
+-- Helper: exactly one of portion or quantity present, and quantity > 0 if present
+validateExactlyOnePortionOrQuantity : Optional OcfVestingConditionPortion -> Optional Decimal -> Bool
+validateExactlyOnePortionOrQuantity portion quantity =
+  case (portion, quantity) of
+    (Some _, None) -> True
+    (None, Some q) -> q > (0.0 : Decimal)
+    _ -> False
+
 validateOcfVestingCondition : OcfVestingCondition -> Bool
 validateOcfVestingCondition c =
   c.id_ /= "" &&
   -- Exactly one of portion or quantity present
-  (case (c.portion, c.quantity) of
-     (Some _, None) -> True
-     (None, Some q) -> q > (0.0 : Decimal)
-     _ -> False) &&
+  validateExactlyOnePortionOrQuantity c.portion c.quantity &&
   (case c.portion of None -> True; Some p -> validateOcfVestingConditionPortion p) &&
   -- Validate trigger specific constraints
   (case c.trigger of
