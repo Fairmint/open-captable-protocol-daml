@@ -130,10 +130,10 @@ async function main() {
     const firstEvent = eventsById[firstEventKey];
 
     // Check if it's a CreatedTreeEvent
-    const createdTreeEvent = firstEvent?.CreatedTreeEvent;
-    if (!createdTreeEvent) {
+    if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
       throw new Error('First event is not a CreatedTreeEvent');
     }
+    const createdTreeEvent = firstEvent.CreatedTreeEvent;
 
     const contractId = createdTreeEvent.value.contractId;
     if (!contractId) {
