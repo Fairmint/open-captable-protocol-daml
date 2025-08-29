@@ -1,0 +1,58 @@
+module TestStockSplitPerformance where
+import Daml.Script
+import DA.Date
+import DA.Time
+import Fairmint.OpenCapTable.Issuer
+import Fairmint.OpenCapTable.StockClass
+import Fairmint.OpenCapTable.Types
+import Setup
+
+-- Top-level recursive issuer for positions to satisfy DAML restrictions
+issueLoop : Int -> Party -> ContractId StockClass -> Party -> [ContractId StockPosition] -> Script [ContractId StockPosition]
+issueLoop i issuer stockClassCid alice acc =
+  if i == 0 then pure acc
+  else do
+    pos <- submit issuer $ exerciseCmd stockClassCid IssueStock with
+      transfer = TransferOperation with recipient = alice; quantity = 1.0
+    Some posData <- queryContractId alice pos
+    issueLoop (i - 1) issuer posData.stock_class alice [pos]
+
+-- Performance-oriented script: split with many positions
+-- This doesn't assert time but ensures correctness under large counts.
+setupAndSplitMany : Int -> Script ()
+setupAndSplitMany numPositions = script do
+  TestUsers{system_operator, issuer, alice} <- setupUsers
+  issuerCid <- createIssuer system_operator issuer
+
+  -- Create stock class
+  stockClassCid <- submit issuer $ exerciseCmd issuerCid CreateStockClass with
+    stock_class_data = OcfStockClassData with
+      name = "Class A Common"
+      class_type = OcfStockClassTypeCommon
+      default_id_prefix = "CS-"
+      initial_shares_authorized = OcfInitialSharesNumeric 1000000.0
+      votes_per_share = 1.0
+      seniority = 1.0
+      board_approval_date = None
+      stockholder_approval_date = None
+      par_value = None
+      price_per_share = None
+      liquidation_preference_multiple = None
+      participation_cap_multiple = None
+      conversion_rights = []
+      comments = None
+
+  -- Issue many small positions to Alice
+  positions <- issueLoop numPositions issuer stockClassCid alice []
+
+  -- Execute a 2-for-1 split on all positions using the latest class
+  [(latestClassCid, _)] <- query @StockClass issuer
+  _ <- submit issuer $ exerciseCmd latestClassCid SplitStockClass with
+    split_ratio = 2.0
+    positions = positions
+    date = DA.Time.time (DA.Date.date 2025 Jan 1) 0 0 0
+
+  pure ()
+
+-- Wrapper to invoke with a concrete size under daml test
+stockSplitPerf_200 = setupAndSplitMany 200

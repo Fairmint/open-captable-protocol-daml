@@ -3,7 +3,8 @@
 import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../generated/js/OpenCapTable-v11-0.0.2/lib';
+// Import from the combined lib built by scripts/create-root-index.ts
+import { Fairmint } from '../lib';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 
 // Define the contract ID file structure
@@ -87,8 +88,8 @@ async function main() {
   }
 
   // Extract the contract ID - it might be nested in the response
-  const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string' 
-    ? featuredAppRight.featured_app_right 
+  const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string'
+    ? featuredAppRight.featured_app_right
     : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
 
   console.log(`✅ Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
@@ -129,10 +130,10 @@ async function main() {
     const firstEvent = eventsById[firstEventKey];
 
     // Check if it's a CreatedTreeEvent
-    const createdTreeEvent = firstEvent?.CreatedTreeEvent;
-    if (!createdTreeEvent) {
+    if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
       throw new Error('First event is not a CreatedTreeEvent');
     }
+    const createdTreeEvent = firstEvent.CreatedTreeEvent;
 
     const contractId = createdTreeEvent.value.contractId;
     if (!contractId) {

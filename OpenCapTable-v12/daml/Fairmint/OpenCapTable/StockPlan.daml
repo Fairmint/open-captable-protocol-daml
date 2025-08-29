@@ -1,0 +1,277 @@
+module Fairmint.OpenCapTable.StockPlan where
+
+import Fairmint.OpenCapTable.Types
+import Fairmint.OpenCapTable.StockClass
+import Fairmint.OpenCapTable.VestingTerms
+import Splice.Api.FeaturedAppRightV1 as Featured
+import Fairmint.OpenCapTable.Shared.Helpers (createActivityMarker)
+
+-- Helper: validate that a vesting condition id exists and is a start trigger
+assertStartVestingConditionExists
+  : Text                     -- vesting_condition_id
+  -> [OcfVestingCondition]   -- conditions
+  -> Update ()
+assertStartVestingConditionExists vesting_condition_id conditions = do
+  let matches : [OcfVestingCondition] = [ c | c <- conditions, c.id_ == vesting_condition_id ]
+  assertMsg "vesting_condition_id not found in vesting terms" (not (null matches))
+  let isStart = any (\c -> case c of OcfVestingCondition{trigger=OcfVestingStartTrigger} -> True; _ -> False) matches
+  assertMsg "vesting_condition_id must be a start trigger" isStart
+
+-- Plan Security Issuance (Options/RSUs etc.) v1.2.0
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/issuance/PlanSecurityIssuance.schema.json
+template PlanSecurityGrant
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_plan: Optional (ContractId StockPlan)         -- plan-less options supported by schema
+    stock_class: ContractId StockClass                  -- class exercised into
+    stakeholder: Party                                  -- grantee (observer)
+    vesting_terms: Optional (ContractId VestingTerms)
+    issuance_data: OcfEquityCompensationIssuanceData
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+    ensure
+      validateOcfEquityCompensationIssuanceData issuance_data
+
+    choice UpdateIssuanceData : ContractId PlanSecurityGrant
+      with
+        new_issuance_data: OcfEquityCompensationIssuanceData
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create this with issuance_data = new_issuance_data
+
+    -- Emits a VestingStart event for a given vesting condition id
+    nonconsuming choice StartVesting : ContractId PlanSecurityVestingStart
+      with
+        vesting_condition_id: Text
+        date: Time
+      controller issuer
+      do
+        assertMsg "vesting_condition_id must be non-empty" (vesting_condition_id /= "")
+        -- If vesting terms exist, ensure the condition id exists and is a start trigger
+        case vesting_terms of
+          None -> pure ()
+          Some vtCid -> do
+            vt <- fetch vtCid
+            assertStartVestingConditionExists vesting_condition_id vt.vesting_terms_data.vesting_conditions
+        create PlanSecurityVestingStart with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          vesting_condition_id = vesting_condition_id
+          date = date
+
+    -- Acceptance of plan security (beneficiary acknowledges grant)
+    nonconsuming choice AcceptGrant : ContractId PlanSecurityAcceptance
+      with
+        date: Time
+      controller stakeholder
+      do
+        create PlanSecurityAcceptance with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          stakeholder = stakeholder
+          date = date
+
+    -- Cancellation of plan security (issuer cancels before acceptance/exercise)
+    nonconsuming choice CancelGrant : ContractId PlanSecurityCancellation
+      with
+        date: Time
+      controller issuer
+      do
+        create PlanSecurityCancellation with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          stakeholder = stakeholder
+          date = date
+
+    -- Release (e.g., early release of lock-up or restrictions)
+    nonconsuming choice ReleaseGrant : ContractId PlanSecurityRelease
+      with
+        date: Time
+      controller issuer
+      do
+        create PlanSecurityRelease with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          stakeholder = stakeholder
+          date = date
+
+    -- Retraction (beneficiary retracts/declines prior to acceptance)
+    nonconsuming choice RetractGrant : ContractId PlanSecurityRetraction
+      with
+        date: Time
+      controller stakeholder
+      do
+        create PlanSecurityRetraction with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          stakeholder = stakeholder
+          date = date
+
+    -- Exercise of plan security (issues stock to stakeholder)
+    nonconsuming choice ExerciseGrant : ContractId StockPosition
+      with
+        stock_class: ContractId StockClass
+        quantity: Decimal
+        date: Time
+      controller issuer
+      do
+        assertMsg "quantity must be > 0" (quantity > 0.0)
+        _ <- createActivityMarker system_operator featured_app_right
+        posCid <- exercise stock_class IssueStock with
+          transfer = TransferOperation with
+            recipient = stakeholder
+            quantity = quantity
+        _ <- create PlanSecurityExerciseEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          plan_security = self
+          stakeholder = stakeholder
+          stock_class = stock_class
+          quantity = quantity
+          date = date
+        pure posCid
+
+-- OCF Stock Plan (v1.2.0)
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/StockPlan.schema.json
+template StockPlan
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    stock_classes: [ContractId StockClass]
+    plan_data: OcfStockPlanData
+  where
+    signatory issuer, system_operator
+
+    ensure
+      validateOcfStockPlanData plan_data &&
+      length stock_classes >= 1
+
+    choice UpdateStockPlan : ContractId StockPlan
+      with
+        new_plan_data: OcfStockPlanData
+        new_stock_classes: [ContractId StockClass]
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create this with plan_data = new_plan_data, stock_classes = new_stock_classes
+
+    nonconsuming choice IssuePlanSecurity : ContractId PlanSecurityGrant
+      with
+        stakeholder: Party
+        issuance_data: OcfEquityCompensationIssuanceData
+        stock_class: ContractId StockClass
+        vesting_terms: Optional (ContractId VestingTerms)
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create PlanSecurityGrant with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          stock_plan = Some self
+          stock_class = stock_class
+          stakeholder = stakeholder
+          vesting_terms = vesting_terms
+          issuance_data = issuance_data
+
+-- VestingStart event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/vesting/VestingStart.schema.json
+template PlanSecurityVestingStart
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    vesting_condition_id: Text
+    date: Time
+  where
+    signatory issuer, system_operator
+
+    ensure
+      vesting_condition_id /= ""
+
+-- Plan Security Acceptance: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/acceptance/PlanSecurityAcceptance.schema.json
+template PlanSecurityAcceptance
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    stakeholder: Party
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Plan Security Cancellation: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/cancellation/PlanSecurityCancellation.schema.json
+template PlanSecurityCancellation
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    stakeholder: Party
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Plan Security Release: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/release/PlanSecurityRelease.schema.json
+template PlanSecurityRelease
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    stakeholder: Party
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Plan Security Retraction: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/retraction/PlanSecurityRetraction.schema.json
+template PlanSecurityRetraction
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    stakeholder: Party
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Plan Security Exercise Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/exercise/PlanSecurityExercise.schema.json
+template PlanSecurityExerciseEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    plan_security: ContractId PlanSecurityGrant
+    stakeholder: Party
+    stock_class: ContractId StockClass
+    quantity: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+    ensure quantity > 0.0
