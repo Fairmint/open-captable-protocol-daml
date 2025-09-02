@@ -1,5 +1,8 @@
 module Fairmint.OpenCapTable.Issuer where
 
+-- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/objects/Issuer.schema.json
+-- Object describing the issuer of the cap table (the company whose cap table this is).
+
 import Fairmint.OpenCapTable.StockClass
 import Fairmint.OpenCapTable.Stakeholder
 import Fairmint.OpenCapTable.Valuation
@@ -21,12 +24,23 @@ template Issuer
 
     ensure
       validateOcfLegalName issuer_data.legal_name &&
+      -- TODO: formation_date is required by schema, but temporarily Optional due to missing data
+      -- If provided, no extra validation here beyond type; presence not enforced
       validateOcfCountryCode issuer_data.country_of_formation &&
       optional True validateOcfCountrySubdivisionCode issuer_data.country_subdivision_of_formation &&
+      -- Subdivision code and subdivision name must not both be present (schema anyOf logic)
+      (case (issuer_data.country_subdivision_of_formation, issuer_data.country_subdivision_name_of_formation) of
+        (Some _, Some _) -> False
+        _ -> True) &&
       optional True validateOcfEmail issuer_data.email &&
       optional True validateOcfPhone issuer_data.phone &&
       optional True validateOcfAddress issuer_data.address &&
-      optional True (all validateOcfTaxID) issuer_data.tax_ids
+      optional True (all validateOcfTaxID) issuer_data.tax_ids &&
+      -- If initial_shares_authorized is provided as numeric, it must be >= 0
+      (case issuer_data.initial_shares_authorized of
+        None -> True
+        Some (OcfInitialSharesNumeric n) -> n >= (0.0)
+        Some (OcfInitialSharesEnum _) -> True)
 
     nonconsuming choice CreateStockClass : ContractId StockClass
       with
@@ -138,6 +152,30 @@ template Issuer
         create this with
           issuer_data = new_issuer_data
 
+    -- Authorized shares adjustment for Issuer
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/adjustment/IssuerAuthorizedSharesAdjustment.schema.json
+    choice AdjustIssuerAuthorizedShares : ContractId Issuer
+      with
+        new_authorized: Decimal
+        date: Time
+      controller issuer
+      do
+        -- Only allowed when issuer initial_shares_authorized is numeric
+        case issuer_data.initial_shares_authorized of
+          None -> assertMsg "Issuer.initial_shares_authorized must be defined to adjust" False
+          Some (OcfInitialSharesEnum _) -> assertMsg "Issuer.initial_shares_authorized must be numeric to adjust" False
+          Some (OcfInitialSharesNumeric _) -> pure ()
+        _ <- createActivityMarker system_operator featured_app_right
+        let newIssuerData = issuer_data with initial_shares_authorized = Some (OcfInitialSharesNumeric new_authorized)
+        newIssuerCid <- create this with issuer_data = newIssuerData
+        _ <- create IssuerAuthorizedSharesAdjustmentEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          new_authorized = new_authorized
+          date = date
+        pure newIssuerCid
+
     -- Convertible issuance (minimal scaffold)
     -- Creates a Convertible object with strict validation of issuance data.
     nonconsuming choice IssueConvertible : ContractId Convertible
@@ -214,6 +252,84 @@ template Convertible
           date = date
         pure posCid
 
+    -- Transfer convertible to a new stakeholder
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/transfer/ConvertibleTransfer.schema.json
+    choice Transfer : ContractId Convertible
+      with
+        to_owner: Party
+        amount: OcfMonetary
+        date: Time
+        consideration_text: Optional Text
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        newConv <- create Convertible with
+          stakeholder = to_owner
+          ..
+        _ <- create ConvertibleTransferEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          convertible_old = self
+          convertible_new = newConv
+          from_stakeholder = stakeholder
+          to_stakeholder = to_owner
+          amount = amount
+          consideration_text = consideration_text
+          date = date
+        pure newConv
+
+    -- Acceptance
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/acceptance/ConvertibleAcceptance.schema.json
+    nonconsuming choice Accept : ContractId ConvertibleAcceptance
+      with
+        date: Time
+      controller stakeholder
+      do
+        create ConvertibleAcceptance with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          convertible = self
+          stakeholder = stakeholder
+          date = date
+
+    -- Cancellation (monetary amount)
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/cancellation/ConvertibleCancellation.schema.json
+    nonconsuming choice Cancel : ContractId ConvertibleCancellation
+      with
+        amount: OcfMonetary
+        date: Time
+        reason_text: Optional Text
+      controller issuer
+      do
+        create ConvertibleCancellation with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          convertible = self
+          stakeholder = stakeholder
+          amount = amount
+          reason_text = reason_text
+          date = date
+
+    -- Retraction (no monetary)
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/retraction/ConvertibleRetraction.schema.json
+    nonconsuming choice Retract : ContractId ConvertibleRetraction
+      with
+        date: Time
+        reason_text: Optional Text
+      controller stakeholder
+      do
+        create ConvertibleRetraction with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          convertible = self
+          stakeholder = stakeholder
+          reason_text = reason_text
+          date = date
+
 -- Warrant object template (strict validation, scaffold)
 -- Spec: https://schema.opencaptablecoalition.com/v/1.1.0/objects/transactions/issuance/WarrantIssuance.schema.json
 template Warrant
@@ -256,6 +372,28 @@ template Warrant
           date = date
         pure posCid
 
+    -- Transfer warrant (records event only; does not alter ledger ownership state)
+    -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/transfer/WarrantTransfer.schema.json
+    nonconsuming choice TransferWarrant : ContractId WarrantTransferEvent
+      with
+        to_owner: Party
+        quantity: Decimal
+        date: Time
+        consideration_text: Optional Text
+      controller issuer
+      do
+        _ <- createActivityMarker system_operator featured_app_right
+        create WarrantTransferEvent with
+          issuer = issuer
+          system_operator = system_operator
+          featured_app_right = featured_app_right
+          warrant = self
+          from_stakeholder = stakeholder
+          to_stakeholder = to_owner
+          quantity = quantity
+          consideration_text = consideration_text
+          date = date
+
 -- Convertible Conversion Event
 -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/conversion/ConvertibleConversion.schema.json
 template ConvertibleConversionEvent
@@ -273,6 +411,79 @@ template ConvertibleConversionEvent
     observer stakeholder
     ensure quantity > (0.0)
 
+-- Convertible Transfer Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/transfer/ConvertibleTransfer.schema.json
+template ConvertibleTransferEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    convertible_old: ContractId Convertible
+    convertible_new: ContractId Convertible
+    from_stakeholder: Party
+    to_stakeholder: Party
+    amount: OcfMonetary
+    consideration_text: Optional Text
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer from_stakeholder, to_stakeholder
+
+-- Convertible Acceptance Event
+template ConvertibleAcceptance
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    convertible: ContractId Convertible
+    stakeholder: Party
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Convertible Cancellation Event
+template ConvertibleCancellation
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    convertible: ContractId Convertible
+    stakeholder: Party
+    amount: OcfMonetary
+    reason_text: Optional Text
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Convertible Retraction Event
+template ConvertibleRetraction
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    convertible: ContractId Convertible
+    stakeholder: Party
+    reason_text: Optional Text
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer stakeholder
+
+-- Issuer Authorized Shares Adjustment Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/adjustment/IssuerAuthorizedSharesAdjustment.schema.json
+template IssuerAuthorizedSharesAdjustmentEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    new_authorized: Decimal
+    date: Time
+  where
+    signatory issuer, system_operator
+    ensure new_authorized >= (0.0)
+
 -- Warrant Exercise Event
 -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/exercise/WarrantExercise.schema.json
 template WarrantExerciseEvent
@@ -288,4 +499,22 @@ template WarrantExerciseEvent
   where
     signatory issuer, system_operator
     observer stakeholder
+    ensure quantity > (0.0)
+
+-- Warrant Transfer Event
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/transactions/transfer/WarrantTransfer.schema.json
+template WarrantTransferEvent
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+    warrant: ContractId Warrant
+    from_stakeholder: Party
+    to_stakeholder: Party
+    quantity: Decimal
+    consideration_text: Optional Text
+    date: Time
+  where
+    signatory issuer, system_operator
+    observer from_stakeholder, to_stakeholder
     ensure quantity > (0.0)
