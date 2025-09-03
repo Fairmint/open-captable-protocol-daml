@@ -1,27 +1,55 @@
 module Fairmint.OpenCapTable.VestingTerms where
 
 import Fairmint.OpenCapTable.Types
-import Splice.Api.FeaturedAppRightV1 as Featured
-import Fairmint.OpenCapTable.Shared.Helpers (createActivityMarker)
+import Fairmint.OpenCapTable.Helpers (createMarker)
+
+-- Local validators specific to Vesting Terms
+validateOcfVestingConditionPortion : OcfVestingConditionPortion -> Bool
+validateOcfVestingConditionPortion p =
+  p.numerator > (0.0) && p.denominator > (0.0)
+
+-- Exactly one of portion or quantity present, and quantity > 0 if present
+validateExactlyOnePortionOrQuantity : Optional OcfVestingConditionPortion -> Optional Decimal -> Bool
+validateExactlyOnePortionOrQuantity portion quantity =
+  case (portion, quantity) of
+    (Some _, None) -> True
+    (None, Some q) -> q > (0.0)
+    _ -> False
+
+validateOcfVestingCondition : OcfVestingCondition -> Bool
+validateOcfVestingCondition c =
+  c.id_ /= "" &&
+  validateExactlyOnePortionOrQuantity c.portion c.quantity &&
+  (case c.portion of None -> True; Some p -> validateOcfVestingConditionPortion p) &&
+  (case c.trigger of
+     OcfVestingStartTrigger -> True
+     OcfVestingScheduleAbsoluteTrigger _ -> True
+     OcfVestingScheduleRelativeTrigger{period, relative_to_condition_id} ->
+       relative_to_condition_id /= "" && (case period of OcfVestingPeriodDays d -> d > 0; OcfVestingPeriodMonths m -> m > 0)
+     OcfVestingEventTrigger -> True) &&
+  all (\t -> t /= "") c.next_condition_ids
+
+validateOcfVestingTermsData : OcfVestingTermsData -> Bool
+validateOcfVestingTermsData t =
+  t.name /= "" && t.description /= "" &&
+  not (null t.vesting_conditions) &&
+  all validateOcfVestingCondition t.vesting_conditions
 
 -- OCF Vesting Terms (v1.2.0)
 -- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/VestingTerms.schema.json
 template VestingTerms
   with
-    issuer: Party
-    system_operator: Party
-    featured_app_right: ContractId Featured.FeaturedAppRight
+    context: Context
     vesting_terms_data: OcfVestingTermsData
   where
-    signatory issuer, system_operator
+    signatory context.issuer, context.system_operator
 
     ensure
       validateOcfVestingTermsData vesting_terms_data
 
-    choice UpdateVestingTerms : ContractId VestingTerms
-      with
-        new_vesting_terms_data: OcfVestingTermsData
-      controller issuer
+    -- Allow issuer to archive without system_operator involvement
+    choice ArchiveByIssuer : ()
+      controller context.issuer
       do
-        _ <- createActivityMarker system_operator featured_app_right
-        create this with vesting_terms_data = new_vesting_terms_data
+        _ <- createMarker context
+        exercise self Archive

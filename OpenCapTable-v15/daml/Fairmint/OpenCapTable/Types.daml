@@ -1,6 +1,7 @@
 module Fairmint.OpenCapTable.Types where
 
 import qualified DA.Text as Text
+import Splice.Api.FeaturedAppRightV1 as Featured
 
 -- =============================================================================
 -- OCF TYPES AND VALIDATION FUNCTIONS
@@ -355,60 +356,7 @@ data OcfStockClassConversionRight = OcfStockClassConversionRight
     expires_at: Optional Time                    -- Expiration timestamp after which the conversion right is no longer valid
   deriving (Eq, Show)
 
--- Validation function for conversion rights
-validateOcfStockClassConversionRight : OcfStockClassConversionRight -> Bool
-validateOcfStockClassConversionRight conversionRight =
-  conversionRight.type_ /= "" &&
-  conversionRight.converts_to_stock_class_id /= "" &&
-  -- Mechanism-specific constraints
-  (case conversionRight.conversion_mechanism of
-     OcfConversionMechanismRatioConversion ->
-       case conversionRight.ratio of
-         Some r -> validateOcfRatio r
-         None -> False
-     OcfConversionMechanismPercentCapitalizationConversion ->
-       case conversionRight.percent_of_capitalization of
-         Some p -> p > (0.0) && p <= (1.0 : Decimal)
-         None -> False
-     OcfConversionMechanismFixedAmountConversion ->
-       case conversionRight.conversion_price of
-         Some price -> validateOcfMonetary price
-         None -> False
-     OcfConversionMechanismValuationBasedConversion ->
-       case conversionRight.reference_valuation_price_per_share of
-         Some pps -> validateOcfMonetary pps
-         None -> False
-     OcfConversionMechanismSharePriceBasedConversion ->
-       case (conversionRight.reference_share_price, conversionRight.floor_price_per_share, conversionRight.ceiling_price_per_share) of
-         (Some pps, _, _) -> validateOcfMonetary pps
-         _ -> False
-     OcfConversionMechanismSAFEConversion ->
-       -- Require at least one of discount_rate or valuation_cap, and any provided prices valid
-       ((case (conversionRight.discount_rate, conversionRight.valuation_cap) of
-           (Some d, _) -> d > (0.0) && d < (1.0 : Decimal)
-           (_, Some cap) -> validateOcfMonetary cap
-           _ -> False) &&
-        optional True validateOcfMonetary conversionRight.floor_price_per_share &&
-        optional True validateOcfMonetary conversionRight.ceiling_price_per_share)
-     OcfConversionMechanismNoteConversion ->
-       -- Same requirement baseline as SAFE for now
-       ((case (conversionRight.discount_rate, conversionRight.valuation_cap) of
-           (Some d, _) -> d > (0.0) && d < (1.0 : Decimal)
-           (_, Some cap) -> validateOcfMonetary cap
-           _ -> False) &&
-        optional True validateOcfMonetary conversionRight.floor_price_per_share &&
-        optional True validateOcfMonetary conversionRight.ceiling_price_per_share)
-     OcfConversionMechanismCustomConversion ->
-       case conversionRight.custom_description of
-         Some t -> t /= ""
-         None -> False) &&
-  -- If price is provided, it must be valid
-  (case conversionRight.conversion_price of
-     None -> True
-     Some price -> validateOcfMonetary price)
-  -- Note: expires_at validation for future time requires current time context,
-  -- which is not available in pure validation functions. This should be checked
-  -- in the contract's ensure clause or choice when current time is available.
+-- StockClass conversion-right validator moved to StockClass module
 
 -- =============================================================================
 -- OCF OBJECT TYPES
@@ -421,18 +369,11 @@ data OcfDocument = OcfDocument
     path: Optional Text
     uri: Optional Text
     md5: Text
-    related_objects: Optional [Text]
+    related_objects: Optional [OcfObjectReference]
     comments: Optional [Text]
   deriving (Eq, Show)
 
-validateOcfDocument : OcfDocument -> Bool
-validateOcfDocument d =
-  -- md5 required and either path or uri present
-  d.md5 /= "" &&
-  (case (d.path, d.uri) of
-     (Some _, _) -> True
-     (_, Some _) -> True
-     _ -> False)
+-- Document validator moved to Document module
 
 -- Financing object
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/objects/Financing.schema.json
@@ -488,11 +429,6 @@ data OcfValuationData = OcfValuationData
     effective_date: Time
     valuation_type: OcfValuationType
   deriving (Eq, Show)
-
-validateOcfValuationData : OcfValuationData -> Bool
-validateOcfValuationData v =
-  (case v.provider of None -> True; Some p -> p /= "") &&
-  validateOcfMonetary v.price_per_share
 
 -- =============================================================================
 -- OCF PLAN SECURITIES TYPES (EQUITY COMPENSATION)
@@ -619,9 +555,7 @@ data OcfVestingConditionPortion = OcfVestingConditionPortion
     remainder: Bool
   deriving (Eq, Show)
 
-validateOcfVestingConditionPortion : OcfVestingConditionPortion -> Bool
-validateOcfVestingConditionPortion p =
-  p.numerator > (0.0) && p.denominator > (0.0)
+-- Vesting validators moved to VestingTerms module
 
 -- Vesting condition
 data OcfVestingCondition = OcfVestingCondition
@@ -633,30 +567,7 @@ data OcfVestingCondition = OcfVestingCondition
     trigger: OcfVestingTrigger
     next_condition_ids: [Text]
   deriving (Eq, Show)
-
--- Helper: exactly one of portion or quantity present, and quantity > 0 if present
-validateExactlyOnePortionOrQuantity : Optional OcfVestingConditionPortion -> Optional Decimal -> Bool
-validateExactlyOnePortionOrQuantity portion quantity =
-  case (portion, quantity) of
-    (Some _, None) -> True
-    (None, Some q) -> q > (0.0)
-    _ -> False
-
-validateOcfVestingCondition : OcfVestingCondition -> Bool
-validateOcfVestingCondition c =
-  c.id_ /= "" &&
-  -- Exactly one of portion or quantity present
-  validateExactlyOnePortionOrQuantity c.portion c.quantity &&
-  (case c.portion of None -> True; Some p -> validateOcfVestingConditionPortion p) &&
-  -- Validate trigger specific constraints
-  (case c.trigger of
-     OcfVestingStartTrigger -> True
-     OcfVestingScheduleAbsoluteTrigger _ -> True
-     OcfVestingScheduleRelativeTrigger{period, relative_to_condition_id} ->
-       relative_to_condition_id /= "" && (case period of OcfVestingPeriodDays d -> d > 0; OcfVestingPeriodMonths m -> m > 0)
-     OcfVestingEventTrigger -> True) &&
-  -- next_condition_ids can be empty but no blanks
-  all (\t -> t /= "") c.next_condition_ids
+-- Vesting validators moved to VestingTerms module
 
 -- Vesting terms data
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/objects/VestingTerms.schema.json
@@ -669,11 +580,7 @@ data OcfVestingTermsData = OcfVestingTermsData
     comments: Optional [Text]
   deriving (Eq, Show)
 
-validateOcfVestingTermsData : OcfVestingTermsData -> Bool
-validateOcfVestingTermsData t =
-  t.name /= "" && t.description /= "" &&
-  not (null t.vesting_conditions) &&
-  all validateOcfVestingCondition t.vesting_conditions
+-- VestingTerms validator moved to VestingTerms module
 
 -- Stock Legend Template data
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/objects/StockLegendTemplate.schema.json
@@ -684,9 +591,7 @@ data OcfStockLegendTemplateData = OcfStockLegendTemplateData
     comments: Optional [Text]
   deriving (Eq, Show)
 
-validateOcfStockLegendTemplateData : OcfStockLegendTemplateData -> Bool
-validateOcfStockLegendTemplateData t =
-  t.name /= "" && t.text /= ""
+-- StockLegendTemplate validator moved to module
 
 -- Stock Plan cancellation behavior enum (strict)
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/enums/StockPlanCancellationBehaviorType.schema.json
@@ -709,9 +614,7 @@ data OcfStockPlanData = OcfStockPlanData
     comments: Optional [Text]
   deriving (Eq, Show)
 
-validateOcfStockPlanData : OcfStockPlanData -> Bool
-validateOcfStockPlanData p =
-  p.plan_name /= "" && p.initial_shares_reserved >= (0.0)
+-- StockPlan validator moved to module
 
 -- Name validation (OCF Name type)
 -- OCF Specification: https://schema.opencaptablecoalition.com/v/1.2.0/types/Name.schema.json
@@ -737,18 +640,7 @@ data OcfContactInfoWithoutName = OcfContactInfoWithoutName
     address: Optional OcfAddress
   deriving (Eq, Show)
 
-validateOcfContactInfo : OcfContactInfo -> Bool
-validateOcfContactInfo info =
-  validateOcfName info.name &&
-  optional True validateOcfEmail info.email &&
-  optional True validateOcfPhone info.phone &&
-  optional True validateOcfAddress info.address
-
-validateOcfContactInfoWithoutName : OcfContactInfoWithoutName -> Bool
-validateOcfContactInfoWithoutName info =
-  optional True validateOcfEmail info.email &&
-  optional True validateOcfPhone info.phone &&
-  optional True validateOcfAddress info.address
+-- Contact validators moved to Stakeholder module
 
 -- Stakeholder type enumeration
 -- OCF Specification: https://schema.opencaptablecoalition.com/v/1.1.0/enums/StakeholderType.schema.json
@@ -758,8 +650,7 @@ data OcfStakeholderType = OcfStakeholderTypeIndividual | OcfStakeholderTypeInsti
 -- For relationship type, we keep a free-form text aligned with OCF enum values
 -- OCF Specification: https://schema.opencaptablecoalition.com/v/1.1.0/enums/StakeholderRelationshipType.schema.json
 -- Validation ensures non-empty when provided; stricter validation can be added if needed
-validateOcfStakeholderRelationship : Text -> Bool
-validateOcfStakeholderRelationship rel = rel /= ""
+-- Relationship validator moved to Stakeholder module
 
 -- Stakeholder Status Type enum (strict)
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/enums/StakeholderStatusType.schema.json
@@ -848,19 +739,19 @@ data OcfStakeholderData = OcfStakeholderData
     comments: Optional [Text]
   deriving (Eq, Show)
 
--- Validation for stakeholder data
-validateOcfStakeholderData : OcfStakeholderData -> Bool
-validateOcfStakeholderData s =
-  validateOcfName s.name &&
-  all validateOcfStakeholderRelationship s.current_relationships &&
-  optional True validateOcfContactInfo s.primary_contact &&
-  optional True validateOcfContactInfoWithoutName s.contact_info &&
-  all validateOcfAddress s.addresses &&
-  all validateOcfTaxID s.tax_ids
+-- Stakeholder validator moved to Stakeholder module
 
 -- =============================================================================
 -- OPENCAPTABLE CUSTOM TYPES
 -- =============================================================================
+
+-- Core context carried by all templates in this application
+data Context = Context
+  with
+    issuer: Party
+    system_operator: Party
+    featured_app_right: ContractId Featured.FeaturedAppRight
+  deriving (Eq, Show)
 
 -- Custom types for OpenCapTable contracts (not part of OCF spec)
 data TransferOperation = TransferOperation
@@ -911,12 +802,13 @@ data OcfStakeholderRelationshipType =
 
 -- ObjectReference type
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/types/ObjectReference.schema.json
-data OcfObjectReference = OcfObjectReference with
-  object_type: OcfObjectType
-  object_id: Text
+data OcfObjectReference = OcfObjectReference
+  with
+    object_type: OcfObjectType
+    object_id: Text
+  deriving (Eq, Show)
 
-validateOcfObjectReference : OcfObjectReference -> Bool
-validateOcfObjectReference r = r.object_id /= ""
+-- ObjectReference validator moved to Document module
 
 -- Percentage type (0..1 inclusive)
 -- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/types/Percentage.schema.json
