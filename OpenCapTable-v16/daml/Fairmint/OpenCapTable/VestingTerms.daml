@@ -1,0 +1,108 @@
+module Fairmint.OpenCapTable.VestingTerms where
+
+import Fairmint.OpenCapTable.Types (Context)
+import Fairmint.OpenCapTable.Helpers (createMarker)
+
+-- Vesting period variants for relative triggers
+data OcfVestingPeriod = OcfVestingPeriodDays Int | OcfVestingPeriodMonths Int
+  deriving (Eq, Show)
+
+-- Vesting trigger variants
+data OcfVestingTrigger =
+    OcfVestingStartTrigger
+  | OcfVestingScheduleAbsoluteTrigger Time
+  | OcfVestingScheduleRelativeTrigger with
+      period: OcfVestingPeriod
+      relative_to_condition_id: Text
+  | OcfVestingEventTrigger
+  deriving (Eq, Show)
+
+-- Vesting condition portion
+data OcfVestingConditionPortion = OcfVestingConditionPortion
+  with
+    numerator: Decimal
+    denominator: Decimal
+    remainder: Bool
+  deriving (Eq, Show)
+
+-- Allocation Type enum (strict)
+-- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/enums/AllocationType.schema.json
+data OcfAllocationType =
+    OcfAllocationCumulativeRounding
+  | OcfAllocationCumulativeRoundDown
+  | OcfAllocationFrontLoaded
+  | OcfAllocationBackLoaded
+  | OcfAllocationFrontLoadedToSingleTranche
+  | OcfAllocationBackLoadedToSingleTranche
+  | OcfAllocationFractional
+  deriving (Eq, Show)
+
+-- Vesting condition
+data OcfVestingCondition = OcfVestingCondition
+  with
+    id_: Text
+    description: Optional Text
+    portion: Optional OcfVestingConditionPortion
+    quantity: Optional Decimal
+    trigger: OcfVestingTrigger
+    next_condition_ids: [Text]
+  deriving (Eq, Show)
+-- Vesting validators moved to VestingTerms module
+
+-- Vesting terms data
+-- OCF: https://schema.opencaptablecoalition.com/v/1.2.0/objects/VestingTerms.schema.json
+data OcfVestingTermsData = OcfVestingTermsData
+  with
+    name: Text
+    description: Text
+    allocation_type: OcfAllocationType
+    vesting_conditions: [OcfVestingCondition]
+    comments: Optional [Text]
+  deriving (Eq, Show)
+
+-- Local validators specific to Vesting Terms
+validateOcfVestingConditionPortion : OcfVestingConditionPortion -> Bool
+validateOcfVestingConditionPortion p =
+  p.numerator > (0.0) && p.denominator > (0.0)
+
+-- Exactly one of portion or quantity present, and quantity > 0 if present
+validateExactlyOnePortionOrQuantity : Optional OcfVestingConditionPortion -> Optional Decimal -> Bool
+validateExactlyOnePortionOrQuantity portion quantity =
+  case (portion, quantity) of
+    (Some _, None) -> True
+    (None, Some q) -> q > (0.0)
+    _ -> False
+
+validateOcfVestingCondition : OcfVestingCondition -> Bool
+validateOcfVestingCondition c =
+  c.id_ /= "" &&
+  validateExactlyOnePortionOrQuantity c.portion c.quantity &&
+  (case c.portion of None -> True; Some p -> validateOcfVestingConditionPortion p) &&
+  (case c.trigger of
+     OcfVestingStartTrigger -> True
+     OcfVestingScheduleAbsoluteTrigger _ -> True
+     OcfVestingScheduleRelativeTrigger{period, relative_to_condition_id} ->
+       relative_to_condition_id /= "" && (case period of OcfVestingPeriodDays d -> d > 0; OcfVestingPeriodMonths m -> m > 0)
+     OcfVestingEventTrigger -> True) &&
+  all (\t -> t /= "") c.next_condition_ids
+
+-- OCF Vesting Terms (v1.2.0)
+-- Spec: https://schema.opencaptablecoalition.com/v/1.2.0/objects/VestingTerms.schema.json
+template VestingTerms
+  with
+    context: Context
+    vesting_terms_data: OcfVestingTermsData
+  where
+    signatory context.issuer, context.system_operator
+
+    ensure
+      vesting_terms_data.name /= "" && vesting_terms_data.description /= "" &&
+      not (null vesting_terms_data.vesting_conditions) &&
+      all validateOcfVestingCondition vesting_terms_data.vesting_conditions
+
+    -- Allow issuer to archive without system_operator involvement
+    choice ArchiveByIssuer : ()
+      controller context.issuer
+      do
+        _ <- createMarker context
+        exercise self Archive

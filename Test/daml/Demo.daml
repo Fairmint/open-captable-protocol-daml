@@ -4,19 +4,22 @@ import Fairmint.OpenCapTable.Issuer
 import Fairmint.OpenCapTable.IssuerAuthorization
 import Fairmint.OpenCapTable.StockClass
 import Fairmint.OpenCapTable.StockPlan
-import Fairmint.OpenCapTable.Types
+import Fairmint.OpenCapTable.StockLegendTemplate
+import Fairmint.OpenCapTable.VestingTerms
+import Fairmint.OpenCapTable.Stakeholder
 import Setup
 import Daml.Script
 import DA.Date
 import DA.Time
--- The goal as described by Thibauld:
--- 1. We create the issuer "Acme Inc" with 15M authorized shares
--- 2. We create a stockclass "Common" (for common shares) with 10M authorized shares (of this class)
--- 3. We create 2 stakeholders: "John Bob" and "Jim Alice"
--- 4. We issue 10M common shares to Bob
--- 5. Bob transfers 2M common shares to Alice
+-- The goal as described by Thibauld (adapted for simplified implementation):
+-- 1. Authorize and create the issuer "Acme Inc" with 15M authorized issuer shares
+-- 2. Create a stockclass "Common" with 12M authorized shares
+-- 3. Create 2 stakeholders: "Alice" and "Bob"
+-- 4. Create a stock legend template
+-- 5. Create vesting terms and a stock plan
+
 testDemo = script do
-  -- Pre-req: create parties (more can be added anytime)
+  -- Pre-req: create parties
   TestUsers{system_operator, issuer, alice, bob, rando} <- setupUsers
   -- Create test featured app right
   testRightCid <- submit system_operator do
@@ -57,7 +60,7 @@ testDemo = script do
           initial_shares_authorized = Some (OcfInitialSharesNumeric 15_000_000.0)
           comments = None
   -- 2.1: Issuer creates stockclass "Common" with 12M authorized shares
-  commonStockClassCid <- submit issuer do
+  _commonStockClassCid <- submit issuer do
     exerciseCmd issuerCid CreateStockClass
       with
         -- OCF StockClass data
@@ -79,32 +82,9 @@ testDemo = script do
           conversion_rights = []
           comments = None
 
-  -- 4.1: Issuer issues 10M common shares to Bob
-  bobStockPositionCid <- submit issuer do
-    exerciseCmd commonStockClassCid IssueStock
-      with
-        transfer = TransferOperation with
-          recipient = bob
-          quantity = 10_000_000.0
-  -- Fetch latest StockClass cid after issuance (previous version replaced)
-  [(latestStockClassCid, _)] <- query @StockClass issuer
-  -- 5.1: Bob proposes 2M common share transfer to Alice
-  transferProposalCid <- submit bob do
-    exerciseCmd bobStockPositionCid ProposeTransfer
-      with
-        transfer = TransferOperation with
-          recipient = alice
-          quantity = 2_000_000.0
-  -- 5.2: Issuer executes the transfer (accept) and Alice receives shares
-  aliceStockPositionCid <- submit issuer do
-    exerciseCmd transferProposalCid AcceptTransfer with
-      date = DA.Time.time (DA.Date.date 2025 Jan 1) 0 0 0
-  pure()
-
-  -- 6.1: Create stakeholders for Alice and Bob
+  -- 3.1: Create stakeholders for Alice and Bob
   _ <- submit issuer do
     exerciseCmd issuerCid CreateStakeholder with
-      stakeholder = alice
       stakeholder_data = OcfStakeholderData with
         name = "Alice"
         stakeholder_type = OcfStakeholderTypeIndividual
@@ -118,7 +98,6 @@ testDemo = script do
         comments = None
   _ <- submit issuer do
     exerciseCmd issuerCid CreateStakeholder with
-      stakeholder = bob
       stakeholder_data = OcfStakeholderData with
         name = "Bob"
         stakeholder_type = OcfStakeholderTypeIndividual
@@ -131,7 +110,7 @@ testDemo = script do
         tax_ids = []
         comments = None
 
-  -- 7.1: Create a stock legend template
+  -- 4.1: Create a stock legend template
   _ <- submit issuer do
     exerciseCmd issuerCid CreateStockLegendTemplate with
       template_data = OcfStockLegendTemplateData with
@@ -139,7 +118,7 @@ testDemo = script do
         text = "THIS SECURITY HAS NOT BEEN REGISTERED..."
         comments = None
 
-  -- 8.1: Create vesting terms (single start condition)
+  -- 5.1: Create vesting terms (single start condition)
   let vtCond = OcfVestingCondition with
         id_ = "start"
         description = Some "All at start"
@@ -156,10 +135,9 @@ testDemo = script do
         vesting_conditions = [vtCond]
         comments = None
 
-  -- 9.1: Create stock plan and issue a plan security to Alice
-  planCid <- submit issuer do
+  -- 5.2: Create a stock plan
+  _planCid <- submit issuer do
     exerciseCmd issuerCid CreateStockPlan with
-      stock_classes = [latestStockClassCid]
       plan_data = OcfStockPlanData with
         plan_name = "2025 Equity Incentive Plan"
         board_approval_date = None
@@ -167,80 +145,4 @@ testDemo = script do
         initial_shares_reserved = 1_000_000.0
         default_cancellation_behavior = None
         comments = None
-  grantCid <- submit issuer do
-    exerciseCmd planCid IssuePlanSecurity with
-      stakeholder = alice
-      issuance_data = OcfEquityCompensationIssuanceData with
-        compensation_type = OcfCompensationTypeOptionNSO
-        quantity = 10_000.0
-        exercise_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
-        base_price = None
-        early_exercisable = Some False
-        vestings = None
-        expiration_date = None
-        termination_exercise_windows = []
-        comments = None
-      stock_class = latestStockClassCid
-      vesting_terms = Some vestingTermsCid
-
-  -- 9.2: Exercise a portion of the grant
-  _ <- submit issuer do
-    exerciseCmd grantCid ExerciseGrant with
-      stock_class = latestStockClassCid
-      quantity = 1_000.0
-      date = DA.Time.time (DA.Date.date 2025 Jan 10) 0 0 0
-
-  -- Refresh latest stock class after issuance from grant
-  [(latestStockClassCid, _)] <- query @StockClass issuer
-
-  -- 10.1: Create a valuation for the stock class
-  _ <- submit issuer do
-    exerciseCmd issuerCid CreateValuation with
-      stock_class = latestStockClassCid
-      valuation_data = OcfValuationData with
-        provider = Some "Acme Advisory"
-        board_approval_date = None
-        stockholder_approval_date = None
-        comments = None
-        price_per_share = OcfMonetary with amount = 1.00, currency = "USD"
-        effective_date = DA.Time.time (DA.Date.date 2025 Jan 1) 0 0 0
-        valuation_type = OcfValuationType409A
-
-  -- 11.1: Issue a convertible to Alice and convert part into common stock
-  cCid <- submit issuer do
-    exerciseCmd issuerCid IssueConvertible with
-      stakeholder = alice
-      issuance_data = OcfConvertibleIssuanceData with
-        investment_amount = OcfMonetary with amount = 100_000.0; currency = "USD"
-        convertible_type = OcfConvertibleNote
-        conversion_triggers = [OcfTriggerElectiveAtWill]
-        seniority = 1
-        pro_rata = None
-        comments = None
-  _ <- submit issuer do
-    exerciseCmd cCid Convert with
-      stock_class = latestStockClassCid
-      quantity = 100.0
-      date = DA.Time.time (DA.Date.date 2025 Jan 12) 0 0 0
-
-  -- Refresh latest stock class after convertible conversion
-  [(latestStockClassCid, _)] <- query @StockClass issuer
-
-  -- 12.1: Issue a warrant to Bob and exercise part into common stock
-  wCid <- submit issuer do
-    exerciseCmd issuerCid IssueWarrant with
-      stakeholder = bob
-      stock_class = latestStockClassCid
-      issuance_data = OcfWarrantIssuanceData with
-        quantity = 1_000.0
-        exercise_price = OcfMonetary with amount = 1.0; currency = "USD"
-        purchase_price = OcfMonetary with amount = 0.0; currency = "USD"
-        exercise_triggers = [OcfTriggerElectiveAtWill]
-        warrant_expiration_date = None
-        vesting_terms_id = None
-        comments = None
-  _ <- submit issuer do
-    exerciseCmd wCid ExerciseWarrant with
-      quantity = 100.0
-      date = DA.Time.time (DA.Date.date 2025 Jan 11) 0 0 0
   pure ()
