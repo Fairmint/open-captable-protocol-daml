@@ -2,8 +2,8 @@ import fs from 'fs';
 import path from 'path';
 
 const packageDirs = [
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v16-0.0.1'),
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v18-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'),
 ];
 
 // Create index.js and index.d.ts that re-export from lib/index.js if the directory exists

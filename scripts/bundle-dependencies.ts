@@ -5,8 +5,8 @@ import path from 'path';
 
 // Paths
 const PACKAGE_DIRS = [
-	path.join(__dirname, '../generated/js/OpenCapTable-v16-0.0.1'),
-	path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.1'),
+	path.join(__dirname, '../generated/js/OpenCapTable-v18-0.0.1'),
+	path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
