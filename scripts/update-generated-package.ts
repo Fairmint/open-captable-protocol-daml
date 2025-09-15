@@ -10,7 +10,7 @@ const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as {
 };
 
 const packages = [
-  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v18-0.0.4'), name: rootPackage.name },
+  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v19-0.0.1'), name: rootPackage.name },
   { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'), name: `${rootPackage.name}-reports` },
 ];
 
