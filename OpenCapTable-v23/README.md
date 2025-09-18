@@ -43,7 +43,7 @@ If any of the above fails, update the DAML to conform to the schema. The schema 
 ### Paths
 
 - Schema (source of truth): `Open-Cap-Format-OCF/schema/` (aka `@schema/`)
-- This module: `open-captable-protocol-daml/OpenCapTable-v22/`
+- This module: `open-captable-protocol-daml/OpenCapTable-v23/`
 
 For questions or proposed schema changes, open an issue with a concrete diff to `@schema/` and the rationale for the change.
 

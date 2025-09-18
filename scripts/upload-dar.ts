@@ -34,7 +34,7 @@ async function main() {
     // Create client using EnvLoader
     const client = createLedgerJsonApiClient(network, provider);
 
-    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v22', '.daml', 'dist', 'OpenCapTable-v22-0.0.1.dar') });
+    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v23', '.daml', 'dist', 'OpenCapTable-v23-0.0.1.dar') });
 
     console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
   }

@@ -5,7 +5,7 @@ import path from 'path';
 
 // Paths
 const PACKAGE_DIRS = [
-	path.join(__dirname, '../generated/js/OpenCapTable-v22-0.0.1'),
+	path.join(__dirname, '../generated/js/OpenCapTable-v23-0.0.1'),
 	path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
