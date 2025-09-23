@@ -1,0 +1,64 @@
+module Fairmint.OpenCapTableProof.OwnershipProof where
+
+import qualified DA.Set as Set
+import Fairmint.OpenCapTable.Types (Context)
+import Fairmint.OpenCapTable.StockIssuance (StockIssuance(..))
+import Fairmint.OpenCapTable.StockCancellation (StockCancellation(..))
+
+-- A public proof that a stakeholder (Party) owns an expected quantity of stock
+-- based on a provided list of source transaction contracts.
+-- Observers can view the proof without access to underlying source contracts.
+
+template OwnershipProof
+  with
+    context: Context
+    stakeholder_id: Text
+    expected_total: Decimal
+    -- Source transactions that impact the holder's stock balance.
+    stock_issuances: [ContractId StockIssuance]
+    stock_cancellations: [ContractId StockCancellation]
+    created_at: Time
+    observers: [Party]
+  where
+    signatory context.system_operator
+    observer observers
+
+    ensure
+      expected_total >= (0.0) && stakeholder_id /= ""
+
+    choice AddObservers : ContractId OwnershipProof
+      with
+        added: [Party]
+      controller context.system_operator
+      do
+        let updatedObservers = Set.toList (Set.fromList (observers ++ added))
+        if length updatedObservers == length observers then
+          abort "AddObservers: no new observers provided"
+        else do
+          create this with observers = updatedObservers
+
+    nonconsuming choice Verify : ()
+      controller context.system_operator
+      do
+        issuances <- mapA (\cid -> fetch cid) stock_issuances
+        let issuanceQuantities = map (\s -> s.issuance_data.quantity) issuances
+        let allIssuanceStakeholdersMatch = all (\s -> s.issuance_data.stakeholder_id == stakeholder_id) issuances
+        if not allIssuanceStakeholdersMatch then
+          abort "Verify: issuance stakeholder_id mismatch"
+        else pure ()
+        -- Cancellations must reference securities from those issuances
+        let issuanceSecurityIds = map (\s -> s.issuance_data.security_id) issuances
+        cancellations <- mapA (\cid -> fetch cid) stock_cancellations
+        let cancellationQuantities = map (\c -> c.cancellation_data.quantity) cancellations
+        let allCancellationsMatchSecurities = all (\c -> c.cancellation_data.security_id `elem` issuanceSecurityIds) cancellations
+        if not allCancellationsMatchSecurities then
+          abort "Verify: cancellation refers to unrelated security_id"
+        else pure ()
+        let totalIssued = foldl (+) (0.0 : Decimal) issuanceQuantities
+        let totalCancelled = foldl (+) (0.0 : Decimal) cancellationQuantities
+        let computed = totalIssued - totalCancelled
+        if computed /= expected_total then
+          abort ("Ownership total mismatch: computed=" <> show computed <> ", expected=" <> show expected_total)
+        else pure ()
+
+
