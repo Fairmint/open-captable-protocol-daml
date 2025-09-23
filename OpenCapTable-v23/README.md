@@ -21,7 +21,13 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
 - **Arrays are non-optional**: Do not omit array fields. When there are no items, emit an empty array (`[]`) instead of leaving the field out.
 - **Required numbers may be zero**: A required numeric field may validly be `0` unless the schema specifies otherwise (e.g., via minimums or other constraints). Do not substitute `null` for required numeric fields, similarly if the number is optional `null` may have a different meaning than `0` (e.g. unknown vs none).
 - **Code Comments**: The DAML code should be well commented, directly linking to the schema for each object or type and including the comments from the schema for each field.
+  - Use the JSON Schema `$id` raw GitHub URL for links (copy from the `$id` field in the schema). Example:
+    - `-- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/enums/ConversionTriggerType.schema.json`
+  - Place the link immediately above each corresponding DAML type/enum/record definition.
+  - Ensure links reference the canonical repository (`Open-Cap-Table-Coalition/Open-Cap-Format-OCF`) and not versioned site URLs.
+  - To find the correct schema quickly, grep the `@schema/` folder (i.e., `Open-Cap-Format-OCF/schema/`) for the type or object/type/enum name and copy its `$id` value.
 - **Shared Types**: Shared types should be defined in the `Types.daml` file (and their validators) and imported into the other modules. Types which are specific to a template should be defined in the template module/file.
+  - Do not introduce trivial alias types that do not add semantics (e.g., `type OcfNumeric = Decimal`). Prefer using the underlying DAML type directly. Exception: validators may still use a dedicated function name (e.g., keep `validateOcfPercentage`, but use `Decimal` as the type).
 - **Deprecated fields**: Deprecated fields should be excluded from the DAML code. The SDK will map any deprecated inputs into the latest standard.
 - **Signatories**: All OCP objects must use both the issuer and system operator as signatories. Because of this, we cannot directly create or archive contracts. The creation of new OCP objects should be done via the Issuer contract's choices. And archiving should be done via the `ArchiveByIssuer` choice in each template.
 - **Test Helpers**: Test helpers should be defined in the Test package, never in the main package (OpenCapTable, OpenCapTableReports, or OpenCapTableShared).
