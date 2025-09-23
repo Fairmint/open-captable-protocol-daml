@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 const packageDirs = [
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v24-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v24-0.0.2'),
   path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'),
 ];
 
