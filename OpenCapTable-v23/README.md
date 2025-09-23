@@ -26,8 +26,43 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
   - Place the link immediately above each corresponding DAML type/enum/record definition.
   - Ensure links reference the canonical repository (`Open-Cap-Table-Coalition/Open-Cap-Format-OCF`) and not versioned site URLs.
   - To find the correct schema quickly, grep the `@schema/` folder (i.e., `Open-Cap-Format-OCF/schema/`) for the type or object/type/enum name and copy its `$id` value.
+  - For each type/object definition, include comments in this order directly above the DAML definition:
+    1) schema `title`
+    2) schema `description`
+    3) schema `$comment` (if present)
+    4) OCF `$id` URL
+  - For every field in every object/type, copy the schema comments:
+     - Use the field's `title`, then `description`, then `$comment` (if present), in that order; add them as preceding `--` comments above the DAML field. Follow with the OCF `$id` URL when helpful.
+    - For arrays, include helpful constraints from the schema such as `minItems`, `uniqueItems` (e.g., `-- minItems: 1`).
+    - Do not add `required`/`optional` comments; DAML types convey optionality (`Optional ...`) and the schema drives validation.
+    - Prefer comments from the most specific schema that defines the field (e.g., use WarrantIssuance comments for `purchase_price`, but use Issuance primitive comments for `security_law_exemptions`).
+    - When our code enforces a stronger constraint than the schema (e.g., non-empty arrays), note it explicitly in a comment (e.g., `-- minItems: 1`).
+  - Follow `allOf` references to find inherited field comments:
+    - Look at the `allOf` array in the object schema (e.g., WarrantIssuance) to identify referenced primitive/object schemas (e.g., Issuance).
+    - Open those referenced schemas locally under `Open-Cap-Format-OCF/schema/...` and copy the `title`/`description`/`$comment` for inherited fields (e.g., `board_approval_date`, `stockholder_approval_date`, `consideration_text`).
+    - Use the referenced schema's comments where the field originates; avoid inventing summaries.
+  - Keep comments simple and high-signal:
+    - Do not annotate fields with provenance comments like "From primitives Transaction/SecurityTransaction/Issuance". Prefer field-level descriptions only.
+  - Non-empty Text values:
+    - Never allow empty `Text` strings. For any `Text` field, validate it is not `""`.
+    - For `Optional Text` fields, if a value is provided (`Some t`), validate `t /= ""`.
+    - Example: `consideration_text` in transactions should be either `None` or a non-empty string.
+    - For arrays of `Text`, validate each element is non-empty (e.g., use a shared `validateTextArray`). Apply this to fields like `comments`.
 - **Shared Types**: Shared types should be defined in the `Types.daml` file (and their validators) and imported into the other modules. Types which are specific to a template should be defined in the template module/file.
   - Do not introduce trivial alias types that do not add semantics (e.g., `type OcfNumeric = Decimal`). Prefer using the underlying DAML type directly. Exception: validators may still use a dedicated function name (e.g., keep `validateOcfPercentage`, but use `Decimal` as the type).
+  - Field ordering inside each data/record definition MUST follow this structure:
+    1) `id` first
+    2) Required scalar fields (alphabetical)
+    3) Arrays (alphabetical)
+    4) Optional fields (alphabetical)
+    This improves readability, diffs, and consistency across objects.
+  - For readability, add a short section header before each group, followed by a separator line, exactly like:
+    - `-- Required fields (alphabetical)`
+    - `-- ---------------------------------`
+    - `-- Arrays (alphabetical)`
+    - `-- ---------------------------------`
+    - `-- Optional fields (alphabetical)`
+    - `-- ---------------------------------`
 - **Deprecated fields**: Deprecated fields should be excluded from the DAML code. The SDK will map any deprecated inputs into the latest standard.
 - **Signatories**: All OCP objects must use both the issuer and system operator as signatories. Because of this, we cannot directly create or archive contracts. The creation of new OCP objects should be done via the Issuer contract's choices. And archiving should be done via the `ArchiveByIssuer` choice in each template.
 - **Test Helpers**: Test helpers should be defined in the Test package, never in the main package (OpenCapTable, OpenCapTableReports, or OpenCapTableShared).
