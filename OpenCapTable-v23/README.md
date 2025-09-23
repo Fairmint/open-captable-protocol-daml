@@ -24,6 +24,7 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
 - **Shared Types**: Shared types should be defined in the `Types.daml` file (and their validators) and imported into the other modules. Types which are specific to a template should be defined in the template module/file.
 - **Deprecated fields**: Deprecated fields should be excluded from the DAML code. The SDK will map any deprecated inputs into the latest standard.
 - **Signatories**: All OCP objects must use both the issuer and system operator as signatories. Because of this, we cannot directly create or archive contracts. The creation of new OCP objects should be done via the Issuer contract's choices. And archiving should be done via the `ArchiveByIssuer` choice in each template.
+- **Test Helpers**: Test helpers should be defined in the Test package, never in the main package (OpenCapTable, OpenCapTableReports, or OpenCapTableShared).
 
 #### Shared types organization
 
