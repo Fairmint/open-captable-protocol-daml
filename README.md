@@ -14,6 +14,16 @@ For package-specific details about each implementation, see the README.md file i
   - Never allow empty `Text` strings. For `Optional Text`, if provided (`Some t`), ensure `t /= ""`.
   - For arrays of `Text`, validate each element is non-empty.
 - **Arrays are non-optional**: Do not omit array fields. When there are no items, emit an empty array (`[]`) instead of leaving the field out.
+- **Avoid trivial type aliases**: Do not create semantic aliases for native types (e.g., `type OcfMd5 = Text`). Prefer native types with validators. Example:
+
+```daml
+-- MD5
+-- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/Md5.schema.json
+validateOcfMd5 : Text -> Bool
+validateOcfMd5 md5 =
+  let n = Text.length md5 in
+  n == 32 && CryptoText.isHex md5
+```
 - **Shared types and organization**:
   - Define any type used by more than one template in `Types.daml` (with its validator) and import where needed.
   - Keep template files focused; if a type is only used by a single template, define it in that template file.
