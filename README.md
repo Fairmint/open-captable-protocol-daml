@@ -33,6 +33,14 @@ For package-specific details about each implementation, see the README.md file i
     - `-- Optional fields (alphabetical)`
     - `-- ---------------------------------`
  - **Declaration order in template files**: Place declarations in this order within each template file: 1) `template` block first, 2) top-level `data` (the main object record), 3) subtype `data` (helper or nested records specific to the template). Keep the two data definitions adjacent.
+- **Validator placement**: Define the validator immediately after the corresponding `data` type it validates, in the same file. Example:
+
+```daml
+data OcfThing = OcfThing with field: Text deriving (Eq, Show)
+
+validateOcfThing : OcfThing -> Bool
+validateOcfThing t = t.field /= ""
+```
 - **Test helpers**: Place test helpers only in the `Test` package, never in main packages.
 
 ### Package-specific guidance
