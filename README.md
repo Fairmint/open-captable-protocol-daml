@@ -53,6 +53,8 @@ validateOcfThing t = t.field /= ""
 ```
 - **Test helpers**: Place test helpers only in the `Test` package, never in main packages.
 
+- **Choice ordering in templates**: When there is no clear logical lifecycle ordering, sort choice declarations alphabetically by choice name. As a convention, place create-style choices before archive-style choices (e.g., put `ArchiveByIssuer` last).
+
 ### Package-specific guidance
 
 Each package may include additional constraints and domain guidance. Refer to:

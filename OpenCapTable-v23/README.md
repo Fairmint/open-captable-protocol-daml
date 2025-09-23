@@ -69,16 +69,16 @@ data Example = Example
     id: Text
 
     -- Required fields (alphabetical)
-    -- ---------------------------------
+    ---------------------------------
     required_a: Text
     required_b: Int
 
     -- Arrays (alphabetical)
-    -- ---------------------------------
+    ---------------------------------
     items: [Text]
 
     -- Optional fields (alphabetical)
-    -- ---------------------------------
+    ---------------------------------
     optional_a: Optional Text
     optional_b: Optional Int
   deriving (Eq, Show)
