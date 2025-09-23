@@ -14,6 +14,7 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
 
 - In DAML we are currently using the `Time` type instead of `Date` even though the schema excludes a time component from dates. This is a workaround to a Javascript library parsing error.
 - In DAML we exclude the `object_type` field since it is implied from the template used.
+- `Issuer.formation_date` is required by the OCF schema, but we are temporarily making it Optional due to missing data in upstream sources. This violates the schema requirements and should be reverted to required when data is available.
 
 ### Implementation guidance
 
