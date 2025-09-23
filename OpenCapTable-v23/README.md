@@ -25,6 +25,12 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
 - **Deprecated fields**: Deprecated fields should be excluded from the DAML code. The SDK will map any deprecated inputs into the latest standard.
 - **Signatories**: All OCP objects must use both the issuer and system operator as signatories. Because of this, we cannot directly create or archive contracts. The creation of new OCP objects should be done via the Issuer contract's choices. And archiving should be done via the `ArchiveByIssuer` choice in each template.
 
+#### Shared types organization
+
+- Define any type used by more than one template in `Types.daml` (with its validator), and import it where needed.
+- Keep template files focused: if a type is only used by a single template, define it in that template file.
+- Do not import a template module solely to access a type; move that type to `Types.daml` instead.
+
 ### Usage Guidance
 
 - **Issuer Management**: The Issuer object is the primary object for managing the cap table. Most other objects are created via the Issuer contract's choices.
