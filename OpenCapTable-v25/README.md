@@ -44,8 +44,8 @@ For shared coding guidelines that apply to all OCP DAML packages, see `open-capt
 
 ### Package-specific notes
 
-- `Issuer.formation_date` is required by the OCF schema, but we are temporarily making it Optional due to missing data in upstream sources. This violates the schema requirements and should be reverted to required when data is available.
 - In DAML we exclude the `object_type` field since it is implied from the template used.
+- In `StockIssuance`, the schema requires `stock_legend_ids` with `minItems: 1`. Our implementation temporarily allows an empty array for `stock_legend_ids` to support existing data that lacks legends. The validator therefore does not enforce non-empty `stock_legend_ids`. This exception should be reverted when upstream data is corrected.
 
 See global exceptions and implementation guidance in the shared guidelines.
 
