@@ -1,8 +1,8 @@
 ## Shared Coding Guidelines for OCP DAML Packages
 
-This repository contains multiple DAML packages (e.g., `OpenCapTable-v24`, `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `OpenCapTableShared-v01`). This document defines coding guidelines that apply to all packages.
+This repository contains multiple DAML packages (e.g., `OpenCapTable-v25`, `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `OpenCapTableShared-v01`). This document defines coding guidelines that apply to all packages.
 
-For package-specific details about each implementation, see the README.md file in the respective package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v24/README.md`).
+For package-specific details about each implementation, see the README.md file in the respective package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v25/README.md`).
 
 ### Global exceptions
 
@@ -59,7 +59,7 @@ validateOcfThing t = t.field /= ""
 
 Each package may include additional constraints and domain guidance. Refer to:
 
-- `open-captable-protocol-daml/OpenCapTable-v24/README.md` for Open Cap Table specifics (e.g., Issuer management patterns).
+- `open-captable-protocol-daml/OpenCapTable-v25/README.md` for Open Cap Table specifics (e.g., Issuer management patterns).
 - Other package READMEs as applicable.
 
 
