@@ -1,0 +1,241 @@
+module Splice.Subscriptions.Subscription where
+
+import DA.Optional (isSome)
+import Splice.Amulet qualified as Amulet
+
+-- | Request for DSO to create FeaturedAppActivityMarkers for processed subscription payments
+-- This follows a proposal pattern where the subscription creates the request,
+-- and DSO processes it separately to create the actual markers
+template SubscriptionActivityMarkerRequest
+  with
+    dso : Party
+      -- ^ DSO party who will create the markers
+    provider : Party
+      -- ^ Featured app provider
+    recipient : Party
+      -- ^ Payment recipient
+    subscriber : Party
+      -- ^ Subscriber (for reference)
+    roundsProcessed : Int
+      -- ^ Number of rounds processed
+    subscriptionId : Text
+      -- ^ Reference to the subscription (for tracking)
+  where
+    signatory subscriber, recipient
+    observer dso, provider
+
+    -- | DSO processes the request and creates FeaturedAppActivityMarkers
+    choice SubscriptionActivityMarkerRequest_Process : [( ContractId Amulet.FeaturedAppActivityMarker, ContractId Amulet.FeaturedAppActivityMarker)]
+      controller dso
+      do
+        -- Create FeaturedAppActivityMarker for each round processed
+        -- Split rewards: 70% to provider, 30% to recipient
+        forA [1..roundsProcessed] (\_ -> do
+          providerMarker <- create Amulet.FeaturedAppActivityMarker with
+            dso = dso
+            provider = provider
+            beneficiary = provider
+            weight = 0.7
+          recipientMarker <- create Amulet.FeaturedAppActivityMarker with
+            dso = dso
+            provider = provider
+            beneficiary = recipient
+            weight = 0.3
+          pure (providerMarker, recipientMarker))
+
+-- | Subscription proposal created by subscriber, accepted by service provider
+-- 
+-- Follows the proposal/acceptance pattern with upfront collateral:
+-- 1. Subscriber locks funds in a LockedAmulet
+-- 2. Subscriber proposes a subscription with the locked amulet
+-- 3. Service provider sees the locked funds and accepts
+template SubscriptionProposal
+  with
+    subscriber : Party
+      -- ^ Party proposing to make recurring payments (customer)
+    recipient : Party
+      -- ^ Party who would receive recurring payments (service provider)
+    provider : Party
+      -- ^ Featured app provider (for reward tracking, usually same as recipient)
+    dso : Party
+      -- ^ DSO party (for activity marker requests only, not a signatory)
+    reason : Text
+      -- ^ Description of the subscription purpose
+    amountPerRound : Decimal
+      -- ^ Amount to pay per round
+    lockedAmulet : ContractId Amulet.LockedAmulet
+      -- ^ LockedAmulet providing payment collateral (REQUIRED)
+  where
+    signatory subscriber
+    observer recipient, provider
+    
+    ensure
+      reason /= "" &&
+      amountPerRound > 0.0
+
+    -- | Service provider accepts the proposal, creating an active subscription
+    choice SubscriptionProposal_Accept : ContractId Subscription
+      controller recipient
+      do
+        create Subscription with
+          subscriber = subscriber
+          recipient = recipient
+          provider = provider
+          dso = dso
+          reason = reason
+          amountPerRound = amountPerRound
+          lockedAmulet = Some lockedAmulet
+          lastProcessedRound = 0
+
+    -- | Service provider rejects the proposal
+    -- Returns the LockedAmulet to the subscriber (user unlocks it separately)
+    choice SubscriptionProposal_Reject : ContractId Amulet.LockedAmulet
+      controller recipient
+      do
+        -- Return the locked amulet (subscriber can unlock it separately)
+        pure lockedAmulet
+
+    -- | Subscriber cancels the proposal before it's accepted
+    -- Returns the LockedAmulet (user unlocks it separately)
+    choice SubscriptionProposal_Cancel : ContractId Amulet.LockedAmulet
+      controller subscriber
+      do
+        -- Return the locked amulet (subscriber can unlock it separately)
+        pure lockedAmulet
+
+-- | Active subscription contract for recurring payments using LockedAmulet
+-- 
+-- A subscription allows a subscriber to make recurring payments to a recipient
+-- every round. The subscriber provides collateral via a LockedAmulet, and the
+-- recipient processes payments each round. If the recipient misses rounds, they
+-- can catch up later. Either party can cancel at any time.
+--
+-- Payment processing creates SubscriptionActivityMarkerRequests that the DSO
+-- can process to issue FeaturedAppActivityMarker rewards.
+template Subscription
+  with
+    subscriber : Party
+      -- ^ Party making recurring payments
+    recipient : Party
+      -- ^ Party receiving recurring payments
+    provider : Party
+      -- ^ Featured app provider (for reward tracking)
+    dso : Party
+      -- ^ DSO party (for activity marker requests only, not a signatory)
+    reason : Text
+      -- ^ Description of the subscription purpose
+    amountPerRound : Decimal
+      -- ^ Amount to pay per round
+    lockedAmulet : Optional (ContractId Amulet.LockedAmulet)
+      -- ^ Optional LockedAmulet providing payment collateral
+    lastProcessedRound : Int
+      -- ^ Last round for which payment was processed
+  where
+    signatory subscriber, recipient
+    observer provider
+    
+    ensure
+      reason /= "" &&
+      amountPerRound > 0.0 &&
+      lastProcessedRound >= 0
+
+    -- | Add or replace the LockedAmulet for this subscription
+    -- Only the subscriber can add collateral
+    choice Subscription_AddLockedAmulet : ContractId Subscription
+      with
+        lockedAmuletCid : ContractId Amulet.LockedAmulet
+      controller subscriber
+      do
+        -- If there's an existing locked amulet, we replace it
+        -- The caller is responsible for managing the old one
+        create this with lockedAmulet = Some lockedAmuletCid
+
+    -- | Withdraw the LockedAmulet from the subscription
+    -- Only the subscriber can withdraw their collateral
+    choice Subscription_WithdrawLockedAmulet : (ContractId Subscription, Optional (ContractId Amulet.LockedAmulet))
+      controller subscriber
+      do
+        let oldLockedAmulet = lockedAmulet
+        newSubscriptionCid <- create this with lockedAmulet = None
+        pure (newSubscriptionCid, oldLockedAmulet)
+
+    -- | Process payment for a specific round
+    -- The recipient processes payments and can catch up on missed rounds
+    -- Creates a SubscriptionActivityMarkerRequest for DSO to process
+    choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
+      with
+        currentRound : Int
+          -- ^ Round number to process payment for
+        subscriptionId : Text
+          -- ^ Unique identifier for this subscription (for tracking)
+      controller recipient
+      do
+        -- Validate that we're not processing old rounds
+        assertMsg "Cannot process rounds before last processed round" 
+          (currentRound > lastProcessedRound)
+        
+        -- Validate that we have locked amulet
+        assertMsg "No locked amulet available for payment" 
+          (isSome lockedAmulet)
+        
+        -- Calculate payment amount
+        let roundsToProcess = currentRound - lastProcessedRound
+        let totalPayment = amountPerRound * intToDecimal roundsToProcess
+        
+        -- Note: In a full implementation, we would:
+        -- 1. Unlock the required amount from the LockedAmulet
+        -- 2. Transfer to the recipient
+        -- 3. Update or archive the LockedAmulet
+        -- For now, we just track the processed round
+        
+        -- Create a request for DSO to process and create FeaturedAppActivityMarkers
+        markerRequestCid <- create SubscriptionActivityMarkerRequest with
+          dso = dso
+          provider = provider
+          recipient = recipient
+          subscriber = subscriber
+          roundsProcessed = roundsToProcess
+          subscriptionId = subscriptionId
+        
+        -- Update subscription with new processed round
+        newSubscriptionCid <- create this with lastProcessedRound = currentRound
+        
+        pure Subscription_ProcessPaymentResult with
+          subscriptionCid = newSubscriptionCid
+          activityMarkerRequest = markerRequestCid
+
+    -- | Cancel the subscription
+    -- Either party can cancel at any time
+    -- Returns the LockedAmulet if present (user unlocks separately)
+    choice Subscription_Cancel : Optional (ContractId Amulet.LockedAmulet)
+      controller [subscriber, recipient]
+      do
+        -- Return the locked amulet if present (user unlocks separately)
+        pure lockedAmulet
+
+    -- | Subscriber-only cancel
+    -- Allows subscriber to cancel without recipient signature
+    -- Returns the LockedAmulet if present (user unlocks separately)
+    choice Subscription_CancelBySubscriber : Optional (ContractId Amulet.LockedAmulet)
+      controller subscriber
+      do
+        -- Return the locked amulet if present (user unlocks separately)
+        pure lockedAmulet
+
+    -- | Recipient-only cancel
+    -- Allows recipient to cancel without subscriber signature
+    -- Returns the LockedAmulet if present (user unlocks separately)
+    choice Subscription_CancelByRecipient : Optional (ContractId Amulet.LockedAmulet)
+      controller recipient
+      do
+        -- Return the locked amulet if present (user unlocks separately)
+        pure lockedAmulet
+
+-- | Result of processing a subscription payment
+data Subscription_ProcessPaymentResult = Subscription_ProcessPaymentResult
+  with
+    subscriptionCid : ContractId Subscription
+      -- ^ The updated subscription contract
+    activityMarkerRequest : ContractId SubscriptionActivityMarkerRequest
+      -- ^ Request for DSO to create activity markers
+  deriving (Eq, Show)
