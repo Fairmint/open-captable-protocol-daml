@@ -8,6 +8,7 @@ import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
 import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
 import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), SubscriptionAmount(..), PaymentConfig(..), validateSubscriptionConfig)
+import Fairmint.Shared.SpliceHelpers (createActivityMarker)
 
 -- | Convert a per-day rate to the actual amount for the processing period
 -- Calculates: (amountPerDay * processingPeriod) / 1 day
@@ -109,7 +110,11 @@ template Subscription
     -- | Process payment for the current period
     -- The processor executes this periodically, with subscriber authorization
     -- Uses amulet inputs provided by subscriber to transfer funds to recipient and processor
-    -- FeaturedAppRights and fee ratios for transfers are specified in the subscription config
+    -- 
+    -- Important: Receivers always pay transfer fees (receiverFeeRatio = 1.0).
+    -- This ensures subscribers are charged exactly the amount they agreed to - no surprises.
+    -- The recipient and processor bear the transfer costs for predictable subscriber billing.
+    -- 
     -- Cannot process payments after subscription expiration date
     choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
       with
@@ -120,6 +125,10 @@ template Subscription
       do
         -- Get current ledger time
         now <- getTime
+        
+        -- Validate not in free trial mode
+        assertMsg "Cannot process payments during free trial (use Subscription_ProcessFreeTrial instead)" 
+          (not (isSome config.freeTrialEndsAt))
         
         -- Validate subscription hasn't expired
         assertMsg "Cannot process payments after subscription expiration" 
@@ -153,7 +162,7 @@ template Subscription
           provider = context.processor
           receiver = config.recipient
           amount = amountForThisPeriod
-          receiverFeeRatio = config.recipientPayment.receiverFeeRatio
+          receiverFeeRatio = 1.0  -- Receiver pays fees so subscriber is charged exact amount (no surprises)
           featuredAppRight = config.recipientPayment.featuredAppRight
           expectedDso = context.dso
           amuletInputs = paymentCtx.amuletInputs
@@ -175,7 +184,7 @@ template Subscription
               provider = context.processor
               receiver = context.processor
               amount = feeAmountForThisPeriod
-              receiverFeeRatio = config.processorPayment.receiverFeeRatio
+              receiverFeeRatio = 1.0  -- Processor pays fees so subscriber is charged exact amount (no surprises)
               featuredAppRight = config.processorPayment.featuredAppRight
               expectedDso = context.dso
               amuletInputs = [changeAmuletCid]
@@ -191,6 +200,65 @@ template Subscription
         
         pure Subscription_ProcessPaymentResult with
           ..
+
+    -- | Process free trial period
+    -- The processor executes this periodically during free trial
+    -- Advances paidUntil without requiring payment
+    -- Creates activity markers for recipient and processor if they have FeaturedAppRights
+    choice Subscription_ProcessFreeTrial : ContractId Subscription
+      with
+        processingPeriod : RelTime
+          -- ^ Duration to advance the free trial (will be capped to remaining trial time)
+      controller context.processor
+      do
+        -- Get current ledger time
+        now <- getTime
+        
+        -- Validate we're in free trial mode
+        assertMsg "Can only process free trial when freeTrialEndsAt is set" 
+          (isSome config.freeTrialEndsAt)
+        
+        let freeTrialEnd = fromSome config.freeTrialEndsAt
+        
+        -- Validate free trial hasn't ended yet
+        assertMsg "Free trial has already ended" 
+          (now < freeTrialEnd)
+        
+        -- Validate subscription hasn't expired
+        assertMsg "Cannot process free trial after subscription expiration" 
+          (now <= config.expiresAt)
+        
+        -- Validate subscription period has elapsed (paid through time has passed)
+        assertMsg "Cannot process free trial before subscription period elapses (still paid through current paidUntil time)" 
+          (now > paidUntil)
+        
+        -- Calculate the actual processing period
+        -- If the full processingPeriod would exceed free trial end, use remaining trial time
+        let nextPaidUntil = addRelTime paidUntil processingPeriod
+        let (actualPeriod, newPaidUntil, newFreeTrialEndsAt) = 
+              if nextPaidUntil >= freeTrialEnd
+              then (subTime freeTrialEnd paidUntil, freeTrialEnd, None)  -- Free trial ends, cap to trial end
+              else (processingPeriod, nextPaidUntil, Some freeTrialEnd)  -- Continue trial
+        
+        -- Create activity marker for recipient if they have a FeaturedAppRight
+        case config.recipientPayment.featuredAppRight of
+          Some farCid -> do
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            createActivityMarker config.recipient farIfaceCid
+          None -> pure ()
+        
+        -- Create activity marker for processor if they have a FeaturedAppRight
+        case config.processorPayment.featuredAppRight of
+          Some farCid -> do
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            createActivityMarker context.processor farIfaceCid
+          None -> pure ()
+        
+        -- Update subscription - advance paidUntil and potentially clear freeTrialEndsAt
+        create this with 
+          paidUntil = newPaidUntil
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
 
     -- | Update subscription expiration date
     -- Allows subscriber to extend or modify when the subscription expires
@@ -267,20 +335,13 @@ template Subscription
           (getAmount newRecipientAmount > getAmount oldRecipientAmount || 
            getAmount newProcessorAmount > getAmount oldProcessorAmount)
         
-        -- Validate fee ratio changes don't benefit subscriber
-        -- Lower receiverFeeRatio means subscriber pays more, so we allow decreases
-        assertMsg "Recipient fee ratio can only decrease (subscriber pays more)" 
-          (newRecipientPayment.receiverFeeRatio <= config.recipientPayment.receiverFeeRatio)
-        assertMsg "Processor fee ratio can only decrease (subscriber pays more)" 
-          (newProcessorPayment.receiverFeeRatio <= config.processorPayment.receiverFeeRatio)
-        
         create this with
           config = config with
             recipientPayment = newRecipientPayment
             processorPayment = newProcessorPayment
 
     -- | Recipient decreases their payment
-    -- Allows recipient to decrease their own payment amount and adjust fee ratio to pay more
+    -- Allows recipient to decrease their own payment amount
     choice Subscription_RecipientDecreasePayment : ContractId Subscription
       with
         newRecipientPayment : PaymentConfig
@@ -299,17 +360,12 @@ template Subscription
         assertMsg "Recipient payment amount cannot increase" 
           (getAmount newAmount <= getAmount oldAmount)
         
-        -- Validate fee ratio doesn't decrease (recipient paying less of the fee)
-        -- Higher receiverFeeRatio means recipient pays more
-        assertMsg "Recipient fee ratio can only increase (recipient pays more)" 
-          (newRecipientPayment.receiverFeeRatio >= config.recipientPayment.receiverFeeRatio)
-        
         create this with
           config = config with
             recipientPayment = newRecipientPayment
 
     -- | Processor decreases their payment
-    -- Allows processor to decrease their own payment amount and adjust fee ratio to pay more
+    -- Allows processor to decrease their own payment amount
     choice Subscription_ProcessorDecreasePayment : ContractId Subscription
       with
         newProcessorPayment : PaymentConfig
@@ -327,11 +383,6 @@ template Subscription
         -- Validate amount doesn't increase
         assertMsg "Processor payment amount cannot increase" 
           (getAmount newAmount <= getAmount oldAmount)
-        
-        -- Validate fee ratio doesn't decrease (processor paying less of the fee)
-        -- Higher receiverFeeRatio means processor pays more
-        assertMsg "Processor fee ratio can only increase (processor pays more)" 
-          (newProcessorPayment.receiverFeeRatio >= config.processorPayment.receiverFeeRatio)
         
         create this with
           config = config with
@@ -400,6 +451,60 @@ template Subscription
           config = config with
             recipientPayment = config.recipientPayment with
               featuredAppRight = Some newFeaturedAppRight
+
+    -- | Subscriber reduces free trial end time
+    -- Allows subscriber to reduce or clear the free trial period
+    choice Subscription_SubscriberReduceFreeTrial : ContractId Subscription
+      with
+        newFreeTrialEndsAt : Optional Time
+          -- ^ New (earlier) free trial end time, or None to end trial immediately
+      controller config.subscriber
+      do
+        -- Validate free trial is currently set
+        assertMsg "Free trial must be set to reduce it" 
+          (isSome config.freeTrialEndsAt)
+        
+        let currentFreeTrialEnd = fromSome config.freeTrialEndsAt
+        
+        -- Validate new time is earlier (or None)
+        case newFreeTrialEndsAt of
+          Some newEnd -> 
+            assertMsg "New free trial end must be earlier than current" 
+              (newEnd < currentFreeTrialEnd)
+          None -> pure ()
+        
+        create this with
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
+
+    -- | Recipient increases or sets free trial end time
+    -- Allows recipient to increase, set, or clear the free trial period
+    choice Subscription_RecipientUpdateFreeTrial : ContractId Subscription
+      with
+        newFreeTrialEndsAt : Optional Time
+          -- ^ New free trial end time (can be later, or None to clear)
+      controller config.recipient
+      do
+        -- If setting a new time (not clearing), validate it's in the future
+        case newFreeTrialEndsAt of
+          Some newEnd -> do
+            now <- getTime
+            assertMsg "New free trial end must be in the future" (newEnd > now)
+          None -> pure ()
+        
+        -- If currently set and increasing, validate new time is later
+        case config.freeTrialEndsAt of
+          Some currentEnd -> 
+            case newFreeTrialEndsAt of
+              Some newEnd -> 
+                assertMsg "Recipient can only increase free trial end time" 
+                  (newEnd > currentEnd)
+              None -> pure ()  -- Recipient can clear trial
+          None -> pure ()  -- Recipient can set trial from None
+        
+        create this with
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
 
     -- | Subscriber-only cancel
     -- Allows subscriber to cancel without recipient signature
