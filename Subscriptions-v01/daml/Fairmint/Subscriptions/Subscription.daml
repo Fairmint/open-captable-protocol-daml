@@ -17,53 +17,54 @@ subscriptionAmountToAmulet amount usdToAmuletRate =
     AmuletAmount amt -> amt
     USDAmount usdAmt -> usdAmt * usdToAmuletRate
 
--- | Payment context containing the common payment infrastructure
+-- | Payment context containing Amulet transfer dependencies
 data PaymentContext = PaymentContext
   with
     amuletInputs : [ContractId Amulet.Amulet]
-      -- ^ Amulet inputs to use for payment
     amuletRulesCid : ContractId AmuletRules
-      -- ^ AmuletRules contract for executing transfers
     openMiningRoundCid : ContractId OpenMiningRound
-      -- ^ Current open mining round (for pricing and context)
     amuletPrice : Decimal
-      -- ^ USD to Amulet conversion rate from the open mining round
   deriving (Eq, Show)
 
--- | Helper to execute a payment transfer to a receiver
--- Builds the transfer context and executes the transfer through AmuletRules
-paymentTo 
-  : Party  -- sender
-  -> Party  -- provider
-  -> Party  -- receiver
-  -> Decimal  -- amount
-  -> Decimal  -- receiver fee ratio (0.0 = sender pays all, 1.0 = receiver pays all)
-  -> Optional (ContractId Amulet.FeaturedAppRight)  -- featured app right
-  -> Party  -- expectedDso
-  -> PaymentContext
-  -> Update TransferResult
-paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight expectedDso paymentCtx = do
+-- | Complete payment request with all necessary context
+data PaymentRequest = PaymentRequest
+  with
+    sender : Party
+    provider : Party
+    receiver : Party
+    amount : Decimal
+    receiverFeeRatio : Decimal
+    featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+    expectedDso : Party
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Execute a payment transfer
+paymentTo : PaymentRequest -> Update TransferResult
+paymentTo req = do
   let transfer = Transfer with
-        sender = sender
-        provider = provider
-        inputs = map InputAmulet paymentCtx.amuletInputs
+        sender = req.sender
+        provider = req.provider
+        inputs = map InputAmulet req.amuletInputs
         outputs = [TransferOutput with
-          receiver = receiver
-          receiverFeeRatio = receiverFeeRatio
-          amount = amount
+          receiver = req.receiver
+          receiverFeeRatio = req.receiverFeeRatio
+          amount = req.amount
           lock = None]
         beneficiaries = None
   
   let context = TransferContext with
-        openMiningRound = paymentCtx.openMiningRoundCid
-        featuredAppRight = featuredAppRight
+        openMiningRound = req.openMiningRoundCid
+        featuredAppRight = req.featuredAppRight
         issuingMiningRounds = Map.empty
         validatorRights = Map.empty
   
-  exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
+  exercise req.amuletRulesCid AmuletRules_Transfer with
     transfer = transfer
     context = context
-    expectedDso = Some expectedDso
+    expectedDso = Some req.expectedDso
 
 -- | Active subscription contract for recurring payments
 -- 
@@ -100,14 +101,10 @@ template Subscription
     choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
       with
         paymentCtx : PaymentContext
-          -- ^ Payment context containing amulet inputs, rules, and mining round
       controller context.processor
       do
         -- Get current ledger time
         now <- getTime
-        
-        -- Use the amuletPrice (USD to Amulet rate) from the payment context
-        let usdToAmuletRate = paymentCtx.amuletPrice
         
         -- Validate subscription hasn't expired
         assertMsg "Cannot process payments after subscription expiration" 
@@ -123,22 +120,24 @@ template Subscription
         
         -- Validate USD to Amulet rate is positive (from OpenMiningRound)
         assertMsg "USD to Amulet conversion rate must be positive" 
-          (usdToAmuletRate > 0.0)
+          (paymentCtx.amuletPrice > 0.0)
 
         -- Step 1: Transfer payment to recipient
-        let amountPerPeriodInAmulet = subscriptionAmountToAmulet config.amountPerRound usdToAmuletRate
-        recipientTransferResult <- paymentTo 
-          config.subscriber 
-          context.processor 
-          config.recipient 
-          amountPerPeriodInAmulet 
-          config.recipientReceiverFeeRatio
-          config.recipientFeaturedAppRight
-          context.dso
-          paymentCtx
+        let amountPerPeriodInAmulet = subscriptionAmountToAmulet config.amountPerRound paymentCtx.amuletPrice
+        recipientTransferResult <- paymentTo PaymentRequest with
+          sender = config.subscriber
+          provider = context.processor
+          receiver = config.recipient
+          amount = amountPerPeriodInAmulet
+          receiverFeeRatio = config.recipientReceiverFeeRatio
+          featuredAppRight = config.recipientFeaturedAppRight
+          expectedDso = context.dso
+          amuletInputs = paymentCtx.amuletInputs
+          amuletRulesCid = paymentCtx.amuletRulesCid
+          openMiningRoundCid = paymentCtx.openMiningRoundCid
         
         -- Step 2: If there's a processor fee, transfer to processor
-        let feeAmountPerPeriodInAmulet = subscriptionAmountToAmulet config.feeAmountPerRound usdToAmuletRate
+        let feeAmountPerPeriodInAmulet = subscriptionAmountToAmulet config.feeAmountPerRound paymentCtx.amuletPrice
         processorTransferResult <- 
           if feeAmountPerPeriodInAmulet > 0.0
           then do
@@ -146,20 +145,18 @@ template Subscription
             assertMsg "Expected change amulet from recipient transfer" (isSome recipientTransferResult.senderChangeAmulet)
             let changeAmuletCid = fromSome recipientTransferResult.senderChangeAmulet
             
-            -- Build payment context with change amulet for processor fee
-            let processorPaymentCtx = paymentCtx with
-                  amuletInputs = [changeAmuletCid]
-            
             -- Transfer processor fee to processor using change from recipient payment
-            result <- paymentTo 
-              config.subscriber 
-              context.processor 
-              context.processor 
-              feeAmountPerPeriodInAmulet 
-              config.processorReceiverFeeRatio
-              config.processorFeaturedAppRight
-              context.dso
-              processorPaymentCtx
+            result <- paymentTo PaymentRequest with
+              sender = config.subscriber
+              provider = context.processor
+              receiver = context.processor
+              amount = feeAmountPerPeriodInAmulet
+              receiverFeeRatio = config.processorReceiverFeeRatio
+              featuredAppRight = config.processorFeaturedAppRight
+              expectedDso = context.dso
+              amuletInputs = [changeAmuletCid]
+              amuletRulesCid = paymentCtx.amuletRulesCid
+              openMiningRoundCid = paymentCtx.openMiningRoundCid
             pure (Some result)
           else
             pure None

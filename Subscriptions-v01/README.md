@@ -149,10 +149,10 @@ subscriptionCid <- submit serviceProvider do
 -- FeaturedAppRights and fee ratios are specified in the subscription config
 result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
-    paymentCtx = PaymentContext with
-      amuletInputs = subscriberAmuletInputs  -- Provided by subscriber
-      amuletRulesCid = amuletRulesCid
-      openMiningRoundCid = openRoundCid
+    amuletInputs = subscriberAmuletInputs  -- Provided by subscriber
+    amuletRulesCid = amuletRulesCid
+    openMiningRoundCid = openRoundCid
+    amuletPrice = openRound.amuletPrice  -- USD to Amulet conversion rate
 
 -- 5. Either party can cancel (NO DSO SIGNATURE)
 () <- submit subscriber do
