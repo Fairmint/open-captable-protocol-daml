@@ -2,13 +2,13 @@ module TestSubscription where
 
 import Daml.Script
 import DA.Date (datetime, Month(..))
+import DA.Time (days, addRelTime)
 import Fairmint.Subscriptions.Subscription
 import Fairmint.Subscriptions.SubscriptionProposal
+import Fairmint.Subscriptions.ProcessorApprovedSubscriptionProposal
 import Fairmint.Subscriptions.SubscriptionFactory
-import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig(..), ProcessorContext(..))
-import Splice.AmuletRules (TransferContext(..), AmuletRules)
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig(..), ProcessorContext(..), SubscriptionAmount(..))
 import TestUtils (tap, sharedDso, getFirstOpenRound, getAmuletRules)
-import qualified DA.Map as Map
 
 -- Helper to create a SubscriptionFactory
 createSubscriptionFactory : Party -> Script (ContractId SubscriptionFactory)
@@ -20,7 +20,20 @@ createSubscriptionFactory processor = do
         processor = processor
         dso = dso
 
--- Test the factory/proposal/acceptance flow
+-- Helper to create a subscription proposal
+-- Uses createAndExerciseCmd to create factory and proposal in one transaction, avoiding divulgence issues
+createProposal : Party -> Party -> Party -> SubscriptionConfig -> Script (ContractId SubscriptionProposal)
+createProposal processor subscriber dso config = do
+  submitMulti [subscriber, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with
+        context = ProcessorContext with
+          processor = processor
+          dso = dso)
+      (SubscriptionFactory_CreateProposal with
+        config = config)
+
+-- Test the factory/proposal/approval/acceptance flow
 testFactoryProposalAcceptance : Script ()
 testFactoryProposalAcceptance = script do
   alice <- allocateParty "Alice"
@@ -28,74 +41,67 @@ testFactoryProposalAcceptance = script do
   processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Create factory
-  factoryCid <- createSubscriptionFactory processor
+  -- Alice creates subscription proposal via factory
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 10.0
+    feeAmountPerRound = AmuletAmount 2.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Monthly service fee"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
-  -- Alice creates subscription proposal via factory (no amulet yet)
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 10.0
-        feeAmountPerRound = 2.0
-        reason = Some "Monthly service fee"
+  -- Processor approves the proposal
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
   
-  -- Alice creates an amulet for payment
-  amuletCid <- tap alice 100.0
-  
-  -- Get necessary context for locking the amulet
-  openRoundCid <- getFirstOpenRound dso
-  amuletRulesCid <- getAmuletRules dso
-  let transferContext = TransferContext with
-        openMiningRound = openRoundCid
-        featuredAppRight = None
-        issuingMiningRounds = Map.empty
-        validatorRights = Map.empty
-  
-  -- Bob accepts the proposal, providing the amulet and locking 100.0
+  -- Bob (recipient) accepts the approved proposal
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept with
-      inputAmulets = [amuletCid]
-      amountToLock = 100.0
-      amuletRulesCid = amuletRulesCid
-      openMiningRoundCid = openRoundCid
-      transferContext = transferContext
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
   
-  -- Verify subscription was created with locked amulet
+  -- Verify subscription was created
   Some subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscriber should be alice" (subscription.config.subscriber == alice)
   assertMsg "Recipient should be bob" (subscription.config.recipient == bob)
-  assertMsg "Processor should match" (subscription.processor == processor)
-  assertMsg "Should have locked amulet" (subscription.lockedAmulet /= None)
-  assertMsg "Amount per round should be 10.0" (subscription.config.amountPerRound == 10.0)
-  assertMsg "Fee amount per round should be 2.0" (subscription.config.feeAmountPerRound == 2.0)
+  assertMsg "Processor should match" (subscription.context.processor == processor)
+  assertMsg "Amount per round should be 10.0" (subscription.config.amountPerRound == AmuletAmount 10.0)
+  assertMsg "Fee amount per round should be 2.0" (subscription.config.feeAmountPerRound == AmuletAmount 2.0)
   
   pure ()
 
--- Test proposal rejection
-testProposalRejection : Script ()
-testProposalRejection = script do
+-- Test proposal rejection by recipient
+testProposalRejectionByRecipient : Script ()
+testProposalRejectionByRecipient = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  -- Create factory
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Alice proposes subscription via factory
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
-        reason = Some "Service subscription"
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service subscription"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
-  -- Bob rejects
+  -- Bob (recipient) rejects
   submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Reject
+    exerciseCmd proposalCid SubscriptionProposal_RecipientReject
   
   -- Verify proposal is archived
   proposal <- queryContractId bob proposalCid
@@ -103,29 +109,67 @@ testProposalRejection = script do
   
   pure ()
 
--- Test subscriber canceling proposal
-testProposalCancelBySubscriber : Script ()
-testProposalCancelBySubscriber = script do
+-- Test proposal rejection by processor
+testProposalRejectionByProcessor : Script ()
+testProposalRejectionByProcessor = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  -- Create factory
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Alice proposes subscription via factory
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
-        reason = Some "Service subscription"
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service subscription"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
-  -- Alice cancels before Bob accepts
+  -- Processor rejects
+  submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorReject
+  
+  -- Verify proposal is archived
+  proposal <- queryContractId processor proposalCid
+  assertMsg "Proposal should be archived" (proposal == None)
+  
+  pure ()
+
+-- Test subscriber withdrawing proposal
+testProposalWithdrawBySubscriber : Script ()
+testProposalWithdrawBySubscriber = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  dso <- sharedDso
+  
+  -- Alice proposes subscription via factory
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service subscription"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
+  
+  -- Alice withdraws before processor approves
   submit alice do
-    exerciseCmd proposalCid SubscriptionProposal_Cancel
+    exerciseCmd proposalCid SubscriptionProposal_SubscriberWithdraw
   
   -- Verify proposal is archived
   proposal <- queryContractId alice proposalCid
@@ -141,46 +185,37 @@ testCancelBySubscriber = script do
   processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Create factory
-  factoryCid <- createSubscriptionFactory processor
-  
   -- Alice proposes via factory
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
-        reason = Some "Service subscription"
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service subscription"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
-  -- Alice creates amulet and Bob accepts with locking
-  amuletCid <- tap alice 50.0
-  openRoundCid <- getFirstOpenRound dso
-  amuletRulesCid <- getAmuletRules dso
-  let transferContext = TransferContext with
-        openMiningRound = openRoundCid
-        featuredAppRight = None
-        issuingMiningRounds = Map.empty
-        validatorRights = Map.empty
+  -- Processor approves
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
   
+  -- Bob accepts
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept with
-      amuletCid = amuletCid
-      amuletRulesCid = amuletRulesCid
-      openMiningRoundCid = openRoundCid
-      transferContext = transferContext
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
   
-  -- Alice cancels
-  returnedLockedAmulet <- submit alice do
+  -- Alice cancels the subscription
+  submit alice do
     exerciseCmd subscriptionCid Subscription_CancelBySubscriber
   
   -- Verify subscription was archived
   subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
-  
-  -- Verify we got back the locked amulet
-  assertMsg "Should return locked amulet" (returnedLockedAmulet /= None)
   
   pure ()
 
@@ -192,36 +227,37 @@ testCancelByRecipient = script do
   processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Create factory
-  factoryCid <- createSubscriptionFactory processor
-  
   -- Alice proposes via factory
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
-        reason = Some "Service subscription"
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service subscription"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
-  -- Alice creates amulet and Bob accepts
-  amuletCid <- tap alice 50.0
+  -- Processor approves
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
   
+  -- Bob accepts
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept with
-      amuletCid = amuletCid
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
   
-  -- Bob cancels
-  returnedAmulet <- submit bob do
+  -- Bob cancels the subscription
+  submit bob do
     exerciseCmd subscriptionCid Subscription_CancelByRecipient
   
   -- Verify subscription was archived
   subscription <- queryContractId bob subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
-  
-  -- Verify we got back the amulet
-  assertMsg "Should return amulet" (returnedAmulet /= None)
   
   pure ()
 
@@ -231,18 +267,26 @@ testNegativeAmountNotAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
+  dso <- sharedDso
   
-  factoryCid <- createSubscriptionFactory processor
-  
-  -- Try to create proposal with negative amount
-  submitMustFail alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
+  -- Try to create proposal with negative amount (should fail validation)
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  submitMultiMustFail [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposal SubscriptionConfig with
         subscriber = alice
         recipient = bob
-        amountPerRound = -5.0
-        feeAmountPerRound = 1.0
+        amountPerRound = AmuletAmount (-5.0)
+        feeAmountPerRound = AmuletAmount 1.0
+        processingPeriod = days 30
+        expiresAt = expiresAt
         reason = Some "Service"
+        recipientReceiverFeeRatio = 0.0
+        processorReceiverFeeRatio = 0.0
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None)
   
   pure ()
 
@@ -252,18 +296,26 @@ testNegativeFeeNotAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Try to create proposal with negative fee
-  submitMustFail alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  submitMultiMustFail [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposal SubscriptionConfig with
         subscriber = alice
         recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = -1.0
+        amountPerRound = AmuletAmount 5.0
+        feeAmountPerRound = AmuletAmount (-1.0)
+        processingPeriod = days 30
+        expiresAt = expiresAt
         reason = Some "Service"
+        recipientReceiverFeeRatio = 0.0
+        processorReceiverFeeRatio = 0.0
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None)
   
   pure ()
 
@@ -273,22 +325,27 @@ testZeroFeeAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Create proposal with zero fee (should succeed)
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 0.0
-        reason = Some "Service"
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 0.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
   -- Verify proposal was created
   Some proposal <- queryContractId alice proposalCid
-  assertMsg "Fee should be 0.0" (proposal.config.feeAmountPerRound == 0.0)
+  assertMsg "Fee should be 0.0" (proposal.config.feeAmountPerRound == AmuletAmount 0.0)
   
   pure ()
 
@@ -298,18 +355,26 @@ testEmptyStringReasonNotAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Try to create proposal with Some "" reason
-  submitMustFail alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  submitMultiMustFail [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposal SubscriptionConfig with
         subscriber = alice
         recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
+        amountPerRound = AmuletAmount 5.0
+        feeAmountPerRound = AmuletAmount 1.0
+        processingPeriod = days 30
+        expiresAt = expiresAt
         reason = Some ""
+        recipientReceiverFeeRatio = 0.0
+        processorReceiverFeeRatio = 0.0
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None)
   
   pure ()
 
@@ -319,18 +384,23 @@ testNoneReasonAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   processor <- allocateParty "Processor"
-  
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Create proposal with None reason (should succeed)
-  proposalCid <- submit alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
-        subscriber = alice
-        recipient = bob
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
-        reason = None
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = None
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
   
   -- Verify proposal was created
   Some proposal <- queryContractId alice proposalCid
@@ -343,17 +413,185 @@ testSubscriberRecipientMustBeDifferent : Script ()
 testSubscriberRecipientMustBeDifferent = script do
   alice <- allocateParty "Alice"
   processor <- allocateParty "Processor"
-  
-  factoryCid <- createSubscriptionFactory processor
+  dso <- sharedDso
   
   -- Try to create proposal where subscriber == recipient
-  submitMustFail alice do
-    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
-      config = SubscriptionConfig with
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  submitMultiMustFail [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposal SubscriptionConfig with
         subscriber = alice
         recipient = alice  -- Same as subscriber
-        amountPerRound = 5.0
-        feeAmountPerRound = 1.0
+        amountPerRound = AmuletAmount 5.0
+        feeAmountPerRound = AmuletAmount 1.0
+        processingPeriod = days 30
+        expiresAt = expiresAt
         reason = Some "Service"
+        recipientReceiverFeeRatio = 0.0
+        processorReceiverFeeRatio = 0.0
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None)
+  
+  pure ()
+
+-- Test processing a subscription payment
+testProcessPayment : Script ()
+testProcessPayment = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  dso <- allocateParty "dso-payment-test"
+  
+  -- Create subscription
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 10.0
+    feeAmountPerRound = AmuletAmount 2.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Monthly service"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
+  
+  -- Processor approves
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
+  
+  -- Bob accepts to create active subscription
+  subscriptionCid <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
+  
+  -- Alice creates amulet for payment (before advancing time so mining rounds exist)
+  amuletCid <- tap alice 100.0
+  
+  -- Get payment context
+  openRoundCid <- getFirstOpenRound dso
+  amuletRulesCid <- getAmuletRules dso
+  
+  -- Wait for the processing period to elapse
+  now2 <- getTime
+  setTime (addRelTime now2 (days 31))
+  let paymentCtx = PaymentContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  -- Process payment (requires both alice and processor signatures)
+  result <- submitMulti [alice, processor] [] do
+    exerciseCmd subscriptionCid Subscription_ProcessPayment with
+      paymentCtx = paymentCtx
+  
+  -- Verify the subscription was updated
+  Some updatedSubscription <- queryContractId alice result.subscriptionCid
+  assertMsg "Subscription should be updated" (updatedSubscription.paidUntil > now)
+  
+  pure ()
+
+-- Test processing payment fails before period elapses
+testProcessPaymentFailsBeforePeriodElapses : Script ()
+testProcessPaymentFailsBeforePeriodElapses = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  dso <- allocateParty "dso-before-period-test"
+  
+  -- Create subscription
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
+  
+  -- Processor approves
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
+  
+  -- Bob accepts
+  subscriptionCid <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
+  
+  -- Create amulet for payment
+  amuletCid <- tap alice 50.0
+  openRoundCid <- getFirstOpenRound dso
+  amuletRulesCid <- getAmuletRules dso
+  
+  -- Try to process payment immediately (should fail - period hasn't elapsed)
+  let paymentCtx = PaymentContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  submitMultiMustFail [alice, processor] [] do
+    exerciseCmd subscriptionCid Subscription_ProcessPayment with
+      paymentCtx = paymentCtx
+  
+  pure ()
+
+-- Test processing payment fails after expiration
+testProcessPaymentFailsAfterExpiration : Script ()
+testProcessPaymentFailsAfterExpiration = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  dso <- allocateParty "dso-after-expiration-test"
+  
+  -- Create subscription with short expiration
+  now <- getTime
+  let expiresAt = addRelTime now (days 60)  -- Expires in 60 days
+  proposalCid <- createProposal processor alice dso SubscriptionConfig with
+    subscriber = alice
+    recipient = bob
+    amountPerRound = AmuletAmount 5.0
+    feeAmountPerRound = AmuletAmount 1.0
+    processingPeriod = days 30
+    expiresAt = expiresAt
+    reason = Some "Service"
+    recipientReceiverFeeRatio = 0.0
+    processorReceiverFeeRatio = 0.0
+    recipientFeaturedAppRight = None
+    processorFeaturedAppRight = None
+  
+  -- Processor approves
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
+  
+  -- Bob accepts
+  subscriptionCid <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept
+  
+  -- Create amulet for payment before advancing time
+  amuletCid <- tap alice 50.0
+  openRoundCid <- getFirstOpenRound dso
+  amuletRulesCid <- getAmuletRules dso
+  
+  -- Wait past expiration
+  now2 <- getTime
+  setTime (addRelTime now2 (days 61))
+  
+  -- Try to process payment after expiration (should fail)
+  let paymentCtx = PaymentContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  submitMultiMustFail [alice, processor] [] do
+    exerciseCmd subscriptionCid Subscription_ProcessPayment with
+      paymentCtx = paymentCtx
   
   pure ()

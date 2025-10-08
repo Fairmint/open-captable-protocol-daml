@@ -1,8 +1,11 @@
 module Fairmint.Subscriptions.Subscription where
 
 import DA.Optional (isSome, fromSome)
+import DA.Time (addRelTime)
+import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), SubscriptionAmount(..), validateSubscriptionConfig)
 
 -- | Convert a SubscriptionAmount to Amulet Decimal using the provided USD to Amulet rate
@@ -13,6 +16,51 @@ subscriptionAmountToAmulet amount usdToAmuletRate =
   case amount of
     AmuletAmount amt -> amt
     USDAmount usdAmt -> usdAmt * usdToAmuletRate
+
+-- | Payment context containing the common payment infrastructure
+data PaymentContext = PaymentContext
+  with
+    amuletInputs : [ContractId Amulet.Amulet]
+      -- ^ Amulet inputs to use for payment
+    amuletRulesCid : ContractId AmuletRules
+      -- ^ AmuletRules contract for executing transfers
+    openMiningRoundCid : ContractId OpenMiningRound
+      -- ^ Current open mining round (for pricing and context)
+  deriving (Eq, Show)
+
+-- | Helper to execute a payment transfer to a receiver
+-- Builds the transfer context and executes the transfer through AmuletRules
+paymentTo 
+  : Party  -- sender
+  -> Party  -- provider
+  -> Party  -- receiver
+  -> Decimal  -- amount
+  -> Decimal  -- receiver fee ratio (0.0 = sender pays all, 1.0 = receiver pays all)
+  -> Optional (ContractId Amulet.FeaturedAppRight)  -- featured app right
+  -> PaymentContext
+  -> Update TransferResult
+paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight paymentCtx = do
+  let transfer = Transfer with
+        sender = sender
+        provider = provider
+        inputs = map InputAmulet paymentCtx.amuletInputs
+        outputs = [TransferOutput with
+          receiver = receiver
+          receiverFeeRatio = receiverFeeRatio
+          amount = amount
+          lock = None]
+        beneficiaries = None
+  
+  let context = TransferContext with
+        openMiningRound = paymentCtx.openMiningRoundCid
+        featuredAppRight = featuredAppRight
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
+  
+  exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
+    transfer = transfer
+    context = context
+    expectedDso = None
 
 -- | Active subscription contract for recurring payments
 -- 
@@ -32,8 +80,8 @@ template Subscription
       -- ^ Subscription configuration
     context : ProcessorContext
       -- ^ Processor and DSO context (assigned by factory)
-    lastProcessedAt : Time
-      -- ^ Last time payment was processed
+    paidUntil : Time
+      -- ^ Subscription is paid through this time (extends by one period with each payment)
   where
     signatory config.subscriber, config.recipient
     observer context.processor
@@ -44,106 +92,87 @@ template Subscription
     -- | Process payment for the current period
     -- The processor executes this periodically, with subscriber authorization
     -- Uses amulet inputs provided by subscriber to transfer funds to recipient and processor
-    -- Separate transfer contexts allow different FeaturedAppRights for each payment
+    -- FeaturedAppRights and fee ratios for transfers are specified in the subscription config
     -- Cannot process payments after subscription expiration date
     choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
       with
-        amuletInputs : [ContractId Amulet.Amulet]
-          -- ^ Amulet inputs from subscriber's account to use for this payment
-        amuletRulesCid : ContractId AmuletRules
-          -- ^ AmuletRules contract for executing transfers
-        recipientTransferContext : TransferContext
-          -- ^ Transfer context for payment to recipient (includes FeaturedAppRight)
-        processorTransferContext : TransferContext
-          -- ^ Transfer context for payment to processor (includes FeaturedAppRight)
-        usdToAmuletRate : Decimal
-          -- ^ Conversion rate from USD to Amulet (USD * rate = Amulet)
-          --   Only used if amounts are denominated in USD, ignored for Amulet amounts
+        paymentCtx : PaymentContext
+          -- ^ Payment context containing amulet inputs, rules, and mining round
       controller config.subscriber, context.processor
       do
         -- Get current ledger time
         now <- getTime
         
+        -- Fetch the OpenMiningRound to get the current amuletPrice (USD to Amulet rate)
+        openRound <- fetch paymentCtx.openMiningRoundCid
+        let usdToAmuletRate = openRound.amuletPrice
+        
         -- Validate subscription hasn't expired
         assertMsg "Cannot process payments after subscription expiration" 
           (now <= config.expiresAt)
         
-        -- Validate we're not processing too soon after last payment
-        assertMsg "Cannot process payment before last processed time" 
-          (now > lastProcessedAt)
+        -- Validate subscription period has elapsed (paid through time has passed)
+        assertMsg "Cannot process payment before subscription period elapses (still paid through current paidUntil time)" 
+          (now > paidUntil)
         
         -- Validate amulet inputs are provided
         assertMsg "Must provide at least one amulet input for payment" 
-          (not (null amuletInputs))
+          (not (null paymentCtx.amuletInputs))
         
-        -- Validate USD to Amulet rate is positive
+        -- Validate USD to Amulet rate is positive (from OpenMiningRound)
         assertMsg "USD to Amulet conversion rate must be positive" 
           (usdToAmuletRate > 0.0)
         
-        -- Calculate payment amounts, converting USD to Amulet if needed
-        -- Process payment for exactly one period per call
+        -- Validate AmuletRules DSO matches expected DSO
+        -- This implicitly validates that the amulet inputs and mining round belong to this DSO
+        -- since AmuletRules will check ownership and validity during transfer
+        amuletRules <- fetch paymentCtx.amuletRulesCid
+        assertMsg "AmuletRules DSO must match expected DSO from subscription context"
+          (amuletRules.dso == context.dso)
+
+        -- Step 1: Transfer payment to recipient
         let amountPerPeriodInAmulet = subscriptionAmountToAmulet config.amountPerRound usdToAmuletRate
+        recipientTransferResult <- paymentTo 
+          config.subscriber 
+          context.processor 
+          config.recipient 
+          amountPerPeriodInAmulet 
+          config.recipientReceiverFeeRatio
+          config.recipientFeaturedAppRight
+          paymentCtx
+        
+        -- Step 2: If there's a processor fee, transfer to processor
         let feeAmountPerPeriodInAmulet = subscriptionAmountToAmulet config.feeAmountPerRound usdToAmuletRate
-        let totalPaymentToRecipient = amountPerPeriodInAmulet
-        let totalFeeToProcessor = feeAmountPerPeriodInAmulet
-        
-        -- Step 1: Transfer to recipient using recipient's transfer context
-        let recipientOutput = TransferOutput with
-              receiver = config.recipient
-              receiverFeeRatio = 0.0
-              amount = totalPaymentToRecipient
-              lock = None
-        
-        let recipientTransfer = Transfer with
-              sender = config.subscriber
-              provider = context.processor
-              inputs = map InputAmulet amuletInputs
-              outputs = [recipientOutput]
-              beneficiaries = None
-        
-        recipientTransferResult <- exercise amuletRulesCid AmuletRules_Transfer with
-          transfer = recipientTransfer
-          context = recipientTransferContext
-          expectedDso = Some context.dso
-        
-        -- Step 2: If there's a processor fee, transfer to processor using processor's transfer context
         processorTransferResult <- 
-          if totalFeeToProcessor > 0.0
+          if feeAmountPerPeriodInAmulet > 0.0
           then do
             -- Get the change amulet from the recipient transfer
             assertMsg "Expected change amulet from recipient transfer" (isSome recipientTransferResult.senderChangeAmulet)
             let changeAmuletCid = fromSome recipientTransferResult.senderChangeAmulet
             
-            -- Transfer processor fee to processor
-            let processorOutput = TransferOutput with
-                  receiver = context.processor
-                  receiverFeeRatio = 0.0
-                  amount = totalFeeToProcessor
-                  lock = None
+            -- Build payment context with change amulet for processor fee
+            let processorPaymentCtx = paymentCtx with
+                  amuletInputs = [changeAmuletCid]
             
-            let processorTransfer = Transfer with
-                  sender = config.subscriber
-                  provider = context.processor
-                  inputs = [InputAmulet changeAmuletCid]
-                  outputs = [processorOutput]
-                  beneficiaries = None
-            
-            result <- exercise amuletRulesCid AmuletRules_Transfer with
-              transfer = processorTransfer
-              context = processorTransferContext
-              expectedDso = Some context.dso
+            -- Transfer processor fee to processor using change from recipient payment
+            result <- paymentTo 
+              config.subscriber 
+              context.processor 
+              context.processor 
+              feeAmountPerPeriodInAmulet 
+              config.processorReceiverFeeRatio
+              config.processorFeaturedAppRight
+              processorPaymentCtx
             pure (Some result)
           else
             pure None
         
-        -- Step 3: Update subscription with new processed time
-        newSubscriptionCid <- create this with 
-          lastProcessedAt = now
+        -- Step 3: Update subscription - extend paidUntil by one period
+        subscriptionCid <- create this with 
+          paidUntil = addRelTime paidUntil config.processingPeriod
         
         pure Subscription_ProcessPaymentResult with
-          subscriptionCid = newSubscriptionCid
-          recipientTransferResult = recipientTransferResult
-          processorTransferResult = processorTransferResult
+          ..
 
     -- | Update subscription expiration date
     -- Allows subscriber to extend or modify when the subscription expires
@@ -153,6 +182,10 @@ template Subscription
           -- ^ New expiration time for the subscription
       controller config.subscriber
       do
+        -- Validate that the new expiration is in the future (otherwise cancel)
+        now <- getTime
+        assertMsg "New expiration must be in the future" (newExpiresAt > now)
+      
         create this with
           config = config with
             expiresAt = newExpiresAt

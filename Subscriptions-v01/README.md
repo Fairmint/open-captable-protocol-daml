@@ -124,11 +124,15 @@ proposalCid <- submit subscriber do
     config = SubscriptionConfig with
       subscriber = subscriber
       recipient = serviceProvider
+      amountPerRound = AmuletAmount 10.0  -- or USDAmount 10.0
+      feeAmountPerRound = AmuletAmount 1.0
       processingPeriod = days 30  -- Monthly subscription
-      amountPerPeriod = AmuletAmount 10.0  -- or USDAmount 10.0
-      feeAmountPerPeriod = AmuletAmount 1.0
       expiresAt = farFutureTime
       reason = Some "Premium membership"
+      recipientFeaturedAppRight = None  -- Optional featured app right for recipient
+      processorFeaturedAppRight = None  -- Optional featured app right for processor
+      recipientReceiverFeeRatio = 0.0  -- Subscriber pays all fees for recipient transfer
+      processorReceiverFeeRatio = 0.0  -- Subscriber pays all fees for processor transfer
 
 -- 2. Processor approves the proposal
 approvedCid <- submit processor do
@@ -141,14 +145,14 @@ subscriptionCid <- submit serviceProvider do
 
 -- 4. Processor processes payment each period (NO DSO SIGNATURE)
 -- Subscriber provides amulet inputs for each payment
+-- The USD to Amulet rate is automatically read from the OpenMiningRound
+-- FeaturedAppRights and fee ratios are specified in the subscription config
 result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
-    currentTime = now
-    amuletInputs = subscriberAmuletInputs  -- Provided by subscriber
-    amuletRulesCid = amuletRulesCid
-    recipientTransferContext = recipientContext
-    processorTransferContext = processorContext
-    usdToAmuletRate = 1.0  -- Current conversion rate
+    paymentCtx = PaymentContext with
+      amuletInputs = subscriberAmuletInputs  -- Provided by subscriber
+      amuletRulesCid = amuletRulesCid
+      openMiningRoundCid = openRoundCid
 
 -- 5. Either party can cancel (NO DSO SIGNATURE)
 () <- submit subscriber do
