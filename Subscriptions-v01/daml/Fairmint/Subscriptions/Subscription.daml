@@ -26,6 +26,8 @@ data PaymentContext = PaymentContext
       -- ^ AmuletRules contract for executing transfers
     openMiningRoundCid : ContractId OpenMiningRound
       -- ^ Current open mining round (for pricing and context)
+    amuletPrice : Decimal
+      -- ^ USD to Amulet conversion rate from the open mining round
   deriving (Eq, Show)
 
 -- | Helper to execute a payment transfer to a receiver
@@ -37,9 +39,10 @@ paymentTo
   -> Decimal  -- amount
   -> Decimal  -- receiver fee ratio (0.0 = sender pays all, 1.0 = receiver pays all)
   -> Optional (ContractId Amulet.FeaturedAppRight)  -- featured app right
+  -> Party  -- expectedDso
   -> PaymentContext
   -> Update TransferResult
-paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight paymentCtx = do
+paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight expectedDso paymentCtx = do
   let transfer = Transfer with
         sender = sender
         provider = provider
@@ -60,7 +63,7 @@ paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight paym
   exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
     transfer = transfer
     context = context
-    expectedDso = None
+    expectedDso = Some expectedDso
 
 -- | Active subscription contract for recurring payments
 -- 
@@ -76,12 +79,12 @@ paymentTo sender provider receiver amount receiverFeeRatio featuredAppRight paym
 -- Either the subscriber or recipient can cancel at any time.
 template Subscription
   with
+    paidUntil : Time
+      -- ^ Subscription is paid through this time (extends by one period with each payment)
     config : SubscriptionConfig
       -- ^ Subscription configuration
     context : ProcessorContext
       -- ^ Processor and DSO context (assigned by factory)
-    paidUntil : Time
-      -- ^ Subscription is paid through this time (extends by one period with each payment)
   where
     signatory config.subscriber, config.recipient
     observer context.processor
@@ -98,14 +101,13 @@ template Subscription
       with
         paymentCtx : PaymentContext
           -- ^ Payment context containing amulet inputs, rules, and mining round
-      controller config.subscriber, context.processor
+      controller context.processor
       do
         -- Get current ledger time
         now <- getTime
         
-        -- Fetch the OpenMiningRound to get the current amuletPrice (USD to Amulet rate)
-        openRound <- fetch paymentCtx.openMiningRoundCid
-        let usdToAmuletRate = openRound.amuletPrice
+        -- Use the amuletPrice (USD to Amulet rate) from the payment context
+        let usdToAmuletRate = paymentCtx.amuletPrice
         
         -- Validate subscription hasn't expired
         assertMsg "Cannot process payments after subscription expiration" 
@@ -122,13 +124,6 @@ template Subscription
         -- Validate USD to Amulet rate is positive (from OpenMiningRound)
         assertMsg "USD to Amulet conversion rate must be positive" 
           (usdToAmuletRate > 0.0)
-        
-        -- Validate AmuletRules DSO matches expected DSO
-        -- This implicitly validates that the amulet inputs and mining round belong to this DSO
-        -- since AmuletRules will check ownership and validity during transfer
-        amuletRules <- fetch paymentCtx.amuletRulesCid
-        assertMsg "AmuletRules DSO must match expected DSO from subscription context"
-          (amuletRules.dso == context.dso)
 
         -- Step 1: Transfer payment to recipient
         let amountPerPeriodInAmulet = subscriptionAmountToAmulet config.amountPerRound usdToAmuletRate
@@ -139,6 +134,7 @@ template Subscription
           amountPerPeriodInAmulet 
           config.recipientReceiverFeeRatio
           config.recipientFeaturedAppRight
+          context.dso
           paymentCtx
         
         -- Step 2: If there's a processor fee, transfer to processor
@@ -162,6 +158,7 @@ template Subscription
               feeAmountPerPeriodInAmulet 
               config.processorReceiverFeeRatio
               config.processorFeaturedAppRight
+              context.dso
               processorPaymentCtx
             pure (Some result)
           else
