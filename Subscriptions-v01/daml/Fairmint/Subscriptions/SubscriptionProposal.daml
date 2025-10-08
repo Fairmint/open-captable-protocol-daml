@@ -1,10 +1,6 @@
 module Fairmint.Subscriptions.SubscriptionProposal where
 
-import DA.Date (datetime, Month(..))
 import Splice.Amulet qualified as Amulet
-import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..))
-import Splice.Expiry (TimeLock(..))
-import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.Subscription
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
 
@@ -32,58 +28,23 @@ template SubscriptionProposal
     
     ensure validateSubscriptionConfig config
 
-    -- | Recipient accepts the proposal with Amulets provided for payments
-    -- The specified amount is locked from the provided amulets and attached to the subscription
-    -- Any change is returned to the subscriber as regular amulets
+    -- | Recipient accepts the proposal with a LockedAmulet for payments
+    -- The subscriber should lock the amulet before calling this choice
+    -- The LockedAmulet must not expire before the subscription end date
     choice SubscriptionProposal_Accept : ContractId Subscription
       with
-        inputAmulets : [ContractId Amulet.Amulet]
-          -- ^ Amulets to use as inputs (can be multiple)
-        amountToLock : Decimal
-          -- ^ Specific amount to lock for subscription payments
-        amuletRulesCid : ContractId AmuletRules
-          -- ^ AmuletRules contract for locking the amulet
-        openMiningRoundCid : ContractId OpenMiningRound
-          -- ^ Current open mining round
-        transferContext : TransferContext
-          -- ^ Transfer context (includes open mining round and other context)
+        lockedAmuletCid : ContractId Amulet.LockedAmulet
+          -- ^ LockedAmulet to use for subscription payments
       controller config.recipient
       do
-        -- Validate amount to lock is positive
-        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
-        
-        -- Lock the specified amount by transferring to self with a lock
-        -- This creates a LockedAmulet without requiring DSO as a controller on our contract
-        -- Any excess from the inputs will be returned as regular amulets (change)
-        let lockOutput = TransferOutput with
-              receiver = config.subscriber  -- Transfer to self with lock
-              receiverFeeRatio = 0.0
-              amount = amountToLock  -- Lock exactly this amount
-              lock = Some (TimeLock with
-                holders = [config.subscriber]
-                expiresAt = config.expiresAt
-                optContext = Some "Subscription collateral")
-        
-        let lockTransfer = Transfer with
-              sender = config.subscriber
-              provider = context.processor
-              inputs = map InputAmulet inputAmulets
-              outputs = [lockOutput]
-              beneficiaries = None
-        
-        lockResult <- exercise amuletRulesCid AmuletRules_Transfer with
-          transfer = lockTransfer
-          context = transferContext
-          expectedDso = Some context.dso
-        
-        -- Extract the locked amulet from the created amulets
-        -- There should be exactly one LockedAmulet created
-        let lockedAmuletCid = case filter (\(created, _) -> 
-              case created of
-                Amulet.CreatedLockedAmulet _ -> True
-                _ -> False) lockResult.createdAmulets of
-              [(Amulet.CreatedLockedAmulet cid, _)] -> cid
-              _ -> error "Expected exactly one locked amulet from lock transfer"
+        -- Validate the locked amulet
+        lockedAmulet <- fetch lockedAmuletCid
+        assertMsg "LockedAmulet DSO must match subscription DSO" 
+          (lockedAmulet.amulet.dso == context.dso)
+        assertMsg "LockedAmulet owner must be subscriber" 
+          (lockedAmulet.amulet.owner == config.subscriber)
+        assertMsg "LockedAmulet must not expire before subscription end date" 
+          (lockedAmulet.lock.expiresAt >= config.expiresAt)
         
         -- Create the active subscription with the locked amulet
         create Subscription with
