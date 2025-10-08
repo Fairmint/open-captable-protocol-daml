@@ -66,10 +66,11 @@ async function main() {
 
   // Get DSO party ID
   console.log('Looking up DSO party...');
-  const dsoPartyId = await validatorClient.getDsoPartyId();
-  if (!dsoPartyId) {
+  const dsoResponse = await validatorClient.getDsoPartyId();
+  if (!dsoResponse || !dsoResponse.dso_party_id) {
     throw new Error('Could not determine DSO party ID');
   }
+  const dsoPartyId = dsoResponse.dso_party_id;
   console.log(`✅ DSO Party: ${dsoPartyId}`);
 
   const subscriptionFactoryData: any = {

@@ -11,6 +11,8 @@ const PACKAGE_DIRS = [
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
+const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
+const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 
 function createDirectoryIfNotExists(dirPath: string): void {
 	if (!fs.existsSync(dirPath)) {
@@ -281,6 +283,36 @@ exports.Api = Api;
 	console.log('✅ Created bundled splice-api-featured-app-v1 structure');
 }
 
+function createBundledSpliceAmuletFiles(targetDir: string): void {
+	console.log('📦 Bundling splice-amulet dependency...');
+	const spliceDestDir = path.join(targetDir, 'lib/Splice');
+	const spliceSourceDir = path.join(SPLICE_AMULET_DIR, 'lib/Splice');
+
+	if (!fs.existsSync(spliceSourceDir)) {
+		console.log('⚠️  splice-amulet Splice directory not found');
+		return;
+	}
+
+	// Copy the entire Splice directory from splice-amulet
+	copyDirectory(spliceSourceDir, spliceDestDir);
+	console.log('✅ Copied splice-amulet Splice modules');
+}
+
+function createBundledDATimeTypesFiles(targetDir: string): void {
+	console.log('📦 Bundling DA Time Types dependency...');
+	const daDestDir = path.join(targetDir, 'lib/DA/Time');
+	const daSourceDir = path.join(DA_TIME_TYPES_DIR, 'lib/DA/Time');
+
+	if (!fs.existsSync(daSourceDir)) {
+		console.log('⚠️  DA Time Types directory not found');
+		return;
+	}
+
+	// Copy the DA/Time directory
+	copyDirectory(daSourceDir, daDestDir);
+	console.log('✅ Copied DA Time Types modules');
+}
+
 function updateMainIndex(targetDir: string): void {
 	console.log('📝 Updating main index files...');
 
@@ -399,6 +431,42 @@ function replaceDependencyReferences(targetDir: string): void {
 			}
 		}
 
+		if (content.includes('@daml.js/splice-amulet-0.1.14')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib'))
+				.replace(/\\/g, '/');
+			console.log(`  Updating ${path.relative(targetDir, filePath)} with splice-amulet path: ${relativePath}`);
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-amulet-0\.1\.14';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-amulet-0\.1\.14'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Time/Types'))
+				.replace(/\\/g, '/');
+			console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Time Types path: ${relativePath}`);
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/daml-stdlib-DA-Time-Types-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/daml-stdlib-DA-Time-Types-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
 		if (content !== originalContent) {
 			fs.writeFileSync(filePath, content);
 			replacedCount++;
@@ -415,6 +483,8 @@ function removeLocalDependency(targetDir: string): void {
 	const localDependencies = [
 		'@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
 		'@daml.js/splice-api-featured-app-v1-1.0.0',
+		'@daml.js/splice-amulet-0.1.14',
+		'@daml.js/daml-stdlib-DA-Time-Types-1.0.0',
 	];
 	let removedCount = 0;
 	for (const dep of localDependencies) {
@@ -443,6 +513,11 @@ function main(): void {
 			console.log(`📦 Processing package: ${targetDir}`);
 			createBundledFiles(targetDir);
 			createBundledSpliceFiles(targetDir);
+			// Only bundle splice-amulet and DA Time Types for Subscriptions package
+			if (targetDir.includes('Subscriptions-v01')) {
+				createBundledSpliceAmuletFiles(targetDir);
+				createBundledDATimeTypesFiles(targetDir);
+			}
 			updateMainIndex(targetDir);
 			replaceDependencyReferences(targetDir);
 			removeLocalDependency(targetDir);
@@ -459,4 +534,4 @@ if (require.main === module) {
 	main();
 }
 
-export { createBundledFiles, createBundledSpliceFiles, updateMainIndex, replaceDependencyReferences, removeLocalDependency, main };
+export { createBundledFiles, createBundledSpliceFiles, createBundledSpliceAmuletFiles, createBundledDATimeTypesFiles, updateMainIndex, replaceDependencyReferences, removeLocalDependency, main };
