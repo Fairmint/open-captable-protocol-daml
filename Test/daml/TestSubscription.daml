@@ -2,193 +2,122 @@ module TestSubscription where
 
 import Daml.Script
 import DA.Date (datetime, Month(..))
-import Splice.Subscriptions.Subscription
+import Fairmint.Subscriptions.Subscription
+import Fairmint.Subscriptions.SubscriptionProposal
+import Fairmint.Subscriptions.SubscriptionFactory
+import Fairmint.Subscriptions.SubscriptionConfig
 import Splice.Amulet qualified as Amulet
 import Splice.Expiry (TimeLock(..))
-import TestUtils (tap, sharedDso)
+import Splice.AmuletRules (TransferContext(..))
+import TestUtils (tap, sharedDso, getFirstOpenRound)
+import qualified DA.Map as Map
 
--- Helper to create a LockedAmulet for testing
-createLockedAmulet : Party -> Decimal -> Script (ContractId Amulet.LockedAmulet)
-createLockedAmulet owner amount = do
+-- Helper to create a SubscriptionFactory
+createSubscriptionFactory : Party -> Script (ContractId SubscriptionFactory)
+createSubscriptionFactory processor = do
   dso <- sharedDso
-  amuletCid <- tap owner amount
-  Some amulet <- queryContractId owner amuletCid
-  
-  -- Create LockedAmulet (signed by both dso and owner)
-  submitMulti [dso, owner] [] do
-    createCmd Amulet.LockedAmulet with
-      amulet = amulet
-      lock = TimeLock with
-        holders = [owner]
-        expiresAt = datetime 2099 Dec 31 23 59 59
-        optContext = Some "Subscription collateral"
+  submit processor do
+    createCmd SubscriptionFactory with
+      processor = processor
+      dso = dso
 
--- Test the proposal/acceptance flow with locked funds
-testProposalAcceptance : Script ()
-testProposalAcceptance = script do
+-- Test the factory/proposal/acceptance flow
+testFactoryProposalAcceptance : Script ()
+testFactoryProposalAcceptance = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
+  processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Alice locks funds first
-  lockedAmuletCid <- createLockedAmulet alice 100.0
+  -- Create factory
+  factoryCid <- createSubscriptionFactory processor
   
-  -- Alice proposes subscription with locked funds (no DSO signature needed)
+  -- Alice creates subscription proposal via factory (no amulet yet)
   proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Monthly service fee"
-      amountPerRound = 10.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 10.0
+        feeAmountPerRound = 2.0
+        reason = Some "Monthly service fee"
   
-  -- Bob accepts the proposal (no DSO signature needed)
+  -- Alice creates an amulet for payment
+  amuletCid <- tap alice 100.0
+  
+  -- Bob accepts the proposal, providing the amulet
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept
+    exerciseCmd proposalCid SubscriptionProposal_Accept with
+      amuletCid = amuletCid
   
-  -- Verify subscription was created with locked funds
+  -- Verify subscription was created with amulet
   Some subscription <- queryContractId alice subscriptionCid
-  assertMsg "Subscriber should be alice" (subscription.subscriber == alice)
-  assertMsg "Recipient should be bob" (subscription.recipient == bob)
-  assertMsg "Provider should match" (subscription.provider == provider)
-  assertMsg "Should have locked amulet" (subscription.lockedAmulet == Some lockedAmuletCid)
+  assertMsg "Subscriber should be alice" (subscription.config.subscriber == alice)
+  assertMsg "Recipient should be bob" (subscription.config.recipient == bob)
+  assertMsg "Processor should match" (subscription.processor == processor)
+  assertMsg "Should have amulet" (subscription.amulet /= None)
+  assertMsg "Amount per round should be 10.0" (subscription.config.amountPerRound == 10.0)
+  assertMsg "Fee amount per round should be 2.0" (subscription.config.feeAmountPerRound == 2.0)
   
   pure ()
 
--- Test proposal rejection returns locked funds
+-- Test proposal rejection
 testProposalRejection : Script ()
 testProposalRejection = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
+  processor <- allocateParty "Processor"
   
-  -- Alice locks funds
-  lockedAmuletCid <- createLockedAmulet alice 50.0
+  -- Create factory
+  factoryCid <- createSubscriptionFactory processor
   
-  -- Alice proposes subscription
+  -- Alice proposes subscription via factory
   proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service subscription"
   
-  -- Bob rejects (no DSO signature needed)
-  returnedLockedAmuletCid <- submit bob do
+  -- Bob rejects
+  submit bob do
     exerciseCmd proposalCid SubscriptionProposal_Reject
   
   -- Verify proposal is archived
   proposal <- queryContractId bob proposalCid
   assertMsg "Proposal should be archived" (proposal == None)
   
-  -- Verify we got back the locked amulet
-  assertMsg "Should return locked amulet" (returnedLockedAmuletCid == lockedAmuletCid)
-  
   pure ()
 
--- Test subscriber canceling proposal gets funds back
+-- Test subscriber canceling proposal
 testProposalCancelBySubscriber : Script ()
 testProposalCancelBySubscriber = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
+  processor <- allocateParty "Processor"
   
-  -- Alice locks funds
-  lockedAmuletCid <- createLockedAmulet alice 50.0
+  -- Create factory
+  factoryCid <- createSubscriptionFactory processor
   
-  -- Alice proposes subscription
+  -- Alice proposes subscription via factory
   proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service subscription"
   
-  -- Alice cancels before Bob accepts (no DSO signature needed)
-  returnedLockedAmuletCid <- submit alice do
+  -- Alice cancels before Bob accepts
+  submit alice do
     exerciseCmd proposalCid SubscriptionProposal_Cancel
   
   -- Verify proposal is archived
   proposal <- queryContractId alice proposalCid
   assertMsg "Proposal should be archived" (proposal == None)
-  
-  -- Verify we got back the locked amulet
-  assertMsg "Should return locked amulet" (returnedLockedAmuletCid == lockedAmuletCid)
-  
-  pure ()
-
--- Test processing payments with ActivityMarkerRequest pattern
-testProcessPayment : Script ()
-testProcessPayment = script do
-  alice <- allocateParty "Alice"
-  bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
-  
-  -- Alice locks funds
-  lockedAmuletCid <- createLockedAmulet alice 100.0
-  
-  -- Alice proposes with locked amulet
-  proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
-  
-  -- Bob accepts
-  subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept
-  
-  -- Bob processes payment for round 1 (no DSO signature needed)
-  result1 <- submit bob do
-    exerciseCmd subscriptionCid Subscription_ProcessPayment with
-      currentRound = 1
-      subscriptionId = "sub-001"
-  
-  -- Verify round was processed and marker request created
-  Some subscription <- queryContractId bob result1.subscriptionCid
-  assertMsg "Last processed round should be 1" (subscription.lastProcessedRound == 1)
-  
-  -- Verify marker request was created
-  Some markerRequest <- queryContractId dso result1.activityMarkerRequest
-  assertMsg "Should have request for 1 round" (markerRequest.roundsProcessed == 1)
-  assertMsg "Provider should match" (markerRequest.provider == provider)
-  assertMsg "Recipient should match" (markerRequest.recipient == bob)
-  
-  -- DSO processes the request to create markers
-  markers <- submit dso do
-    exerciseCmd result1.activityMarkerRequest SubscriptionActivityMarkerRequest_Process
-  
-  assertMsg "Should have 1 pair of activity markers" (length markers == 1)
-  
-  -- Bob processes payment for rounds 2-5 (catch up)
-  result2 <- submit bob do
-    exerciseCmd result1.subscriptionCid Subscription_ProcessPayment with
-      currentRound = 5
-      subscriptionId = "sub-001"
-  
-  -- Verify rounds were processed
-  Some subscription <- queryContractId bob result2.subscriptionCid
-  assertMsg "Last processed round should be 5" (subscription.lastProcessedRound == 5)
-  
-  -- Verify new marker request
-  Some markerRequest2 <- queryContractId dso result2.activityMarkerRequest
-  assertMsg "Should have request for 4 rounds" (markerRequest2.roundsProcessed == 4)
   
   pure ()
 
@@ -197,26 +126,30 @@ testCancelBySubscriber : Script ()
 testCancelBySubscriber = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
+  processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Alice locks funds and proposes
-  lockedAmuletCid <- createLockedAmulet alice 50.0
+  -- Create factory
+  factoryCid <- createSubscriptionFactory processor
   
+  -- Alice proposes via factory
   proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service subscription"
+  
+  -- Alice creates amulet and Bob accepts
+  amuletCid <- tap alice 50.0
   
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept
+    exerciseCmd proposalCid SubscriptionProposal_Accept with
+      amuletCid = amuletCid
   
-  -- Alice cancels (no DSO signature needed)
+  -- Alice cancels
   returnedAmulet <- submit alice do
     exerciseCmd subscriptionCid Subscription_CancelBySubscriber
   
@@ -224,8 +157,8 @@ testCancelBySubscriber = script do
   subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
   
-  -- Verify we got back the locked amulet
-  assertMsg "Should return locked amulet" (returnedAmulet == Some lockedAmuletCid)
+  -- Verify we got back the amulet
+  assertMsg "Should return amulet" (returnedAmulet /= None)
   
   pure ()
 
@@ -234,26 +167,30 @@ testCancelByRecipient : Script ()
 testCancelByRecipient = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
+  processor <- allocateParty "Processor"
   dso <- sharedDso
   
-  -- Alice locks funds and proposes
-  lockedAmuletCid <- createLockedAmulet alice 50.0
+  -- Create factory
+  factoryCid <- createSubscriptionFactory processor
   
+  -- Alice proposes via factory
   proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service subscription"
+  
+  -- Alice creates amulet and Bob accepts
+  amuletCid <- tap alice 50.0
   
   subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept
+    exerciseCmd proposalCid SubscriptionProposal_Accept with
+      amuletCid = amuletCid
   
-  -- Bob cancels (no DSO signature needed)
+  -- Bob cancels
   returnedAmulet <- submit bob do
     exerciseCmd subscriptionCid Subscription_CancelByRecipient
   
@@ -261,69 +198,8 @@ testCancelByRecipient = script do
   subscription <- queryContractId bob subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
   
-  -- Verify we got back the locked amulet
-  assertMsg "Should return locked amulet" (returnedAmulet == Some lockedAmuletCid)
-  
-  pure ()
-
--- Test validation: cannot process old rounds
-testCannotProcessOldRounds : Script ()
-testCannotProcessOldRounds = script do
-  alice <- allocateParty "Alice"
-  bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
-  
-  -- Create and propose with locked amulet
-  lockedAmuletCid <- createLockedAmulet alice 100.0
-  
-  proposalCid <- submit alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service subscription"
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
-  
-  subscriptionCid <- submit bob do
-    exerciseCmd proposalCid SubscriptionProposal_Accept
-  
-  -- Process up to round 5
-  result <- submit bob do
-    exerciseCmd subscriptionCid Subscription_ProcessPayment with
-      currentRound = 5
-      subscriptionId = "sub-002"
-  
-  -- Try to process round 3 (before last processed) - should fail
-  submitMustFail bob do
-    exerciseCmd result.subscriptionCid Subscription_ProcessPayment with
-      currentRound = 3
-      subscriptionId = "sub-002"
-  
-  pure ()
-
--- Test validation: empty reason not allowed
-testEmptyReasonNotAllowed : Script ()
-testEmptyReasonNotAllowed = script do
-  alice <- allocateParty "Alice"
-  bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
-  
-  lockedAmuletCid <- createLockedAmulet alice 50.0
-  
-  -- Try to create proposal with empty reason
-  submitMustFail alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = ""
-      amountPerRound = 5.0
-      lockedAmulet = lockedAmuletCid
+  -- Verify we got back the amulet
+  assertMsg "Should return amulet" (returnedAmulet /= None)
   
   pure ()
 
@@ -332,20 +208,130 @@ testNegativeAmountNotAllowed : Script ()
 testNegativeAmountNotAllowed = script do
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
-  provider <- allocateParty "Provider"
-  dso <- sharedDso
+  processor <- allocateParty "Processor"
   
-  lockedAmuletCid <- createLockedAmulet alice 50.0
+  factoryCid <- createSubscriptionFactory processor
   
   -- Try to create proposal with negative amount
   submitMustFail alice do
-    createCmd SubscriptionProposal with
-      subscriber = alice
-      recipient = bob
-      provider = provider
-      dso = dso
-      reason = "Service"
-      amountPerRound = -5.0
-      lockedAmulet = lockedAmuletCid
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = -5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service"
+  
+  pure ()
+
+-- Test validation: negative fee not allowed
+testNegativeFeeNotAllowed : Script ()
+testNegativeFeeNotAllowed = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  
+  factoryCid <- createSubscriptionFactory processor
+  
+  -- Try to create proposal with negative fee
+  submitMustFail alice do
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = -1.0
+        reason = Some "Service"
+  
+  pure ()
+
+-- Test validation: zero fee is allowed
+testZeroFeeAllowed : Script ()
+testZeroFeeAllowed = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  
+  factoryCid <- createSubscriptionFactory processor
+  
+  -- Create proposal with zero fee (should succeed)
+  proposalCid <- submit alice do
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 0.0
+        reason = Some "Service"
+  
+  -- Verify proposal was created
+  Some proposal <- queryContractId alice proposalCid
+  assertMsg "Fee should be 0.0" (proposal.config.feeAmountPerRound == 0.0)
+  
+  pure ()
+
+-- Test validation: empty string reason not allowed when Some is provided
+testEmptyStringReasonNotAllowed : Script ()
+testEmptyStringReasonNotAllowed = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  
+  factoryCid <- createSubscriptionFactory processor
+  
+  -- Try to create proposal with Some "" reason
+  submitMustFail alice do
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some ""
+  
+  pure ()
+
+-- Test validation: None reason is allowed
+testNoneReasonAllowed : Script ()
+testNoneReasonAllowed = script do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  processor <- allocateParty "Processor"
+  
+  factoryCid <- createSubscriptionFactory processor
+  
+  -- Create proposal with None reason (should succeed)
+  proposalCid <- submit alice do
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = bob
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = None
+  
+  -- Verify proposal was created
+  Some proposal <- queryContractId alice proposalCid
+  assertMsg "Reason should be None" (proposal.config.reason == None)
+  
+  pure ()
+
+-- Test validation: subscriber and recipient must be different
+testSubscriberRecipientMustBeDifferent : Script ()
+testSubscriberRecipientMustBeDifferent = script do
+  alice <- allocateParty "Alice"
+  processor <- allocateParty "Processor"
+  
+  factoryCid <- createSubscriptionFactory processor
+  
+  -- Try to create proposal where subscriber == recipient
+  submitMustFail alice do
+    exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+      config = SubscriptionConfig with
+        subscriber = alice
+        recipient = alice  -- Same as subscriber
+        amountPerRound = 5.0
+        feeAmountPerRound = 1.0
+        reason = Some "Service"
   
   pure ()

@@ -1,0 +1,193 @@
+module Fairmint.Subscriptions.Subscription where
+
+import DA.Optional (isSome, fromSome)
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Fairmint.Subscriptions.SubscriptionConfig
+
+-- | Active subscription contract for recurring payments using Amulet
+-- 
+-- Three-party model:
+-- - Subscriber: pays the bill
+-- - Recipient: receives payments (company/treasury address)
+-- - Processor: processes subscription payments each round (assigned by factory)
+--
+-- The subscriber provides collateral via an Amulet. Each round, the processor
+-- executes the payment transfer, sending funds to the recipient and collecting a fee.
+-- Separate TransferContexts allow different FeaturedAppRights for recipient and processor.
+--
+-- Either the subscriber or recipient can cancel at any time.
+template Subscription
+  with
+    config : SubscriptionConfig
+      -- ^ Subscription configuration
+    processor : Party
+      -- ^ Party who processes payments (assigned by factory)
+    dso : Party
+      -- ^ Expected DSO party (must match all amulets)
+    amulet : Optional (ContractId Amulet.Amulet)
+      -- ^ Optional Amulet providing payment collateral
+    lastProcessedRound : Int
+      -- ^ Last round for which payment was processed
+  where
+    signatory config.subscriber, config.recipient
+    observer processor
+    
+    ensure
+      validateSubscriptionConfig config &&
+      lastProcessedRound >= 0
+
+    -- | Add or replace the Amulet for this subscription
+    -- Only the subscriber can add collateral
+    choice Subscription_AddAmulet : ContractId Subscription
+      with
+        amuletCid : ContractId Amulet.Amulet
+      controller config.subscriber
+      do
+        -- Validate that the new amulet has the expected DSO
+        amuletContract <- fetch amuletCid
+        assertMsg "Amulet DSO must match subscription DSO" 
+          (amuletContract.dso == dso)
+        assertMsg "Amulet owner must be subscriber"
+          (amuletContract.owner == config.subscriber)
+        
+        -- If there's an existing amulet, we replace it
+        -- The caller is responsible for managing the old one
+        create this with amulet = Some amuletCid
+
+    -- | Withdraw the Amulet from the subscription
+    -- Only the subscriber can withdraw their collateral
+    choice Subscription_WithdrawAmulet : (ContractId Subscription, Optional (ContractId Amulet.Amulet))
+      controller config.subscriber
+      do
+        let oldAmulet = amulet
+        newSubscriptionCid <- create this with amulet = None
+        pure (newSubscriptionCid, oldAmulet)
+
+    -- | Process payment for a specific round
+    -- The processor executes this each round, with subscriber authorization
+    -- Transfers funds from the amulet to recipient and processor
+    -- Separate transfer contexts allow different FeaturedAppRights for each payment
+    choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
+      with
+        currentRound : Int
+          -- ^ Round number to process payment for
+        amuletRulesCid : ContractId AmuletRules
+          -- ^ AmuletRules contract for executing transfers
+        recipientTransferContext : TransferContext
+          -- ^ Transfer context for payment to recipient (includes FeaturedAppRight)
+        processorTransferContext : TransferContext
+          -- ^ Transfer context for payment to processor (includes FeaturedAppRight)
+      controller config.subscriber, processor
+      do
+        -- Validate that we're not processing old rounds
+        assertMsg "Cannot process rounds before last processed round" 
+          (currentRound > lastProcessedRound)
+        
+        -- Validate that we have an amulet
+        assertMsg "No amulet available for payment" 
+          (isSome amulet)
+        
+        let amuletCid = fromSome amulet
+        
+        -- Calculate payment amounts
+        let roundsToProcess = currentRound - lastProcessedRound
+        let totalPaymentToRecipient = config.amountPerRound * intToDecimal roundsToProcess
+        let totalFeeToProcessor = config.feeAmountPerRound * intToDecimal roundsToProcess
+        
+        -- Step 1: Transfer to recipient using recipient's transfer context
+        let recipientOutput = TransferOutput with
+              receiver = config.recipient
+              receiverFeeRatio = 0.0
+              amount = totalPaymentToRecipient
+              lock = None
+        
+        let recipientTransfer = Transfer with
+              sender = config.subscriber
+              provider = processor
+              inputs = [InputAmulet amuletCid]
+              outputs = [recipientOutput]
+              beneficiaries = None
+        
+        recipientTransferResult <- exercise amuletRulesCid AmuletRules_Transfer with
+          transfer = recipientTransfer
+          context = recipientTransferContext
+          expectedDso = Some dso
+        
+        -- Step 2: If there's a processor fee, transfer to processor using processor's transfer context
+        processorTransferResult <- 
+          if totalFeeToProcessor > 0.0
+          then do
+            -- Get the change amulet from the recipient transfer
+            assertMsg "Expected change amulet from recipient transfer" (isSome recipientTransferResult.senderChangeAmulet)
+            let changeAmuletCid = fromSome recipientTransferResult.senderChangeAmulet
+            
+            -- Transfer processor fee to processor
+            let processorOutput = TransferOutput with
+                  receiver = processor
+                  receiverFeeRatio = 0.0
+                  amount = totalFeeToProcessor
+                  lock = None
+            
+            let processorTransfer = Transfer with
+                  sender = config.subscriber
+                  provider = processor
+                  inputs = [InputAmulet changeAmuletCid]
+                  outputs = [processorOutput]
+                  beneficiaries = None
+            
+            result <- exercise amuletRulesCid AmuletRules_Transfer with
+              transfer = processorTransfer
+              context = processorTransferContext
+              expectedDso = Some dso
+            pure (Some result)
+          else
+            pure None
+        
+        -- Step 3: Update subscription with new processed round
+        newSubscriptionCid <- create this with 
+          lastProcessedRound = currentRound
+          amulet = None  -- Amulet has been spent
+        
+        pure Subscription_ProcessPaymentResult with
+          subscriptionCid = newSubscriptionCid
+          recipientTransferResult = recipientTransferResult
+          processorTransferResult = processorTransferResult
+
+    -- | Cancel the subscription
+    -- Either subscriber or recipient can cancel at any time
+    -- Returns the Amulet if present
+    choice Subscription_Cancel : Optional (ContractId Amulet.Amulet)
+      controller [config.subscriber, config.recipient]
+      do
+        -- Return the amulet if present
+        pure amulet
+
+    -- | Subscriber-only cancel
+    -- Allows subscriber to cancel without recipient signature
+    -- Returns the Amulet if present
+    choice Subscription_CancelBySubscriber : Optional (ContractId Amulet.Amulet)
+      controller config.subscriber
+      do
+        -- Return the amulet if present
+        pure amulet
+
+    -- | Recipient-only cancel
+    -- Allows recipient to cancel without subscriber signature
+    -- Returns the Amulet if present
+    choice Subscription_CancelByRecipient : Optional (ContractId Amulet.Amulet)
+      controller config.recipient
+      do
+        -- Return the amulet if present
+        pure amulet
+
+-- | Result of processing a subscription payment
+data Subscription_ProcessPaymentResult = Subscription_ProcessPaymentResult
+  with
+    subscriptionCid : ContractId Subscription
+      -- ^ The updated subscription contract
+    recipientTransferResult : TransferResult
+      -- ^ The result of the transfer to the recipient
+    processorTransferResult : Optional TransferResult
+      -- ^ The result of the transfer to the processor (if fee > 0)
+  deriving (Eq, Show)
