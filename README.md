@@ -62,4 +62,155 @@ Each package may include additional constraints and domain guidance. Refer to:
 - `open-captable-protocol-daml/OpenCapTable-v25/README.md` for Open Cap Table specifics (e.g., Issuer management patterns).
 - Other package READMEs as applicable.
 
+## Adding Support for New Packages
+
+When adding a new DAML package to this repository (e.g., `NewPackage-v01`), follow these steps to ensure full integration with the build, deployment, and publishing pipeline:
+
+### 1. Create the Package Directory
+
+Create a new directory at the root level with your package name and version (e.g., `NewPackage-v01/`).
+
+### 2. Set Up Package Structure
+
+- Create `daml.yaml` with proper configuration
+- Add your DAML modules under `daml/` directory
+- Create a package-specific `README.md` documenting the package purpose and usage
+
+### 3. Update Build Scripts
+
+Update the following files to include your new package:
+
+#### `package.json`
+- **codegen script**: Add codegen step for your package in the `codegen` script
+  ```
+  cd NewPackage-v01 && daml codegen js && cd ..
+  ```
+- **upload-dar script**: Add new script for uploading DAR files
+  ```json
+  "upload-dar:newpackage": "npm run build && ts-node scripts/upload-dar-newpackage.ts --network devnet && ts-node scripts/upload-dar-newpackage.ts --network mainnet"
+  ```
+- **create-factory script**: Add new script for creating factory contracts
+  ```json
+  "create-factory:newpackage": "npm run codegen && ts-node scripts/create-newpackage-factory.ts --network devnet && ts-node scripts/create-newpackage-factory.ts --network mainnet"
+  ```
+- **upload-and-create script**: Add combined script
+  ```json
+  "upload-and-create:newpackage": "npm run upload-dar:newpackage && npm run create-factory:newpackage"
+  ```
+- **exports**: Add export for factory contract ID JSON
+  ```json
+  "./newpackage-factory-contract-id.json": {
+    "types": "./generated/newpackage-factory-contract-id.json.d.ts",
+    "default": "./generated/newpackage-factory-contract-id.json"
+  }
+  ```
+- **files**: Add generated files to the npm package
+  ```json
+  "generated/newpackage-factory-contract-id.json",
+  "generated/newpackage-factory-contract-id.json.d.ts"
+  ```
+- **typesVersions**: Add type definitions for JSON imports
+  ```json
+  "newpackage-factory-contract-id.json": [
+    "generated/newpackage-factory-contract-id.json.d.ts"
+  ]
+  ```
+
+#### `scripts/bundle-dependencies.ts`
+Add your package directory to the `PACKAGE_DIRS` array:
+```typescript
+const PACKAGE_DIRS = [
+  path.join(__dirname, '../generated/js/OpenCapTable-v25-0.0.1'),
+  path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
+  path.join(__dirname, '../generated/js/NewPackage-v01-0.0.1'),
+];
+```
+
+#### `scripts/create-package-index.ts`
+Add your package directory to the `packageDirs` array:
+```typescript
+const packageDirs = [
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v25-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'),
+  path.join(__dirname, '..', 'generated', 'js', 'NewPackage-v01-0.0.1'),
+];
+```
+
+#### `scripts/create-root-index.ts`
+1. Add constants for your package directories:
+   ```typescript
+   const NEWPACKAGE_DIR = path.join(ROOT_DIR, 'generated', 'js', 'NewPackage-v01-0.0.1');
+   const NEWPACKAGE_LIB = path.join(NEWPACKAGE_DIR, 'lib');
+   ```
+
+2. Copy your package namespace in `buildCombinedLib()`:
+   ```typescript
+   copyDir(path.join(NEWPACKAGE_LIB, 'Fairmint', 'NewPackage'), path.join(destFairmint, 'NewPackage'));
+   ```
+
+3. Update Fairmint index files to export your namespace:
+   ```typescript
+   // In index.js:
+   var NewPackage = require('./NewPackage');
+   exports.NewPackage = NewPackage;
+   
+   // In index.d.ts:
+   export * as NewPackage from './NewPackage';
+   ```
+
+4. Add JSON type definition in `ensureJsonDts()`:
+   ```typescript
+   ensureJson(
+     path.join(ROOT_DIR, 'generated', 'newpackage-factory-contract-id.json'),
+     path.join(ROOT_DIR, 'generated', 'newpackage-factory-contract-id.json.d.ts'),
+     `declare const data: {\n    devnet: {\n        newpackageFactoryContractId: string;\n        templateId: string;\n    };\n    mainnet: {\n        newpackageFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
+   );
+   ```
+
+### 4. Create Deployment Scripts
+
+Create two new scripts in the `scripts/` directory:
+
+#### `scripts/upload-dar-newpackage.ts`
+Upload the DAR file to both devnet and mainnet. Use existing scripts as templates (e.g., `upload-dar-reports.ts`).
+
+Key elements:
+- Parse `--network` argument
+- Upload to both `intellect` and `5n` providers
+- Point to correct DAR file path: `NewPackage-v01/.daml/dist/NewPackage-v01-{version}.dar`
+
+#### `scripts/create-newpackage-factory.ts`
+Create factory contract on both networks. Use existing factory scripts as templates.
+
+Key elements:
+- Import generated DAML types from `../lib`
+- Create factory contract with appropriate arguments
+- Save contract ID to `generated/newpackage-factory-contract-id.json`
+- Include proper error handling and network argument parsing
+
+### 5. Test the Integration
+
+1. Build DAML packages:
+   ```bash
+   npm run build
+   ```
+
+2. Generate JavaScript bindings:
+   ```bash
+   npm run codegen
+   ```
+
+3. Verify generated files exist in `lib/Fairmint/NewPackage/`
+
+4. Test deployment scripts:
+   ```bash
+   npm run upload-and-create:newpackage
+   ```
+
+### 6. Update Documentation
+
+- Add package to the list in this README's introduction
+- Create package-specific README with domain guidance
+- Document any new contract templates and their usage
+
 

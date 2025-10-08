@@ -4,8 +4,10 @@ import path from 'path';
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTable-v25-0.0.1');
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTableReports-v01-0.0.2');
+const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'Subscriptions-v01-0.0.1');
 const OCP_LIB = path.join(OCP_DIR, 'lib');
 const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
+const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
 const DEST_LIB = path.join(ROOT_DIR, 'lib');
 
 function rimraf(dir: string) {
@@ -50,6 +52,7 @@ function buildCombinedLib() {
 	const destFairmint = path.join(DEST_LIB, 'Fairmint');
 	copyDir(path.join(OCP_LIB, 'Fairmint', 'OpenCapTable'), path.join(destFairmint, 'OpenCapTable'));
 	copyDir(path.join(REPORTS_LIB, 'Fairmint', 'OpenCapTableReports'), path.join(destFairmint, 'OpenCapTableReports'));
+	copyDir(path.join(SUBSCRIPTIONS_LIB, 'Fairmint', 'Subscriptions'), path.join(destFairmint, 'Subscriptions'));
 
 	// Write Fairmint index.js and index.d.ts
 	ensureFile(
@@ -65,12 +68,15 @@ var OpenCapTable = require('./OpenCapTable');
 exports.OpenCapTable = OpenCapTable;
 var OpenCapTableReports = require('./OpenCapTableReports');
 exports.OpenCapTableReports = OpenCapTableReports;
+var Subscriptions = require('./Subscriptions');
+exports.Subscriptions = Subscriptions;
 `
 	);
 	ensureFile(
 		path.join(destFairmint, 'index.d.ts'),
 		`export * as OpenCapTable from './OpenCapTable';
 export * as OpenCapTableReports from './OpenCapTableReports';
+export * as Subscriptions from './Subscriptions';
 `
 	);
 
@@ -124,6 +130,12 @@ function ensureJsonDts() {
 		path.join(ROOT_DIR, 'generated', 'reports-factory-contract-id.json'),
 		path.join(ROOT_DIR, 'generated', 'reports-factory-contract-id.json.d.ts'),
 		`declare const data: {\n    devnet: {\n        reportsFactoryContractId: string;\n        templateId: string;\n    };\n    mainnet: {\n        reportsFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
+	);
+
+	ensureJson(
+		path.join(ROOT_DIR, 'generated', 'subscriptions-factory-contract-id.json'),
+		path.join(ROOT_DIR, 'generated', 'subscriptions-factory-contract-id.json.d.ts'),
+		`declare const data: {\n    devnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n    };\n    mainnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
 	);
 }
 
