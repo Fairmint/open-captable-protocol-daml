@@ -10,8 +10,8 @@ The Subscriptions package enables parties to create recurring payment subscripti
 - **Upfront collateral**: Subscriber must lock funds before proposing (prevents spam and ensures payment capability)
 - **Proposal/Acceptance pattern**: Realistic user flow where subscriber proposes and service provider accepts
 - **No DSO signatures required**: User-to-user contract that doesn't require DSO involvement for core operations
-- **Flexible subscriptions**: Subscriptions are processed by the recipient every round
-- **Catch-up payments**: Recipients can catch up on missed rounds if they skip processing
+- **Configurable payment periods**: Subscriptions can be processed at configurable intervals (e.g., 10 minutes, hourly, daily, monthly)
+- **Catch-up payments**: Recipients can catch up on missed periods if they skip processing
 - **Dynamic balance management**: Subscribers can add or withdraw LockedAmulet at any time
 - **Bilateral cancellation**: Either party can cancel the subscription at any time
 - **Featured app rewards**: Creates SubscriptionActivityMarkerRequests that DSO can process to issue rewards
@@ -45,7 +45,7 @@ A request created when payments are processed, asking DSO to create FeaturedAppA
 - `provider`: Featured app provider  
 - `recipient`: Payment recipient
 - `subscriber`: Subscriber (for reference)
-- `roundsProcessed`: Number of rounds processed
+- `periodsProcessed`: Number of periods processed
 - `subscriptionId`: Reference to the subscription
 
 **Key choices:**
@@ -53,25 +53,33 @@ A request created when payments are processed, asking DSO to create FeaturedAppA
 
 ### SubscriptionProposal
 
-A proposal created by the subscriber (customer), which the service provider can accept or reject.
+A proposal created by the subscriber via SubscriptionFactory, requiring processor approval before recipient acceptance.
 
-**Important**: The subscriber MUST provide a LockedAmulet upfront when creating the proposal.
-
-**Namespace:** `Splice.Subscriptions.Subscription`
+**Namespace:** `Fairmint.Subscriptions.SubscriptionProposal`
 
 **Key fields:**
-- `subscriber`: Party proposing to make recurring payments (customer)
-- `recipient`: Party who would receive recurring payments (service provider)
-- `provider`: Featured app provider (for reward tracking, usually same as recipient)
-- `dso`: DSO party (for reward requests only, not a signatory)
-- `reason`: Text describing the purpose of the subscription (non-empty)
-- `amountPerRound`: Payment amount per round (Decimal)
-- `lockedAmulet`: ContractId of the LockedAmulet providing collateral (**REQUIRED**)
+- `config`: SubscriptionConfig containing all subscription parameters (subscriber, recipient, processingPeriod, amountPerPeriod, etc.)
+- `context`: ProcessorContext (processor and DSO parties assigned by factory)
 
 **Key choices:**
-- `SubscriptionProposal_Accept`: Service provider accepts, creating active Subscription
-- `SubscriptionProposal_Reject`: Service provider rejects and returns the LockedAmulet
-- `SubscriptionProposal_Cancel`: Subscriber cancels before acceptance and retrieves the LockedAmulet
+- `SubscriptionProposal_ProcessorApprove`: Processor approves the proposal, creating ProcessorApprovedSubscriptionProposal
+- `SubscriptionProposal_ProcessorReject`: Processor rejects the proposal (e.g., invalid fee structure)
+- `SubscriptionProposal_SubscriberWithdraw`: Subscriber withdraws the proposal before processor approval
+
+### ProcessorApprovedSubscriptionProposal
+
+A processor-approved subscription proposal awaiting recipient acceptance.
+
+**Namespace:** `Fairmint.Subscriptions.ProcessorApprovedSubscriptionProposal`
+
+**Key fields:**
+- `config`: SubscriptionConfig containing all subscription parameters
+- `context`: ProcessorContext (processor and DSO parties)
+
+**Key choices:**
+- `ProcessorApprovedSubscriptionProposal_RecipientAccept`: Recipient accepts, creating active Subscription
+- `ProcessorApprovedSubscriptionProposal_RecipientReject`: Recipient rejects the proposal
+- `ProcessorApprovedSubscriptionProposal_SubscriberWithdraw`: Subscriber withdraws after processor approval but before recipient acceptance
 
 ### Subscription
 
@@ -85,14 +93,16 @@ The active subscription contract that tracks payment processing and creates rewa
 - `provider`: Featured app provider (for reward tracking)
 - `dso`: DSO party (for reward requests only, not a signatory)
 - `reason`: Text describing the purpose of the subscription (non-empty)
-- `amountPerRound`: Payment amount per round (Decimal)
+- `processingPeriod`: Time period between payments (RelTime)
+- `amountPerPeriod`: Payment amount per processing period (SubscriptionAmount - Amulet or USD)
+- `feeAmountPerPeriod`: Fee amount per processing period (SubscriptionAmount - Amulet or USD)
 - `lockedAmulet`: Optional ContractId of the LockedAmulet providing collateral
-- `lastProcessedRound`: The last round for which payment was processed (Int)
+- `lastProcessedAt`: Timestamp of last processed payment (Time)
 
 **Key choices:**
 - `Subscription_AddLockedAmulet`: Subscriber adds or replaces a LockedAmulet
 - `Subscription_WithdrawLockedAmulet`: Subscriber withdraws the LockedAmulet
-- `Subscription_ProcessPayment`: Recipient processes payment for a round (can catch up multiple rounds)
+- `Subscription_ProcessPayment`: Recipient processes payment for a period (can catch up multiple periods)
   - Creates a `SubscriptionActivityMarkerRequest` for DSO to process later
   - Returns `Subscription_ProcessPaymentResult` with updated subscription and marker request
 - `Subscription_Cancel`: Bilateral cancellation (requires both parties)
@@ -104,39 +114,44 @@ The active subscription contract that tracks payment processing and creates rewa
 ### Complete User Flow
 
 ```daml
-import Splice.Subscriptions.Subscription
+import Fairmint.Subscriptions.Subscription
+import Fairmint.Subscriptions.SubscriptionConfig
 import Splice.Amulet qualified as Amulet
 
--- 1. Subscriber locks funds FIRST (required)
-lockedAmuletCid <- createLockedAmulet subscriber 120.0  -- e.g., 12 months at 10.0/month
-
--- 2. Subscriber proposes subscription with locked funds (NO DSO SIGNATURE)
+-- 1. Subscriber proposes subscription via factory (NO DSO SIGNATURE)
 proposalCid <- submit subscriber do
-  createCmd SubscriptionProposal with
-    subscriber = subscriber
-    recipient = serviceProvider
-    provider = serviceProvider  -- Usually same as recipient
-    dso = dso
-    reason = "Premium membership"
-    amountPerRound = 10.0
-    lockedAmulet = lockedAmuletCid  -- REQUIRED
+  exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+    config = SubscriptionConfig with
+      subscriber = subscriber
+      recipient = serviceProvider
+      processingPeriod = days 30  -- Monthly subscription
+      amountPerPeriod = AmuletAmount 10.0  -- or USDAmount 10.0
+      feeAmountPerPeriod = AmuletAmount 1.0
+      expiresAt = farFutureTime
+      reason = Some "Premium membership"
 
--- 3. Service provider accepts (NO DSO SIGNATURE)
+-- 2. Processor approves the proposal
+approvedCid <- submit processor do
+  exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
+
+-- 3. Recipient accepts (NO DSO SIGNATURE)
 subscriptionCid <- submit serviceProvider do
-  exerciseCmd proposalCid SubscriptionProposal_Accept
+  exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+    startTime = now
 
--- 4. Service provider processes payment each round (NO DSO SIGNATURE)
-result <- submit serviceProvider do
+-- 4. Processor processes payment each period (NO DSO SIGNATURE)
+-- Subscriber provides amulet inputs for each payment
+result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
-    currentRound = 5
-    subscriptionId = "unique-sub-id"
+    currentTime = now
+    amuletInputs = subscriberAmuletInputs  -- Provided by subscriber
+    amuletRulesCid = amuletRulesCid
+    recipientTransferContext = recipientContext
+    processorTransferContext = processorContext
+    usdToAmuletRate = 1.0  -- Current conversion rate
 
--- 5. DSO processes reward request (SEPARATE STEP)
-markers <- submit dso do
-  exerciseCmd result.activityMarkerRequest SubscriptionActivityMarkerRequest_Process
-
--- 6. Either party can cancel (NO DSO SIGNATURE)
-withdrawnLockedAmulet <- submit subscriber do
+-- 5. Either party can cancel (NO DSO SIGNATURE)
+() <- submit subscriber do
   exerciseCmd result.subscriptionCid Subscription_CancelBySubscriber
 ```
 

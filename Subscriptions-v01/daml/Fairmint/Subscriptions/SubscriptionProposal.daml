@@ -1,25 +1,24 @@
 module Fairmint.Subscriptions.SubscriptionProposal where
 
-import Splice.Amulet qualified as Amulet
-import Fairmint.Subscriptions.Subscription
+import Fairmint.Subscriptions.ProcessorApprovedSubscriptionProposal
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
 
--- | Subscription proposal: created by subscriber via factory, accepted by recipient with amulet
+-- | Subscription proposal: created by subscriber via factory
 -- 
 -- Three-party model:
--- 1. Subscriber: pays the bill
+-- 1. Subscriber: pays the bill (provides amulet inputs each payment)
 -- 2. Recipient: receives payments (company/treasury address)  
--- 3. Processor: processes subscription payments each round (assigned by factory)
+-- 3. Processor: processes subscription payments each period (assigned by factory)
 --
 -- Flow:
--- 1. Subscriber creates proposal via SubscriptionFactory (which assigns processor and validates DSO)
--- 2. Recipient accepts the proposal, providing an Amulet which gets locked
--- 3. Locked Amulet is attached to the active subscription
--- 4. Processor executes payment transfers each round
+-- 1. Subscriber creates proposal via SubscriptionFactory
+-- 2. Processor validates and approves the proposal (e.g. checking expected fees)
+-- 3. Recipient accepts, activating the subscription
+-- 4. Processor executes payment transfers each period using amulet inputs from subscriber
 template SubscriptionProposal
   with
     config : SubscriptionConfig
-      -- ^ Subscription configuration (includes lock expiration)
+      -- ^ Subscription configuration
     context : ProcessorContext
       -- ^ Processor and DSO context (assigned by factory)
   where
@@ -28,39 +27,28 @@ template SubscriptionProposal
     
     ensure validateSubscriptionConfig config
 
-    -- | Recipient accepts the proposal with a LockedAmulet for payments
-    -- The subscriber should lock the amulet before calling this choice
-    -- The LockedAmulet must not expire before the subscription end date
-    choice SubscriptionProposal_Accept : ContractId Subscription
-      with
-        lockedAmuletCid : ContractId Amulet.LockedAmulet
-          -- ^ LockedAmulet to use for subscription payments
-      controller config.recipient
+    -- | Processor approves the proposal after validating terms
+    -- This is typically an automated job checking the recipient and expected fees
+    choice SubscriptionProposal_ProcessorApprove : ContractId ProcessorApprovedSubscriptionProposal
+      controller context.processor
       do
-        -- Validate the locked amulet
-        lockedAmulet <- fetch lockedAmuletCid
-        assertMsg "LockedAmulet DSO must match subscription DSO" 
-          (lockedAmulet.amulet.dso == context.dso)
-        assertMsg "LockedAmulet owner must be subscriber" 
-          (lockedAmulet.amulet.owner == config.subscriber)
-        assertMsg "LockedAmulet must not expire before subscription end date" 
-          (lockedAmulet.lock.expiresAt >= config.expiresAt)
-        
-        -- Create the active subscription with the locked amulet
-        create Subscription with
-          config = config
-          context = context
-          lockedAmulet = Some lockedAmuletCid
-          lastProcessedRound = 0
+        create ProcessorApprovedSubscriptionProposal with
+          ..
 
-    -- | Recipient rejects the proposal
-    choice SubscriptionProposal_Reject : ()
-      controller config.recipient
+    -- | Processor rejects the proposal (e.g., invalid fee structure)
+    choice SubscriptionProposal_ProcessorReject : ()
+      controller context.processor
       do
         pure ()
 
-    -- | Subscriber cancels the proposal before it's accepted
-    choice SubscriptionProposal_Cancel : ()
+    -- | Subscriber withdraws the proposal before processor approval
+    choice SubscriptionProposal_SubscriberWithdraw : ()
       controller config.subscriber
+      do
+        pure ()
+
+    -- Allow the recipient to reject at this stage
+    choice SubscriptionProposal_RecipientReject : ()
+      controller config.recipient
       do
         pure ()
