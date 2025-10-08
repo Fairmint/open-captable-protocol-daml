@@ -1,8 +1,12 @@
 module Fairmint.Subscriptions.SubscriptionProposal where
 
+import DA.Date (datetime, Month(..))
 import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..))
+import Splice.Expiry (TimeLock(..))
+import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.Subscription
-import Fairmint.Subscriptions.SubscriptionConfig
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
 
 -- | Subscription proposal: created by subscriber via factory, accepted by recipient with amulet
 -- 
@@ -19,36 +23,73 @@ import Fairmint.Subscriptions.SubscriptionConfig
 template SubscriptionProposal
   with
     config : SubscriptionConfig
-      -- ^ Subscription configuration
-    processor : Party
-      -- ^ Party who processes payments (assigned by factory)
-    dso : Party
-      -- ^ Expected DSO party (must match amulet)
+      -- ^ Subscription configuration (includes lock expiration)
+    context : ProcessorContext
+      -- ^ Processor and DSO context (assigned by factory)
   where
     signatory config.subscriber
-    observer config.recipient, processor
+    observer config.recipient, context.processor
     
     ensure validateSubscriptionConfig config
 
-    -- | Recipient accepts the proposal with an Amulet provided for payments
-    -- The Amulet is attached to the active subscription for future payment processing
+    -- | Recipient accepts the proposal with Amulets provided for payments
+    -- The specified amount is locked from the provided amulets and attached to the subscription
+    -- Any change is returned to the subscriber as regular amulets
     choice SubscriptionProposal_Accept : ContractId Subscription
       with
-        amuletCid : ContractId Amulet.Amulet
-          -- ^ Amulet to use for subscription payments
+        inputAmulets : [ContractId Amulet.Amulet]
+          -- ^ Amulets to use as inputs (can be multiple)
+        amountToLock : Decimal
+          -- ^ Specific amount to lock for subscription payments
+        amuletRulesCid : ContractId AmuletRules
+          -- ^ AmuletRules contract for locking the amulet
+        openMiningRoundCid : ContractId OpenMiningRound
+          -- ^ Current open mining round
+        transferContext : TransferContext
+          -- ^ Transfer context (includes open mining round and other context)
       controller config.recipient
       do
-        -- Fetch the amulet to validate
-        amulet <- fetch amuletCid
-        assertMsg "Amulet DSO must match subscription DSO" (amulet.dso == dso)
-        assertMsg "Amulet owner must be subscriber" (amulet.owner == config.subscriber)
+        -- Validate amount to lock is positive
+        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
         
-        -- Create the active subscription with the amulet
+        -- Lock the specified amount by transferring to self with a lock
+        -- This creates a LockedAmulet without requiring DSO as a controller on our contract
+        -- Any excess from the inputs will be returned as regular amulets (change)
+        let lockOutput = TransferOutput with
+              receiver = config.subscriber  -- Transfer to self with lock
+              receiverFeeRatio = 0.0
+              amount = amountToLock  -- Lock exactly this amount
+              lock = Some (TimeLock with
+                holders = [config.subscriber]
+                expiresAt = config.expiresAt
+                optContext = Some "Subscription collateral")
+        
+        let lockTransfer = Transfer with
+              sender = config.subscriber
+              provider = context.processor
+              inputs = map InputAmulet inputAmulets
+              outputs = [lockOutput]
+              beneficiaries = None
+        
+        lockResult <- exercise amuletRulesCid AmuletRules_Transfer with
+          transfer = lockTransfer
+          context = transferContext
+          expectedDso = Some context.dso
+        
+        -- Extract the locked amulet from the created amulets
+        -- There should be exactly one LockedAmulet created
+        let lockedAmuletCid = case filter (\(created, _) -> 
+              case created of
+                Amulet.CreatedLockedAmulet _ -> True
+                _ -> False) lockResult.createdAmulets of
+              [(Amulet.CreatedLockedAmulet cid, _)] -> cid
+              _ -> error "Expected exactly one locked amulet from lock transfer"
+        
+        -- Create the active subscription with the locked amulet
         create Subscription with
           config = config
-          processor = processor
-          dso = dso
-          amulet = Some amuletCid
+          context = context
+          lockedAmulet = Some lockedAmuletCid
           lastProcessedRound = 0
 
     -- | Recipient rejects the proposal

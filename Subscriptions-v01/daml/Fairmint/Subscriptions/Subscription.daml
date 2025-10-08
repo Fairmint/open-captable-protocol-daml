@@ -3,16 +3,17 @@ module Fairmint.Subscriptions.Subscription where
 import DA.Optional (isSome, fromSome)
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
-import Fairmint.Subscriptions.SubscriptionConfig
+import Splice.Round (OpenMiningRound)
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
 
--- | Active subscription contract for recurring payments using Amulet
+-- | Active subscription contract for recurring payments using LockedAmulet
 -- 
 -- Three-party model:
 -- - Subscriber: pays the bill
 -- - Recipient: receives payments (company/treasury address)
 -- - Processor: processes subscription payments each round (assigned by factory)
 --
--- The subscriber provides collateral via an Amulet. Each round, the processor
+-- The subscriber provides collateral via a LockedAmulet. Each round, the processor
 -- executes the payment transfer, sending funds to the recipient and collecting a fee.
 -- Separate TransferContexts allow different FeaturedAppRights for recipient and processor.
 --
@@ -21,52 +22,50 @@ template Subscription
   with
     config : SubscriptionConfig
       -- ^ Subscription configuration
-    processor : Party
-      -- ^ Party who processes payments (assigned by factory)
-    dso : Party
-      -- ^ Expected DSO party (must match all amulets)
-    amulet : Optional (ContractId Amulet.Amulet)
-      -- ^ Optional Amulet providing payment collateral
+    context : ProcessorContext
+      -- ^ Processor and DSO context (assigned by factory)
+    lockedAmulet : Optional (ContractId Amulet.LockedAmulet)
+      -- ^ Optional LockedAmulet providing payment collateral
     lastProcessedRound : Int
       -- ^ Last round for which payment was processed
   where
     signatory config.subscriber, config.recipient
-    observer processor
+    observer context.processor
     
     ensure
       validateSubscriptionConfig config &&
       lastProcessedRound >= 0
 
-    -- | Add or replace the Amulet for this subscription
+    -- | Add or replace the LockedAmulet for this subscription
     -- Only the subscriber can add collateral
-    choice Subscription_AddAmulet : ContractId Subscription
+    choice Subscription_AddLockedAmulet : ContractId Subscription
       with
-        amuletCid : ContractId Amulet.Amulet
+        lockedAmuletCid : ContractId Amulet.LockedAmulet
       controller config.subscriber
       do
-        -- Validate that the new amulet has the expected DSO
-        amuletContract <- fetch amuletCid
-        assertMsg "Amulet DSO must match subscription DSO" 
-          (amuletContract.dso == dso)
-        assertMsg "Amulet owner must be subscriber"
-          (amuletContract.owner == config.subscriber)
+        -- Validate that the new locked amulet has the expected DSO
+        lockedAmuletContract <- fetch lockedAmuletCid
+        assertMsg "LockedAmulet DSO must match subscription DSO" 
+          (lockedAmuletContract.amulet.dso == context.dso)
+        assertMsg "LockedAmulet owner must be subscriber"
+          (lockedAmuletContract.amulet.owner == config.subscriber)
         
-        -- If there's an existing amulet, we replace it
+        -- If there's an existing locked amulet, we replace it
         -- The caller is responsible for managing the old one
-        create this with amulet = Some amuletCid
+        create this with lockedAmulet = Some lockedAmuletCid
 
-    -- | Withdraw the Amulet from the subscription
+    -- | Withdraw the LockedAmulet from the subscription
     -- Only the subscriber can withdraw their collateral
-    choice Subscription_WithdrawAmulet : (ContractId Subscription, Optional (ContractId Amulet.Amulet))
+    choice Subscription_WithdrawLockedAmulet : (ContractId Subscription, Optional (ContractId Amulet.LockedAmulet))
       controller config.subscriber
       do
-        let oldAmulet = amulet
-        newSubscriptionCid <- create this with amulet = None
-        pure (newSubscriptionCid, oldAmulet)
+        let oldLockedAmulet = lockedAmulet
+        newSubscriptionCid <- create this with lockedAmulet = None
+        pure (newSubscriptionCid, oldLockedAmulet)
 
     -- | Process payment for a specific round
     -- The processor executes this each round, with subscriber authorization
-    -- Transfers funds from the amulet to recipient and processor
+    -- Unlocks the LockedAmulet and transfers funds to recipient and processor
     -- Separate transfer contexts allow different FeaturedAppRights for each payment
     choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
       with
@@ -74,28 +73,36 @@ template Subscription
           -- ^ Round number to process payment for
         amuletRulesCid : ContractId AmuletRules
           -- ^ AmuletRules contract for executing transfers
+        openMiningRoundCid : ContractId OpenMiningRound
+          -- ^ Current open mining round (needed for unlocking)
         recipientTransferContext : TransferContext
           -- ^ Transfer context for payment to recipient (includes FeaturedAppRight)
         processorTransferContext : TransferContext
           -- ^ Transfer context for payment to processor (includes FeaturedAppRight)
-      controller config.subscriber, processor
+      controller config.subscriber, context.processor
       do
         -- Validate that we're not processing old rounds
         assertMsg "Cannot process rounds before last processed round" 
           (currentRound > lastProcessedRound)
         
-        -- Validate that we have an amulet
-        assertMsg "No amulet available for payment" 
-          (isSome amulet)
+        -- Validate that we have a locked amulet
+        assertMsg "No locked amulet available for payment" 
+          (isSome lockedAmulet)
         
-        let amuletCid = fromSome amulet
+        let lockedAmuletCid = fromSome lockedAmulet
         
         -- Calculate payment amounts
         let roundsToProcess = currentRound - lastProcessedRound
         let totalPaymentToRecipient = config.amountPerRound * intToDecimal roundsToProcess
         let totalFeeToProcessor = config.feeAmountPerRound * intToDecimal roundsToProcess
         
-        -- Step 1: Transfer to recipient using recipient's transfer context
+        -- Step 1: Unlock the LockedAmulet
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = openMiningRoundCid
+        
+        let unlockedAmuletCid = unlockResult.amuletSum.amulet
+        
+        -- Step 2: Transfer to recipient using recipient's transfer context
         let recipientOutput = TransferOutput with
               receiver = config.recipient
               receiverFeeRatio = 0.0
@@ -104,15 +111,15 @@ template Subscription
         
         let recipientTransfer = Transfer with
               sender = config.subscriber
-              provider = processor
-              inputs = [InputAmulet amuletCid]
+              provider = context.processor
+              inputs = [InputAmulet unlockedAmuletCid]
               outputs = [recipientOutput]
               beneficiaries = None
         
         recipientTransferResult <- exercise amuletRulesCid AmuletRules_Transfer with
           transfer = recipientTransfer
           context = recipientTransferContext
-          expectedDso = Some dso
+          expectedDso = Some context.dso
         
         -- Step 2: If there's a processor fee, transfer to processor using processor's transfer context
         processorTransferResult <- 
@@ -124,14 +131,14 @@ template Subscription
             
             -- Transfer processor fee to processor
             let processorOutput = TransferOutput with
-                  receiver = processor
+                  receiver = context.processor
                   receiverFeeRatio = 0.0
                   amount = totalFeeToProcessor
                   lock = None
             
             let processorTransfer = Transfer with
                   sender = config.subscriber
-                  provider = processor
+                  provider = context.processor
                   inputs = [InputAmulet changeAmuletCid]
                   outputs = [processorOutput]
                   beneficiaries = None
@@ -139,7 +146,7 @@ template Subscription
             result <- exercise amuletRulesCid AmuletRules_Transfer with
               transfer = processorTransfer
               context = processorTransferContext
-              expectedDso = Some dso
+              expectedDso = Some context.dso
             pure (Some result)
           else
             pure None
@@ -147,7 +154,7 @@ template Subscription
         -- Step 3: Update subscription with new processed round
         newSubscriptionCid <- create this with 
           lastProcessedRound = currentRound
-          amulet = None  -- Amulet has been spent
+          lockedAmulet = None  -- Amulet has been spent
         
         pure Subscription_ProcessPaymentResult with
           subscriptionCid = newSubscriptionCid
@@ -156,30 +163,30 @@ template Subscription
 
     -- | Cancel the subscription
     -- Either subscriber or recipient can cancel at any time
-    -- Returns the Amulet if present
-    choice Subscription_Cancel : Optional (ContractId Amulet.Amulet)
+    -- Returns the LockedAmulet if present
+    choice Subscription_Cancel : Optional (ContractId Amulet.LockedAmulet)
       controller [config.subscriber, config.recipient]
       do
-        -- Return the amulet if present
-        pure amulet
+        -- Return the locked amulet if present
+        pure lockedAmulet
 
     -- | Subscriber-only cancel
     -- Allows subscriber to cancel without recipient signature
-    -- Returns the Amulet if present
-    choice Subscription_CancelBySubscriber : Optional (ContractId Amulet.Amulet)
+    -- Returns the LockedAmulet if present
+    choice Subscription_CancelBySubscriber : Optional (ContractId Amulet.LockedAmulet)
       controller config.subscriber
       do
-        -- Return the amulet if present
-        pure amulet
+        -- Return the locked amulet if present
+        pure lockedAmulet
 
     -- | Recipient-only cancel
     -- Allows recipient to cancel without subscriber signature
-    -- Returns the Amulet if present
-    choice Subscription_CancelByRecipient : Optional (ContractId Amulet.Amulet)
+    -- Returns the LockedAmulet if present
+    choice Subscription_CancelByRecipient : Optional (ContractId Amulet.LockedAmulet)
       controller config.recipient
       do
-        -- Return the amulet if present
-        pure amulet
+        -- Return the locked amulet if present
+        pure lockedAmulet
 
 -- | Result of processing a subscription payment
 data Subscription_ProcessPaymentResult = Subscription_ProcessPaymentResult

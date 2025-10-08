@@ -5,11 +5,9 @@ import DA.Date (datetime, Month(..))
 import Fairmint.Subscriptions.Subscription
 import Fairmint.Subscriptions.SubscriptionProposal
 import Fairmint.Subscriptions.SubscriptionFactory
-import Fairmint.Subscriptions.SubscriptionConfig
-import Splice.Amulet qualified as Amulet
-import Splice.Expiry (TimeLock(..))
-import Splice.AmuletRules (TransferContext(..))
-import TestUtils (tap, sharedDso, getFirstOpenRound)
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig(..), ProcessorContext(..))
+import Splice.AmuletRules (TransferContext(..), AmuletRules)
+import TestUtils (tap, sharedDso, getFirstOpenRound, getAmuletRules)
 import qualified DA.Map as Map
 
 -- Helper to create a SubscriptionFactory
@@ -18,8 +16,9 @@ createSubscriptionFactory processor = do
   dso <- sharedDso
   submit processor do
     createCmd SubscriptionFactory with
-      processor = processor
-      dso = dso
+      context = ProcessorContext with
+        processor = processor
+        dso = dso
 
 -- Test the factory/proposal/acceptance flow
 testFactoryProposalAcceptance : Script ()
@@ -45,17 +44,30 @@ testFactoryProposalAcceptance = script do
   -- Alice creates an amulet for payment
   amuletCid <- tap alice 100.0
   
-  -- Bob accepts the proposal, providing the amulet
+  -- Get necessary context for locking the amulet
+  openRoundCid <- getFirstOpenRound dso
+  amuletRulesCid <- getAmuletRules dso
+  let transferContext = TransferContext with
+        openMiningRound = openRoundCid
+        featuredAppRight = None
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
+  
+  -- Bob accepts the proposal, providing the amulet and locking 100.0
   subscriptionCid <- submit bob do
     exerciseCmd proposalCid SubscriptionProposal_Accept with
-      amuletCid = amuletCid
+      inputAmulets = [amuletCid]
+      amountToLock = 100.0
+      amuletRulesCid = amuletRulesCid
+      openMiningRoundCid = openRoundCid
+      transferContext = transferContext
   
-  -- Verify subscription was created with amulet
+  -- Verify subscription was created with locked amulet
   Some subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscriber should be alice" (subscription.config.subscriber == alice)
   assertMsg "Recipient should be bob" (subscription.config.recipient == bob)
   assertMsg "Processor should match" (subscription.processor == processor)
-  assertMsg "Should have amulet" (subscription.amulet /= None)
+  assertMsg "Should have locked amulet" (subscription.lockedAmulet /= None)
   assertMsg "Amount per round should be 10.0" (subscription.config.amountPerRound == 10.0)
   assertMsg "Fee amount per round should be 2.0" (subscription.config.feeAmountPerRound == 2.0)
   
@@ -142,23 +154,33 @@ testCancelBySubscriber = script do
         feeAmountPerRound = 1.0
         reason = Some "Service subscription"
   
-  -- Alice creates amulet and Bob accepts
+  -- Alice creates amulet and Bob accepts with locking
   amuletCid <- tap alice 50.0
+  openRoundCid <- getFirstOpenRound dso
+  amuletRulesCid <- getAmuletRules dso
+  let transferContext = TransferContext with
+        openMiningRound = openRoundCid
+        featuredAppRight = None
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
   
   subscriptionCid <- submit bob do
     exerciseCmd proposalCid SubscriptionProposal_Accept with
       amuletCid = amuletCid
+      amuletRulesCid = amuletRulesCid
+      openMiningRoundCid = openRoundCid
+      transferContext = transferContext
   
   -- Alice cancels
-  returnedAmulet <- submit alice do
+  returnedLockedAmulet <- submit alice do
     exerciseCmd subscriptionCid Subscription_CancelBySubscriber
   
   -- Verify subscription was archived
   subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
   
-  -- Verify we got back the amulet
-  assertMsg "Should return amulet" (returnedAmulet /= None)
+  -- Verify we got back the locked amulet
+  assertMsg "Should return locked amulet" (returnedLockedAmulet /= None)
   
   pure ()
 
