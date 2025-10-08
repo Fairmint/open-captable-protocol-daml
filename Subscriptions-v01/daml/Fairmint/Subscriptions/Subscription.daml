@@ -1,0 +1,539 @@
+module Fairmint.Subscriptions.Subscription where
+
+import DA.Optional (isSome, fromSome)
+import DA.Time (addRelTime, convertRelTimeToMicroseconds, subTime, RelTime)
+import qualified DA.Map as Map
+import Splice.Amulet qualified as Amulet
+import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round (OpenMiningRound)
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), SubscriptionAmount(..), PaymentConfig(..), validateSubscriptionConfig)
+import Fairmint.Shared.SpliceHelpers (createActivityMarker)
+
+-- | Convert a per-day rate to the actual amount for the processing period
+-- Calculates: (amountPerDay * processingPeriod) / 1 day
+calculateAmountForPeriod : PaymentConfig -> RelTime -> Decimal -> Decimal
+calculateAmountForPeriod paymentCfg processingPeriod usdToAmuletRate =
+  let
+    -- Convert to Amulet first
+    dailyAmountInAmulet = case paymentCfg.amountPerDay of
+      AmuletAmount amt -> amt
+      USDAmount usdAmt -> usdAmt * usdToAmuletRate
+    
+    -- One day in microseconds (24 * 60 * 60 * 1000000)
+    oneDayMicros = 86400000000
+    
+    -- Get processing period in microseconds
+    periodMicros = convertRelTimeToMicroseconds processingPeriod
+    
+    -- Calculate pro-rata amount: (dailyRate * periodDays)
+    periodDays = intToDecimal periodMicros / intToDecimal oneDayMicros
+  in
+    dailyAmountInAmulet * periodDays
+
+-- | Payment context containing Amulet transfer dependencies
+data PaymentContext = PaymentContext
+  with
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+    amuletPrice : Decimal
+  deriving (Eq, Show)
+
+-- | Complete payment request with all necessary context
+data PaymentRequest = PaymentRequest
+  with
+    sender : Party
+    provider : Party
+    receiver : Party
+    amount : Decimal
+    receiverFeeRatio : Decimal
+    featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+    expectedDso : Party
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Execute a payment transfer
+paymentTo : PaymentRequest -> Update TransferResult
+paymentTo req = do
+  let transfer = Transfer with
+        sender = req.sender
+        provider = req.provider
+        inputs = map InputAmulet req.amuletInputs
+        outputs = [TransferOutput with
+          receiver = req.receiver
+          receiverFeeRatio = req.receiverFeeRatio
+          amount = req.amount
+          lock = None]
+        beneficiaries = None
+  
+  let context = TransferContext with
+        openMiningRound = req.openMiningRoundCid
+        featuredAppRight = req.featuredAppRight
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
+  
+  exercise req.amuletRulesCid AmuletRules_Transfer with
+    transfer = transfer
+    context = context
+    expectedDso = Some req.expectedDso
+
+-- | Active subscription contract for recurring payments
+-- 
+-- Three-party model:
+-- - Subscriber: pays the bill (provides amulet inputs each payment)
+-- - Recipient: receives payments (company/treasury address)
+-- - Processor: processes subscription payments each round (assigned by factory)
+--
+-- Each round, the processor executes payment transfers using amulet inputs
+-- provided by the subscriber. Separate TransferContexts allow different 
+-- FeaturedAppRights for recipient and processor.
+--
+-- Either the subscriber or recipient can cancel at any time.
+template Subscription
+  with
+    paidUntil : Time
+      -- ^ Subscription is paid through this time (extends by one period with each payment)
+    config : SubscriptionConfig
+      -- ^ Subscription configuration
+    context : ProcessorContext
+      -- ^ Processor and DSO context (assigned by factory)
+  where
+    signatory config.subscriber, config.recipient
+    observer context.processor
+    
+    ensure
+      validateSubscriptionConfig config
+
+    -- | Process payment for the current period
+    -- The processor executes this periodically, with subscriber authorization
+    -- Uses amulet inputs provided by subscriber to transfer funds to recipient and processor
+    -- 
+    -- Important: Receivers always pay transfer fees (receiverFeeRatio = 1.0).
+    -- This ensures subscribers are charged exactly the amount they agreed to - no surprises.
+    -- The recipient and processor bear the transfer costs for predictable subscriber billing.
+    -- 
+    -- Cannot process payments after subscription expiration date
+    choice Subscription_ProcessPayment : Subscription_ProcessPaymentResult
+      with
+        processingPeriod : RelTime
+          -- ^ Duration of this billing period (payment extends paidUntil by this amount, unless near expiration)
+        paymentCtx : PaymentContext
+      controller context.processor
+      do
+        -- Get current ledger time
+        now <- getTime
+        
+        -- Validate not in free trial mode
+        assertMsg "Cannot process payments during free trial (use Subscription_ProcessFreeTrial instead)" 
+          (not (isSome config.freeTrialEndsAt))
+        
+        -- Validate subscription hasn't expired
+        assertMsg "Cannot process payments after subscription expiration" 
+          (now <= config.expiresAt)
+        
+        -- Validate subscription period has elapsed (paid through time has passed)
+        assertMsg "Cannot process payment before subscription period elapses (still paid through current paidUntil time)" 
+          (now > paidUntil)
+        
+        -- Validate amulet inputs are provided
+        assertMsg "Must provide at least one amulet input for payment" 
+          (not (null paymentCtx.amuletInputs))
+        
+        -- Validate USD to Amulet rate is positive (from OpenMiningRound)
+        assertMsg "USD to Amulet conversion rate must be positive" 
+          (paymentCtx.amuletPrice > 0.0)
+
+        -- Calculate the actual billing period
+        -- If the full processingPeriod would exceed expiration, use a partial period
+        let nextPaidUntil = addRelTime paidUntil processingPeriod
+        let (actualPeriod, newPaidUntil) = 
+              if nextPaidUntil > config.expiresAt
+              then (subTime config.expiresAt paidUntil, config.expiresAt)  -- Partial period to expiration
+              else (processingPeriod, nextPaidUntil)                        -- Full period
+
+        -- Step 1: Transfer payment to recipient
+        -- Calculate the actual amount based on the actual billing period (may be partial)
+        let amountForThisPeriod = calculateAmountForPeriod config.recipientPayment actualPeriod paymentCtx.amuletPrice
+        recipientTransferResult <- paymentTo PaymentRequest with
+          sender = config.subscriber
+          provider = context.processor
+          receiver = config.recipient
+          amount = amountForThisPeriod
+          receiverFeeRatio = 1.0  -- Receiver pays fees so subscriber is charged exact amount (no surprises)
+          featuredAppRight = config.recipientPayment.featuredAppRight
+          expectedDso = context.dso
+          amuletInputs = paymentCtx.amuletInputs
+          amuletRulesCid = paymentCtx.amuletRulesCid
+          openMiningRoundCid = paymentCtx.openMiningRoundCid
+        
+        -- Step 2: If there's a processor fee, transfer to processor
+        let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPayment actualPeriod paymentCtx.amuletPrice
+        processorTransferResult <- 
+          if feeAmountForThisPeriod > 0.0
+          then do
+            -- Get the change amulet from the recipient transfer
+            assertMsg "Expected change amulet from recipient transfer" (isSome recipientTransferResult.senderChangeAmulet)
+            let changeAmuletCid = fromSome recipientTransferResult.senderChangeAmulet
+            
+            -- Transfer processor fee to processor using change from recipient payment
+            result <- paymentTo PaymentRequest with
+              sender = config.subscriber
+              provider = context.processor
+              receiver = context.processor
+              amount = feeAmountForThisPeriod
+              receiverFeeRatio = 1.0  -- Processor pays fees so subscriber is charged exact amount (no surprises)
+              featuredAppRight = config.processorPayment.featuredAppRight
+              expectedDso = context.dso
+              amuletInputs = [changeAmuletCid]
+              amuletRulesCid = paymentCtx.amuletRulesCid
+              openMiningRoundCid = paymentCtx.openMiningRoundCid
+            pure (Some result)
+          else
+            pure None
+        
+        -- Step 3: Update subscription - extend paidUntil (may be partial if near expiration)
+        subscriptionCid <- create this with 
+          paidUntil = newPaidUntil
+        
+        pure Subscription_ProcessPaymentResult with
+          ..
+
+    -- | Process free trial period
+    -- The processor executes this periodically during free trial
+    -- Advances paidUntil without requiring payment
+    -- Creates activity markers for recipient and processor if they have FeaturedAppRights
+    choice Subscription_ProcessFreeTrial : ContractId Subscription
+      with
+        processingPeriod : RelTime
+          -- ^ Duration to advance the free trial (will be capped to remaining trial time)
+      controller context.processor
+      do
+        -- Get current ledger time
+        now <- getTime
+        
+        -- Validate we're in free trial mode
+        assertMsg "Can only process free trial when freeTrialEndsAt is set" 
+          (isSome config.freeTrialEndsAt)
+        
+        let freeTrialEnd = fromSome config.freeTrialEndsAt
+        
+        -- Validate free trial hasn't ended yet
+        assertMsg "Free trial has already ended" 
+          (now < freeTrialEnd)
+        
+        -- Validate subscription hasn't expired
+        assertMsg "Cannot process free trial after subscription expiration" 
+          (now <= config.expiresAt)
+        
+        -- Validate subscription period has elapsed (paid through time has passed)
+        assertMsg "Cannot process free trial before subscription period elapses (still paid through current paidUntil time)" 
+          (now > paidUntil)
+        
+        -- Calculate the actual processing period
+        -- If the full processingPeriod would exceed free trial end, use remaining trial time
+        let nextPaidUntil = addRelTime paidUntil processingPeriod
+        let (actualPeriod, newPaidUntil, newFreeTrialEndsAt) = 
+              if nextPaidUntil >= freeTrialEnd
+              then (subTime freeTrialEnd paidUntil, freeTrialEnd, None)  -- Free trial ends, cap to trial end
+              else (processingPeriod, nextPaidUntil, Some freeTrialEnd)  -- Continue trial
+        
+        -- Create activity marker for recipient if they have a FeaturedAppRight
+        case config.recipientPayment.featuredAppRight of
+          Some farCid -> do
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            createActivityMarker config.recipient farIfaceCid
+          None -> pure ()
+        
+        -- Create activity marker for processor if they have a FeaturedAppRight
+        case config.processorPayment.featuredAppRight of
+          Some farCid -> do
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            createActivityMarker context.processor farIfaceCid
+          None -> pure ()
+        
+        -- Update subscription - advance paidUntil and potentially clear freeTrialEndsAt
+        create this with 
+          paidUntil = newPaidUntil
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
+
+    -- | Update subscription expiration date
+    -- Allows subscriber to extend or modify when the subscription expires
+    choice Subscription_UpdateExpiration : ContractId Subscription
+      with
+        newExpiresAt : Time
+          -- ^ New expiration time for the subscription
+      controller config.subscriber
+      do
+        -- Validate that the new expiration is in the future (otherwise cancel)
+        now <- getTime
+        assertMsg "New expiration must be in the future" (newExpiresAt > now)
+      
+        create this with
+          config = config with
+            expiresAt = newExpiresAt
+
+    -- | Decrease subscription expiration date
+    -- Allows recipient or processor to end the subscription earlier
+    choice Subscription_DecreaseExpiration : ContractId Subscription
+      with
+        newExpiresAt : Time
+          -- ^ New (earlier) expiration time for the subscription
+        exercisingParty : Party
+          -- ^ The party exercising this choice (recipient or processor)
+      controller exercisingParty
+      do
+        -- Validate exercisingParty is recipient or processor
+        assertMsg "Only recipient or processor can decrease expiration" 
+          (exercisingParty == config.recipient || exercisingParty == context.processor)
+        
+        -- Validate that the new expiration is earlier than current
+        assertMsg "New expiration must be earlier than current expiration" 
+          (newExpiresAt < config.expiresAt)
+        
+        -- Validate that the new expiration is in the future
+        now <- getTime
+        assertMsg "New expiration must be in the future" (newExpiresAt > now)
+      
+        create this with
+          config = config with
+            expiresAt = newExpiresAt
+
+    -- | Subscriber increases payments
+    -- Allows subscriber to increase recipient and/or processor payments
+    -- Both payments must not decrease, and at least one must increase
+    -- Can also adjust fee ratios in ways that cost the subscriber more
+    choice Subscription_SubscriberIncreasePayments : ContractId Subscription
+      with
+        newRecipientPayment : PaymentConfig
+          -- ^ New payment config for recipient (amount must not decrease)
+        newProcessorPayment : PaymentConfig
+          -- ^ New payment config for processor (amount must not decrease)
+      controller config.subscriber
+      do
+        let oldRecipientAmount = config.recipientPayment.amountPerDay
+        let oldProcessorAmount = config.processorPayment.amountPerDay
+        let newRecipientAmount = newRecipientPayment.amountPerDay
+        let newProcessorAmount = newProcessorPayment.amountPerDay
+        
+        -- Helper to extract decimal amount for comparison
+        let getAmount amt = case amt of
+              AmuletAmount a -> a
+              USDAmount a -> a
+        
+        -- Validate amounts don't decrease
+        assertMsg "Recipient payment amount cannot decrease" 
+          (getAmount newRecipientAmount >= getAmount oldRecipientAmount)
+        assertMsg "Processor payment amount cannot decrease" 
+          (getAmount newProcessorAmount >= getAmount oldProcessorAmount)
+        
+        -- Validate at least one amount increases
+        assertMsg "At least one payment amount must increase" 
+          (getAmount newRecipientAmount > getAmount oldRecipientAmount || 
+           getAmount newProcessorAmount > getAmount oldProcessorAmount)
+        
+        create this with
+          config = config with
+            recipientPayment = newRecipientPayment
+            processorPayment = newProcessorPayment
+
+    -- | Recipient decreases their payment
+    -- Allows recipient to decrease their own payment amount
+    choice Subscription_RecipientDecreasePayment : ContractId Subscription
+      with
+        newRecipientPayment : PaymentConfig
+          -- ^ New payment config for recipient (amount must not increase)
+      controller config.recipient
+      do
+        let oldAmount = config.recipientPayment.amountPerDay
+        let newAmount = newRecipientPayment.amountPerDay
+        
+        -- Helper to extract decimal amount for comparison
+        let getAmount amt = case amt of
+              AmuletAmount a -> a
+              USDAmount a -> a
+        
+        -- Validate amount doesn't increase
+        assertMsg "Recipient payment amount cannot increase" 
+          (getAmount newAmount <= getAmount oldAmount)
+        
+        create this with
+          config = config with
+            recipientPayment = newRecipientPayment
+
+    -- | Processor decreases their payment
+    -- Allows processor to decrease their own payment amount
+    choice Subscription_ProcessorDecreasePayment : ContractId Subscription
+      with
+        newProcessorPayment : PaymentConfig
+          -- ^ New payment config for processor (amount must not increase)
+      controller context.processor
+      do
+        let oldAmount = config.processorPayment.amountPerDay
+        let newAmount = newProcessorPayment.amountPerDay
+        
+        -- Helper to extract decimal amount for comparison
+        let getAmount amt = case amt of
+              AmuletAmount a -> a
+              USDAmount a -> a
+        
+        -- Validate amount doesn't increase
+        assertMsg "Processor payment amount cannot increase" 
+          (getAmount newAmount <= getAmount oldAmount)
+        
+        create this with
+          config = config with
+            processorPayment = newProcessorPayment
+
+    -- | Update recipient's FeaturedAppRight
+    -- Allows recipient to change their own featuredAppRight
+    choice Subscription_UpdateRecipientFeaturedAppRight : ContractId Subscription
+      with
+        newFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+          -- ^ New featuredAppRight for the recipient (or None to remove)
+      controller config.recipient
+      do
+        -- If featuredAppRight is provided, validate that its provider matches the recipient
+        case newFeaturedAppRight of
+          Some farCid -> do
+            -- Convert to interface to access the view
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            farView <- view <$> fetch farIfaceCid
+            assertMsg "FeaturedAppRight provider must match recipient" (farView.provider == config.recipient)
+          None -> pure ()
+        
+        create this with
+          config = config with
+            recipientPayment = config.recipientPayment with
+              featuredAppRight = newFeaturedAppRight
+
+    -- | Update processor's FeaturedAppRight
+    -- Allows processor to change their own featuredAppRight
+    choice Subscription_UpdateProcessorFeaturedAppRight : ContractId Subscription
+      with
+        newFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+          -- ^ New featuredAppRight for the processor (or None to remove)
+      controller context.processor
+      do
+        -- If featuredAppRight is provided, validate that its provider matches the processor
+        case newFeaturedAppRight of
+          Some farCid -> do
+            -- Convert to interface to access the view
+            let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId farCid
+            farView <- view <$> fetch farIfaceCid
+            assertMsg "FeaturedAppRight provider must match processor" (farView.provider == context.processor)
+          None -> pure ()
+        
+        create this with
+          config = config with
+            processorPayment = config.processorPayment with
+              featuredAppRight = newFeaturedAppRight
+
+    -- | Processor sets recipient's FeaturedAppRight
+    -- Allows processor to set recipient's featuredAppRight to a non-null value
+    -- This is useful for the processor to enable featured app benefits for the recipient
+    choice Subscription_ProcessorSetRecipientFeaturedAppRight : ContractId Subscription
+      with
+        newFeaturedAppRight : ContractId Amulet.FeaturedAppRight
+          -- ^ New featuredAppRight for the recipient (must be non-null)
+      controller context.processor
+      do
+        -- Validate that the featuredAppRight provider matches the recipient
+        -- Convert to interface to access the view
+        let farIfaceCid : ContractId FeaturedAppRightApi.FeaturedAppRight = toInterfaceContractId newFeaturedAppRight
+        farView <- view <$> fetch farIfaceCid
+        assertMsg "FeaturedAppRight provider must match recipient" (farView.provider == config.recipient)
+        
+        create this with
+          config = config with
+            recipientPayment = config.recipientPayment with
+              featuredAppRight = Some newFeaturedAppRight
+
+    -- | Subscriber reduces free trial end time
+    -- Allows subscriber to reduce or clear the free trial period
+    choice Subscription_SubscriberReduceFreeTrial : ContractId Subscription
+      with
+        newFreeTrialEndsAt : Optional Time
+          -- ^ New (earlier) free trial end time, or None to end trial immediately
+      controller config.subscriber
+      do
+        -- Validate free trial is currently set
+        assertMsg "Free trial must be set to reduce it" 
+          (isSome config.freeTrialEndsAt)
+        
+        let currentFreeTrialEnd = fromSome config.freeTrialEndsAt
+        
+        -- Validate new time is earlier (or None)
+        case newFreeTrialEndsAt of
+          Some newEnd -> 
+            assertMsg "New free trial end must be earlier than current" 
+              (newEnd < currentFreeTrialEnd)
+          None -> pure ()
+        
+        create this with
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
+
+    -- | Recipient increases or sets free trial end time
+    -- Allows recipient to increase, set, or clear the free trial period
+    choice Subscription_RecipientUpdateFreeTrial : ContractId Subscription
+      with
+        newFreeTrialEndsAt : Optional Time
+          -- ^ New free trial end time (can be later, or None to clear)
+      controller config.recipient
+      do
+        -- If setting a new time (not clearing), validate it's in the future
+        case newFreeTrialEndsAt of
+          Some newEnd -> do
+            now <- getTime
+            assertMsg "New free trial end must be in the future" (newEnd > now)
+          None -> pure ()
+        
+        -- If currently set and increasing, validate new time is later
+        case config.freeTrialEndsAt of
+          Some currentEnd -> 
+            case newFreeTrialEndsAt of
+              Some newEnd -> 
+                assertMsg "Recipient can only increase free trial end time" 
+                  (newEnd > currentEnd)
+              None -> pure ()  -- Recipient can clear trial
+          None -> pure ()  -- Recipient can set trial from None
+        
+        create this with
+          config = config with
+            freeTrialEndsAt = newFreeTrialEndsAt
+
+    -- | Subscriber-only cancel
+    -- Allows subscriber to cancel without recipient signature
+    choice Subscription_CancelBySubscriber : ()
+      controller config.subscriber
+      do
+        pure ()
+
+    -- | Recipient-only cancel
+    -- Allows recipient to cancel without subscriber signature
+    choice Subscription_CancelByRecipient : ()
+      controller config.recipient
+      do
+        pure ()
+
+    -- | Processor-only cancel
+    -- Allows processor to cancel without subscriber or recipient signature
+    choice Subscription_CancelByProcessor : ()
+      controller context.processor
+      do
+        pure ()
+
+-- | Result of processing a subscription payment
+data Subscription_ProcessPaymentResult = Subscription_ProcessPaymentResult
+  with
+    subscriptionCid : ContractId Subscription
+      -- ^ The updated subscription contract
+    recipientTransferResult : TransferResult
+      -- ^ The result of the transfer to the recipient
+    processorTransferResult : Optional TransferResult
+      -- ^ The result of the transfer to the processor (if fee > 0)
+  deriving (Eq, Show)
