@@ -1,6 +1,5 @@
 module Fairmint.Subscriptions.Subscriptions where
 
-import DA.Foldable (forA_)
 import DA.Optional (isSome, fromSome)
 import DA.Time (addRelTime, convertRelTimeToMicroseconds, subTime, RelTime)
 import qualified DA.Map as Map
@@ -102,10 +101,12 @@ template FreeTrialSubscription
       -- ^ Free trial ends at this time (not optional - this is the contract's purpose)
     paidUntil : Time
       -- ^ Trial is advanced through this time (extends by one period with each processing)
+    recipientProvider : Party
+      -- ^ Provider party for recipient's Amulet transfers (set during acceptance)
     config : SubscriptionConfig
       -- ^ Subscription configuration (without freeTrialEndsAt field)
     context : ProcessorContext
-      -- ^ Processor and DSO context (assigned by factory)
+      -- ^ Processor and DSO context (includes processorProvider, set during processor approval)
   where
     signatory config.subscriber, config.recipient
     observer context.processor
@@ -123,8 +124,12 @@ template FreeTrialSubscription
       with
         processingPeriod : RelTime
           -- ^ Duration to advance the free trial (will be capped to prepayWindow, remaining trial time, and expiration)
-        featuredAppRights : [(Party, ContractId FeaturedAppRightApi.FeaturedAppRight)]
-          -- ^ List of (party, FeaturedAppRight) pairs to generate activity markers for (can be empty)
+        processorProvider : Party
+          -- ^ Provider party for processor's activity markers (passed by processor)
+        recipientFeaturedAppRight : Optional (ContractId FeaturedAppRightApi.FeaturedAppRight)
+          -- ^ Optional FeaturedAppRight for the recipient to generate activity markers
+        processorFeaturedAppRight : Optional (ContractId FeaturedAppRightApi.FeaturedAppRight)
+          -- ^ Optional FeaturedAppRight for the processor to generate activity markers
       controller context.processor
       do
         -- Get current ledger time
@@ -165,9 +170,14 @@ template FreeTrialSubscription
         -- Determine if free trial ends with this processing
         let trialEnded = newPaidUntil >= trialEndsAt
         
-        -- Create activity markers for all provided FeaturedAppRights
-        forA_ featuredAppRights $ \(party, farCid) -> do
-          createActivityMarker party farCid
+        -- Create activity markers for provided FeaturedAppRights
+        case recipientFeaturedAppRight of
+          Some farCid -> createActivityMarker recipientProvider farCid
+          None -> pure ()
+        
+        case processorFeaturedAppRight of
+          Some farCid -> createActivityMarker processorProvider farCid
+          None -> pure ()
         
         -- Return appropriate result based on whether trial ended
         if trialEnded
@@ -175,7 +185,9 @@ template FreeTrialSubscription
             -- Trial ended - create PaidSubscription
             paidSubscriptionCid <- create PaidSubscription with
               paidUntil = newPaidUntil
-              ..
+              recipientProvider
+              config
+              context
             pure FreeTrialSubscription_ProcessResult with
               result = Right paidSubscriptionCid
           else do
@@ -298,14 +310,6 @@ template FreeTrialSubscription
           (getAmount newProcessorPaymentPerDay <= getAmount oldAmount)
         create this with config = config with processorPaymentPerDay = newProcessorPaymentPerDay
 
-    -- | Recipient updates their provider
-    choice FreeTrialSubscription_RecipientUpdateProvider : ContractId FreeTrialSubscription
-      with
-        newRecipientProvider : Party
-      controller config.recipient
-      do
-        create this with config = config with recipientProvider = newRecipientProvider
-
     -- | Subscriber cancels (instant - no prepaid amount in trial)
     choice FreeTrialSubscription_CancelBySubscriber : ()
       controller config.subscriber
@@ -320,6 +324,14 @@ template FreeTrialSubscription
     choice FreeTrialSubscription_CancelByProcessor : ()
       controller context.processor
       do pure ()
+
+    -- | Recipient updates their provider
+    choice FreeTrialSubscription_RecipientUpdateProvider : ContractId FreeTrialSubscription
+      with
+        newRecipientProvider : Party
+      controller config.recipient
+      do
+        create this with recipientProvider = newRecipientProvider
 
 -- | Result of processing a free trial period
 data FreeTrialSubscription_ProcessResult = FreeTrialSubscription_ProcessResult
@@ -342,10 +354,12 @@ template PaidSubscription
   with
     paidUntil : Time
       -- ^ Subscription is paid through this time (extends by one period with each payment)
+    recipientProvider : Party
+      -- ^ Provider party for recipient's Amulet transfers (set during acceptance)
     config : SubscriptionConfig
       -- ^ Subscription configuration (without freeTrialEndsAt field)
     context : ProcessorContext
-      -- ^ Processor and DSO context (assigned by factory)
+      -- ^ Processor and DSO context (set during processor approval)
   where
     signatory config.subscriber, config.recipient
     observer context.processor
@@ -358,6 +372,8 @@ template PaidSubscription
       with
         processingPeriod : RelTime
         paymentCtx : PaymentContext
+        processorProvider : Party
+          -- ^ Provider party for processor's Amulet transfers (passed by processor)
         recipientFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
           -- ^ Optional FeaturedAppRight for the recipient payment to generate AppRewardCoupons
         processorFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
@@ -390,7 +406,7 @@ template PaidSubscription
         recipientTransferResult <- paymentTo PaymentRequest with
           sender = config.subscriber
           receiver = config.recipient
-          provider = if processorPaymentIsZero then context.processor else config.recipientProvider
+          provider = if processorPaymentIsZero then processorProvider else recipientProvider
           amount = amountForThisPeriod
           featuredAppRight = if processorPaymentIsZero then processorFeaturedAppRight else recipientFeaturedAppRight
           expectedDso = context.dso
@@ -407,7 +423,7 @@ template PaidSubscription
             result <- paymentTo PaymentRequest with
               sender = config.subscriber
               receiver = context.processor
-              provider = context.processor
+              provider = processorProvider
               amount = feeAmountForThisPeriod
               featuredAppRight = processorFeaturedAppRight
               expectedDso = context.dso
@@ -512,7 +528,7 @@ template PaidSubscription
         newRecipientProvider : Party
       controller config.recipient
       do
-        create this with config = config with recipientProvider = newRecipientProvider
+        create this with recipientProvider = newRecipientProvider
 
     -- | Subscriber cancels
     choice PaidSubscription_CancelBySubscriber : Optional (ContractId Prepaid.PrepaidCanceledSubscription)
@@ -530,59 +546,20 @@ template PaidSubscription
           else pure None
 
     -- | Recipient cancels
-    choice PaidSubscription_CancelByRecipient : PaidSubscription_CancelByRecipientResult
-      with
-        refund : Bool
-          -- ^ If True and there is prepaid time, refund the subscriber for unused time
-        refundPaymentCtx : Optional PaymentContext
-          -- ^ Payment context required if refund is True and paidUntil > now
+    -- Creates PrepaidCanceledSubscription if there's remaining prepaid time
+    choice PaidSubscription_CancelByRecipient : Optional (ContractId Prepaid.PrepaidCanceledSubscription)
       controller config.recipient
       do
         now <- getTime
         if paidUntil > now
           then do
-            if refund
-              then do
-                -- Refund the prepaid amount
-                assertMsg "Payment context required for refund" (isSome refundPaymentCtx)
-                let paymentCtx = fromSome refundPaymentCtx
-                
-                openRound <- exercise paymentCtx.openMiningRoundCid (OpenMiningRound_Fetch with p = context.processor)
-                let amuletPrice = openRound.amuletPrice
-                assertMsg "USD to Amulet conversion rate must be positive" (amuletPrice > 0.0)
-                
-                -- Calculate refund for the unused period
-                let unusedPeriod = subTime paidUntil now
-                let refundAmount = calculateAmountForPeriod config.recipientPaymentPerDay unusedPeriod amuletPrice
-                
-                -- Transfer refund from recipient back to subscriber
-                refundResult <- paymentTo PaymentRequest with
-                  sender = config.recipient
-                  receiver = config.subscriber
-                  provider = config.subscriber
-                  amount = refundAmount
-                  featuredAppRight = None
-                  expectedDso = context.dso
-                  amuletInputs = paymentCtx.amuletInputs
-                  amuletRulesCid = paymentCtx.amuletRulesCid
-                  openMiningRoundCid = paymentCtx.openMiningRoundCid
-                
-                -- Archive immediately (no prepaid period remains)
-                pure PaidSubscription_CancelByRecipientResult with
-                  result = CancelWithRefund refundResult
-              else do
-                -- No refund - keep as prepaid canceled subscription
-                prepaidCid <- create Prepaid.PrepaidCanceledSubscription with
-                  paidUntil = paidUntil
-                  canceledBy = config.recipient
-                  canceledAt = now
-                  ..
-                pure PaidSubscription_CancelByRecipientResult with
-                  result = CancelWithPrepaid prepaidCid
-          else
-            -- No prepaid time, archive immediately
-            pure PaidSubscription_CancelByRecipientResult with
-              result = CancelImmediate
+            prepaidCid <- create Prepaid.PrepaidCanceledSubscription with
+              paidUntil = paidUntil
+              canceledBy = config.recipient
+              canceledAt = now
+              ..
+            pure (Some prepaidCid)
+          else pure None
 
     -- | Processor cancels
     choice PaidSubscription_CancelByProcessor : Optional (ContractId Prepaid.PrepaidCanceledSubscription)
@@ -605,21 +582,5 @@ data PaidSubscription_ProcessPaymentResult = PaidSubscription_ProcessPaymentResu
     subscriptionCid : ContractId PaidSubscription
     recipientTransferResult : TransferResult
     processorTransferResult : Optional TransferResult
-  deriving (Eq, Show)
-
--- | Result variants for recipient cancellation
-data CancelByRecipientResult
-  = CancelWithRefund TransferResult
-      -- ^ Canceled with refund - subscription archived immediately
-  | CancelWithPrepaid (ContractId Prepaid.PrepaidCanceledSubscription)
-      -- ^ Canceled without refund - remains as PrepaidCanceledSubscription until expiry
-  | CancelImmediate
-      -- ^ Canceled when no prepaid time remained - archived immediately
-  deriving (Eq, Show)
-
--- | Result of recipient canceling a subscription
-data PaidSubscription_CancelByRecipientResult = PaidSubscription_CancelByRecipientResult
-  with
-    result : CancelByRecipientResult
   deriving (Eq, Show)
 

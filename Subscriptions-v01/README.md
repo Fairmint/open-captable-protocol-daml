@@ -1,4 +1,4 @@
-# Subscriptions-v01
+# Subscriptions
 
 A general-purpose DAML package for recurring payment subscriptions using Splice Amulet.
 
@@ -15,7 +15,9 @@ Three-party subscription system with flexible payment processing:
 - Free trials that transition into paid subscriptions
   - Optionally generating FeaturedAppActivityMarkers during the trial
 - Pay-as-you-go (no lockup required)
-- Prepay window ensures zero downtime—gives subscribers buffer time to reup balance before subscription lapses
+- Prepay windows
+   - ensures zero downtime by giving subscribers buffer time to reup balance before subscription lapses
+   - optionally refunded on cancellation
 - Dynamic payment and expiration updates
 
 ## Architecture
@@ -32,8 +34,8 @@ amountForPeriod = (amountPerDay × periodDuration) / 1 day
 **Payment Model:** Pay-as-you-go where subscriber provides Amulet inputs each period (not locked upfront). Receivers pay transfer fees for predictable subscriber billing.
 
 **Processor Payment Modes:**
-- **Standard mode** (`processorPaymentPerDay > 0`): Processor receives a separate payment and AppRewardCoupon via their FeaturedAppRight. Recipient receives payment and AppRewardCoupon via their `recipientProvider` (which can be updated by the recipient at any time).
-- **Zero-fee mode** (`processorPaymentPerDay = 0`): Processor provides the AppRewardCoupon for the recipient payment via their FeaturedAppRight (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion.
+- **Standard mode** (`processorPaymentPerDay > 0`): Processor receives a separate payment and AppRewardCoupon via their provider (passed to Process choice). Recipient receives payment and AppRewardCoupon via their provider (set during acceptance, can be updated anytime).
+- **Zero-fee mode** (`processorPaymentPerDay = 0`): Processor provides the AppRewardCoupon for the recipient payment via their provider (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion.
 
 **Prepay Window:** Determines how far ahead payments can extend `paidUntil` beyond the current time, providing zero-downtime insurance:
 - **Purpose:** Gives subscribers a buffer period to top up their balance before service actually lapses, ensuring continuous service
@@ -255,7 +257,6 @@ proposalCid <- submit subscriber do
   exerciseCmd factoryCid SubscriptionFactory_CreateSubscriberProposal with
     config = SubscriptionConfig with
       subscriber, recipient
-      recipientProvider = recipient
       recipientPaymentPerDay = AmuletAmount 10.0
       processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
@@ -267,9 +268,10 @@ proposalCid <- submit subscriber do
 approvedCid <- submit processor do
   exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
 
--- 3. Recipient accepts
+-- 3. Recipient accepts (providing their provider)
 subscriptionCid <- submit recipient do
-  exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept
+  exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+    recipientProvider = recipient
 
 -- 4. Process payments periodically (standard mode - both parties get AppRewardCoupons)
 result <- submit processor do
@@ -278,6 +280,7 @@ result <- submit processor do
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
+    processorProvider = processor  -- Processor passes their own provider
     recipientFeaturedAppRight = Some recipientFARCid
     processorFeaturedAppRight = Some processorFARCid
 
@@ -288,6 +291,7 @@ resultZeroFee <- submit processor do
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
+    processorProvider = processor  -- Processor passes their own provider
     recipientFeaturedAppRight = None  -- Must be None when processorPaymentPerDay is 0
     processorFeaturedAppRight = Some processorFARCid
 
@@ -296,9 +300,19 @@ updatedSubscriptionCid <- submit recipient do
   exerciseCmd subscriptionCid PaidSubscription_RecipientUpdateProvider with
     newRecipientProvider = newProviderParty
 
--- 6. Cancel anytime
-() <- submit subscriber do
+-- 6. Cancel anytime (creates PrepaidCanceledSubscription if prepaid time remains)
+maybePrepaidCid <- submit subscriber do
   exerciseCmd subscriptionCid PaidSubscription_CancelBySubscriber
+
+-- 6b. If prepaid time remains and recipient wants to refund immediately
+case maybePrepaidCid of
+  Some prepaidCid -> do
+    refundResult <- submit recipient do
+      exerciseCmd prepaidCid PrepaidCanceledSubscription_RecipientRefundAndArchive with
+        paymentContext = PaymentContext with
+          amuletInputs = recipientAmuletCids
+          amuletRulesCid, openMiningRoundCid
+  None -> pure ()  -- No prepaid time, already archived
 ```
 
 ### Recipient-Initiated Flow
@@ -309,7 +323,6 @@ proposalCid <- submit recipient do
   exerciseCmd factoryCid SubscriptionFactory_CreateRecipientProposal with
     config = SubscriptionConfig with
       subscriber, recipient
-      recipientProvider = recipient
       recipientPaymentPerDay = AmuletAmount 10.0
       processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
@@ -321,9 +334,10 @@ proposalCid <- submit recipient do
 approvedCid <- submit processor do
   exerciseCmd proposalCid RecipientInitiatedSubscriptionProposal_ProcessorApprove
 
--- 3. Subscriber accepts
+-- 3. Subscriber accepts (recipient's provider can be set here or during proposal)
 subscriptionCid <- submit subscriber do
-  exerciseCmd approvedCid ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept
+  exerciseCmd approvedCid ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept with
+    recipientProvider = recipient
 
 -- 4. Process payments periodically (standard mode - same as subscriber-initiated)
 result <- submit processor do
@@ -345,14 +359,23 @@ resultZeroFee <- submit processor do
     recipientFeaturedAppRight = None  -- Must be None when processorPaymentPerDay is 0
     processorFeaturedAppRight = Some processorFARCid
 
--- 5. Cancel anytime
--- Recipient can choose to refund prepaid amount when canceling
-result <- submit recipient do
-  exerciseCmd subscriptionCid PaidSubscription_CancelByRecipient with
-    refund = True  -- Refund prepaid amount to subscriber
-    refundPaymentCtx = Some PaymentContext with
-      amuletInputs = recipientAmuletCids
-      amuletRulesCid, openMiningRoundCid
+-- 5. Cancel anytime (creates PrepaidCanceledSubscription if prepaid time remains)
+maybePrepaidCid <- submit recipient do
+  exerciseCmd subscriptionCid PaidSubscription_CancelByRecipient
+
+-- 5b. If prepaid time remains, recipient can optionally refund immediately
+case maybePrepaidCid of
+  Some prepaidCid -> do
+    -- Option A: Let prepaid period expire naturally (subscriber keeps access)
+    -- Any party can archive once paidUntil passes
+    
+    -- Option B: Refund and archive immediately
+    refundResult <- submit recipient do
+      exerciseCmd prepaidCid PrepaidCanceledSubscription_RecipientRefundAndArchive with
+        paymentContext = PaymentContext with
+          amuletInputs = recipientAmuletCids
+          amuletRulesCid, openMiningRoundCid
+  None -> pure ()  -- No prepaid time, already archived
 ```
 
 ## Dependencies
@@ -361,21 +384,21 @@ result <- submit recipient do
 - `splice-api-featured-app-v1` - FeaturedAppRight integration for rewards
 - `Shared-v01` - Shared helpers for FeaturedAppActivityMarker creation
 
-## Recipient Cancellation with Optional Refund
+## Cancellation with Prepaid Time
 
-When a recipient cancels a subscription that has prepaid time remaining (`paidUntil > now`), they have two options:
+When any party cancels a subscription that has prepaid time remaining (`paidUntil > now`), a `PrepaidCanceledSubscription` contract is created. The recipient then has two options:
 
-### Option 1: Cancel with Refund (`refund = True`)
+### Option 1: Let Prepaid Period Expire
+- Subscription remains in `PrepaidCanceledSubscription` state until `paidUntil` has passed
+- Subscriber keeps access for the time they've already paid for
+- Any party can archive the contract once `paidUntil` is reached
+
+### Option 2: Issue Refund and Archive Immediately
+- Recipient can call `PrepaidCanceledSubscription_RecipientRefundAndArchive`
 - Recipient provides Amulet inputs to refund the unused prepaid amount
-- Refund amount calculated as: `(paidUntil - now) × amountPerDay`
+- Refund amount calculated as: `(paidUntil - now) × recipientPaymentPerDay`
 - Subscription is archived immediately after refund transfer
 - Provides good subscriber experience and maintains trust
-
-### Option 2: Cancel without Refund (`refund = False`)
-- Creates a `PrepaidCanceledSubscription` contract
-- Subscription remains active until `paidUntil` has passed
-- Any party can then archive the contract
-- Subscriber keeps access for the time they've already paid for
 
 **Note:** Subscriber and processor cancellations always create `PrepaidCanceledSubscription` (no refund option). Only recipients have the refund option since they're best positioned to provide customer service.
 
@@ -405,3 +428,50 @@ The subscriber can pause or cancel (intentionally or not) simply by having insuf
 - Subscribers might unintentionally let subscriptions lapse
 
 **Recommendation:** The debit card model provides the best subscriber experience with the lowest friction. Recipients should notify subscribers when payments fail and design systems to handle payment failures gracefully.
+
+## Future Improvements
+
+### Change Proposal Contracts
+
+**Current State:** Subscription changes can only be initiated by the party with authorization for that change:
+- Subscriber can increase payments (both recipient and processor)
+- Recipient can decrease their own payment amount
+- Processor can decrease their own payment amount
+- Subscriber can extend expiration date
+- Recipient/Processor can decrease expiration date
+
+**Limitation:** If the recipient wants to increase their payment (e.g., price increase), they must communicate this off-chain and wait for the subscriber to take action. Similarly, if the processor wants the subscriber to extend the expiration, they must request it through other channels.
+
+**Future Enhancement:** Introduce change proposal contracts that allow one party to propose a change and the other party to accept or reject it on-chain.
+
+**Example Flow:**
+```daml
+-- Recipient proposes payment increase
+proposalCid <- submit recipient do
+  createCmd SubscriptionChangeProposal with
+    subscriptionCid = activeSubscriptionCid
+    proposer = recipient
+    newRecipientPaymentPerDay = AmuletAmount 15.0  -- up from 10.0
+    reason = Some "Annual price adjustment"
+
+-- Subscriber reviews and accepts
+updatedSubscriptionCid <- submit subscriber do
+  exerciseCmd proposalCid SubscriptionChangeProposal_SubscriberAccept
+
+-- Or subscriber rejects
+() <- submit subscriber do
+  exerciseCmd proposalCid SubscriptionChangeProposal_SubscriberReject
+```
+
+**Benefits:**
+- Provides on-chain record of change requests and responses
+- Enables async negotiation without real-time communication
+- Creates audit trail of price changes and other modifications
+- Allows parties to communicate intent clearly through contract state
+- Supports workflows where one party proposes and another approves
+
+**Implementation Considerations:**
+- Each change type (payment increase, expiration extension, etc.) may need its own proposal contract
+- Proposals should have expiration times to prevent stale proposals
+- Need to handle the case where the underlying subscription is modified or canceled while proposal is pending
+- Consider allowing counter-proposals for negotiation scenarios

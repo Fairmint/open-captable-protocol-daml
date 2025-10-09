@@ -1,6 +1,11 @@
 module Fairmint.Subscriptions.PrepaidCanceledSubscription where
 
-import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
+import DA.Time (subTime, convertRelTimeToMicroseconds, RelTime)
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round (OpenMiningRound, OpenMiningRound_Fetch(..))
+import qualified DA.Map as Map
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), SubscriptionAmount(..), validateSubscriptionConfig)
 
 -- | Prepaid canceled subscription contract
 -- 
@@ -23,10 +28,12 @@ template PrepaidCanceledSubscription
       -- ^ The party who canceled the subscription
     canceledAt : Time
       -- ^ The time when the subscription was canceled
+    recipientProvider : Party
+      -- ^ Provider party for recipient's Amulet transfers (preserved from active subscription)
     config : SubscriptionConfig
       -- ^ Subscription configuration (without freeTrialEndsAt field)
     context : ProcessorContext
-      -- ^ Processor and DSO context (assigned by factory)
+      -- ^ Processor and DSO context (set during processor approval)
   where
     signatory config.subscriber, config.recipient
     observer context.processor
@@ -54,4 +61,80 @@ template PrepaidCanceledSubscription
           (now > paidUntil)
         
         pure ()
+
+    -- | Recipient issues refund for unused prepaid time and archives immediately
+    choice PrepaidCanceledSubscription_RecipientRefundAndArchive : TransferResult
+      with
+        paymentContext : PaymentContext
+          -- ^ Payment context with recipient's Amulet inputs for refund
+      controller config.recipient
+      do
+        now <- getTime
+        
+        -- Validate there is still prepaid time remaining
+        assertMsg "No prepaid time remaining - use Archive instead" (paidUntil > now)
+        
+        -- Get current amulet price
+        openRound <- exercise paymentContext.openMiningRoundCid (OpenMiningRound_Fetch with p = context.processor)
+        let amuletPrice = openRound.amuletPrice
+        assertMsg "USD to Amulet conversion rate must be positive" (amuletPrice > 0.0)
+        assertMsg "Must provide at least one amulet input for refund" (not (null paymentContext.amuletInputs))
+        
+        -- Calculate refund amount for the unused period
+        let unusedPeriod = subTime paidUntil now
+        let refundAmount = calculateAmountForPeriod config.recipientPaymentPerDay unusedPeriod amuletPrice
+        
+        -- Transfer refund from recipient back to subscriber
+        let transfer = Transfer with
+              sender = config.recipient
+              provider = config.subscriber
+              inputs = map InputAmulet paymentContext.amuletInputs
+              outputs = [TransferOutput with
+                receiver = config.subscriber
+                receiverFeeRatio = 1.0
+                amount = refundAmount
+                lock = None]
+              beneficiaries = None
+        
+        let transferContext = TransferContext with
+              openMiningRound = paymentContext.openMiningRoundCid
+              featuredAppRight = None
+              issuingMiningRounds = Map.empty
+              validatorRights = Map.empty
+        
+        refundResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = transfer
+          context = transferContext
+          expectedDso = Some context.dso
+        
+        -- Archive immediately after refund
+        pure refundResult
+
+-- | Payment context containing Amulet transfer dependencies
+data PaymentContext = PaymentContext
+  with
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Convert a per-day rate to the actual amount for the processing period
+calculateAmountForPeriod : SubscriptionAmount -> RelTime -> Decimal -> Decimal
+calculateAmountForPeriod amountPerDay processingPeriod usdToAmuletRate =
+  let
+    -- Convert to Amulet first
+    dailyAmountInAmulet = case amountPerDay of
+      AmuletAmount amt -> amt
+      USDAmount usdAmt -> usdAmt * usdToAmuletRate
+    
+    -- One day in microseconds (24 * 60 * 60 * 1000000)
+    oneDayMicros = 86400000000
+    
+    -- Get processing period in microseconds
+    periodMicros = convertRelTimeToMicroseconds processingPeriod
+    
+    -- Calculate pro-rata amount: (dailyRate * periodDays)
+    periodDays = intToDecimal periodMicros / intToDecimal oneDayMicros
+  in
+    dailyAmountInAmulet * periodDays
 
