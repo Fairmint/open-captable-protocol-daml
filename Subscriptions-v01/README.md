@@ -36,21 +36,23 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
   - Can be increased by the subscriber and decreased by the recipient
 
 **Duration:**
-- **`expiresAt`**: When the paid subscription terminates (can be far in the future for ongoing subscriptions)
+- **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
   - Can only be changed by the subscriber (to any time)
-  - Can be set to the free trial end time for an opt-in paid subscriptions after the trial ends
-- **`freeTrialEndsAt`**: Optional trial period where no payment is required
-  - Can be extended by the recipient or reduced by the subscriber.
-  - Recipients can start a new period trial anytime.
+- **Free trial**: Optional trial period (specified at proposal creation) where no payment is required
+  - Managed by `FreeTrialSubscription` template with `trialEndsAt` field
+  - Can be extended by the recipient or reduced by the subscriber
+  - Recipients can convert a paid subscription back to a free trial anytime
+  - Automatically converts to `PaidSubscription` when trial ends
 
 **Other:**
-- **`reason`**: Optional human-readable description of what the subscription is for. Can include both a user-friendly description and an app-specific identifier (e.g., "Premium membership", "Premium tier access - app_id:123"). The app ID allows systems to connect subscriptions programmatically.
-  - Changes require approval from both subscriber and recipient (via propose/accept pattern)
+- **`reason`**: Optional human-readable description of the subscription purpose (e.g., "Premium membership", "Premium tier - app_id:123")
+  - Changes require both subscriber and recipient approval via reason update proposal contracts
 
 **Key Principles:**
 - Terms are agreed upon during the proposal/acceptance flow
 - Any party can cancel at any time
-- Terms are only changable by the party that is negatively impacted by the change, e.g. increasing payments may only be done by the subscriber. New contracts may be introduced to enable on-chain proposals (see appendix).
+- Terms can only be changed by the party negatively impacted (e.g., subscriber increases payments, recipient decreases their payment)
+- On-chain proposals exist for changes requiring both parties' approval (e.g., reason updates)
 
 ## Architecture
 
@@ -68,27 +70,48 @@ It's pay-as-you-go where transfer fees are paid by the recipient and processor, 
 **Processor Payments:**
 The processor can use any period length, so long as it does not exceed the prepay window (when the window is 0, payments may only advance up until `now`).
 
-- **Processor Fees** (`processorPaymentPerDay > 0`): The processor receives a separate payment and a (featured) AppRewardCoupon issued to their provider. Recipient receives payment and a (featured) AppRewardCoupon issued to their provider.
-- **Zero-fee mode** (`processorPaymentPerDay = 0`): The processor receives a (featured) AppRewardCoupon for the recipient payment by speciying their provider (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion since they cannot receive rewards. Some compensation is necessary to offset the processor's traffic costs.
+- **Standard mode** (`processorPaymentPerDay > 0`): Processor and recipient each receive a separate payment and AppRewardCoupon (issued to their respective providers)
+- **Zero-fee mode** (`processorPaymentPerDay = 0`): Recipient receives normal payment and AppRewardCoupon. Processor receives a FeaturedAppActivityMarker (no payment) to offset traffic costs.
 
-**Prepay Window:** Determines how far ahead payments can extend `paidUntil` beyond the current time, providing zero-downtime insurance:
-- **Purpose:** Gives subscribers a buffer period to top up their balance before service actually lapses, ensuring continuous service
-- **Alternative (0 prepay window):** Payments only advance to `<= now`, and recipients set their own tolerance buffer before canceling service for non-payment
-    - **Small prepay windows:** When the prepay window is less than or equal to the processor's period, the subscription's `paidUntil` will often be in the recent past instead of always being in the future (as one might expect with larger prepay windows). This is because processing can only occur after `paidUntil` has passed, and the small prepay window limits how far forward each payment advances.
-- **Cancellation with prepaid time:** When canceling a subscription with remaining prepaid time, recipients can either (1) refund the overpayment, or (2) allow service to continue until the end of the paid period
-- **Limits:** `paidUntil` is always capped to the earliest of: `(now + prepayWindow)` or `expiresAt`
+**Prepay Window:** Controls how far ahead `paidUntil` can extend beyond current time:
+- **Large window (e.g., 7 days):** Creates buffer before service interruption; `paidUntil` stays ahead of now
+- **Zero window:** Payments only cover past usage (`paidUntil ≤ now`); recipient manages grace period
+- **Small window (≤ processing period):** `paidUntil` may trail current time since processing must wait until period elapses
+- **Limits:** `paidUntil` capped at `min(now + prepayWindow, expiresAt)`
+
+## Contract Templates
+
+The subscription system uses separate templates for each lifecycle state:
+
+**Proposal Flow:**
+- `SubscriptionFactory` - Creates proposals with processor/DSO context
+- `SubscriberSubscriptionProposal` - Subscriber initiates, awaits processor approval
+- `RecipientSubscriptionProposal` - Recipient initiates, awaits processor approval  
+- `ProcessorApprovedSubscriptionProposal` - Awaits recipient acceptance
+- `ProcessorApprovedRecipientInitiatedSubscriptionProposal` - Awaits subscriber acceptance
+
+**Active Subscriptions:**
+- `FreeTrialSubscription` - Active trial period (no payments, creates activity markers)
+- `PaidSubscription` - Active paid subscription (processes payments)
+- `PrepaidCanceledSubscription` - Canceled with remaining prepaid time
+
+**Configuration Updates:**
+- `ReasonUpdateProposal` - Update reason field (requires both parties, works for either subscription type)
 
 ## Flow Diagrams
 
-**Process Overview:**
+**Lifecycle Overview:**
 
-1. Subscription terms are proposed by the subscriber or recipient
-2. The processor approves the terms (confirming things like our fee is sufficient)
-3. The other party accepts to activate the subscription
-4. If in a free trial, process & create a FeaturedAppActivityMarker. Loop each period until the trial ends.
-5. Use subscriber funds to pay the recipient and processor (w/ app rewards). Loop each period until the subscription expires.
+1. **Proposal:** Subscriber or recipient proposes terms via `SubscriptionFactory`
+2. **Approval:** Processor validates and approves (e.g., confirms fee structure)
+3. **Acceptance:** Other party accepts, creating either `FreeTrialSubscription` or `PaidSubscription`
+4. **Processing:**
+   - Free trial: Processor advances `paidUntil` and creates activity markers (no payments)
+   - Paid: Processor executes transfers from subscriber to recipient and processor (with app rewards)
+5. **Lifecycle:** Continues until expiration or cancellation by any party
+6. **Transitions:** Trial converts to paid when `trialEndsAt` reached; paid subscription can convert back to trial
 
-**Note:** Any of the 3 parties can cancel at any time.
+**Cancellation:** Any party can cancel anytime. Paid subscriptions with `paidUntil > now` create `PrepaidCanceledSubscription`.
 
 ## Contract Lifecycle Diagrams
 
@@ -151,15 +174,18 @@ flowchart LR
 flowchart LR
     PS[Paid Subscription]
     PS -->|"process (processor)"| Marker[Transfer & AppRewardCoupon<br/>created]
-    Marker --> Choice{subscription<br/>expired?}
-    Choice -.->|no| PS
-    Choice -->|yes| End(( ))
-    PS -->|"cancel (any party)"| End(( ))
+    Marker --> Choice1{subscription<br/>expired?}
+    Choice1 -.->|no| PS
+    Choice1 -->|yes| End1(( ))
+    PS -->|"cancel (any party)"| Choice2{paidUntil<br/>> now?}
+    Choice2 -->|yes| PC[Prepaid Canceled]
+    Choice2 -->|no| End2(( ))
+    PC -->|"wait or refund"| End3(( ))
     
     classDef active fill:#e6f3ff,stroke:#666
-    classDef ended fill:#f5f5f5,stroke:#999
-    class PS,FT active
-    class PC ended
+    classDef canceled fill:#fff3e0,stroke:#666
+    class PS active
+    class PC canceled
 ```
 
 ## Usage Example
@@ -174,49 +200,67 @@ proposalCid <- submit subscriber do
       processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
       expiresAt = farFutureTime
-      freeTrialEndsAt = Some trialEndTime
       reason = Some "Premium membership"
+    freeTrialEndsAt = Some trialEndTime  -- Separate parameter, not part of config
 
 -- 2. Processor approves
 approvedCid <- submit processor do
-  exerciseCmd proposalCid SubscriptionProposal_ProcessorApprove
+  exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
 
 -- 3. Recipient accepts (providing their provider)
-subscriptionCid <- submit recipient do
+acceptResult <- submit recipient do
   exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
     recipientProvider = recipient
 
--- 4. Process payments periodically (standard mode - both parties get AppRewardCoupons)
-result <- submit processor do
-  exerciseCmd subscriptionCid Subscription_ProcessPayment with
+-- Result is Either: Left FreeTrialSubscription | Right PaidSubscription
+-- For this example, we have a trial so it's Left freeTrialCid
+
+-- 4. Process trial period (creates activity markers, no payments)
+trialResult <- submit processor do
+  exerciseCmd freeTrialCid FreeTrialSubscription_Process with
+    processingPeriod = days 1
+    processorProvider = processor
+    recipientFeaturedAppRight = Some recipientFARCid
+    processorFeaturedAppRight = Some processorFARCid
+
+-- When trial ends, trialResult.result is Right paidSubscriptionCid
+
+-- 5. Process payments periodically (after trial ends)
+-- Standard mode with processor fees:
+paymentResult <- submit processor do
+  exerciseCmd paidSubscriptionCid PaidSubscription_ProcessPayment with
     processingPeriod = days 1
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
-    processorProvider = processor  -- Processor passes their own provider
+    processorProvider = processor
     recipientFeaturedAppRight = Some recipientFARCid
     processorFeaturedAppRight = Some processorFARCid
+    processorActivityMarkerFAR = None  -- Only used in zero-fee mode
+
+-- Zero-fee mode (processorPaymentPerDay = 0):
+-- Set processorFeaturedAppRight = None
+-- Set processorActivityMarkerFAR = Some activityMarkerFARCid
 ```
 
 ## Appendix
 
 ### Cancellation with Prepaid Time
 
-When any party cancels a subscription that has prepaid time remaining (`paidUntil > now`), a `PrepaidCanceledSubscription` contract is created. The recipient then has two options:
+When any party cancels a `PaidSubscription` with `paidUntil > now`, a `PrepaidCanceledSubscription` contract is created, tracking who canceled and when. The recipient then chooses:
 
-#### Option 1: Let Prepaid Period Expire
-- Subscription remains in `PrepaidCanceledSubscription` state until `paidUntil` has passed
-- Subscriber keeps access for the time they've already paid for
-- Any party can archive the contract once `paidUntil` is reached
+**Option 1: Honor Prepaid Period**
+- Subscriber retains access until `paidUntil`
+- Any party archives once `paidUntil` passes
+- Common for content services (e.g., streaming platforms)
 
-#### Option 2: Issue Refund and Archive Immediately
-- Recipient can call `PrepaidCanceledSubscription_RecipientRefundAndArchive`
-- Recipient provides Amulet inputs to refund the unused prepaid amount
-- Refund amount calculated as: `(paidUntil - now) × recipientPaymentPerDay`
-- Subscription is archived immediately after refund transfer
-- Provides good subscriber experience and maintains trust
+**Option 2: Refund and Archive Immediately**  
+- Recipient calls `PrepaidCanceledSubscription_RecipientRefundAndArchive`
+- Refund: `(paidUntil - now) × (recipientPaymentPerDay + processorPaymentPerDay)`
+- Contract archives after refund transfer
+- Common for usage-based services (e.g., insurance, utilities)
 
-Both options are supported since it depends on the recipient's business model. e.g. Netflix would prefer option 1 but may use option 2 in response to a customer call while State Farm would use option 2 to refund partial payments.
+The choice depends on the recipient's business model and customer relationship.
 
 ### Tradeoff: LockedAmulets
 
@@ -231,7 +275,7 @@ The `prepayWindow` parameter allows payments to advance up to a specified durati
 
 **Why not use LockedAmulets?**
 
-We don't need full `LockedAmulet` security because that would only guarantee that subscription funds can always be refunded on cancellation. However, the current implementation makes refunds discretionary—the recipient can choose whether to refund prepaid amounts after cancellation. Since refunds are a choice (not guaranteed), there's no need to locking funds.
+We don't need full `LockedAmulet` security because that would only guarantee subscription funds can always be refunded on cancellation. However, the current implementation makes refunds discretionary—the recipient chooses whether to refund prepaid amounts. Since refunds aren't guaranteed, there's no need to lock funds.
 
 **Pros:**
 - Easy to start—no large upfront deposit or locked funds required
@@ -259,47 +303,44 @@ The transactional approach trades some efficiency for better UX and works natura
 
 ### Future Improvements
 
-#### Change Proposal Contracts
+#### Additional Change Proposal Contracts
 
-**Current State:** Subscription changes can only be initiated by the party with authorization for that change:
-- Subscriber can increase payments (both recipient and processor)
-- Recipient can decrease their own payment amount
-- Processor can decrease their own payment amount
-- Subscriber can set any future expiration date
+**Implemented:** `ReasonUpdateProposal` allows either party to propose changes to the `reason` field on any subscription type, requiring both parties' approval.
 
-**Limitation:** If the recipient wants to increase their payment (e.g., price increase), they must communicate this off-chain and wait for the subscriber to take action.
+**Current Single-Party Changes:**
+- Subscriber: increase payments, extend expiration, increase prepay window
+- Recipient: decrease their payment, start free trial, decrease prepay window
+- Processor: decrease their payment
 
-**Future Enhancement:** Introduce change proposal contracts that allow one party to propose a change and the other party to accept or reject it on-chain.
+**Future Enhancement:** Additional proposal contracts for changes requiring negotiation:
 
-**Example Flow:**
+**Payment Change Proposals:**
 ```daml
 -- Recipient proposes payment increase
 proposalCid <- submit recipient do
-  createCmd SubscriptionChangeProposal with
-    subscriptionCid = activeSubscriptionCid
-    proposer = recipient
-    newRecipientPaymentPerDay = AmuletAmount 15.0  -- up from 10.0
+  createCmd PaymentIncreaseProposal with
+    paidSubscriptionCid
+    newRecipientPaymentPerDay = AmuletAmount 15.0
+    effectiveDate = futureTime
     reason = Some "Annual price adjustment"
+```
 
--- Subscriber reviews and accepts
-updatedSubscriptionCid <- submit subscriber do
-  exerciseCmd proposalCid SubscriptionChangeProposal_SubscriberAccept
-
--- Or subscriber rejects
-() <- submit subscriber do
-  exerciseCmd proposalCid SubscriptionChangeProposal_SubscriberReject
+**Expiration Extension Proposals:**
+```daml
+-- Recipient proposes extending subscription beyond current expiration
+proposalCid <- submit recipient do
+  createCmd ExpirationExtensionProposal with
+    subscriptionCid
+    newExpiresAt = farFutureTime
+    incentive = Some "Lock in current rate for 2 years"
 ```
 
 **Benefits:**
-- Provides on-chain record of change requests and responses
-- Enables async negotiation without real-time communication
-- Creates audit trail of price changes and other modifications
-- Allows parties to communicate intent clearly through contract state
-- Supports workflows where one party proposes and another approves
+- On-chain audit trail of all change requests
+- Async negotiation without real-time communication
+- Clear intent signaling through contract state
 
-**Implementation Considerations:**
-- Each change type (payment increase, expiration extension, etc.) may need its own proposal contract
-- Proposals should have expiration times to prevent stale proposals
-- Need to handle the case where the underlying subscription is modified or canceled while proposal is pending
-- Consider allowing counter-proposals for negotiation scenarios
-- These could be created in a separate package (or remain in this same package)
+**Implementation Notes:**
+- Each change type needs its own proposal template
+- Should include expiration times for proposals
+- Must handle underlying subscription changes during proposal lifecycle

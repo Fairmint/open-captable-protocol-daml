@@ -330,7 +330,9 @@ template PaidSubscription
         recipientFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
           -- ^ Optional FeaturedAppRight for the recipient payment to generate AppRewardCoupons
         processorFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
-          -- ^ Optional FeaturedAppRight for the processor payment to generate AppRewardCoupons
+          -- ^ Optional FeaturedAppRight for the processor payment to generate AppRewardCoupons (standard mode)
+        processorActivityMarkerFAR : Optional (ContractId FeaturedAppRightApi.FeaturedAppRight)
+          -- ^ Optional FeaturedAppRight for processor activity markers (zero-fee mode only)
       controller context.processor
       do
         now <- getTime
@@ -351,26 +353,30 @@ template PaidSubscription
         let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPaymentPerDay actualPeriod amuletPrice
         let processorPaymentIsZero = feeAmountForThisPeriod == 0.0
         
-        -- When processor payment is 0, processor provides the AppRewardCoupon for recipient payment
-        assertMsg "recipientFeaturedAppRight must be None when processorPaymentPerDay is 0" 
-          (not processorPaymentIsZero || not (isSome recipientFeaturedAppRight))
-        
+        -- Pay recipient (always uses recipient's provider and FeaturedAppRight)
         let amountForThisPeriod = calculateAmountForPeriod config.recipientPaymentPerDay actualPeriod amuletPrice
         recipientTransferResult <- paymentTo PaymentRequest with
           sender = config.subscriber
           receiver = config.recipient
-          provider = if processorPaymentIsZero then processorProvider else recipientProvider
+          provider = recipientProvider
           amount = amountForThisPeriod
-          featuredAppRight = if processorPaymentIsZero then processorFeaturedAppRight else recipientFeaturedAppRight
+          featuredAppRight = recipientFeaturedAppRight
           expectedDso = context.dso
           amuletInputs = paymentCtx.amuletInputs
           amuletRulesCid = paymentCtx.amuletRulesCid
           openMiningRoundCid = paymentCtx.openMiningRoundCid
         
+        -- Handle processor compensation
         processorTransferResult <- 
           if processorPaymentIsZero
-          then pure None
+          then do
+            -- Zero-fee mode: Create activity marker for processor to offset traffic costs
+            case processorActivityMarkerFAR of
+              Some farCid -> createActivityMarker processorProvider farCid
+              None -> pure ()
+            pure None
           else do
+            -- Standard mode: Pay processor fee
             assertMsg "Expected change amulet from recipient transfer" (isSome recipientTransferResult.senderChangeAmulet)
             let changeAmuletCid = fromSome recipientTransferResult.senderChangeAmulet
             result <- paymentTo PaymentRequest with
