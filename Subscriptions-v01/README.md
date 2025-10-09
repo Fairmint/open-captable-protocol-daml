@@ -20,7 +20,9 @@ Three-party subscription system with flexible payment processing:
 
 ## Architecture
 
-**Three-Party Flow:** Subscriber proposes → Processor approves → Recipient accepts → Processor executes periodic payments
+**Three-Party Flow:** Supports both subscriber-initiated and recipient-initiated flows:
+- **Subscriber-initiated:** Subscriber proposes → Processor approves → Recipient accepts → Processor executes periodic payments
+- **Recipient-initiated:** Recipient proposes → Processor approves → Subscriber accepts → Processor executes periodic payments
 
 **Billing Model:** Per-day rates (`amountPerDay`) automatically pro-rated for any processing period:
 ```
@@ -31,7 +33,9 @@ amountForPeriod = (amountPerDay × periodDuration) / 1 day
 
 **Prepay Window:** Limits how far into the future `paidUntil` can be extended. If 0, payments only advance to `now`. Capped to earliest of: (now + prepayWindow), expiresAt, or freeTrialEndsAt.
 
-## Flow Diagram
+## Flow Diagrams
+
+### Subscriber-Initiated Flow
 
 ```mermaid
 sequenceDiagram
@@ -40,7 +44,7 @@ sequenceDiagram
     participant P as Processor (party)
     participant O as Onchain
     
-    S->>O: 1) CreateProposal(config)
+    S->>O: 1) CreateSubscriberProposal(config)
     O-->>S: SubscriptionProposal
     
     P->>O: 2) ProcessorApprove
@@ -62,13 +66,54 @@ sequenceDiagram
     end
 ```
 
+### Recipient-Initiated Flow
+
+```mermaid
+sequenceDiagram
+    participant S as Subscriber (party)
+    participant R as Recipient (party)
+    participant P as Processor (party)
+    participant O as Onchain
+    
+    R->>O: 1) CreateRecipientProposal(config)
+    O-->>R: RecipientInitiatedSubscriptionProposal
+    
+    P->>O: 2) ProcessorApprove
+    O-->>P: ProcessorApprovedRecipientInitiatedSubscriptionProposal
+    
+    S->>O: 3) SubscriberAccept
+    O-->>S: Subscription (Active)
+    
+    loop Free Trial Period
+        P->>O: 4) ProcessFreeTrial
+        O-->>P: Subscription (paidUntil)
+        Note over O: Creates FeaturedAppActivityMarkers
+    end
+    
+    loop Paid Period
+        P->>O: 5) ProcessPayment (with subscriber's Amulet)
+        O-->>P: Subscription (paidUntil)
+        Note over O: Transfers to Recipient + Processor w/ app rewards
+    end
+```
+
 ## Contracts
 
-**SubscriptionFactory** → Creates proposals with consistent processor/DSO assignment
+**SubscriptionFactory** → Creates proposals with consistent processor/DSO assignment (supports both flows)
+
+### Subscriber-Initiated Flow
 
 **SubscriptionProposal** → Subscriber's proposal awaiting processor approval
 
 **ProcessorApprovedSubscriptionProposal** → Processor-approved proposal awaiting recipient acceptance
+
+### Recipient-Initiated Flow
+
+**RecipientInitiatedSubscriptionProposal** → Recipient's proposal awaiting processor approval
+
+**ProcessorApprovedRecipientInitiatedSubscriptionProposal** → Processor-approved proposal awaiting subscriber acceptance
+
+### Shared
 
 **SubscriptionConfig** → Configuration data (parties, payments, prepayWindow, expiration, free trial)
 
@@ -78,12 +123,14 @@ sequenceDiagram
 - Dynamic updates: Increase/decrease payments, extend/decrease expiration, update FeaturedAppRights
 - Cancellation: Any party can cancel unilaterally
 
-## Usage Example
+## Usage Examples
+
+### Subscriber-Initiated Flow
 
 ```daml
--- 1. Create proposal
+-- 1. Create proposal (subscriber initiates)
 proposalCid <- submit subscriber do
-  exerciseCmd factoryCid SubscriptionFactory_CreateProposal with
+  exerciseCmd factoryCid SubscriptionFactory_CreateSubscriberProposal with
     config = SubscriptionConfig with
       subscriber, recipient
       recipientPayment = PaymentConfig with
@@ -116,6 +163,46 @@ result <- submit processor do
 -- 5. Cancel anytime
 () <- submit subscriber do
   exerciseCmd subscriptionCid Subscription_CancelBySubscriber
+```
+
+### Recipient-Initiated Flow
+
+```daml
+-- 1. Create proposal (recipient initiates)
+proposalCid <- submit recipient do
+  exerciseCmd factoryCid SubscriptionFactory_CreateRecipientProposal with
+    config = SubscriptionConfig with
+      subscriber, recipient
+      recipientPayment = PaymentConfig with
+        amountPerDay = AmuletAmount 10.0
+        featuredAppRight = None
+      processorPayment = PaymentConfig with
+        amountPerDay = AmuletAmount 1.0
+        featuredAppRight = None
+      prepayWindow = days 7
+      expiresAt = farFutureTime
+      freeTrialEndsAt = Some trialEndTime
+      reason = Some "Premium membership"
+
+-- 2. Processor approves
+approvedCid <- submit processor do
+  exerciseCmd proposalCid RecipientInitiatedSubscriptionProposal_ProcessorApprove
+
+-- 3. Subscriber accepts
+subscriptionCid <- submit subscriber do
+  exerciseCmd approvedCid ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept
+
+-- 4. Process payments periodically (same as subscriber-initiated)
+result <- submit processor do
+  exerciseCmd subscriptionCid Subscription_ProcessPayment with
+    processingPeriod = days 1
+    paymentCtx = PaymentContext with
+      amuletInputs = subscriberAmuletCids
+      amuletRulesCid, openMiningRoundCid
+
+-- 5. Cancel anytime
+() <- submit recipient do
+  exerciseCmd subscriptionCid Subscription_CancelByRecipient
 ```
 
 ## Dependencies
