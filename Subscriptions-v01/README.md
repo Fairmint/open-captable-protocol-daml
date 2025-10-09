@@ -7,24 +7,19 @@ A general-purpose DAML package for recurring payment subscriptions using Splice 
 Three-party subscription system with flexible payment processing:
 - **Subscriber**: Pays for the subscription (funds are automatically withdrawn each period)
 - **Recipient**: Receives subscription payments
-- **Processor**: Executes transfers each period for a fee
+- **Processor**: Executes transfers each period, optionally for a fee
 
 **Key Features:**
-- Daily billing rates that automatically scale to any period
-  - Supports both Amulet and USD denominations
-- Free trials that transition into paid subscriptions
-  - Optionally generating FeaturedAppActivityMarkers during the trial
-- Pay-as-you-go (no lockup required)
-- Prepay windows
-   - ensures zero downtime by giving subscribers buffer time to reup balance before subscription lapses
-   - optionally refunded on cancellation
-- Dynamic payment and expiration updates
+- Daily billing rates in Amulet or USD
+- Free trials that convert to paid subscriptions
+- Pay-as-you-go (no lockup)
+- Prepay buffer prevents service interruption (refundable)
 
 ## Architecture
 
 **Three-Party Flow:** Supports both subscriber-initiated and recipient-initiated flows:
-- **Subscriber-initiated:** Subscriber proposes → Processor approves → Recipient accepts → Processor executes periodic payments
-- **Recipient-initiated:** Recipient proposes → Processor approves → Subscriber accepts → Processor executes periodic payments
+- **Subscriber-initiated:** Subscriber proposes → Processor approves → Recipient accepts
+- **Recipient-initiated:** Recipient proposes → Processor approves → Subscriber accepts
 
 **Billing Model:** Per-day rates (`amountPerDay`) automatically pro-rated for any processing period:
 ```
