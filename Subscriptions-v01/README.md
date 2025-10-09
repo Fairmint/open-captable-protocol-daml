@@ -5,17 +5,18 @@ A general-purpose DAML package for recurring payment subscriptions using Splice 
 ## Overview
 
 Three-party subscription system with flexible payment processing:
-- **Subscriber**: Pays for the subscription (funds automatically withdrawn each period)
-- **Recipient**: Receives subscription payments (service provider)
-- **Processor**: Executes payment transfers each period (Fairmint)
+- **Subscriber**: Pays for the subscription (funds are automatically withdrawn each period)
+- **Recipient**: Receives subscription payments
+- **Processor**: Executes transfers each period for a fee
 
 **Key Features:**
 - Daily billing rates that automatically scale to any period
-- Free trials that generate FeaturedAppMarkers (for the processor and the recipient if they have a FeaturedAppRight)
-- Pay-as-you-go (no upfront collateral required)
-- Prepay window limits future payment extension
+  - Supports both Amulet and USD denominations
+- Free trials that transition into paid subscriptions
+  - Optionally generating FeaturedAppActivityMarkers during the trial
+- Pay-as-you-go (no lockup required)
+- Prepay window ensures zero downtime—gives subscribers buffer time to reup balance before subscription lapses
 - Dynamic payment and expiration updates
-- Supports both Amulet and USD denominations
 
 ## Architecture
 
@@ -30,7 +31,15 @@ amountForPeriod = (amountPerDay × periodDuration) / 1 day
 
 **Payment Model:** Pay-as-you-go where subscriber provides Amulet inputs each period (not locked upfront). Receivers pay transfer fees for predictable subscriber billing.
 
-**Prepay Window:** Limits how far into the future `paidUntil` can be extended. If 0, payments only advance to `now`. Capped to earliest of: (now + prepayWindow), expiresAt, or freeTrialEndsAt.
+**Processor Payment Modes:**
+- **Standard mode** (`processorPaymentPerDay > 0`): Processor receives a separate payment and AppRewardCoupon via their FeaturedAppRight. Recipient receives payment and AppRewardCoupon via their `recipientProvider` (which can be updated by the recipient at any time).
+- **Zero-fee mode** (`processorPaymentPerDay = 0`): Processor provides the AppRewardCoupon for the recipient payment via their FeaturedAppRight (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion.
+
+**Prepay Window:** Determines how far ahead payments can extend `paidUntil` beyond the current time, providing zero-downtime insurance:
+- **Purpose:** Gives subscribers a buffer period to top up their balance before service actually lapses, ensuring continuous service
+- **Alternative (0 prepay window):** Payments only advance to `now`, and recipients set their own tolerance buffer before canceling service for non-payment
+- **Cancellation with prepaid time:** When canceling a subscription with remaining prepaid time, recipients can either (1) refund the overpayment immediately, or (2) allow service to continue until the end of the paid period
+- **Limits:** `paidUntil` is always capped to the earliest of: `(now + prepayWindow)`, `expiresAt`, or `freeTrialEndsAt`
 
 ## Flow Diagrams
 
@@ -92,9 +101,9 @@ sequenceDiagram
     Note over P,O: After subscription is active (from either flow)
     
     loop Free Trial Period
-        P->>O: 4) ProcessFreeTrial
+        P->>O: 4) ProcessFreeTrial (with array of FeaturedAppRights)
         O-->>P: Subscription (paidUntil)
-        Note over O: Creates FeaturedAppActivityMarkers
+        Note over O: Creates FeaturedAppActivityMarkers for provided rights
     end
     
     loop Paid Period
@@ -110,7 +119,7 @@ sequenceDiagram
 
 ```mermaid
 flowchart LR
-    Start(( )) --> |"propose (subscriber)"|SP[Proposal]
+    Start(( )) --> |"propose (subscriber)"|SP["Proposal<br>(via factory)"]
     SP -->|"approve (processor)"| PA[Processor Approved]
     SP -.->|"reject (any)"| End(( ))
     PA -->|"accept (recipient)"| Choice{with trial?}
@@ -128,7 +137,7 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    Start(( )) --> |"propose (recipient)"| RP[Proposal]
+    Start(( )) --> |"propose (recipient)"| RP["Proposal<br>(via factory)"]
     RP -->|"approve (processor)"| PA[Processor Approved]
     RP -.->|"reject (any)"| End(( ))
     PA -->|"accept (subscriber)"| Choice{with trial?}
@@ -147,26 +156,30 @@ flowchart LR
 ```mermaid
 flowchart LR
     FT[Free Trial]
-    FT -->|Process<br/>processor| Marker[FeaturedAppMarker<br/>created]
+    FT -->|"process (processor)"| Marker[FeaturedAppMarker<br/>created]
     Marker --> Choice{trial<br/>complete?}
-    Choice -->|no| FT2[Free Trial<br/>updated]
+    Choice -->|no| FT
     Choice -->|yes| PS[Paid Subscription]
     FT -->|reduce trial duration<br/>subscriber| FT
     FT -->|extend trial duration<br/>recipient| FT
-    FT -->|update payments<br/>subscriber/recipient/processor| FT
-    FT -->|update expiration<br/>subscriber/recipient/processor| FT
-    FT -.->|cancel<br/>any party| End(( ))
+    FT -->|"update (any)"| FT
+    FT -.->|"cancel (any party)"| End(( ))
     
     classDef active fill:#e6f3ff,stroke:#666
     classDef effect fill:#e8f5e9,stroke:#666
-    class FT,FT2,PS active
+    class FT,PS active
     class Marker effect
 ```
 
-**Additional choices not shown in diagram:**
-- `UpdateRecipientFeaturedAppRight` (recipient updates their own FeaturedAppRight)
-- `UpdateProcessorFeaturedAppRight` (processor updates their own FeaturedAppRight)
-- `ProcessorSetRecipientFeaturedAppRight` (processor sets recipient's FeaturedAppRight)
+**Update choices:**
+- `FreeTrialSubscription_RecipientExtendTrial` (recipient extends trial duration)
+- `FreeTrialSubscription_SubscriberReduceTrial` (subscriber reduces trial duration)
+- `FreeTrialSubscription_SubscriberUpdateExpiration` (subscriber updates expiration)
+- `FreeTrialSubscription_DecreaseExpiration` (recipient or processor decreases expiration)
+- `FreeTrialSubscription_SubscriberIncreasePayments` (subscriber increases payment amounts)
+- `FreeTrialSubscription_RecipientDecreasePayment` (recipient decreases their payment)
+- `FreeTrialSubscription_ProcessorDecreasePayment` (processor decreases their payment)
+- `FreeTrialSubscription_RecipientUpdateProvider` (recipient updates their provider)
 
 ### Paid Subscription Lifecycle
 
@@ -174,8 +187,7 @@ flowchart LR
 flowchart LR
     PS[Paid Subscription]
     PS -->|"process payment (processor)<br/>transfers + AppRewardCoupons"| PS
-    PS -->|update payments<br/>subscriber/recipient/processor| PS
-    PS -->|update expiration<br/>subscriber/recipient/processor| PS
+    PS -->|"update (any)"| PS
     PS -->|start trial<br/>recipient| FT[Free Trial]
     PS -->|cancel with prepaid<br/>any party| PC[Prepaid Canceled]
     PS -.->|cancel without prepaid<br/>any party| End(( ))
@@ -188,10 +200,13 @@ flowchart LR
     class PC ended
 ```
 
-**Additional choices not shown in diagram:**
-- `UpdateRecipientFeaturedAppRight` (recipient updates their own FeaturedAppRight)
-- `UpdateProcessorFeaturedAppRight` (processor updates their own FeaturedAppRight)
-- `ProcessorSetRecipientFeaturedAppRight` (processor sets recipient's FeaturedAppRight)
+**Update choices:**
+- `PaidSubscription_SubscriberUpdateExpiration` (subscriber updates expiration)
+- `PaidSubscription_DecreaseExpiration` (recipient or processor decreases expiration)
+- `PaidSubscription_SubscriberIncreasePayments` (subscriber increases payment amounts)
+- `PaidSubscription_RecipientDecreasePayment` (recipient decreases their payment)
+- `PaidSubscription_ProcessorDecreasePayment` (processor decreases their payment)
+- `PaidSubscription_RecipientUpdateProvider` (recipient updates their provider)
 
 ## Contracts
 
@@ -211,18 +226,18 @@ flowchart LR
 
 ### Shared
 
-**SubscriptionConfig** → Configuration data (parties, payments, prepayWindow, expiration, free trial)
+**SubscriptionConfig** → Configuration data (parties, payment amounts, prepayWindow, expiration)
 
 **FreeTrialSubscription** → Active subscription during free trial period with key operations:
-- `Process`: Advances free trial, creates FeaturedAppActivityMarkers
+- `Process`: Advances free trial, creates FeaturedAppActivityMarkers for an array of (Party, FeaturedAppRight) pairs (can be empty)
 - Transitions to PaidSubscription when trial ends
-- Dynamic updates: payment amounts, trial duration, expiration, FeaturedAppRights
+- Dynamic updates: payment amounts, trial duration, expiration
 - Cancellation: Any party can cancel instantly (no prepaid amount during trial)
 
 **PaidSubscription** → Active paid subscription with key operations:
-- `ProcessPayment`: Executes Amulet transfers (recipient + processor fee), respects prepayWindow
+- `ProcessPayment`: Executes Amulet transfers (recipient + processor fee) with optional AppRewardCoupons via FeaturedAppRights
 - Can transition to FreeTrialSubscription when recipient starts a trial
-- Dynamic updates: Increase/decrease payments, extend/decrease expiration, update FeaturedAppRights
+- Dynamic updates: Increase/decrease payments, extend/decrease expiration
 - Cancellation: Any party can cancel unilaterally. Recipients can optionally refund prepaid amounts when canceling
 
 **PrepaidCanceledSubscription** → Canceled subscription with remaining prepaid time:
@@ -240,12 +255,9 @@ proposalCid <- submit subscriber do
   exerciseCmd factoryCid SubscriptionFactory_CreateSubscriberProposal with
     config = SubscriptionConfig with
       subscriber, recipient
-      recipientPayment = PaymentConfig with
-        amountPerDay = AmuletAmount 10.0
-        featuredAppRight = None
-      processorPayment = PaymentConfig with
-        amountPerDay = AmuletAmount 1.0
-        featuredAppRight = None
+      recipientProvider = recipient
+      recipientPaymentPerDay = AmuletAmount 10.0
+      processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
       expiresAt = farFutureTime
       freeTrialEndsAt = Some trialEndTime
@@ -259,15 +271,32 @@ approvedCid <- submit processor do
 subscriptionCid <- submit recipient do
   exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept
 
--- 4. Process payments periodically
+-- 4. Process payments periodically (standard mode - both parties get AppRewardCoupons)
 result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
     processingPeriod = days 1
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
+    recipientFeaturedAppRight = Some recipientFARCid
+    processorFeaturedAppRight = Some processorFARCid
 
--- 5. Cancel anytime
+-- 4b. Process payments with zero processor fee (processor provides AppRewardCoupon for recipient)
+resultZeroFee <- submit processor do
+  exerciseCmd subscriptionCid Subscription_ProcessPayment with
+    processingPeriod = days 1
+    paymentCtx = PaymentContext with
+      amuletInputs = subscriberAmuletCids
+      amuletRulesCid, openMiningRoundCid
+    recipientFeaturedAppRight = None  -- Must be None when processorPaymentPerDay is 0
+    processorFeaturedAppRight = Some processorFARCid
+
+-- 5. Recipient updates provider (optional - can be done anytime)
+updatedSubscriptionCid <- submit recipient do
+  exerciseCmd subscriptionCid PaidSubscription_RecipientUpdateProvider with
+    newRecipientProvider = newProviderParty
+
+-- 6. Cancel anytime
 () <- submit subscriber do
   exerciseCmd subscriptionCid PaidSubscription_CancelBySubscriber
 ```
@@ -280,12 +309,9 @@ proposalCid <- submit recipient do
   exerciseCmd factoryCid SubscriptionFactory_CreateRecipientProposal with
     config = SubscriptionConfig with
       subscriber, recipient
-      recipientPayment = PaymentConfig with
-        amountPerDay = AmuletAmount 10.0
-        featuredAppRight = None
-      processorPayment = PaymentConfig with
-        amountPerDay = AmuletAmount 1.0
-        featuredAppRight = None
+      recipientProvider = recipient
+      recipientPaymentPerDay = AmuletAmount 10.0
+      processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
       expiresAt = farFutureTime
       freeTrialEndsAt = Some trialEndTime
@@ -299,13 +325,25 @@ approvedCid <- submit processor do
 subscriptionCid <- submit subscriber do
   exerciseCmd approvedCid ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept
 
--- 4. Process payments periodically (same as subscriber-initiated)
+-- 4. Process payments periodically (standard mode - same as subscriber-initiated)
 result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
     processingPeriod = days 1
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
+    recipientFeaturedAppRight = Some recipientFARCid
+    processorFeaturedAppRight = Some processorFARCid
+
+-- 4b. Or with zero processor fee (processor provides AppRewardCoupon for recipient)
+resultZeroFee <- submit processor do
+  exerciseCmd subscriptionCid Subscription_ProcessPayment with
+    processingPeriod = days 1
+    paymentCtx = PaymentContext with
+      amuletInputs = subscriberAmuletCids
+      amuletRulesCid, openMiningRoundCid
+    recipientFeaturedAppRight = None  -- Must be None when processorPaymentPerDay is 0
+    processorFeaturedAppRight = Some processorFARCid
 
 -- 5. Cancel anytime
 -- Recipient can choose to refund prepaid amount when canceling
