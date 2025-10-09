@@ -15,22 +15,55 @@ Three-party subscription system with flexible payment processing:
 - Pay-as-you-go (no lockup)
 - Prepay buffer prevents service interruption (refundable)
 
+## Subscription Terms
+
+When a subscriber and recipient agree to a subscription, they commit to a set of terms defined in the `SubscriptionConfig`:
+
+**Payment Terms:**
+- **`recipientPaymentPerDay`**: The daily rate the subscriber pays to the recipient (in Amulet or USD)
+- **`processorPaymentPerDay`**: The daily rate the subscriber pays to the processor for handling payments (in Amulet or USD)
+- Pro-rated billing ensures subscribers only pay for the exact time period used
+
+**Service Continuity:**
+- **`prepayWindow`**: How far ahead payments can advance beyond the current time (e.g., 7 days)
+  - Provides a buffer period for subscribers to top up their balance before service interruption
+  - Larger windows provide more service stability; smaller windows reduce capital requirements
+  - Zero prepay window means payments only advance to the current time
+
+**Duration:**
+- **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
+  - Either party can modify expiration: subscriber extends, recipient/processor can decrease
+- **`freeTrialEndsAt`**: Optional trial period where no payment is required
+  - Recipient can extend trial duration, subscriber can reduce it
+
+**Other:**
+- **`reason`**: Optional human-readable description of what the subscription is for. Can include both a user-friendly description and an app-specific identifier (e.g., "Premium membership", "Premium tier access - app_id:123"). The app ID allows systems to connect subscriptions programmatically while maintaining human readability.
+
+**Key Principles:**
+- Terms are agreed upon during the proposal/acceptance flow
+- Most terms can be modified after activation (with appropriate party authorization)
+- Subscribers can increase payment amounts unilaterally (good for tipping/upgrading)
+- Recipients/processors can only decrease their own payment amounts (prevents forced price increases)
+- Any party can cancel at any time
+
 ## Architecture
 
-**Three-Party Flow:** Supports both subscriber-initiated and recipient-initiated flows:
-- **Subscriber-initiated:** Subscriber proposes → Processor approves → Recipient accepts
-- **Recipient-initiated:** Recipient proposes → Processor approves → Subscriber accepts
+**Three-Party Flow:** Either subscriber-initiated or recipient-initiated:
+- **Subscriber-initiated:** Subscriber proposes terms → Processor approves → Recipient accepts
+- **Recipient-initiated:** Recipient proposes terms → Processor approves → Subscriber accepts
 
-**Billing Model:** Per-day rates (`amountPerDay`) automatically pro-rated for any processing period:
+**Billing Model:** Configured as a rate per day but charged pro-rated for any processing period used:
 ```
 amountForPeriod = (amountPerDay × periodDuration) / 1 day
 ```
 
-**Payment Model:** Pay-as-you-go where subscriber provides Amulet inputs each period (not locked upfront). Receivers pay transfer fees for predictable subscriber billing.
+Pay-as-you-go where transfer fees are paid by the recipient and processor, not the subscriber. This means consistent and predictable costs for end-users regardless of the processing period used.
 
 **Processor Payment Modes:**
-- **Standard mode** (`processorPaymentPerDay > 0`): Processor receives a separate payment and AppRewardCoupon via their provider (passed to Process choice). Recipient receives payment and AppRewardCoupon via their provider (set during acceptance, can be updated anytime).
-- **Zero-fee mode** (`processorPaymentPerDay = 0`): Processor provides the AppRewardCoupon for the recipient payment via their provider (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion.
+The processor can use any period length, so long as it does not exceed the prepay window (when the window is 0, payments may only advance up until `now`).
+
+- **Standard mode** (`processorPaymentPerDay > 0`): The processor receives a separate payment and a (featured) AppRewardCoupon issued to their provider. Recipient receives payment and a (featured) AppRewardCoupon issued to their provider.
+- **Zero-fee mode** (`processorPaymentPerDay = 0`): The processor receives a (featured) AppRewardCoupon for the recipient payment by speciying their provider (no separate processor payment). The `recipientFeaturedAppRight` must be None in this mode to avoid confusion since they cannot receive rewards.
 
 **Prepay Window:** Determines how far ahead payments can extend `paidUntil` beyond the current time, providing zero-downtime insurance:
 - **Purpose:** Gives subscribers a buffer period to top up their balance before service actually lapses, ensuring continuous service
@@ -423,6 +456,19 @@ The subscriber can pause or cancel (intentionally or not) simply by having insuf
 - Subscribers might unintentionally let subscriptions lapse
 
 **Recommendation:** The debit card model provides the best subscriber experience with the lowest friction. Recipients should notify subscribers when payments fail and design systems to handle payment failures gracefully.
+
+### Canton Network Polling Alignment
+
+**Benefit:** This pay-as-you-go approach is particularly well-suited for Canton Network's frequent polling mechanism.
+
+With each process transaction, we're securing additional funds and advancing the `paidUntil` timestamp. This transactional approach makes sense because:
+- **Incremental fund capture**: Each polling cycle can capture newly available funds from the subscriber's account
+- **Real-time balance tracking**: Processing transactions ensure we always work with current account balances
+- **Natural failure handling**: If funds aren't available, the transaction simply doesn't advance the payment period
+
+**Alternative (if funds were pre-locked):** If we used `LockedAmulet` to secure funds upfront, we wouldn't need transactions to advance the payment period—we could simply rely on timestamp comparisons since the funds would already be committed. However, this would sacrifice the low-friction user experience and require larger upfront deposits.
+
+The transactional approach trades some efficiency for better UX and works naturally with Canton's polling-based processing model.
 
 ## Future Improvements
 
