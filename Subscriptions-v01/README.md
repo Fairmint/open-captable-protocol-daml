@@ -21,7 +21,9 @@ When a subscriber and recipient agree to a subscription, they commit to a set of
 
 **Payment Terms:**
 - **`recipientPaymentPerDay`**: The daily rate the subscriber pays to the recipient (in Amulet or USD)
+  - Can be increased by the subscriber and decreased by the recipient
 - **`processorPaymentPerDay`**: The daily rate the subscriber pays to the processor for handling payments (in Amulet or USD)
+  - Can be increased by the subscriber and decreased by the processor
 
 Pro-rated billing ensures subscribers only pay for the exact time period used
 
@@ -30,15 +32,18 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
   - Provides a buffer period for subscribers to top up their balance before service interruption
   - Larger windows provide more service stability; smaller windows reduce capital requirements
   - Zero prepay window means payments only advance up to recent history instead of prepaying for future usage, so services must honor a grace period before terminating
+  - Can be increased by the subscriber (to extend buffer time) and decreased by the recipient (to reduce capital requirements)
 
 **Duration:**
 - **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
-  - Subscriber can set any future expiration time (since they can cancel at any time anyway)
+  - Can only be changed by the subscriber (to any future time)
 - **`freeTrialEndsAt`**: Optional trial period where no payment is required
-  - The recipient can extend trial duration or start a new trial, the subscriber can reduce it
+  - Can be extended by the recipient (to start or prolong a trial)
+  - Can be reduced by the subscriber (to shorten or end a trial early)
 
 **Other:**
 - **`reason`**: Optional human-readable description of what the subscription is for. Can include both a user-friendly description and an app-specific identifier (e.g., "Premium membership", "Premium tier access - app_id:123"). The app ID allows systems to connect subscriptions programmatically while maintaining human readability.
+  - Can be changed by either party, but requires approval from both subscriber and recipient (via proposal pattern)
 
 **Key Principles:**
 - Terms are agreed upon during the proposal/acceptance flow
@@ -405,12 +410,6 @@ case maybePrepaidCid of
   None -> pure ()  -- No prepaid time, already archived
 ```
 
-## Dependencies
-
-- `splice-amulet` - Payment transfers via AmuletRules
-- `splice-api-featured-app-v1` - FeaturedAppRight integration for rewards
-- `Shared-v01` - Shared helpers for FeaturedAppActivityMarker creation
-
 ## Cancellation with Prepaid Time
 
 When any party cancels a subscription that has prepaid time remaining (`paidUntil > now`), a `PrepaidCanceledSubscription` contract is created. The recipient then has two options:
@@ -431,30 +430,42 @@ When any party cancels a subscription that has prepaid time remaining (`paidUnti
 
 ## Tradeoffs Discussion
 
-### No LockedAmulet: Debit Card vs. Prepaid Gift Card
+### LockedAmulets
 
-**Decision:** This implementation works like a **debit card** that's charged monthly—funds are pulled from the subscriber's account when each payment is due.
+**Decision:** This implementation uses **pay-as-you-go with optional prepayment**—funds are pulled from the subscriber's account during each payment processing cycle, with the `prepayWindow` parameter controlling how far ahead payments can advance.
 
-**Why not other approaches?**
-- **Credit card model**: Would let subscribers run up debt, creating unpaid balance risk for recipients
-- **Prepaid gift card model**: Would lock up subscriber funds upfront (using `LockedAmulet`), requiring a large deposit
+**The prepayWindow provides security without LockedAmulets:**
 
-**Current approach (Debit Card):**
+The `prepayWindow` parameter allows payments to advance up to a specified duration ahead of the current time (e.g., 7 days, 1 hour). This creates a prepaid buffer that effectively accomplishes the security that using `LockedAmulet` would offer, without the complexity:
 
-The subscriber can pause or cancel (intentionally or not) simply by having insufficient funds when payment processing occurs. No funds are locked in advance.
+- **With prepayWindow > 0**: Payments advance ahead of current time, giving recipients revenue certainty
+- **With prepayWindow = 0**: Payments only advance up to current time, covering past usage with no prepayment
+
+**Why not use LockedAmulets?**
+
+We don't need full `LockedAmulet` security because that would only guarantee that subscription funds can always be refunded on cancellation. However, the current implementation makes refunds discretionary—the recipient can choose whether to refund prepaid amounts after cancellation. Since refunds are a choice (not guaranteed), there's no benefit to locking funds just to ensure refunds are always possible.
+
+**How it works:**
+
+1. No funds are locked upfront—subscribers simply need sufficient balance when payments process
+2. The `prepayWindow` is configurable: subscriber can increase it (extending prepayment buffer), recipient can decrease it (reducing capital requirements)
+3. On cancellation, prepaid amounts can be handled at the recipient's discretion (refund, credit, keep)
+4. If subscriber has insufficient funds, payment fails and subscription service can be suspended
 
 **Pros:**
-- Easy to start—no large upfront deposit required
+- Easy to start—no large upfront deposit or locked funds required
+- Flexible security—`prepayWindow` can be adjusted by subscriber (increase) or recipient (decrease)
 - Simple for subscribers—just maintain account balance
+- Recipients get configurable revenue certainty via prepayWindow
 - Natural expiration—subscriptions lapse if funds run out
-- No refund complexity when canceling
+- No complex refund guarantees to manage
 
 **Cons:**
-- Payments can fail if insufficient funds
-- Recipients have less revenue certainty
+- Payments can still fail if insufficient funds (even with prepayWindow)
+- Refunds after cancellation are discretionary, not automatic
 - Subscribers might unintentionally let subscriptions lapse
 
-**Recommendation:** The debit card model provides the best subscriber experience with the lowest friction. Recipients should notify subscribers when payments fail and design systems to handle payment failures gracefully.
+**Recommendation:** Use a reasonable `prepayWindow` (e.g., 7 days, 12 hours) to balance subscriber capital requirements with recipient revenue certainty. Recipients should notify subscribers when payments fail and design systems to handle payment failures gracefully.
 
 ### Canton Network Polling Alignment
 
@@ -514,3 +525,4 @@ updatedSubscriptionCid <- submit subscriber do
 - Proposals should have expiration times to prevent stale proposals
 - Need to handle the case where the underlying subscription is modified or canceled while proposal is pending
 - Consider allowing counter-proposals for negotiation scenarios
+- These could be created in a separate package (or remain in this same package)

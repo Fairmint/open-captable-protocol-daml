@@ -1,0 +1,79 @@
+module Fairmint.Subscriptions.Types where
+
+import DA.Time (convertRelTimeToMicroseconds, RelTime)
+import qualified DA.Map as Map
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round (OpenMiningRound)
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionAmount(..))
+
+-- | Payment context containing Amulet transfer dependencies
+data PaymentContext = PaymentContext
+  with
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Complete payment request with all necessary context
+data PaymentRequest = PaymentRequest
+  with
+    sender : Party
+    receiver : Party
+    provider : Party
+      -- ^ Party that receives the AppRewardCoupon
+    amount : Decimal
+    featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+    expectedDso : Party
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Convert a per-day rate to the actual amount for the processing period
+-- Calculates: (amountPerDay * processingPeriod) / 1 day
+calculateAmountForPeriod : SubscriptionAmount -> RelTime -> Decimal -> Decimal
+calculateAmountForPeriod amountPerDay processingPeriod usdToAmuletRate =
+  let
+    -- Convert to Amulet first
+    dailyAmountInAmulet = case amountPerDay of
+      AmuletAmount amt -> amt
+      USDAmount usdAmt -> usdAmt * usdToAmuletRate
+    
+    -- One day in microseconds (24 * 60 * 60 * 1000000)
+    oneDayMicros = 86400000000
+    
+    -- Get processing period in microseconds
+    periodMicros = convertRelTimeToMicroseconds processingPeriod
+    
+    -- Calculate pro-rata amount: (dailyRate * periodDays)
+    periodDays = intToDecimal periodMicros / intToDecimal oneDayMicros
+  in
+    dailyAmountInAmulet * periodDays
+
+-- | Execute a payment transfer
+paymentTo : PaymentRequest -> Update TransferResult
+paymentTo req = do
+  let transfer = Transfer with
+        sender = req.sender
+        provider = req.provider
+        inputs = map InputAmulet req.amuletInputs
+        outputs = [TransferOutput with
+          receiver = req.receiver
+          -- Receiver pays fees so subscriber is charged exact amount (no surprises)
+          receiverFeeRatio = 1.0
+          amount = req.amount
+          lock = None]
+        beneficiaries = None
+  
+  let context = TransferContext with
+        openMiningRound = req.openMiningRoundCid
+        featuredAppRight = req.featuredAppRight
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
+  
+  exercise req.amuletRulesCid AmuletRules_Transfer with
+    transfer = transfer
+    context = context
+    expectedDso = Some req.expectedDso
+
