@@ -32,6 +32,7 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
   - Provides a buffer period for subscribers to top up their balance before service interruption
   - Larger windows provide more service stability; smaller windows reduce capital requirements
   - Zero prepay window means payments only advance up to recent history instead of prepaying for future usage, so services must honor a grace period before terminating
+  - Small prepay windows (less than or equal to the processor's period) will result in `paidUntil` often being in the recent past rather than the future
   - Can be increased by the subscriber (to extend buffer time) and decreased by the recipient (to reduce capital requirements)
 
 **Duration:**
@@ -74,6 +75,7 @@ The processor can use any period length, so long as it does not exceed the prepa
 **Prepay Window:** Determines how far ahead payments can extend `paidUntil` beyond the current time, providing zero-downtime insurance:
 - **Purpose:** Gives subscribers a buffer period to top up their balance before service actually lapses, ensuring continuous service
 - **Alternative (0 prepay window):** Payments only advance to `now`, and recipients set their own tolerance buffer before canceling service for non-payment
+- **Small prepay windows:** When the prepay window is less than or equal to the processor's period, the subscription's `paidUntil` will often be in the recent past instead of always being in the future (as one might expect with larger prepay windows). This is because processing can only occur after `paidUntil` has passed, and the small prepay window limits how far forward each payment advances.
 - **Cancellation with prepaid time:** When canceling a subscription with remaining prepaid time, recipients can either (1) refund the overpayment immediately, or (2) allow service to continue until the end of the paid period
 - **Limits:** `paidUntil` is always capped to the earliest of: `(now + prepayWindow)`, `expiresAt`, or `freeTrialEndsAt`
 
