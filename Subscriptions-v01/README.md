@@ -10,9 +10,10 @@ Three-party subscription system with flexible payment processing:
 - **Processor**: Executes payment transfers each period
 
 **Key Features:**
-- Per-day billing with automatic pro-rata calculation for any processing interval
+- Per-day billing with automatic pro-rata calculation
 - Free trial support with FeaturedAppRight rewards
 - Pay-as-you-go (no upfront collateral required)
+- Prepay window limits future payment extension
 - Dynamic payment and expiration updates
 - No DSO signatures required for core operations
 - Supports both Amulet and USD denominations
@@ -27,6 +28,8 @@ amountForPeriod = (amountPerDay × periodDuration) / 1 day
 ```
 
 **Payment Model:** Pay-as-you-go where subscriber provides Amulet inputs each period (not locked upfront). Receivers pay transfer fees for predictable subscriber billing.
+
+**Prepay Window:** Limits how far into the future `paidUntil` can be extended. If 0, payments only advance to `now`. Capped to earliest of: (now + prepayWindow), expiresAt, or freeTrialEndsAt.
 
 ## Flow Diagram
 
@@ -67,10 +70,10 @@ sequenceDiagram
 
 **ProcessorApprovedSubscriptionProposal** → Processor-approved proposal awaiting recipient acceptance
 
-**SubscriptionConfig** → Configuration data (parties, payments, expiration, free trial)
+**SubscriptionConfig** → Configuration data (parties, payments, prepayWindow, expiration, free trial)
 
-**Subscription** → Active subscription with these key operations:
-- `ProcessPayment`: Executes Amulet transfers (recipient + processor fee)
+**Subscription** → Active subscription with key operations:
+- `ProcessPayment`: Executes Amulet transfers (recipient + processor fee), respects prepayWindow
 - `ProcessFreeTrial`: Advances free trial, creates FeaturedAppActivityMarkers
 - Dynamic updates: Increase/decrease payments, extend/decrease expiration, update FeaturedAppRights
 - Cancellation: Any party can cancel unilaterally
@@ -89,6 +92,7 @@ proposalCid <- submit subscriber do
       processorPayment = PaymentConfig with
         amountPerDay = AmuletAmount 1.0
         featuredAppRight = None
+      prepayWindow = days 7
       expiresAt = farFutureTime
       freeTrialEndsAt = Some trialEndTime
       reason = Some "Premium membership"
@@ -105,7 +109,10 @@ subscriptionCid <- submit recipient do
 result <- submit processor do
   exerciseCmd subscriptionCid Subscription_ProcessPayment with
     processingPeriod = days 1
-    paymentCtx = PaymentContext with ..
+    paymentCtx = PaymentContext with
+      amuletInputs = subscriberAmuletCids
+      amuletRulesCid, openMiningRoundCid
+      amuletPrice = usdToAmuletRate
 
 -- 5. Cancel anytime
 () <- submit subscriber do
@@ -115,4 +122,5 @@ result <- submit processor do
 ## Dependencies
 
 - `splice-amulet` - Payment transfers via AmuletRules
-- `splice-api-featured-app-v1` - FeaturedAppRight integration for rewards during free trials
+- `splice-api-featured-app-v1` - FeaturedAppRight integration for rewards
+- `Shared-v01` - Shared helpers for FeaturedAppActivityMarker creation
