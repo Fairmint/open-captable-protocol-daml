@@ -22,19 +22,20 @@ When a subscriber and recipient agree to a subscription, they commit to a set of
 **Payment Terms:**
 - **`recipientPaymentPerDay`**: The daily rate the subscriber pays to the recipient (in Amulet or USD)
 - **`processorPaymentPerDay`**: The daily rate the subscriber pays to the processor for handling payments (in Amulet or USD)
-- Pro-rated billing ensures subscribers only pay for the exact time period used
+
+Pro-rated billing ensures subscribers only pay for the exact time period used
 
 **Service Continuity:**
 - **`prepayWindow`**: How far ahead payments can advance beyond the current time (e.g., 7 days)
   - Provides a buffer period for subscribers to top up their balance before service interruption
   - Larger windows provide more service stability; smaller windows reduce capital requirements
-  - Zero prepay window means payments only advance to the current time
+  - Zero prepay window means payments only advance up to recent history instead of prepaying for future usage, so services must honor a grace period before terminating
 
 **Duration:**
 - **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
-  - Either party can modify expiration: subscriber extends, recipient/processor can decrease
+  - Subscriber can set any future expiration time (since they can cancel at any time anyway)
 - **`freeTrialEndsAt`**: Optional trial period where no payment is required
-  - Recipient can extend trial duration, subscriber can reduce it
+  - The recipient can extend trial duration or start a new trial, the subscriber can reduce it
 
 **Other:**
 - **`reason`**: Optional human-readable description of what the subscription is for. Can include both a user-friendly description and an app-specific identifier (e.g., "Premium membership", "Premium tier access - app_id:123"). The app ID allows systems to connect subscriptions programmatically while maintaining human readability.
@@ -204,8 +205,7 @@ flowchart LR
 **Update choices:**
 - `FreeTrialSubscription_RecipientExtendTrial` (recipient extends trial duration)
 - `FreeTrialSubscription_SubscriberReduceTrial` (subscriber reduces trial duration)
-- `FreeTrialSubscription_SubscriberUpdateExpiration` (subscriber updates expiration)
-- `FreeTrialSubscription_DecreaseExpiration` (recipient or processor decreases expiration)
+- `FreeTrialSubscription_SubscriberUpdateExpiration` (subscriber updates expiration to any future time)
 - `FreeTrialSubscription_SubscriberIncreasePayments` (subscriber increases payment amounts)
 - `FreeTrialSubscription_RecipientDecreasePayment` (recipient decreases their payment)
 - `FreeTrialSubscription_ProcessorDecreasePayment` (processor decreases their payment)
@@ -231,8 +231,7 @@ flowchart LR
 ```
 
 **Update choices:**
-- `PaidSubscription_SubscriberUpdateExpiration` (subscriber updates expiration)
-- `PaidSubscription_DecreaseExpiration` (recipient or processor decreases expiration)
+- `PaidSubscription_SubscriberUpdateExpiration` (subscriber updates expiration to any future time)
 - `PaidSubscription_SubscriberIncreasePayments` (subscriber increases payment amounts)
 - `PaidSubscription_RecipientDecreasePayment` (recipient decreases their payment)
 - `PaidSubscription_ProcessorDecreasePayment` (processor decreases their payment)
@@ -267,7 +266,7 @@ flowchart LR
 **PaidSubscription** → Active paid subscription with key operations:
 - `ProcessPayment`: Executes Amulet transfers (recipient + processor fee) with optional AppRewardCoupons via FeaturedAppRights
 - Can transition to FreeTrialSubscription when recipient starts a trial
-- Dynamic updates: Increase/decrease payments, extend/decrease expiration
+- Dynamic updates: Increase/decrease payments, subscriber can set any future expiration
 - Cancellation: Any party can cancel unilaterally. Recipients can optionally refund prepaid amounts when canceling
 
 **PrepaidCanceledSubscription** → Canceled subscription with remaining prepaid time:
@@ -478,10 +477,9 @@ The transactional approach trades some efficiency for better UX and works natura
 - Subscriber can increase payments (both recipient and processor)
 - Recipient can decrease their own payment amount
 - Processor can decrease their own payment amount
-- Subscriber can extend expiration date
-- Recipient/Processor can decrease expiration date
+- Subscriber can set any future expiration date
 
-**Limitation:** If the recipient wants to increase their payment (e.g., price increase), they must communicate this off-chain and wait for the subscriber to take action. Similarly, if the processor wants the subscriber to extend the expiration, they must request it through other channels.
+**Limitation:** If the recipient wants to increase their payment (e.g., price increase), they must communicate this off-chain and wait for the subscriber to take action.
 
 **Future Enhancement:** Introduce change proposal contracts that allow one party to propose a change and the other party to accept or reject it on-chain.
 
