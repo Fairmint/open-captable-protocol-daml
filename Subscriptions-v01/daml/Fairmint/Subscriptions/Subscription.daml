@@ -6,7 +6,7 @@ import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
 import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
 import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
-import Splice.Round (OpenMiningRound)
+import Splice.Round (OpenMiningRound, OpenMiningRound_Fetch(..))
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), SubscriptionAmount(..), PaymentConfig(..), validateSubscriptionConfig)
 import Fairmint.Shared.SpliceHelpers (createActivityMarker)
 
@@ -37,8 +37,6 @@ data PaymentContext = PaymentContext
     amuletInputs : [ContractId Amulet.Amulet]
     amuletRulesCid : ContractId AmuletRules
     openMiningRoundCid : ContractId OpenMiningRound
-    amuletPrice : Decimal
-      -- ^ Current Amulet price for USD conversion
   deriving (Eq, Show)
 
 -- | Complete payment request with all necessary context
@@ -127,6 +125,10 @@ template Subscription
         -- Get current ledger time
         now <- getTime
         
+        -- Fetch OpenMiningRound to get amuletPrice (via disclosed contract and public fetch choice)
+        openRound <- exercise paymentCtx.openMiningRoundCid (OpenMiningRound_Fetch with p = context.processor)
+        let amuletPrice = openRound.amuletPrice
+        
         -- Validate not in free trial mode
         assertMsg "Cannot process payments during free trial (use Subscription_ProcessFreeTrial instead)" 
           (not (isSome config.freeTrialEndsAt))
@@ -143,9 +145,9 @@ template Subscription
         assertMsg "Must provide at least one amulet input for payment" 
           (not (null paymentCtx.amuletInputs))
         
-        -- Validate USD to Amulet rate is positive (from PaymentContext)
+        -- Validate USD to Amulet rate is positive (from OpenMiningRound)
         assertMsg "USD to Amulet conversion rate must be positive" 
-          (paymentCtx.amuletPrice > 0.0)
+          (amuletPrice > 0.0)
 
         -- Calculate the maximum allowed paidUntil based on prepayWindow
         let maxAllowedPaidUntil = addRelTime now config.prepayWindow
@@ -168,7 +170,7 @@ template Subscription
 
         -- Step 1: Transfer payment to recipient
         -- Calculate the actual amount based on the actual billing period (may be partial)
-        let amountForThisPeriod = calculateAmountForPeriod config.recipientPayment.amountPerDay actualPeriod paymentCtx.amuletPrice
+        let amountForThisPeriod = calculateAmountForPeriod config.recipientPayment.amountPerDay actualPeriod amuletPrice
         recipientTransferResult <- paymentTo PaymentRequest with
           sender = config.subscriber
           receiver = config.recipient
@@ -180,7 +182,7 @@ template Subscription
           openMiningRoundCid = paymentCtx.openMiningRoundCid
         
         -- Step 2: If there's a processor fee, transfer to processor
-        let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPayment.amountPerDay actualPeriod paymentCtx.amuletPrice
+        let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPayment.amountPerDay actualPeriod amuletPrice
         processorTransferResult <- 
           if feeAmountForThisPeriod > 0.0
           then do

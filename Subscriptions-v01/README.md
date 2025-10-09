@@ -112,7 +112,6 @@ result <- submit processor do
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
-      amuletPrice = usdToAmuletRate
 
 -- 5. Cancel anytime
 () <- submit subscriber do
