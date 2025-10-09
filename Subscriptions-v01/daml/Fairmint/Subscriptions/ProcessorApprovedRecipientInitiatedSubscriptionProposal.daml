@@ -1,6 +1,7 @@
 module Fairmint.Subscriptions.ProcessorApprovedRecipientInitiatedSubscriptionProposal where
 
-import Fairmint.Subscriptions.Subscription
+import DA.Optional (isSome, fromSome)
+import Fairmint.Subscriptions.Subscriptions
 import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig)
 
 -- | Processor-approved recipient-initiated subscription awaiting subscriber acceptance
@@ -11,6 +12,8 @@ template ProcessorApprovedRecipientInitiatedSubscriptionProposal
       -- ^ Subscription configuration
     context : ProcessorContext
       -- ^ Processor and DSO context
+    freeTrialEndsAt : Optional Time
+      -- ^ Optional free trial end time (if set, creates FreeTrialSubscription; otherwise PaidSubscription)
   where
     signatory config.recipient, context.processor
     observer config.subscriber
@@ -19,16 +22,37 @@ template ProcessorApprovedRecipientInitiatedSubscriptionProposal
 
     -- | Subscriber accepts, creating the active subscription
     -- No upfront locking needed - payments use amulet inputs each round
-    choice ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept : ContractId Subscription
+    -- Creates FreeTrialSubscription if freeTrialEndsAt is set, otherwise PaidSubscription
+    choice ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAccept : ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAcceptResult
       controller config.subscriber
       do
         -- Get current ledger time to initialize paidUntil
         now <- getTime
         
-        -- Create the active subscription (paid until start time)
-        create Subscription with
-          paidUntil = now
-          ..
+        -- Create appropriate subscription type based on free trial
+        case freeTrialEndsAt of
+          Some trialEnd -> do
+            -- Validate trial end is in the future
+            assertMsg "Trial end must be in the future" (trialEnd > now)
+            assertMsg "Trial end must not exceed expiration" (trialEnd <= config.expiresAt)
+            
+            -- Create FreeTrialSubscription
+            subscriptionCid <- create FreeTrialSubscription with
+              trialEndsAt = trialEnd
+              paidUntil = now
+              config = config
+              context = context
+            pure ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAcceptResult with
+              subscription = Left subscriptionCid
+          
+          None -> do
+            -- Create PaidSubscription
+            subscriptionCid <- create PaidSubscription with
+              paidUntil = now
+              config = config
+              context = context
+            pure ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAcceptResult with
+              subscription = Right subscriptionCid
 
     -- | Subscriber rejects the processor-approved proposal
     choice ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberReject : ()
@@ -48,3 +72,9 @@ template ProcessorApprovedRecipientInitiatedSubscriptionProposal
       do
         pure ()
 
+-- | Result of subscriber accepting the proposal
+-- Returns Left for FreeTrialSubscription, Right for PaidSubscription
+data ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAcceptResult = ProcessorApprovedRecipientInitiatedSubscriptionProposal_SubscriberAcceptResult
+  with
+    subscription : Either (ContractId FreeTrialSubscription) (ContractId PaidSubscription)
+  deriving (Eq, Show)
