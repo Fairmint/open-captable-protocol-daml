@@ -39,7 +39,11 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
 - **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
   - Can only be changed by the subscriber (to any time)
 - **Free trial**: Optional trial period (specified at proposal creation) where no payment is required
-  - Managed by `FreeTrialSubscription` template with `trialEndsAt` field
+  - Specified using `SubscriptionExpiration` which can be either:
+    - **`AbsoluteExpiration Time`**: Expires at a specific timestamp
+    - **`RelativeExpiration RelTime`**: Expires at a duration from subscription creation time (e.g., 30 days from when accepted)
+  - Relative expirations allow proposals to remain outstanding without eating into the trial duration
+  - Managed by `FreeTrialSubscription` template with `trialEndsAt` field (always resolved to absolute time)
   - Can be extended by the recipient or reduced by the subscriber
   - Recipients can convert a paid subscription back to a free trial anytime
   - Automatically converts to `PaidSubscription` when trial ends
@@ -208,7 +212,9 @@ proposalCid <- submit subscriber do
       expiresAt = farFutureTime
       description = Some "Premium membership"
       metadata = TM.empty  -- Can add RewardShare references later
-    freeTrialEndsAt = Some trialEndTime  -- Separate parameter, not part of config
+    -- Flexible free trial expiration (resolved when subscription is created)
+    freeTrialExpiration = Some (RelativeExpiration (days 30))  -- 30 days from acceptance
+    -- Alternative: freeTrialExpiration = Some (AbsoluteExpiration trialEndTime)
 
 -- 2. Processor approves
 approvedCid <- submit processor do
@@ -450,6 +456,33 @@ The two-stage approval process (processor first, then other party) ensures:
 - Subscriber: increase payments, extend expiration, increase prepay window
 - Recipient: decrease their payment, start free trial, decrease prepay window
 - Processor: decrease their payment
+
+### Flexible Free Trial Expiration
+
+The subscription system supports flexible free trial expiration through the `SubscriptionExpiration` type, which can be either absolute or relative to subscription creation:
+
+**Absolute Expiration (`AbsoluteExpiration Time`):**
+- Expires at a specific timestamp
+- Example: `AbsoluteExpiration (time (date 2025 Dec 31) 23 59 59)`
+- Use when you want the trial to end at a fixed date regardless of when it's accepted
+
+**Relative Expiration (`RelativeExpiration RelTime`):**
+- Expires at a duration from subscription creation time
+- Example: `RelativeExpiration (days 30)` gives a full 30-day trial from acceptance
+- **Key benefit**: Proposals can remain outstanding without eating into the trial duration
+- Use for consistent trial experiences where users get the full duration from signup
+
+**How it works:**
+1. Proposal is created with `freeTrialExpiration: Optional SubscriptionExpiration`
+2. When the proposal is accepted, the expiration is resolved to an absolute `Time` using the current ledger time
+3. The resulting `FreeTrialSubscription` always has a concrete `trialEndsAt: Time` field
+
+**Example scenario:**
+- Day 0: Recipient proposes subscription with `RelativeExpiration (days 30)`
+- Day 7: Subscriber accepts → trial ends at Day 37 (full 30-day trial preserved)
+- vs. `AbsoluteExpiration (now + 30 days)` → trial would end at Day 30 (only 23 days remain)
+
+This ensures subscribers always receive the full trial period, improving fairness and user experience.
 
 ### Metadata Field: RewardShare References
 

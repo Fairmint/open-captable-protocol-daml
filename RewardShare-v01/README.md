@@ -1,10 +1,10 @@
-# AppRewardShare-v01
+# RewardShare-v01
 
 This package provides a simple system for distributing rewards among multiple recipients based on percentage shares.
 
 ## Overview
 
-The AppRewardShare package enables:
+The RewardShare package enables:
 - Anyone can create a reward share defining distribution percentages
 - Immutable reward shares (no editing after creation)
 - Round-based tracking to prevent duplicate distributions
