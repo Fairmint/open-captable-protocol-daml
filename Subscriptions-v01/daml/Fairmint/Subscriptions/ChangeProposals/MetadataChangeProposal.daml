@@ -1,0 +1,178 @@
+module Fairmint.Subscriptions.ChangeProposals.MetadataChangeProposal where
+
+import DA.TextMap (TextMap)
+import Fairmint.Subscriptions.Active.Subscriptions (PaidSubscription, FreeTrialSubscription)
+import Fairmint.Subscriptions.SubscriptionConfig (validateMetadata)
+
+-- | Initial proposal for metadata change - can be created by subscriber or recipient
+-- Processor must approve first, then the other party accepts
+template MetadataChangeProposal
+  with
+    subscriber : Party
+      -- ^ The subscriber party
+    recipient : Party
+      -- ^ The recipient party
+    processor : Party
+      -- ^ The processor party (must approve first)
+    proposer : Party
+      -- ^ The party who created this proposal (subscriber or recipient)
+    newMetadata : TextMap Text
+      -- ^ Proposed new metadata to replace current metadata
+    proposalExpiresAt : Time
+      -- ^ Expiration time for this proposal
+  where
+    signatory proposer
+    observer subscriber, recipient, processor
+    
+    ensure
+      validateMetadata newMetadata &&
+      (proposer == subscriber || proposer == recipient)
+
+    -- | Processor approves the metadata change proposal
+    choice MetadataChangeProposal_ProcessorApprove : ContractId ProcessorApprovedMetadataChangeProposal
+      controller processor
+      do
+        create ProcessorApprovedMetadataChangeProposal with ..
+
+    -- | Processor rejects the metadata change proposal
+    choice MetadataChangeProposal_ProcessorReject : ()
+      with
+        reason : Optional Text
+          -- ^ Optional reason for rejection
+      controller processor
+      do
+        pure ()
+
+    -- | Proposer withdraws the proposal before processor approval
+    choice MetadataChangeProposal_Withdraw : ()
+      with
+        reason : Optional Text
+          -- ^ Optional reason for withdrawal
+      controller proposer
+      do
+        pure ()
+
+    -- | Non-proposer party rejects at this stage
+    choice MetadataChangeProposal_RejectByOtherParty : ()
+      with
+        rejecter : Party
+          -- ^ Must be subscriber or recipient (but not proposer)
+        reason : Optional Text
+          -- ^ Optional reason for rejection
+      controller rejecter
+      do
+        assertMsg "Rejecter must be subscriber or recipient but not the proposer"
+          ((rejecter == subscriber || rejecter == recipient) && rejecter /= proposer)
+        pure ()
+
+
+-- | Processor-approved metadata change proposal awaiting final acceptance
+-- The other party (non-proposer) must now accept
+template ProcessorApprovedMetadataChangeProposal
+  with
+    subscriber : Party
+      -- ^ The subscriber party
+    recipient : Party
+      -- ^ The recipient party
+    processor : Party
+      -- ^ The processor party (has approved)
+    proposer : Party
+      -- ^ The party who created the original proposal
+    newMetadata : TextMap Text
+      -- ^ Proposed new metadata to replace current metadata
+    proposalExpiresAt : Time
+      -- ^ Expiration time for this proposal
+  where
+    signatory proposer, processor
+    observer subscriber, recipient
+    
+    ensure
+      validateMetadata newMetadata &&
+      (proposer == subscriber || proposer == recipient)
+
+    -- | The other party accepts for PaidSubscription
+    choice ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription : ContractId PaidSubscription
+      with
+        paidSubscriptionCid : ContractId PaidSubscription
+        accepter : Party
+          -- ^ Must be the non-proposer party (subscriber or recipient)
+      controller processor, accepter
+      do
+        -- Verify accepter is the other party (not proposer)
+        assertMsg "Accepter must be subscriber or recipient but not the proposer"
+          ((accepter == subscriber || accepter == recipient) && accepter /= proposer)
+        
+        -- Fetch subscription to verify all fields match
+        subscription <- fetch paidSubscriptionCid
+        
+        -- Verify all three parties match
+        assertMsg "Subscriber party mismatch" 
+          (subscription.config.subscriber == subscriber)
+        assertMsg "Recipient party mismatch" 
+          (subscription.config.recipient == recipient)
+        assertMsg "Processor party mismatch" 
+          (subscription.context.processor == processor)
+        
+        -- Check proposal hasn't expired
+        now <- getTime
+        assertMsg "Metadata change proposal has expired" (now <= proposalExpiresAt)
+        
+        -- Update the subscription with new metadata
+        archive paidSubscriptionCid
+        create subscription with 
+          config = subscription.config with metadata = newMetadata
+
+    -- | The other party accepts for FreeTrialSubscription
+    choice ProcessorApprovedMetadataChangeProposal_AcceptForFreeTrialSubscription : ContractId FreeTrialSubscription
+      with
+        freeTrialSubscriptionCid : ContractId FreeTrialSubscription
+        accepter : Party
+          -- ^ Must be the non-proposer party (subscriber or recipient)
+      controller processor, accepter
+      do
+        -- Verify accepter is the other party (not proposer)
+        assertMsg "Accepter must be subscriber or recipient but not the proposer"
+          ((accepter == subscriber || accepter == recipient) && accepter /= proposer)
+        
+        -- Fetch subscription to verify all fields match
+        subscription <- fetch freeTrialSubscriptionCid
+        
+        -- Verify all three parties match
+        assertMsg "Subscriber party mismatch" 
+          (subscription.config.subscriber == subscriber)
+        assertMsg "Recipient party mismatch" 
+          (subscription.config.recipient == recipient)
+        assertMsg "Processor party mismatch" 
+          (subscription.context.processor == processor)
+        
+        -- Check proposal hasn't expired
+        now <- getTime
+        assertMsg "Metadata change proposal has expired" (now <= proposalExpiresAt)
+        
+        -- Update the subscription with new metadata
+        archive freeTrialSubscriptionCid
+        create subscription with 
+          config = subscription.config with metadata = newMetadata
+
+    -- | Other party rejects the processor-approved proposal
+    choice ProcessorApprovedMetadataChangeProposal_Reject : ()
+      with
+        rejecter : Party
+          -- ^ Must be the non-proposer party
+        reason : Optional Text
+          -- ^ Optional reason for rejection
+      controller rejecter
+      do
+        assertMsg "Rejecter must be subscriber or recipient but not the proposer"
+          ((rejecter == subscriber || rejecter == recipient) && rejecter /= proposer)
+        pure ()
+
+    -- | Proposer withdraws even after processor approval
+    choice ProcessorApprovedMetadataChangeProposal_Withdraw : ()
+      with
+        reason : Optional Text
+          -- ^ Optional reason for withdrawal
+      controller proposer
+      do
+        pure ()
+

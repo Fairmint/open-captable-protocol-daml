@@ -45,8 +45,12 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
   - Automatically converts to `PaidSubscription` when trial ends
 
 **Other:**
-- **`reason`**: Optional human-readable description of the subscription purpose (e.g., "Premium membership", "Premium tier - app_id:123")
-  - Changes require both subscriber and recipient approval via reason update proposal contracts
+- **`description`**: Optional human-readable description of the subscription purpose (e.g., "Premium membership", "Premium tier - app_id:123")
+  - Changes require both subscriber and recipient approval via description update proposal contracts
+- **`metadata`**: Structured key-value pairs for additional subscription information
+  - Stored as `TextMap Text` for type-safe, queryable metadata
+  - Changes require processor approval first, then acceptance by the other party (subscriber or recipient)
+  - Common use: Reference RewardShare contract IDs for off-chain reward distribution
 
 **Key Principles:**
 - Terms are agreed upon during the proposal/acceptance flow
@@ -96,9 +100,9 @@ The subscription system uses separate templates for each lifecycle state:
 - `PrepaidCanceledSubscription` - Canceled with remaining prepaid time
 
 **Configuration Updates:**
-- `ReasonUpdateProposal` - Update reason field (requires both parties, works for either subscription type)
 - `PaymentChangeProposal` - Recipient proposes payment increases (requires subscriber acceptance)
 - `ExpirationExtensionProposal` - Recipient proposes extending subscription (requires subscriber acceptance)
+- `MetadataChangeProposal` - Either party proposes metadata changes (requires processor approval, then other party acceptance)
 
 ## Flow Diagrams
 
@@ -202,7 +206,8 @@ proposalCid <- submit subscriber do
       processorPaymentPerDay = AmuletAmount 1.0
       prepayWindow = days 7
       expiresAt = farFutureTime
-      reason = Some "Premium membership"
+      description = Some "Premium membership"
+      metadata = TM.empty  -- Can add RewardShare references later
     freeTrialEndsAt = Some trialEndTime  -- Separate parameter, not part of config
 
 -- 2. Processor approves
@@ -239,6 +244,28 @@ paymentResult <- submit processor do
     recipientFeaturedAppRight = Some recipientFARCid
     processorFeaturedAppRight = Some processorFARCid
     processorActivityMarkerFAR = None  -- Only used in zero-fee mode
+
+-- 6. (Optional) Add RewardShare references via metadata update
+-- Recipient creates a metadata change proposal
+metadataProposalCid <- submit recipient do
+  createCmd MetadataChangeProposal with
+    subscriber, recipient, processor
+    proposer = recipient
+    newMetadata = TM.fromList
+      [ ("recipient_reward_agreement_cid", recipientRewardAgreementCid)
+      , ("processor_reward_agreement_cid", processorRewardAgreementCid)
+      ]
+    proposalExpiresAt = futureTime
+
+-- Processor approves the metadata change
+approvedMetadataProposalCid <- submit processor do
+  exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+
+-- Subscriber accepts the metadata change (requires both processor and subscriber authority)
+updatedPaidSubscriptionCid <- submit processor, subscriber do
+  exerciseCmd approvedMetadataProposalCid ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription with
+    paidSubscriptionCid
+    accepter = subscriber
 
 ```
 
@@ -341,24 +368,6 @@ The transactional approach trades some efficiency for better UX and works natura
 
 The subscription system includes proposal contracts for changes that require negotiation between subscriber and recipient:
 
-#### ReasonUpdateProposal
-
-Allows either party to propose changes to the `reason` field on any subscription type:
-
-```daml
--- Either subscriber or recipient can propose
-proposalCid <- submit proposer do
-  createCmd ReasonUpdateProposal with
-    subscriber, recipient, proposer
-    newReason = Some "Updated subscription purpose"
-    subscriptionCid = Left paidSubscriptionCid  -- or Right for FreeTrialSubscription
-
--- Other party accepts
-updatedSubscriptionCid <- submit subscriber, recipient do
-  exerciseCmd proposalCid ReasonUpdateProposal_AcceptForPaidSubscription with
-    paidSubscriptionCid
-```
-
 #### PaymentChangeProposal
 
 Recipient proposes payment increases (requires subscriber acceptance):
@@ -367,12 +376,12 @@ Recipient proposes payment increases (requires subscriber acceptance):
 -- Recipient proposes payment increase
 proposalCid <- submit recipient do
   createCmd PaymentChangeProposal with
-    subscriber, recipient
+    subscriber, recipient, processor
+    previousRecipientPaymentPerDay = AmuletAmount 10.0
+    previousProcessorPaymentPerDay = AmuletAmount 1.0
     newRecipientPaymentPerDay = AmuletAmount 15.0
     newProcessorPaymentPerDay = AmuletAmount 1.5
-    effectiveDate = Some futureTime
-    reason = Some "Annual price adjustment"
-    subscriptionCid = Left paidSubscriptionCid
+    expiresAt = futureTime
 
 -- Subscriber accepts or rejects
 updatedSubscriptionCid <- submit subscriber, recipient do
@@ -405,7 +414,111 @@ updatedSubscriptionCid <- submit subscriber, recipient do
 - Clear intent signaling through contract state
 - Works with both `PaidSubscription` and `FreeTrialSubscription`
 
+#### MetadataChangeProposal
+
+Either party proposes metadata changes (requires processor approval, then the other party's acceptance):
+
+```daml
+-- Example: Recipient proposes adding RewardShare references
+proposalCid <- submit recipient do
+  createCmd MetadataChangeProposal with
+    subscriber, recipient, processor
+    proposer = recipient
+    newMetadata = TM.fromList 
+      [ ("recipient_reward_agreement_cid", "00abc123...")
+      , ("processor_reward_agreement_cid", "00def456...")
+      ]
+    proposalExpiresAt = futureTime
+
+-- Processor approves the metadata change
+approvedProposalCid <- submit processor do
+  exerciseCmd proposalCid MetadataChangeProposal_ProcessorApprove
+
+-- Subscriber accepts or rejects
+updatedSubscriptionCid <- submit processor, subscriber do
+  exerciseCmd approvedProposalCid ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription with
+    paidSubscriptionCid
+    accepter = subscriber
+```
+
+The two-stage approval process (processor first, then other party) ensures:
+1. **Processor validation**: Processor verifies metadata follows expected format and business rules
+2. **Party consent**: Both subscriber and recipient must agree to metadata changes
+3. **Audit trail**: All metadata changes are recorded on-chain with all parties' signatures
+
 **Single-Party Changes (No Proposal Required):**
 - Subscriber: increase payments, extend expiration, increase prepay window
 - Recipient: decrease their payment, start free trial, decrease prepay window
 - Processor: decrease their payment
+
+### Metadata Field: RewardShare References
+
+The `metadata` field provides a flexible mechanism to attach structured information to subscriptions. A primary use case is referencing **RewardShare contracts** for off-chain reward distribution.
+
+#### Why Use Metadata for RewardShares?
+
+App reward distribution often cannot be handled entirely on-chain. The subscription metadata creates an **on-chain audit trail** showing:
+1. Parties explicitly agreed to reference specific RewardShare contracts
+2. The processor validated and approved the references
+3. A clear record exists if the references are updated later
+4. Contract IDs reference the full reward share details stored on-chain
+
+**It's up to the app to honor these reward shares.** The on-chain contracts provide proof of the distribution terms, but enforcement depends on the app's implementation.
+
+#### Reward Share Patterns
+
+Each `RewardShare` can specify one or more recipients who receive percentage shares of rewards. Anyone can create a RewardShare to define distribution terms (e.g., 10% to partner, 2% to affiliate).
+
+```haskell
+-- **Single RewardShare:**
+-- Reference one RewardShare that defines how rewards should be distributed:
+
+metadata = TM.fromList
+  [ ("reward_share_cid", "00c5d2ba04dc1ee5b12ef0c495f50e5dbf03bd3a0c98f3e2aa1234567890abcd")
+  ]
+
+-- **Multiple RewardShares:**
+-- Reference multiple RewardShares (e.g., separate shares for different reward types):
+
+metadata = TM.fromList
+  [ ("subscription_reward_share_cid", "00c5d2ba04dc1ee5b12ef0c495f50e5dbf03bd3a0c98f3e2aa1234567890abcd")
+  , ("referral_reward_share_cid", "008f1ca97e23b8d4f5e9a1234567890abcd3ef0c495f50e5dbf03bd3a0c98f3e2")
+  ]
+
+-- **No RewardShares:**
+-- No reward distribution references:
+
+metadata = TM.empty
+
+-- Note: Other metadata may also be included with any of the above examples for other purposes.
+
+```
+
+#### Additional Metadata Uses
+
+Beyond RewardShare references, metadata can store:
+- External subscription IDs
+- Service tier identifiers
+- Feature flags or entitlements
+- Billing cycle preferences
+- Custom business logic references
+
+Example:
+```haskell
+metadata = TM.fromList
+  [ ("recipient_reward_agreement_cid", "00c5d2ba04dc1ee5b12ef0c495f50e5dbf03bd3a0c98f3e2aa1234567890abcd")
+  , ("external_subscription_id", "stripe_sub_1234567890")
+  , ("service_tier", "premium_plus")
+  , ("feature_flags", "early_access,beta_features")
+  ]
+```
+
+#### Metadata Constraints
+
+The metadata field has validation rules to prevent abuse:
+- Maximum 100 key-value pairs per subscription
+- Keys: Non-empty, max 256 characters
+- Values: Max 4096 characters
+- Changes require processor approval + other party acceptance
+
+These constraints balance flexibility with performance and ensure metadata remains manageable.

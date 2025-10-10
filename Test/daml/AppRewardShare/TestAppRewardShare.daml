@@ -1,0 +1,324 @@
+module AppRewardShare.TestAppRewardShare where
+
+import DA.Time
+import Daml.Script
+import Fairmint.AppRewardShare.Agreement.RewardShareAgreement
+import Fairmint.AppRewardShare.Agreement.RewardShareAgreementProposal
+import Fairmint.AppRewardShare.Distributor.AppRewardDistributor
+import Fairmint.AppRewardShare.Distributor.AppRewardDistributorProposal
+import Fairmint.AppRewardShare.Types
+
+-- | Test parties
+data TestParties = TestParties
+  with
+    processor : Party
+    dso : Party
+    featuredApp : Party
+    recipient1 : Party
+    recipient2 : Party
+    provider1 : Party
+    provider2 : Party
+  deriving (Eq, Show)
+
+-- | Setup test parties
+setupParties : Script TestParties
+setupParties = do
+  processor <- allocateParty "Processor"
+  dso <- allocateParty "DSO"
+  featuredApp <- allocateParty "FeaturedApp"
+  recipient1 <- allocateParty "Recipient1"
+  recipient2 <- allocateParty "Recipient2"
+  provider1 <- allocateParty "Provider1"
+  provider2 <- allocateParty "Provider2"
+  
+  pure TestParties with ..
+
+-- | Test creating reward share agreements
+testCreateRewardShareAgreements : Script ()
+testCreateRewardShareAgreements = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  -- Create first reward share agreement (60% to recipient1)
+  let config1 = RewardShareConfig with
+        recipient = parties.recipient1
+        sharePercentage = 60.0
+        provider = parties.provider1
+        description = Some "Development team share"
+  
+  -- Featured app proposes agreement
+  proposal1Cid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config = config1
+      context
+      proposer = parties.featuredApp
+  
+  -- Processor approves
+  approved1Cid <- submit parties.processor do
+    exerciseCmd proposal1Cid RewardShareAgreementProposal_ProcessorApprove
+  
+  -- Recipient accepts
+  _agreement1Cid <- submit parties.recipient1 do
+    exerciseCmd approved1Cid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Verify agreements were created
+  agreements <- query @RewardShareAgreement parties.featuredApp
+  assertMsg "Should have created agreements" (length agreements >= 1)
+  
+  pure ()
+
+-- | Test creating distributor via factory
+testCreateDistributorViaFactory : Script (ContractId AppRewardDistributor)
+testCreateDistributorViaFactory = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  -- Create factory
+  factoryCid <- submit parties.processor do
+    createCmd AppRewardDistributorFactory with
+      context
+  
+  -- Create reward share agreement first
+  let config1 = RewardShareConfig with
+        recipient = parties.recipient1
+        sharePercentage = 70.0
+        provider = parties.provider1
+        description = Some "Majority share"
+  
+  proposal1Cid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config = config1
+      context
+      proposer = parties.featuredApp
+  
+  approved1Cid <- submit parties.processor do
+    exerciseCmd proposal1Cid RewardShareAgreementProposal_ProcessorApprove
+  
+  agreement1Cid <- submit parties.recipient1 do
+    exerciseCmd approved1Cid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Create distributor proposal via factory
+  distributorProposalCid <- submit parties.featuredApp do
+    exerciseCmd factoryCid AppRewardDistributorFactory_CreateProposal with
+      featuredApp = parties.featuredApp
+      shareAgreements = [agreement1Cid]
+      description = Some "Main reward distributor"
+  
+  -- Processor approves
+  distributorCid <- submit parties.processor do
+    exerciseCmd distributorProposalCid AppRewardDistributorProposal_ProcessorApprove
+  
+  -- Verify distributor was created
+  Some distributor <- queryContractId parties.processor distributorCid
+  assertMsg "Distributor should start at round 0" (distributor.currentRound == 0)
+  assertMsg "Should have no rewards distributed initially" (distributor.totalRewardsDistributed == 0.0)
+  
+  pure distributorCid
+
+-- | Test adding and removing share agreements from distributor
+testManageShareAgreements : Script ()
+testManageShareAgreements = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  -- Create initial distributor with one agreement
+  distributorCid <- testCreateDistributorViaFactory
+  
+  -- Create another agreement
+  let config2 = RewardShareConfig with
+        recipient = parties.recipient2
+        sharePercentage = 20.0
+        provider = parties.provider2
+        description = Some "Additional share"
+  
+  proposal2Cid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config = config2
+      context
+      proposer = parties.featuredApp
+  
+  approved2Cid <- submit parties.processor do
+    exerciseCmd proposal2Cid RewardShareAgreementProposal_ProcessorApprove
+  
+  agreement2Cid <- submit parties.recipient2 do
+    exerciseCmd approved2Cid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Add agreement to distributor
+  distributorCid2 <- submit parties.processor do
+    exerciseCmd distributorCid AppRewardDistributor_AddShareAgreement with
+      agreementCid = agreement2Cid
+  
+  -- Verify agreement was added
+  Some distributor2 <- queryContractId parties.processor distributorCid2
+  assertMsg "Should have 2 agreements now" (length distributor2.shareAgreements == 2)
+  
+  -- Remove the agreement
+  distributorCid3 <- submit parties.processor do
+    exerciseCmd distributorCid2 AppRewardDistributor_RemoveShareAgreement with
+      agreementCid = agreement2Cid
+  
+  -- Verify agreement was removed
+  Some distributor3 <- queryContractId parties.processor distributorCid3
+  assertMsg "Should have 1 agreement again" (length distributor3.shareAgreements == 1)
+  
+  pure ()
+
+-- | Test updating agreement parameters
+testUpdateAgreementParameters : Script ()
+testUpdateAgreementParameters = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  let config = RewardShareConfig with
+        recipient = parties.recipient1
+        sharePercentage = 50.0
+        provider = parties.provider1
+        description = Some "Initial share"
+  
+  -- Create agreement
+  proposalCid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config
+      context
+      proposer = parties.featuredApp
+  
+  approvedCid <- submit parties.processor do
+    exerciseCmd proposalCid RewardShareAgreementProposal_ProcessorApprove
+  
+  agreementCid <- submit parties.recipient1 do
+    exerciseCmd approvedCid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Featured app updates percentage
+  agreementCid2 <- submit parties.featuredApp do
+    exerciseCmd agreementCid RewardShareAgreement_FeaturedAppUpdatePercentage with
+      newSharePercentage = 45.0
+  
+  Some updatedAgreement <- queryContractId parties.featuredApp agreementCid2
+  assertMsg "Percentage should be updated" (updatedAgreement.config.sharePercentage == 45.0)
+  
+  -- Recipient updates provider
+  agreementCid3 <- submit parties.recipient1 do
+    exerciseCmd agreementCid2 RewardShareAgreement_RecipientUpdateProvider with
+      newProvider = parties.provider2
+  
+  Some finalAgreement <- queryContractId parties.recipient1 agreementCid3
+  assertMsg "Provider should be updated" (finalAgreement.config.provider == parties.provider2)
+  
+  pure ()
+
+-- | Test validation: total shares cannot exceed 100%
+testValidateTotalShares : Script ()
+testValidateTotalShares = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  -- Create two agreements that total more than 100%
+  let config1 = RewardShareConfig with
+        recipient = parties.recipient1
+        sharePercentage = 60.0
+        provider = parties.provider1
+        description = None
+  
+  let config2 = RewardShareConfig with
+        recipient = parties.recipient2
+        sharePercentage = 50.0  -- Total would be 110%
+        provider = parties.provider2
+        description = None
+  
+  -- Create agreements
+  proposal1Cid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config = config1
+      context
+      proposer = parties.featuredApp
+  
+  approved1Cid <- submit parties.processor do
+    exerciseCmd proposal1Cid RewardShareAgreementProposal_ProcessorApprove
+  
+  agreement1Cid <- submit parties.recipient1 do
+    exerciseCmd approved1Cid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  proposal2Cid <- submit parties.featuredApp do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config = config2
+      context
+      proposer = parties.featuredApp
+  
+  approved2Cid <- submit parties.processor do
+    exerciseCmd proposal2Cid RewardShareAgreementProposal_ProcessorApprove
+  
+  agreement2Cid <- submit parties.recipient2 do
+    exerciseCmd approved2Cid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Try to create distributor with both agreements (should fail)
+  distributorProposalCid <- submit parties.featuredApp do
+    createCmd AppRewardDistributorProposal with
+      featuredApp = parties.featuredApp
+      context
+      shareAgreements = [agreement1Cid, agreement2Cid]
+      description = None
+  
+  -- Processor approval should fail due to total > 100%
+  submitMustFail parties.processor do
+    exerciseCmd distributorProposalCid AppRewardDistributorProposal_ProcessorApprove
+  
+  pure ()
+
+-- | Test recipient-initiated proposal
+testRecipientInitiatedProposal : Script ()
+testRecipientInitiatedProposal = do
+  parties <- setupParties
+  
+  let context = ProcessorContext with
+        processor = parties.processor
+        dso = parties.dso
+  
+  let config = RewardShareConfig with
+        recipient = parties.recipient1
+        sharePercentage = 40.0
+        provider = parties.provider1
+        description = Some "Recipient initiated"
+  
+  -- Recipient proposes agreement
+  proposalCid <- submit parties.recipient1 do
+    createCmd RewardShareAgreementProposal with
+      featuredApp = parties.featuredApp
+      config
+      context
+      proposer = parties.recipient1
+  
+  -- Processor approves
+  approvedCid <- submit parties.processor do
+    exerciseCmd proposalCid RewardShareAgreementProposal_ProcessorApprove
+  
+  -- Featured app accepts
+  agreementCid <- submit parties.featuredApp do
+    exerciseCmd approvedCid ProcessorApprovedRewardShareAgreementProposal_Accept
+  
+  -- Verify agreement was created
+  Some recipientInitiatedAgreement <- queryContractId parties.recipient1 agreementCid
+  assertMsg "Agreement should be created" (recipientInitiatedAgreement.config.sharePercentage == 40.0)
+  
+  pure ()
+
