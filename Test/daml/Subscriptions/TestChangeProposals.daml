@@ -1,0 +1,631 @@
+module Subscriptions.TestChangeProposals where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.TextMap qualified as TM
+import Fairmint.Subscriptions.Creation.SubscriberSubscriptionProposal
+import Fairmint.Subscriptions.Creation.ProcessorApprovedSubscriptionProposal
+import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.ChangeProposals.ExpirationExtensionProposal
+import Fairmint.Subscriptions.ChangeProposals.MetadataChangeProposal
+import Fairmint.Subscriptions.ChangeProposals.PaymentChangeProposal
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionAmount(..), ProcessorContext(..), SubscriptionExpiration(..))
+import Fairmint.Subscriptions.Creation.SubscriptionFactory
+import Subscriptions.TestUtils
+
+-- | Test ExpirationExtensionProposal Archive
+testExpirationExtensionProposalArchive : Script ()
+testExpirationExtensionProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  newExpiresAt <- getExpirationTime 500
+  extensionProposalCid <- submit bob do
+    createCmd ExpirationExtensionProposal with
+      subscriber = alice
+      recipient = bob
+      newExpiresAt = newExpiresAt
+      subscriptionCid = Left subscriptionCid
+  
+  submitMulti [alice, bob] [] do
+    archiveCmd extensionProposalCid
+  
+  pure ()
+
+-- | Test ExpirationExtensionProposal_AcceptForPaidSubscription
+testExpirationExtensionProposalAcceptForPaid : Script ()
+testExpirationExtensionProposalAcceptForPaid = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  newExpiresAt <- getExpirationTime 500
+  extensionProposalCid <- submit bob do
+    createCmd ExpirationExtensionProposal with
+      subscriber = alice
+      recipient = bob
+      newExpiresAt = newExpiresAt
+      subscriptionCid = Left subscriptionCid
+  
+  updatedCid <- submitMulti [alice, bob] [] do
+    exerciseCmd extensionProposalCid ExpirationExtensionProposal_AcceptForPaidSubscription with
+      paidSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Expiration should be extended" (updated.config.expiresAt == newExpiresAt)
+  
+  pure ()
+
+-- | Test ExpirationExtensionProposal_AcceptForFreeTrialSubscription
+testExpirationExtensionProposalAcceptForFreeTrial : Script ()
+testExpirationExtensionProposalAcceptForFreeTrial = script do
+  TestParties{..} <- allocateTestParties
+  
+  now <- getTime
+  expiresAt <- getExpirationTime 365
+  let freeTrialEndsAt = addRelTime now (days 30)
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  
+  proposalCid <- submitMulti [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateSubscriberProposal with
+        config = config
+        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt))
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Left cid -> pure cid  -- FreeTrialSubscription
+    Right _ -> error "Expected FreeTrialSubscription"
+  
+  newExpiresAt <- getExpirationTime 500
+  extensionProposalCid <- submit bob do
+    createCmd ExpirationExtensionProposal with
+      subscriber = alice
+      recipient = bob
+      newExpiresAt = newExpiresAt
+      subscriptionCid = Right subscriptionCid
+  
+  updatedCid <- submitMulti [alice, bob] [] do
+    exerciseCmd extensionProposalCid ExpirationExtensionProposal_AcceptForFreeTrialSubscription with
+      freeTrialSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Expiration should be extended" (updated.config.expiresAt == newExpiresAt)
+  
+  pure ()
+
+-- | Test ExpirationExtensionProposal_Reject
+testExpirationExtensionProposalReject : Script ()
+testExpirationExtensionProposalReject = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  newExpiresAt <- getExpirationTime 500
+  extensionProposalCid <- submit bob do
+    createCmd ExpirationExtensionProposal with
+      subscriber = alice
+      recipient = bob
+      newExpiresAt = newExpiresAt
+      subscriptionCid = Left subscriptionCid
+  
+  submit alice do
+    exerciseCmd extensionProposalCid ExpirationExtensionProposal_Reject with
+      reason = Some "Not interested in extending"
+  
+  pure ()
+
+-- | Test ExpirationExtensionProposal_Withdraw
+testExpirationExtensionProposalWithdraw : Script ()
+testExpirationExtensionProposalWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  newExpiresAt <- getExpirationTime 500
+  extensionProposalCid <- submit bob do
+    createCmd ExpirationExtensionProposal with
+      subscriber = alice
+      recipient = bob
+      newExpiresAt = newExpiresAt
+      subscriptionCid = Left subscriptionCid
+  
+  submit bob do
+    exerciseCmd extensionProposalCid ExpirationExtensionProposal_Withdraw with
+      reason = None
+  
+  pure ()
+
+-- | Test MetadataChangeProposal Archive
+testMetadataChangeProposalArchive : Script ()
+testMetadataChangeProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  submitMulti [alice, bob, processor] [] do
+    archiveCmd metadataProposalCid
+  
+  pure ()
+
+-- | Test MetadataChangeProposal_ProcessorApprove
+testMetadataChangeProposalProcessorApprove : Script ()
+testMetadataChangeProposalProcessorApprove = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  Some approved <- queryContractId processor approvedCid
+  assertMsg "Metadata should match" (approved.newMetadata == TM.fromList [("key", "value")])
+  
+  pure ()
+
+-- | Test MetadataChangeProposal_ProcessorReject
+testMetadataChangeProposalProcessorReject : Script ()
+testMetadataChangeProposalProcessorReject = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorReject with
+      reason = Some "Invalid metadata"
+  
+  pure ()
+
+-- | Test MetadataChangeProposal_Withdraw
+testMetadataChangeProposalWithdraw : Script ()
+testMetadataChangeProposalWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  submit alice do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_Withdraw with
+      reason = Some "Changed my mind"
+  
+  pure ()
+
+-- | Test MetadataChangeProposal_RejectByOtherParty
+testMetadataChangeProposalRejectByOtherParty : Script ()
+testMetadataChangeProposalRejectByOtherParty = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  submit bob do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_RejectByOtherParty with
+      rejecter = bob
+      reason = Some "Don't agree with this change"
+  
+  pure ()
+
+-- | Test ProcessorApprovedMetadataChangeProposal Archive
+testProcessorApprovedMetadataChangeProposalArchive : Script ()
+testProcessorApprovedMetadataChangeProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  submitMulti [alice, processor] [bob] do
+    archiveCmd approvedCid
+  
+  pure ()
+
+-- | Test ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription
+testProcessorApprovedMetadataChangeProposalAcceptForPaid : Script ()
+testProcessorApprovedMetadataChangeProposalAcceptForPaid = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("updated", "metadata")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  updatedCid <- submitMulti [processor, bob] [] do
+    exerciseCmd approvedCid ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription with
+      paidSubscriptionCid = subscriptionCid
+      accepter = bob
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Metadata should be updated" (updated.config.metadata == TM.fromList [("updated", "metadata")])
+  
+  pure ()
+
+-- | Test ProcessorApprovedMetadataChangeProposal_AcceptForFreeTrialSubscription
+testProcessorApprovedMetadataChangeProposalAcceptForFreeTrial : Script ()
+testProcessorApprovedMetadataChangeProposalAcceptForFreeTrial = script do
+  TestParties{..} <- allocateTestParties
+  
+  now <- getTime
+  expiresAt <- getExpirationTime 365
+  let freeTrialEndsAt = addRelTime now (days 30)
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  
+  proposalCid <- submitMulti [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateSubscriberProposal with
+        config = config
+        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt))
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Left cid -> pure cid  -- FreeTrialSubscription
+    Right _ -> error "Expected FreeTrialSubscription"
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("updated", "metadata")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  updatedCid <- submitMulti [processor, bob] [] do
+    exerciseCmd approvedCid ProcessorApprovedMetadataChangeProposal_AcceptForFreeTrialSubscription with
+      freeTrialSubscriptionCid = subscriptionCid
+      accepter = bob
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Metadata should be updated" (updated.config.metadata == TM.fromList [("updated", "metadata")])
+  
+  pure ()
+
+-- | Test ProcessorApprovedMetadataChangeProposal_Reject
+testProcessorApprovedMetadataChangeProposalReject : Script ()
+testProcessorApprovedMetadataChangeProposalReject = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  submit bob do
+    exerciseCmd approvedCid ProcessorApprovedMetadataChangeProposal_Reject with
+      rejecter = bob
+      reason = Some "Still don't agree"
+  
+  pure ()
+
+-- | Test ProcessorApprovedMetadataChangeProposal_Withdraw
+testProcessorApprovedMetadataChangeProposalWithdraw : Script ()
+testProcessorApprovedMetadataChangeProposalWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  metadataProposalCid <- submit alice do
+    createCmd MetadataChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      proposer = alice
+      newMetadata = TM.fromList [("key", "value")]
+      proposalExpiresAt = proposalExpiresAt
+  
+  approvedCid <- submit processor do
+    exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
+  
+  submit alice do
+    exerciseCmd approvedCid ProcessorApprovedMetadataChangeProposal_Withdraw with
+      reason = Some "Changed my mind after approval"
+  
+  pure ()
+
+-- | Test PaymentChangeProposal Archive
+testPaymentChangeProposalArchive : Script ()
+testPaymentChangeProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  paymentProposalCid <- submit bob do
+    createCmd PaymentChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      previousRecipientPaymentPerDay = AmuletAmount 1.0
+      previousProcessorPaymentPerDay = AmuletAmount 0.2
+      newRecipientPaymentPerDay = AmuletAmount 2.0
+      newProcessorPaymentPerDay = AmuletAmount 0.4
+      expiresAt = proposalExpiresAt
+  
+  submitMulti [alice, bob] [processor] do
+    archiveCmd paymentProposalCid
+  
+  pure ()
+
+-- | Test PaymentChangeProposal_AcceptForPaidSubscription
+testPaymentChangeProposalAcceptForPaid : Script ()
+testPaymentChangeProposalAcceptForPaid = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso config
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Right cid -> pure cid
+    Left _ -> error "Expected PaidSubscription"
+  
+  proposalExpiresAt <- getExpirationTime 30
+  paymentProposalCid <- submit bob do
+    createCmd PaymentChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      previousRecipientPaymentPerDay = AmuletAmount 1.0
+      previousProcessorPaymentPerDay = AmuletAmount 0.2
+      newRecipientPaymentPerDay = AmuletAmount 2.0
+      newProcessorPaymentPerDay = AmuletAmount 0.4
+      expiresAt = proposalExpiresAt
+  
+  updatedCid <- submitMulti [alice, bob] [] do
+    exerciseCmd paymentProposalCid PaymentChangeProposal_AcceptForPaidSubscription with
+      paidSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Recipient payment should be increased" (updated.config.recipientPaymentPerDay == AmuletAmount 2.0)
+  assertMsg "Processor payment should be increased" (updated.config.processorPaymentPerDay == AmuletAmount 0.4)
+  
+  pure ()
+
+-- | Test PaymentChangeProposal_AcceptForFreeTrialSubscription
+testPaymentChangeProposalAcceptForFreeTrial : Script ()
+testPaymentChangeProposalAcceptForFreeTrial = script do
+  TestParties{..} <- allocateTestParties
+  
+  now <- getTime
+  expiresAt <- getExpirationTime 365
+  let freeTrialEndsAt = addRelTime now (days 30)
+  let config = defaultSubscriptionConfig alice bob expiresAt
+  
+  proposalCid <- submitMulti [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with context = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateSubscriberProposal with
+        config = config
+        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt))
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  
+  result <- submit bob do
+    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
+      recipientProvider = bob
+  
+  subscriptionCid <- case result.subscription of
+    Left cid -> pure cid  -- FreeTrialSubscription
+    Right _ -> error "Expected FreeTrialSubscription"
+  
+  proposalExpiresAt <- getExpirationTime 30
+  paymentProposalCid <- submit bob do
+    createCmd PaymentChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      previousRecipientPaymentPerDay = AmuletAmount 1.0
+      previousProcessorPaymentPerDay = AmuletAmount 0.2
+      newRecipientPaymentPerDay = AmuletAmount 2.0
+      newProcessorPaymentPerDay = AmuletAmount 0.4
+      expiresAt = proposalExpiresAt
+  
+  updatedCid <- submitMulti [alice, bob] [] do
+    exerciseCmd paymentProposalCid PaymentChangeProposal_AcceptForFreeTrialSubscription with
+      freeTrialSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedCid
+  assertMsg "Recipient payment should be increased" (updated.config.recipientPaymentPerDay == AmuletAmount 2.0)
+  assertMsg "Processor payment should be increased" (updated.config.processorPaymentPerDay == AmuletAmount 0.4)
+  
+  pure ()
+
+-- | Test PaymentChangeProposal_Reject
+testPaymentChangeProposalReject : Script ()
+testPaymentChangeProposalReject = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  paymentProposalCid <- submit bob do
+    createCmd PaymentChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      previousRecipientPaymentPerDay = AmuletAmount 1.0
+      previousProcessorPaymentPerDay = AmuletAmount 0.2
+      newRecipientPaymentPerDay = AmuletAmount 2.0
+      newProcessorPaymentPerDay = AmuletAmount 0.4
+      expiresAt = proposalExpiresAt
+  
+  submit alice do
+    exerciseCmd paymentProposalCid PaymentChangeProposal_Reject with
+      reason = Some "Too expensive"
+  
+  pure ()
+
+-- | Test PaymentChangeProposal_Withdraw
+testPaymentChangeProposalWithdraw : Script ()
+testPaymentChangeProposalWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  proposalExpiresAt <- getExpirationTime 30
+  paymentProposalCid <- submit bob do
+    createCmd PaymentChangeProposal with
+      subscriber = alice
+      recipient = bob
+      processor = processor
+      previousRecipientPaymentPerDay = AmuletAmount 1.0
+      previousProcessorPaymentPerDay = AmuletAmount 0.2
+      newRecipientPaymentPerDay = AmuletAmount 2.0
+      newProcessorPaymentPerDay = AmuletAmount 0.4
+      expiresAt = proposalExpiresAt
+  
+  submit bob do
+    exerciseCmd paymentProposalCid PaymentChangeProposal_Withdraw with
+      reason = Some "Decided to keep current pricing"
+  
+  pure ()
+

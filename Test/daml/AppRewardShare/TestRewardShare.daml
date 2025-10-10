@@ -1,0 +1,315 @@
+module AppRewardShare.TestRewardShare where
+
+import Daml.Script
+import DA.TextMap qualified as TM
+import Fairmint.RewardShare.RewardShare
+import Fairmint.RewardShare.Types
+import Shared.TestUtils (sharedDso, tap, getFirstOpenRound, getAmuletRules)
+import Splice.Amulet qualified as Amulet
+
+-- | Standard test parties setup for RewardShare tests
+data TestParties = TestParties with
+    alice : Party
+    bob : Party
+    charlie : Party
+    creator : Party
+    provider : Party
+
+-- | Allocate standard test parties for RewardShare tests
+allocateTestParties : Script TestParties
+allocateTestParties = do
+  alice <- allocateParty "Alice"
+  bob <- allocateParty "Bob"
+  charlie <- allocateParty "Charlie"
+  creator <- allocateParty "Creator"
+  provider <- allocateParty "Provider"
+  pure TestParties with ..
+
+-- | Helper to create a simple RewardShare with two recipients
+createSimpleRewardShare : Party -> Party -> Party -> Party -> Script (ContractId RewardShare)
+createSimpleRewardShare creator recipient1 recipient2 provider = do
+  let config1 = RewardShareConfig with
+        recipient = recipient1
+        sharePercentage = 60.0
+        provider = provider
+  let config2 = RewardShareConfig with
+        recipient = recipient2
+        sharePercentage = 40.0
+        provider = provider
+  submit creator do
+    createCmd RewardShare with
+      creator = creator
+      configs = [config1, config2]
+      lastRoundProcessed = 0
+      description = Some "Test reward share"
+      metadata = TM.empty
+
+-- | Test that the creator can archive a RewardShare using the standard Archive choice
+testRewardShareArchive : Script ()
+testRewardShareArchive = script do
+  TestParties{..} <- allocateTestParties
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Creator archives the RewardShare using standard Archive
+  submit creator do
+    archiveCmd rewardShareCid
+  
+  pure ()
+
+-- | Test that the creator can archive a RewardShare using the custom RewardShare_Archive choice
+testRewardShareArchiveWithReason : Script ()
+testRewardShareArchiveWithReason = script do
+  TestParties{..} <- allocateTestParties
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Creator archives with a reason
+  submit creator do
+    exerciseCmd rewardShareCid RewardShare_Archive with
+      reason = Some "No longer needed"
+  
+  pure ()
+
+-- | Test that the creator can archive without providing a reason
+testRewardShareArchiveNoReason : Script ()
+testRewardShareArchiveNoReason = script do
+  TestParties{..} <- allocateTestParties
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Creator archives without a reason
+  submit creator do
+    exerciseCmd rewardShareCid RewardShare_Archive with
+      reason = None
+  
+  pure ()
+
+-- | Test that RewardShare_Distribute properly distributes rewards to recipients
+testRewardShareDistribute : Script ()
+testRewardShareDistribute = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a RewardShare with two recipients
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Tap funds for the distributor (creator in this case)
+  amuletCid <- tap creator 100.0
+  
+  -- Get the distribution context and DSO
+  dso <- sharedDso
+  amuletRulesCid <- getAmuletRules dso
+  openRoundCid <- getFirstOpenRound dso
+  
+  -- Execute distribution
+  result <- submit creator do
+    exerciseCmd rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = 
+        [ (alice, None)
+        , (bob, None)
+        ]
+      expectedDso = dso
+  
+  -- Verify results
+  assertMsg "Distribution amount should equal total" (result.distributedAmount == 100.0)
+  assertMsg "New round should be 1" (result.newRound == 1)
+  assertMsg "Should have 2 transfer results" (length result.transferResults == 2)
+  
+  pure ()
+
+-- | Test that RewardShare_Distribute properly updates lastRoundProcessed
+testRewardShareDistributeMultipleRounds : Script ()
+testRewardShareDistributeMultipleRounds = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a RewardShare
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Get the distribution context and DSO
+  dso <- sharedDso
+  amuletRulesCid <- getAmuletRules dso
+  openRoundCid <- getFirstOpenRound dso
+  
+  -- First distribution (round 1)
+  amuletCid1 <- tap creator 100.0
+  result1 <- submit creator do
+    exerciseCmd rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid1]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = [(alice, None), (bob, None)]
+      expectedDso = dso
+  
+  assertMsg "First distribution: new round should be 1" (result1.newRound == 1)
+  
+  -- Second distribution (round 2) using the updated contract
+  amuletCid2 <- tap creator 100.0
+  result2 <- submit creator do
+    exerciseCmd result1.rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 2
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid2]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = [(alice, None), (bob, None)]
+      expectedDso = dso
+  
+  assertMsg "Second distribution: new round should be 2" (result2.newRound == 2)
+  
+  pure ()
+
+-- | Test that RewardShare_Distribute fails if distribution round is not greater than lastRoundProcessed
+testRewardShareDistributeInvalidRoundProgression : Script ()
+testRewardShareDistributeInvalidRoundProgression = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a RewardShare
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Get the distribution context and DSO
+  dso <- sharedDso
+  amuletRulesCid <- getAmuletRules dso
+  openRoundCid <- getFirstOpenRound dso
+  
+  -- First distribution (round 1)
+  amuletCid1 <- tap creator 100.0
+  result1 <- submit creator do
+    exerciseCmd rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid1]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = [(alice, None), (bob, None)]
+      expectedDso = dso
+  
+  -- Try to distribute for the same round again (should fail)
+  amuletCid2 <- tap creator 100.0
+  submitMustFail creator do
+    exerciseCmd result1.rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1  -- Same round as before
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid2]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = [(alice, None), (bob, None)]
+      expectedDso = dso
+  
+  pure ()
+
+-- | Test that RewardShare_Distribute fails with zero or negative reward amount
+testRewardShareDistributeInvalidAmount : Script ()
+testRewardShareDistributeInvalidAmount = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a RewardShare
+  rewardShareCid <- createSimpleRewardShare creator alice bob provider
+  
+  -- Get the distribution context and DSO
+  dso <- sharedDso
+  amuletRulesCid <- getAmuletRules dso
+  openRoundCid <- getFirstOpenRound dso
+  
+  -- Tap funds
+  amuletCid <- tap creator 100.0
+  
+  -- Try to distribute with zero amount (should fail)
+  submitMustFail creator do
+    exerciseCmd rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1
+      totalRewardAmount = 0.0  -- Invalid: zero amount
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = [(alice, None), (bob, None)]
+      expectedDso = dso
+  
+  pure ()
+
+-- | Test that RewardShare_Distribute works with three recipients
+testRewardShareDistributeThreeRecipients : Script ()
+testRewardShareDistributeThreeRecipients = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a RewardShare with three recipients
+  let config1 = RewardShareConfig with
+        recipient = alice
+        sharePercentage = 50.0
+        provider = provider
+  let config2 = RewardShareConfig with
+        recipient = bob
+        sharePercentage = 30.0
+        provider = provider
+  let config3 = RewardShareConfig with
+        recipient = charlie
+        sharePercentage = 20.0
+        provider = provider
+  
+  rewardShareCid <- submit creator do
+    createCmd RewardShare with
+      creator = creator
+      configs = [config1, config2, config3]
+      lastRoundProcessed = 0
+      description = Some "Three-way reward share"
+      metadata = TM.empty
+  
+  -- Tap funds for distribution
+  amuletCid <- tap creator 100.0
+  
+  -- Get the distribution context and DSO
+  dso <- sharedDso
+  amuletRulesCid <- getAmuletRules dso
+  openRoundCid <- getFirstOpenRound dso
+  
+  -- Execute distribution
+  result <- submit creator do
+    exerciseCmd rewardShareCid RewardShare_Distribute with
+      distributor = creator
+      distributionRound = 1
+      totalRewardAmount = 100.0
+      couponAmount = 0.0
+      archivedCouponCids = []
+      distributionCtx = DistributionContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRights = 
+        [ (alice, None)
+        , (bob, None)
+        , (charlie, None)
+        ]
+      expectedDso = dso
+  
+  -- Verify we have 3 transfer results
+  assertMsg "Should have 3 transfer results" (length result.transferResults == 3)
+  
+  pure ()
+
