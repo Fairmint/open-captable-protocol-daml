@@ -190,7 +190,7 @@ flowchart LR
 
 ## Usage Example
 
-```daml
+```haskell
 -- 1. Create proposal (subscriber initiates)
 proposalCid <- submit subscriber do
   exerciseCmd factoryCid SubscriptionFactory_CreateSubscriberProposal with
