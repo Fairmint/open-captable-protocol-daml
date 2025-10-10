@@ -64,9 +64,10 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
 
 ## Architecture
 
-**Three-Party Flow:** Either subscriber-initiated or recipient-initiated:
+**Three-Party Flow:** Can be initiated by subscriber, recipient, or processor:
 - **Subscriber-initiated:** Subscriber proposes terms → Processor approves → Recipient accepts
 - **Recipient-initiated:** Recipient proposes terms → Processor approves → Subscriber accepts
+- **Processor-initiated:** Processor proposes terms → Either party accepts first → Other party accepts
 
 **Billing Model:** Configured as a rate per day but charged pro-rated for any processing period used:
 ```
@@ -94,9 +95,11 @@ The subscription system uses separate templates for each lifecycle state:
 **Proposal Flow:**
 - `SubscriptionFactory` - Creates proposals with processor/DSO context
 - `SubscriberSubscriptionProposal` - Subscriber initiates, awaits processor approval
-- `RecipientSubscriptionProposal` - Recipient initiates, awaits processor approval  
-- `ProcessorApprovedSubscriptionProposal` - Awaits recipient acceptance
-- `ProcessorApprovedRecipientInitiatedSubscriptionProposal` - Awaits subscriber acceptance
+- `RecipientSubscriptionProposal` - Recipient initiates, awaits processor approval
+- `ProcessorSubscriptionProposal` - Processor initiates, awaits acceptance from both parties
+- `ProcessorApprovedSubscriptionProposal` - Awaits recipient acceptance (after processor approval of subscriber proposal)
+- `ProcessorApprovedRecipientInitiatedSubscriptionProposal` - Awaits subscriber acceptance (after processor approval of recipient proposal)
+- `OnePartyApprovedProcessorSubscriptionProposal` - Awaits second party acceptance (after one party accepted processor proposal)
 
 **Active Subscriptions:**
 - `FreeTrialSubscription` - Active trial period (no payments, creates activity markers)
@@ -112,9 +115,11 @@ The subscription system uses separate templates for each lifecycle state:
 
 **Lifecycle Overview:**
 
-1. **Proposal:** Subscriber or recipient proposes terms via `SubscriptionFactory`
-2. **Approval:** Processor validates and approves (e.g., confirms fee structure)
-3. **Acceptance:** Other party accepts, creating either `FreeTrialSubscription` or `PaidSubscription`
+1. **Proposal:** Subscriber, recipient, or processor proposes terms via `SubscriptionFactory`
+2. **Approval/Acceptance:**
+   - **Subscriber/Recipient-initiated:** Processor validates and approves, then the other party accepts
+   - **Processor-initiated:** Either party accepts first, then the other party accepts
+3. **Active Subscription:** Creates either `FreeTrialSubscription` or `PaidSubscription`
 4. **Processing:**
    - Free trial: Processor advances `paidUntil` and creates activity markers (no payments)
    - Paid: Processor executes transfers from subscriber to recipient and processor (with app rewards)
@@ -158,6 +163,26 @@ flowchart LR
     classDef proposal fill:#fff9e6,stroke:#666
     classDef active fill:#e6f3ff,stroke:#666
     class RP,PA proposal
+    class FT,PS active
+```
+
+### Processor-Initiated Flow
+
+```mermaid
+flowchart LR
+    Start(( )) --> |"propose (processor)"| PP["Processor Proposal<br>(via factory)"]
+    PP -->|"accept (subscriber or recipient)"| OneApproved[One Party Approved]
+    PP -->|"reject (any)"| End(( ))
+    PP -->|"withdraw (processor)"| End
+    OneApproved -->|"accept (other party)"| Choice{with trial?}
+    OneApproved -->|"reject (any)"| End
+    OneApproved -->|"withdraw (first acceptor or processor)"| End
+    Choice -->|yes| FT[Free Trial]
+    Choice -->|no| PS[Paid Subscription]
+    
+    classDef proposal fill:#fff9e6,stroke:#666
+    classDef active fill:#e6f3ff,stroke:#666
+    class PP,OneApproved proposal
     class FT,PS active
 ```
 
