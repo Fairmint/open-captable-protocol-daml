@@ -97,6 +97,8 @@ The subscription system uses separate templates for each lifecycle state:
 
 **Configuration Updates:**
 - `ReasonUpdateProposal` - Update reason field (requires both parties, works for either subscription type)
+- `PaymentChangeProposal` - Recipient proposes payment increases (requires subscriber acceptance)
+- `ExpirationExtensionProposal` - Recipient proposes extending subscription (requires subscriber acceptance)
 
 ## Flow Diagrams
 
@@ -238,9 +240,6 @@ paymentResult <- submit processor do
     processorFeaturedAppRight = Some processorFARCid
     processorActivityMarkerFAR = None  -- Only used in zero-fee mode
 
--- Zero-fee mode (processorPaymentPerDay = 0):
--- Set processorFeaturedAppRight = None
--- Set processorActivityMarkerFAR = Some activityMarkerFARCid
 ```
 
 ## Appendix
@@ -301,46 +300,112 @@ With each process transaction, we're securing additional funds and advancing the
 
 The transactional approach trades some efficiency for better UX and works naturally with Canton's polling-based processing model.
 
-### Future Improvements
+#### Open Question: Should Prepaid Window Use LockedAmulets?
 
-#### Additional Change Proposal Contracts
+**Context:** Currently, the prepaid window amount is paid from the subscriber's regular account balance during each processing cycle. This provides flexibility but no guarantees.
 
-**Implemented:** `ReasonUpdateProposal` allows either party to propose changes to the `reason` field on any subscription type, requiring both parties' approval.
+**Alternative Approach:** Lock the prepaid window amount (e.g., `prepayWindow × (recipientPaymentPerDay + processorPaymentPerDay)`) in a `LockedAmulet` at subscription start or when the prepaid buffer needs replenishment.
 
-**Current Single-Party Changes:**
-- Subscriber: increase payments, extend expiration, increase prepay window
-- Recipient: decrease their payment, start free trial, decrease prepay window
-- Processor: decrease their payment
+**Potential Benefits:**
 
-**Future Enhancement:** Additional proposal contracts for changes requiring negotiation:
+1. **Guaranteed Refunds on Cancellation:**
+   - Locked funds could be automatically returned to the subscriber after cancellation
+   - Provides stronger consumer protection
+   - Could be an opt-in feature in subscription terms
+   - Removes recipient discretion from refund decisions
 
-**Payment Change Proposals:**
+2. **Guaranteed Service Payment on Delinquency:**
+   - If subscriber runs out of regular funds, service continues for the prepaid period
+   - After non-payment threshold (e.g., 2 weeks), subscription auto-closes and locked funds transfer to recipient
+   - Provides revenue certainty for recipients
+   - Creates clear delinquency handling
+
+**Tradeoffs:**
+
+- **Pro:** Stronger guarantees for both parties (refunds for subscribers, payment for recipients)
+- **Pro:** Could reduce disputes and simplify cancellation logic
+- **Pro:** Aligns prepaid window concept with actual pre-locked funds
+- **Con:** Requires larger upfront deposit from subscribers
+- **Con:** Adds complexity to subscription initialization and replenishment
+- **Con:** May reduce subscriber conversion rates due to higher barrier to entry
+- **Con:** LockedAmulet contracts add overhead to the system
+
+**Questions to Resolve:**
+
+- Should this be the default behavior, or an optional feature controlled by subscription terms?
+- How should locked funds be replenished when they run low?
+- Should both refund and payment guarantees be paired, or offered independently?
+- Does the guaranteed refund model conflict with business models that rely on prepaid non-refundable revenue?
+
+### Change Proposal Contracts
+
+The subscription system includes proposal contracts for changes that require negotiation between subscriber and recipient:
+
+#### ReasonUpdateProposal
+
+Allows either party to propose changes to the `reason` field on any subscription type:
+
+```daml
+-- Either subscriber or recipient can propose
+proposalCid <- submit proposer do
+  createCmd ReasonUpdateProposal with
+    subscriber, recipient, proposer
+    newReason = Some "Updated subscription purpose"
+    subscriptionCid = Left paidSubscriptionCid  -- or Right for FreeTrialSubscription
+
+-- Other party accepts
+updatedSubscriptionCid <- submit subscriber, recipient do
+  exerciseCmd proposalCid ReasonUpdateProposal_AcceptForPaidSubscription with
+    paidSubscriptionCid
+```
+
+#### PaymentChangeProposal
+
+Recipient proposes payment increases (requires subscriber acceptance):
+
 ```daml
 -- Recipient proposes payment increase
 proposalCid <- submit recipient do
-  createCmd PaymentIncreaseProposal with
-    paidSubscriptionCid
+  createCmd PaymentChangeProposal with
+    subscriber, recipient
     newRecipientPaymentPerDay = AmuletAmount 15.0
-    effectiveDate = futureTime
+    newProcessorPaymentPerDay = AmuletAmount 1.5
+    effectiveDate = Some futureTime
     reason = Some "Annual price adjustment"
+    subscriptionCid = Left paidSubscriptionCid
+
+-- Subscriber accepts or rejects
+updatedSubscriptionCid <- submit subscriber, recipient do
+  exerciseCmd proposalCid PaymentChangeProposal_AcceptForPaidSubscription with
+    paidSubscriptionCid
 ```
 
-**Expiration Extension Proposals:**
+#### ExpirationExtensionProposal
+
+Recipient proposes extending subscription beyond current expiration:
+
 ```daml
--- Recipient proposes extending subscription beyond current expiration
+-- Recipient proposes extending subscription
 proposalCid <- submit recipient do
   createCmd ExpirationExtensionProposal with
-    subscriptionCid
+    subscriber, recipient
     newExpiresAt = farFutureTime
     incentive = Some "Lock in current rate for 2 years"
+    subscriptionCid = Left paidSubscriptionCid
+
+-- Subscriber accepts or rejects
+updatedSubscriptionCid <- submit subscriber, recipient do
+  exerciseCmd proposalCid ExpirationExtensionProposal_AcceptForPaidSubscription with
+    paidSubscriptionCid
 ```
 
 **Benefits:**
 - On-chain audit trail of all change requests
 - Async negotiation without real-time communication
 - Clear intent signaling through contract state
+- Works with both `PaidSubscription` and `FreeTrialSubscription`
 
-**Implementation Notes:**
-- Each change type needs its own proposal template
-- Should include expiration times for proposals
-- Must handle underlying subscription changes during proposal lifecycle
+**Single-Party Changes (No Proposal Required):**
+- Subscriber: increase payments, extend expiration, increase prepay window
+- Recipient: decrease their payment, start free trial, decrease prepay window
+- Processor: decrease their payment
