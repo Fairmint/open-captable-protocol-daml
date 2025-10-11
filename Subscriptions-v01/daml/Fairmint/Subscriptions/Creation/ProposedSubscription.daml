@@ -1,7 +1,7 @@
 module Fairmint.Subscriptions.Creation.ProposedSubscription where
 
 import DA.Set (member)
-import DA.Time (days, addRelTime)
+import DA.Time (days)
 import Fairmint.Subscriptions.Active.Subscriptions (FreeTrialSubscription(..), PaidSubscription(..), SubscriptionCreationResult(..))
 import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), getImpactedParties, applyChanges, validateChanges)
 import Fairmint.Shared.TypeHelpers (validateOptionalText)
@@ -97,19 +97,20 @@ template ProposedSubscription
         
         case proposal.freeTrialExpiration of
           Some trialExpiration -> do
-            let trialEnd = resolveSubscriptionTime trialExpiration now
+            trialEnd <- resolveSubscriptionTime trialExpiration
             
             assertMsg "Trial end must be in the future" (trialEnd > now)
             
             -- Validate expiration if set
             case proposal.expiresAt of
               Some expTime -> do
-                let finalExpiration = resolveSubscriptionTime expTime now
+                finalExpiration <- resolveSubscriptionTime expTime
                 assertMsg "Trial end must not exceed expiration" (trialEnd <= finalExpiration)
               None -> pure ()
             
+            config <- buildConfig proposal now
             subscriptionCid <- create FreeTrialSubscription with
-              config = buildConfig proposal now
+              config = config
               trialEndsAt = trialEnd
               paidUntil = now
               context = context
@@ -117,8 +118,9 @@ template ProposedSubscription
               subscription = Left subscriptionCid
           
           None -> do
+            config <- buildConfig proposal now
             subscriptionCid <- create PaidSubscription with
-              config = buildConfig proposal now
+              config = config
               paidUntil = now
               context = context
             pure SubscriptionCreationResult with
@@ -163,9 +165,15 @@ getObservers proposal state =
   (if not state.recipientApproved then [proposal.recipient] else [])
 
 -- | Helper to build Subscription from proposal at creation time
-buildConfig : SubscriptionProposal -> Time -> Subscription
-buildConfig proposal now =
-  Subscription with
+buildConfig : SubscriptionProposal -> Time -> Update Subscription
+buildConfig proposal now = do
+  resolvedExpiresAt <- case proposal.expiresAt of
+    Some expTime -> do
+      resolved <- resolveSubscriptionTime expTime
+      pure (Some resolved)
+    None -> pure None  -- No expiration - continues until explicitly canceled
+  
+  pure Subscription with
     subscriber = proposal.subscriber
     recipient = proposal.recipient
     recipientProvider = proposal.recipientProvider
@@ -176,8 +184,6 @@ buildConfig proposal now =
     prepayWindow = case proposal.prepayWindow of
       Some win -> win
       None -> days 0  -- Default to no prepayment
-    expiresAt = case proposal.expiresAt of
-      Some expTime -> Some (resolveSubscriptionTime expTime now)
-      None -> Some (addRelTime now (days 365))  -- Default to 1 year
+    expiresAt = resolvedExpiresAt
     description = proposal.description
     metadata = proposal.metadata
