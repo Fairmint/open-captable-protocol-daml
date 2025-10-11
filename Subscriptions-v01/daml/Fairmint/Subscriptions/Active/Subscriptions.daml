@@ -1,13 +1,13 @@
 module Fairmint.Subscriptions.Active.Subscriptions where
 
 import DA.Optional (isSome, fromSome)
-import DA.Time (addRelTime, subTime, RelTime)
+import DA.Time (addRelTime, subTime, RelTime, convertRelTimeToMicroseconds, days)
 import Splice.Amulet qualified as Amulet
 import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
 import Splice.AmuletRules (TransferResult(..))
 import Splice.Round (OpenMiningRound_Fetch(..))
 import Fairmint.Subscriptions.Types.Subscription (Subscription, validateSubscription)
-import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), calculateAmountForPeriod)
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), calculateAmountForPeriod, validateSubscriptionAmount)
 import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
 import Fairmint.Shared.Splice.SpliceAmuletHelpers (PaymentRequest(..), paymentTo)
 import Fairmint.Subscriptions.Active.PrepaidCanceledSubscription qualified as Prepaid
@@ -41,16 +41,16 @@ template FreeTrialSubscription
       -- ^ Free trial ends at this time (not optional - this is the contract's purpose)
     paidUntil : Time
       -- ^ Trial is advanced through this time (extends by one period with each processing)
-    config : Subscription
+    subscription : Subscription
       -- ^ Subscription configuration (includes recipientProvider)
     context : ProcessorContext
       -- ^ Processor and DSO context (includes processorProvider, set during processor approval)
   where
-    signatory config.subscriber, config.recipient, context.processor
+    signatory subscription.subscriber, subscription.recipient, context.processor
     
     ensure
-      validateSubscription config &&
-      (case config.expiresAt of
+      validateSubscription subscription &&
+      (case subscription.expiresAt of
         Some exp -> trialEndsAt <= exp
         None -> True)
 
@@ -79,7 +79,7 @@ template FreeTrialSubscription
           (now < trialEndsAt)
         
         -- Validate subscription hasn't expired
-        case config.expiresAt of
+        case subscription.expiresAt of
           Some exp -> assertMsg "Cannot process free trial after subscription expiration" (now <= exp)
           None -> pure ()
         
@@ -87,8 +87,11 @@ template FreeTrialSubscription
         assertMsg "Cannot process free trial before subscription period elapses (still paid through current paidUntil time)" 
           (now > paidUntil)
         
-        -- Calculate the maximum allowed paidUntil based on prepayWindow
-        let maxAllowedPaidUntil = addRelTime now config.prepayWindow
+        -- Calculate the maximum allowed paidUntil based on prepayWindow (default to 0 if None)
+        let effectivePrepayWindow = case subscription.prepayWindow of
+              Some window -> window
+              None -> days 0
+        let maxAllowedPaidUntil = addRelTime now effectivePrepayWindow
         
         -- Calculate the desired next paidUntil
         let desiredPaidUntil = addRelTime paidUntil processingPeriod
@@ -102,7 +105,7 @@ template FreeTrialSubscription
               if cappedPaidUntil > trialEndsAt
               then trialEndsAt
               else cappedPaidUntil
-        let newPaidUntil = case config.expiresAt of
+        let newPaidUntil = case subscription.expiresAt of
               Some exp -> if cappedPaidUntil2 > exp then exp else cappedPaidUntil2
               None -> cappedPaidUntil2
         
@@ -111,7 +114,7 @@ template FreeTrialSubscription
         
         -- Create activity markers for provided FeaturedAppRights
         case recipientFeaturedAppRight of
-          Some farCid -> case config.recipientProvider of
+          Some farCid -> case subscription.recipientProvider of
             Some provider -> createActivityMarker provider farCid
             None -> pure ()
           None -> pure ()
@@ -126,7 +129,7 @@ template FreeTrialSubscription
             -- Trial ended - create PaidSubscription
             paidSubscriptionCid <- create PaidSubscription with
               paidUntil = newPaidUntil
-              config
+              config = subscription
               context
             pure SubscriptionCreationResult with
               subscription = Right paidSubscriptionCid
@@ -143,7 +146,7 @@ template FreeTrialSubscription
     choice FreeTrialSubscription_SubscriberReduceTrial : ContractId FreeTrialSubscription
       with
         newTrialEndsAt : Optional Time
-      controller config.subscriber
+      controller subscription.subscriber
       do
         now <- getTime
         let effectiveTrialEnd = case newTrialEndsAt of
@@ -161,13 +164,13 @@ template FreeTrialSubscription
     choice FreeTrialSubscription_RecipientExtendTrial : ContractId FreeTrialSubscription
       with
         newTrialEndsAt : Time
-      controller config.recipient
+      controller subscription.recipient
       do
         assertMsg "New trial end must be later than current trial end" 
           (newTrialEndsAt > trialEndsAt)
         now <- getTime
         assertMsg "New trial end must be in the future" (newTrialEndsAt > now)
-        case config.expiresAt of
+        case subscription.expiresAt of
           Some exp -> assertMsg "Trial end cannot exceed subscription expiration" (newTrialEndsAt <= exp)
           None -> pure ()
         create this with trialEndsAt = newTrialEndsAt
@@ -176,42 +179,54 @@ template FreeTrialSubscription
     choice FreeTrialSubscription_SubscriberUpdateExpiration : ContractId FreeTrialSubscription
       with
         newExpiresAt : Time
-      controller config.subscriber
+      controller subscription.subscriber
       do
         now <- getTime
         assertMsg "New expiration must be in the future" (newExpiresAt > now)
         assertMsg "Trial end cannot exceed new expiration" (trialEndsAt <= newExpiresAt)
-        create this with config = config with expiresAt = Some newExpiresAt
+        create this with subscription = subscription with expiresAt = Some newExpiresAt
 
     -- | Subscriber increases prepay window
     choice FreeTrialSubscription_SubscriberIncreasePrepayWindow : ContractId FreeTrialSubscription
       with
         newPrepayWindow : RelTime
-      controller config.subscriber
+      controller subscription.subscriber
       do
+        assertMsg "Prepay window must be positive" (convertRelTimeToMicroseconds newPrepayWindow > 0)
+        let currentWindow = case subscription.prepayWindow of
+              Some w -> w
+              None -> days 0
         assertMsg "New prepay window must be greater than current prepay window" 
-          (newPrepayWindow > config.prepayWindow)
-        create this with config = config with prepayWindow = newPrepayWindow
+          (newPrepayWindow > currentWindow)
+        create this with subscription = subscription with prepayWindow = Some newPrepayWindow
 
     -- | Recipient decreases prepay window
     choice FreeTrialSubscription_RecipientDecreasePrepayWindow : ContractId FreeTrialSubscription
       with
         newPrepayWindow : RelTime
-      controller config.recipient
+      controller subscription.recipient
       do
+        assertMsg "Prepay window must be positive" (convertRelTimeToMicroseconds newPrepayWindow > 0)
+        let currentWindow = case subscription.prepayWindow of
+              Some w -> w
+              None -> days 0
         assertMsg "New prepay window must be less than current prepay window" 
-          (newPrepayWindow < config.prepayWindow)
-        create this with config = config with prepayWindow = newPrepayWindow
+          (newPrepayWindow < currentWindow)
+        create this with subscription = subscription with prepayWindow = Some newPrepayWindow
 
     -- | Subscriber increases payments
     choice FreeTrialSubscription_SubscriberIncreasePayments : ContractId FreeTrialSubscription
       with
         newRecipientPaymentPerDay : SubscriptionAmount
         newProcessorPaymentPerDay : SubscriptionAmount
-      controller config.subscriber
+      controller subscription.subscriber
       do
-        let oldRecipientAmount = config.recipientPaymentPerDay
-        let oldProcessorAmount = config.processorPaymentPerDay
+        assertMsg "Recipient payment must be positive" (validateSubscriptionAmount newRecipientPaymentPerDay False)
+        assertMsg "Processor payment must be positive" (validateSubscriptionAmount newProcessorPaymentPerDay False)
+        let oldRecipientAmount = subscription.recipientPaymentPerDay
+        let oldProcessorAmount = case subscription.processorPaymentPerDay of
+              Some amt -> amt
+              None -> AmuletAmount 0.0
         let getAmount amt = case amt of
               AmuletAmount a -> a
               USDAmount a -> a
@@ -223,23 +238,24 @@ template FreeTrialSubscription
           (getAmount newRecipientPaymentPerDay > getAmount oldRecipientAmount || 
            getAmount newProcessorPaymentPerDay > getAmount oldProcessorAmount)
         create this with
-          config = config with
+          subscription = subscription with
             recipientPaymentPerDay = newRecipientPaymentPerDay
-            processorPaymentPerDay = newProcessorPaymentPerDay
+            processorPaymentPerDay = Some newProcessorPaymentPerDay
 
     -- | Recipient decreases their payment
     choice FreeTrialSubscription_RecipientDecreasePayment : ContractId FreeTrialSubscription
       with
         newRecipientPaymentPerDay : SubscriptionAmount
-      controller config.recipient
+      controller subscription.recipient
       do
-        let oldAmount = config.recipientPaymentPerDay
+        assertMsg "Recipient payment must be positive" (validateSubscriptionAmount newRecipientPaymentPerDay False)
+        let oldAmount = subscription.recipientPaymentPerDay
         let getAmount amt = case amt of
               AmuletAmount a -> a
               USDAmount a -> a
         assertMsg "Recipient payment amount cannot increase" 
           (getAmount newRecipientPaymentPerDay <= getAmount oldAmount)
-        create this with config = config with recipientPaymentPerDay = newRecipientPaymentPerDay
+        create this with subscription = subscription with recipientPaymentPerDay = newRecipientPaymentPerDay
 
     -- | Processor decreases their payment
     choice FreeTrialSubscription_ProcessorDecreasePayment : ContractId FreeTrialSubscription
@@ -247,20 +263,23 @@ template FreeTrialSubscription
         newProcessorPaymentPerDay : SubscriptionAmount
       controller context.processor
       do
-        let oldAmount = config.processorPaymentPerDay
+        assertMsg "Processor payment must be positive" (validateSubscriptionAmount newProcessorPaymentPerDay False)
+        let oldAmount = case subscription.processorPaymentPerDay of
+              Some amt -> amt
+              None -> AmuletAmount 0.0
         let getAmount amt = case amt of
               AmuletAmount a -> a
               USDAmount a -> a
         assertMsg "Processor payment amount cannot increase" 
           (getAmount newProcessorPaymentPerDay <= getAmount oldAmount)
-        create this with config = config with processorPaymentPerDay = newProcessorPaymentPerDay
+        create this with subscription = subscription with processorPaymentPerDay = Some newProcessorPaymentPerDay
 
     -- | Subscriber cancels (instant - no prepaid amount in trial)
     choice FreeTrialSubscription_CancelBySubscriber : ()
       with
         reason : Optional Text
           -- ^ Optional reason for cancellation (provides context but is not stored)
-      controller config.subscriber
+      controller subscription.subscriber
       do pure ()
 
     -- | Recipient cancels (instant - no prepaid amount in trial)
@@ -268,7 +287,7 @@ template FreeTrialSubscription
       with
         reason : Optional Text
           -- ^ Optional reason for cancellation (provides context but is not stored)
-      controller config.recipient
+      controller subscription.recipient
       do pure ()
 
     -- | Processor cancels (instant - no prepaid amount in trial)
@@ -283,9 +302,9 @@ template FreeTrialSubscription
     choice FreeTrialSubscription_RecipientUpdateProvider : ContractId FreeTrialSubscription
       with
         newRecipientProvider : Party
-      controller config.recipient
+      controller subscription.recipient
       do
-        create this with config = config with recipientProvider = Some newRecipientProvider
+        create this with subscription = subscription with recipientProvider = Some newRecipientProvider
 
 
 -- | Active paid subscription contract for recurring payments
@@ -339,7 +358,11 @@ template PaidSubscription
         assertMsg "Must provide at least one amulet input for payment" (not (null paymentCtx.amuletInputs))
         assertMsg "USD to Amulet conversion rate must be positive" (amuletPrice > 0.0)
 
-        let maxAllowedPaidUntil = addRelTime now config.prepayWindow
+        -- Calculate the maximum allowed paidUntil based on prepayWindow (default to 0 if None)
+        let effectivePrepayWindow = case config.prepayWindow of
+              Some window -> window
+              None -> days 0
+        let maxAllowedPaidUntil = addRelTime now effectivePrepayWindow
         let desiredPaidUntil = addRelTime paidUntil processingPeriod
         let cappedPaidUntil = if desiredPaidUntil > maxAllowedPaidUntil then maxAllowedPaidUntil else desiredPaidUntil
         let newPaidUntil = case config.expiresAt of
@@ -347,7 +370,9 @@ template PaidSubscription
               None -> cappedPaidUntil
         let actualPeriod = subTime newPaidUntil paidUntil
 
-        let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPaymentPerDay actualPeriod amuletPrice
+        let feeAmountForThisPeriod = case config.processorPaymentPerDay of
+              Some amt -> calculateAmountForPeriod amt actualPeriod amuletPrice
+              None -> 0.0
         let processorPaymentIsZero = feeAmountForThisPeriod == 0.0
         
         -- Pay recipient (always uses recipient's provider and FeaturedAppRight)
@@ -408,7 +433,11 @@ template PaidSubscription
         case config.expiresAt of
           Some exp -> assertMsg "Trial end cannot exceed subscription expiration" (trialEndsAt <= exp)
           None -> pure ()
-        create FreeTrialSubscription with trialEndsAt = trialEndsAt; paidUntil = paidUntil; ..
+        create FreeTrialSubscription with 
+          trialEndsAt
+          paidUntil
+          subscription = config
+          context
 
     -- | Subscriber updates subscription expiration date
     choice PaidSubscription_SubscriberUpdateExpiration : ContractId PaidSubscription
@@ -426,9 +455,13 @@ template PaidSubscription
         newPrepayWindow : RelTime
       controller config.subscriber
       do
+        assertMsg "Prepay window must be positive" (convertRelTimeToMicroseconds newPrepayWindow > 0)
+        let currentWindow = case config.prepayWindow of
+              Some w -> w
+              None -> days 0
         assertMsg "New prepay window must be greater than current prepay window" 
-          (newPrepayWindow > config.prepayWindow)
-        create this with config = config with prepayWindow = newPrepayWindow
+          (newPrepayWindow > currentWindow)
+        create this with config = config with prepayWindow = Some newPrepayWindow
 
     -- | Recipient decreases prepay window
     choice PaidSubscription_RecipientDecreasePrepayWindow : ContractId PaidSubscription
@@ -436,9 +469,13 @@ template PaidSubscription
         newPrepayWindow : RelTime
       controller config.recipient
       do
+        assertMsg "Prepay window must be positive" (convertRelTimeToMicroseconds newPrepayWindow > 0)
+        let currentWindow = case config.prepayWindow of
+              Some w -> w
+              None -> days 0
         assertMsg "New prepay window must be less than current prepay window" 
-          (newPrepayWindow < config.prepayWindow)
-        create this with config = config with prepayWindow = newPrepayWindow
+          (newPrepayWindow < currentWindow)
+        create this with config = config with prepayWindow = Some newPrepayWindow
 
     -- | Subscriber increases payments
     choice PaidSubscription_SubscriberIncreasePayments : ContractId PaidSubscription
@@ -447,8 +484,12 @@ template PaidSubscription
         newProcessorPaymentPerDay : SubscriptionAmount
       controller config.subscriber
       do
+        assertMsg "Recipient payment must be positive" (validateSubscriptionAmount newRecipientPaymentPerDay False)
+        assertMsg "Processor payment must be positive" (validateSubscriptionAmount newProcessorPaymentPerDay False)
         let oldRecipientAmount = config.recipientPaymentPerDay
-        let oldProcessorAmount = config.processorPaymentPerDay
+        let oldProcessorAmount = case config.processorPaymentPerDay of
+              Some amt -> amt
+              None -> AmuletAmount 0.0
         let getAmount amt = case amt of
               AmuletAmount a -> a
               USDAmount a -> a
@@ -462,7 +503,7 @@ template PaidSubscription
         create this with
           config = config with
             recipientPaymentPerDay = newRecipientPaymentPerDay
-            processorPaymentPerDay = newProcessorPaymentPerDay
+            processorPaymentPerDay = Some newProcessorPaymentPerDay
 
     -- | Recipient decreases their payment
     choice PaidSubscription_RecipientDecreasePayment : ContractId PaidSubscription
@@ -470,6 +511,7 @@ template PaidSubscription
         newRecipientPaymentPerDay : SubscriptionAmount
       controller config.recipient
       do
+        assertMsg "Recipient payment must be positive" (validateSubscriptionAmount newRecipientPaymentPerDay False)
         let oldAmount = config.recipientPaymentPerDay
         let getAmount amt = case amt of
               AmuletAmount a -> a
@@ -484,13 +526,16 @@ template PaidSubscription
         newProcessorPaymentPerDay : SubscriptionAmount
       controller context.processor
       do
-        let oldAmount = config.processorPaymentPerDay
+        assertMsg "Processor payment must be positive" (validateSubscriptionAmount newProcessorPaymentPerDay False)
+        let oldAmount = case config.processorPaymentPerDay of
+              Some amt -> amt
+              None -> AmuletAmount 0.0
         let getAmount amt = case amt of
               AmuletAmount a -> a
               USDAmount a -> a
         assertMsg "Processor payment amount cannot increase" 
           (getAmount newProcessorPaymentPerDay <= getAmount oldAmount)
-        create this with config = config with processorPaymentPerDay = newProcessorPaymentPerDay
+        create this with config = config with processorPaymentPerDay = Some newProcessorPaymentPerDay
 
     -- | Recipient updates their provider
     choice PaidSubscription_RecipientUpdateProvider : ContractId PaidSubscription

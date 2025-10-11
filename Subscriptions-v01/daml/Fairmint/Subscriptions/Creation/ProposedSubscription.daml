@@ -1,51 +1,43 @@
 module Fairmint.Subscriptions.Creation.ProposedSubscription where
 
-import DA.Set (member)
-import DA.Time (days)
 import Fairmint.Subscriptions.Active.Subscriptions (FreeTrialSubscription(..), PaidSubscription(..), SubscriptionCreationResult(..))
-import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), getImpactedParties, applyChanges, validateChanges)
-import Fairmint.Shared.TypeHelpers (validateOptionalText)
+import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), updateSubscriptionProposalWithChanges, validateChanges)
+import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal)
-import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.SubscriptionTime (resolveSubscriptionTime)
+import Fairmint.Subscriptions.Types.SubscriptionTime (resolveOptionalSubscriptionTime)
+import Fairmint.Subscriptions.Types.ApprovalState (ApprovalState(..), validateAtLeastOneApproved, validateAllApproved, updateApprovalsAfterEdit, assertIsPartyToSubscription, getSignatories, getObservers)
 
 -- | Unified subscription proposal with approval tracking
 template ProposedSubscription
   with
     proposal : SubscriptionProposal
-    context : ProcessorContext
+    processorContext : ProcessorContext
     approvals : ApprovalState
   where
-    signatory getSignatories proposal context approvals
+    signatory getSignatories proposal processorContext approvals
     observer getObservers proposal approvals
     
-    ensure validateSubscriptionProposal proposal
+    ensure validateSubscriptionProposal proposal && validateAtLeastOneApproved approvals
 
-    -- | Subscriber approves the proposal
-    choice ProposedSubscription_SubscriberApprove : ContractId ProposedSubscription
-      controller proposal.subscriber
+    -- | Any party approves the proposal
+    choice ProposedSubscription_Approve : ContractId ProposedSubscription
+      with
+        actor : Party
+      controller actor
       do
-        assertMsg "Subscriber has already approved" (not approvals.subscriberApproved)
+        assertIsPartyToSubscription actor proposal processorContext
+        assertMsg "Actor has already approved"
+          (not ((actor == proposal.subscriber && approvals.subscriberApproved) ||
+                (actor == proposal.recipient && approvals.recipientApproved) ||
+                (actor == processorContext.processor && approvals.processorApproved)))
+        
         create this with
-          approvals = approvals with subscriberApproved = True
-
-    -- | Recipient approves the proposal
-    choice ProposedSubscription_RecipientApprove : ContractId ProposedSubscription
-      controller proposal.recipient
-      do
-        assertMsg "Recipient has already approved" (not approvals.recipientApproved)
-        create this with
-          approvals = approvals with recipientApproved = True
-
-    -- | Processor approves the proposal
-    choice ProposedSubscription_ProcessorApprove : ContractId ProposedSubscription
-      controller context.processor
-      do
-        assertMsg "Processor has already approved" (not approvals.processorApproved)
-        create this with
-          approvals = approvals with processorApproved = True
+          approvals = ApprovalState with
+            subscriberApproved = approvals.subscriberApproved || actor == proposal.subscriber
+            recipientApproved = approvals.recipientApproved || actor == proposal.recipient
+            processorApproved = approvals.processorApproved || actor == processorContext.processor
 
     -- | Edit the proposal - intelligently revokes approvals from impacted parties
     -- The editor retains their approval
@@ -56,28 +48,12 @@ template ProposedSubscription
         reason : Optional Text
       controller actor
       do
-        assertMsg "Editor must be a party to the subscription" 
-          (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
-        assertMsg "Reason must be non-empty if provided" (validateOptionalText reason)
+        assertIsPartyToSubscription actor proposal processorContext
+        assertValidOptionalText reason
         assertMsg "All changes must differ from current values" (validateChanges changes proposal)
         
-        let updatedProposal = applyChanges changes proposal
-        let impactedParties = getImpactedParties changes proposal context
-        
-        -- Revoke approvals for impacted parties, except the editor keeps theirs
-        let newApprovals = ApprovalState with
-              subscriberApproved = 
-                if actor == proposal.subscriber
-                then True  -- Editor keeps approval
-                else approvals.subscriberApproved && not (member proposal.subscriber impactedParties)
-              recipientApproved = 
-                if actor == proposal.recipient
-                then True
-                else approvals.recipientApproved && not (member proposal.recipient impactedParties)
-              processorApproved = 
-                if actor == context.processor
-                then True
-                else approvals.processorApproved && not (member context.processor impactedParties)
+        let updatedProposal = updateSubscriptionProposalWithChanges changes proposal
+        let newApprovals = updateApprovalsAfterEdit approvals actor changes proposal processorContext
         
         create this with
           proposal = updatedProposal
@@ -89,42 +65,55 @@ template ProposedSubscription
         actor : Party
       controller actor
       do
-        assertMsg "All parties must approve before creating subscription" (allApproved approvals)
-        assertMsg "Creator must be a party to the subscription" 
-          (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
+        assertMsg "All parties must approve before creating subscription" (validateAllApproved approvals)
+        assertIsPartyToSubscription actor proposal processorContext
         
+        -- Resolve optional SubscriptionTime values to absolute times
+        resolvedExpiresAt <- resolveOptionalSubscriptionTime proposal.expiresAt
+        resolvedFreeTrialExpiration <- resolveOptionalSubscriptionTime proposal.freeTrialExpiration
+        
+        -- Get current time for resolving relative times
         now <- getTime
         
-        case proposal.freeTrialExpiration of
-          Some trialExpiration -> do
-            trialEnd <- resolveSubscriptionTime trialExpiration
-            
-            assertMsg "Trial end must be in the future" (trialEnd > now)
-            
-            -- Validate expiration if set
-            case proposal.expiresAt of
-              Some expTime -> do
-                finalExpiration <- resolveSubscriptionTime expTime
-                assertMsg "Trial end must not exceed expiration" (trialEnd <= finalExpiration)
+        -- Build the Subscription config
+        let subscription = Subscription with
+              subscriber = proposal.subscriber
+              recipient = proposal.recipient
+              recipientProvider = proposal.recipientProvider
+              recipientPaymentPerDay = proposal.recipientPaymentPerDay
+              processorPaymentPerDay = proposal.processorPaymentPerDay
+              prepayWindow = proposal.prepayWindow
+              expiresAt = resolvedExpiresAt
+              description = proposal.description
+              metadata = proposal.metadata
+        
+        -- Create either FreeTrialSubscription or PaidSubscription
+        case resolvedFreeTrialExpiration of
+          Some trialEndsAt -> do
+            -- Validate trial end time
+            assertMsg "Free trial end must be in the future" (trialEndsAt > now)
+            case resolvedExpiresAt of
+              Some exp -> assertMsg "Trial end cannot exceed subscription expiration" (trialEndsAt <= exp)
               None -> pure ()
             
-            config <- buildConfig proposal now
-            subscriptionCid <- create FreeTrialSubscription with
-              config = config
-              trialEndsAt = trialEnd
+            -- Create free trial subscription
+            freeTrialCid <- create FreeTrialSubscription with
+              trialEndsAt
               paidUntil = now
-              context = context
+              subscription
+              context = processorContext
             pure SubscriptionCreationResult with
-              subscription = Left subscriptionCid
+              subscription = Left freeTrialCid
           
           None -> do
-            config <- buildConfig proposal now
-            subscriptionCid <- create PaidSubscription with
-              config = config
+            -- Create paid subscription
+            paidSubscriptionCid <- create PaidSubscription with
               paidUntil = now
-              context = context
+              config = subscription
+              context = processorContext
             pure SubscriptionCreationResult with
-              subscription = Right subscriptionCid
+              subscription = Right paidSubscriptionCid
+
 
     -- | Withdraw proposal (any party can withdraw, archives the proposal)
     choice ProposedSubscription_Withdraw : ()
@@ -133,57 +122,6 @@ template ProposedSubscription
         reason : Optional Text
       controller actor
       do
-        assertMsg "Withdrawer must be a party to the subscription"
-          (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
-        assertMsg "Reason must be non-empty if provided" (validateOptionalText reason)
+        assertIsPartyToSubscription actor proposal processorContext
+        assertValidOptionalText reason
         pure ()
-
--- | Tracks which parties have approved the subscription proposal
-data ApprovalState = ApprovalState
-  with
-    subscriberApproved : Bool
-    recipientApproved : Bool
-    processorApproved : Bool
-  deriving (Eq, Show)
-
--- | Check if all parties have approved
-allApproved : ApprovalState -> Bool
-allApproved state =
-  state.subscriberApproved && state.recipientApproved && state.processorApproved
-
--- | Get current signatories based on approval state
-getSignatories : SubscriptionProposal -> ProcessorContext -> ApprovalState -> [Party]
-getSignatories proposal context state =
-  (if state.subscriberApproved then [proposal.subscriber] else []) ++
-  (if state.recipientApproved then [proposal.recipient] else []) ++
-  [context.processor]
-
--- | Get current observers (parties not yet signatories)
-getObservers : SubscriptionProposal -> ApprovalState -> [Party]
-getObservers proposal state =
-  (if not state.subscriberApproved then [proposal.subscriber] else []) ++
-  (if not state.recipientApproved then [proposal.recipient] else [])
-
--- | Helper to build Subscription from proposal at creation time
-buildConfig : SubscriptionProposal -> Time -> Update Subscription
-buildConfig proposal now = do
-  resolvedExpiresAt <- case proposal.expiresAt of
-    Some expTime -> do
-      resolved <- resolveSubscriptionTime expTime
-      pure (Some resolved)
-    None -> pure None  -- No expiration - continues until explicitly canceled
-  
-  pure Subscription with
-    subscriber = proposal.subscriber
-    recipient = proposal.recipient
-    recipientProvider = proposal.recipientProvider
-    recipientPaymentPerDay = proposal.recipientPaymentPerDay
-    processorPaymentPerDay = case proposal.processorPaymentPerDay of
-      Some amt -> amt
-      None -> AmuletAmount 0.0  -- Default to zero if not specified
-    prepayWindow = case proposal.prepayWindow of
-      Some win -> win
-      None -> days 0  -- Default to no prepayment
-    expiresAt = resolvedExpiresAt
-    description = proposal.description
-    metadata = proposal.metadata
