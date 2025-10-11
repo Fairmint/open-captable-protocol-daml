@@ -3,9 +3,11 @@ module Fairmint.Subscriptions.Creation.ProposedSubscription where
 import DA.Set (member)
 import DA.Time (days, addRelTime)
 import Fairmint.Subscriptions.Active.Subscriptions (FreeTrialSubscription(..), PaidSubscription(..), SubscriptionCreationResult(..))
-import Fairmint.Subscriptions.Creation.SubscriptionProposalChanges (SubscriptionProposalChanges(..), getImpactedParties, applyChanges)
+import Fairmint.Subscriptions.Creation.SubscriptionProposalChanges (SubscriptionProposalChanges(..), getImpactedParties, applyChanges, validateChanges)
+import Fairmint.Shared.TypeHelpers (validateOptionalText)
 import Fairmint.Subscriptions.Creation.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal)
-import Fairmint.Subscriptions.SubscriptionConfig (ProcessorContext(..), resolveExpiration, SubscriptionAmount(..), SubscriptionConfig(..))
+import Fairmint.Subscriptions.Subscription (SubscriptionAmount(..), Subscription(..))
+import Fairmint.Subscriptions.Types (ProcessorContext(..), resolveExpiration)
 
 -- | Unified subscription proposal with approval tracking
 template ProposedSubscription
@@ -45,7 +47,7 @@ template ProposedSubscription
 
     -- | Edit the proposal - intelligently revokes approvals from impacted parties
     -- The editor retains their approval
-    choice ProposedSubscription_Edit : ContractId ProposedSubscription
+    choice ProposedSubscription_EditSubscriptionProposal : ContractId ProposedSubscription
       with
         actor : Party
         changes : SubscriptionProposalChanges
@@ -54,7 +56,8 @@ template ProposedSubscription
       do
         assertMsg "Editor must be a party to the subscription" 
           (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
-        validateOptionalText reason        
+        assertMsg "Reason must be non-empty if provided" (validateOptionalText reason)
+        assertMsg "All changes must differ from current values" (validateChanges changes proposal)
         
         let updatedProposal = applyChanges changes proposal
         let impactedParties = getImpactedParties changes proposal context
@@ -80,9 +83,13 @@ template ProposedSubscription
 
     -- | Create the active subscription once all parties have approved
     choice ProposedSubscription_CreateSubscription : SubscriptionCreationResult
-      controller proposal.subscriber, proposal.recipient, context.processor
+      with
+        actor : Party
+      controller actor
       do
         assertMsg "All parties must approve before creating subscription" (allApproved approvals)
+        assertMsg "Creator must be a party to the subscription" 
+          (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
         
         now <- getTime
         
@@ -124,7 +131,7 @@ template ProposedSubscription
       do
         assertMsg "Withdrawer must be a party to the subscription"
           (actor == proposal.subscriber || actor == proposal.recipient || actor == context.processor)
-        validateOptionalText reason
+        assertMsg "Reason must be non-empty if provided" (validateOptionalText reason)
         pure ()
 
 -- | Tracks which parties have approved the subscription proposal
@@ -153,13 +160,13 @@ getObservers proposal state =
   (if not state.subscriberApproved then [proposal.subscriber] else []) ++
   (if not state.recipientApproved then [proposal.recipient] else [])
 
--- | Helper to build SubscriptionConfig from proposal at creation time
-buildConfig : SubscriptionProposal -> Time -> SubscriptionConfig
+-- | Helper to build Subscription from proposal at creation time
+buildConfig : SubscriptionProposal -> Time -> Subscription
 buildConfig proposal now =
-  SubscriptionConfig with
+  Subscription with
     subscriber = proposal.subscriber
     recipient = proposal.recipient
-    recipientProvider = Some proposal.recipientProvider
+    recipientProvider = proposal.recipientProvider
     recipientPaymentPerDay = proposal.recipientPaymentPerDay
     processorPaymentPerDay = case proposal.processorPaymentPerDay of
       Some amt -> amt

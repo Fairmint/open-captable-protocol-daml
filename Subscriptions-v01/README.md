@@ -17,7 +17,7 @@ Three-party subscription system with flexible payment processing:
 
 ## Subscription Terms
 
-When a subscriber and recipient agree to a subscription, they commit to a set of terms defined in the `SubscriptionConfig`:
+When a subscriber and recipient agree to a subscription, they commit to a set of terms defined in the `Subscription` data type:
 
 **Payment Terms:**
 - **`recipientPaymentPerDay`**: The daily rate the subscriber pays to the recipient (in Amulet or USD)
@@ -229,7 +229,7 @@ flowchart LR
 -- 1. Create proposal (subscriber initiates)
 proposalCid <- submit subscriber do
   exerciseCmd factoryCid SubscriptionFactory_CreateSubscriberProposal with
-    config = SubscriptionConfig with
+    config = Subscription with
       subscriber, recipient
       recipientPaymentPerDay = AmuletAmount 10.0
       processorPaymentPerDay = AmuletAmount 1.0
