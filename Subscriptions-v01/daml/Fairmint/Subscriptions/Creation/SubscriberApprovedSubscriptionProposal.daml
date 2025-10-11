@@ -1,0 +1,87 @@
+module Fairmint.Subscriptions.Creation.SubscriberApprovedSubscriptionProposal where
+
+import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionConfig, ProcessorContext(..), validateSubscriptionConfig, SubscriptionExpiration(..), resolveExpiration)
+
+-- | Subscriber and Processor have approved, awaiting Recipient acceptance
+-- Can be reached via two paths:
+-- 1. Subscriber initiates → Processor approves
+-- 2. Processor initiates → Subscriber accepts
+template SubscriberApprovedSubscriptionProposal
+  with
+    config : SubscriptionConfig
+      -- ^ Subscription configuration
+    context : ProcessorContext
+      -- ^ Processor and DSO context
+    freeTrialExpiration : Optional SubscriptionExpiration
+      -- ^ Optional free trial expiration (absolute time or relative duration from creation)
+  where
+    signatory config.subscriber, context.processor
+    observer config.recipient
+    
+    ensure validateSubscriptionConfig config
+
+    -- | Recipient accepts, creating the active subscription
+    choice SubscriberApprovedSubscriptionProposal_RecipientAccept : SubscriberApprovedSubscriptionProposal_AcceptResult
+      with
+        recipientProvider : Party
+          -- ^ Provider party for recipient's Amulet transfers
+      controller config.recipient
+      do
+        now <- getTime
+        
+        case freeTrialExpiration of
+          Some trialExpiration -> do
+            let trialEnd = resolveExpiration trialExpiration now
+            
+            assertMsg "Trial end must be in the future" (trialEnd > now)
+            assertMsg "Trial end must not exceed expiration" (trialEnd <= config.expiresAt)
+            
+            subscriptionCid <- create FreeTrialSubscription with
+              trialEndsAt = trialEnd
+              paidUntil = now
+              recipientProvider
+              config
+              context
+            pure SubscriberApprovedSubscriptionProposal_AcceptResult with
+              subscription = Left subscriptionCid
+          
+          None -> do
+            subscriptionCid <- create PaidSubscription with
+              paidUntil = now
+              recipientProvider
+              config
+              context
+            pure SubscriberApprovedSubscriptionProposal_AcceptResult with
+              subscription = Right subscriptionCid
+
+    -- | Recipient rejects the proposal
+    choice SubscriberApprovedSubscriptionProposal_RecipientReject : ()
+      with
+        reason : Optional Text
+      controller config.recipient
+      do
+        pure ()
+
+    -- | Subscriber withdraws their approval
+    choice SubscriberApprovedSubscriptionProposal_SubscriberWithdraw : ()
+      with
+        reason : Optional Text
+      controller config.subscriber
+      do
+        pure ()
+
+    -- | Processor withdraws their approval
+    choice SubscriberApprovedSubscriptionProposal_ProcessorWithdraw : ()
+      with
+        reason : Optional Text
+      controller context.processor
+      do
+        pure ()
+
+-- | Result of recipient accepting the proposal
+data SubscriberApprovedSubscriptionProposal_AcceptResult = SubscriberApprovedSubscriptionProposal_AcceptResult
+  with
+    subscription : Either (ContractId FreeTrialSubscription) (ContractId PaidSubscription)
+  deriving (Eq, Show)
+

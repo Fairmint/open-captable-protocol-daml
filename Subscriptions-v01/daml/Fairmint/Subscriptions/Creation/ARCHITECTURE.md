@@ -8,34 +8,42 @@ All subscription creation flows converge to just **two intermediate states** bef
 2. **RecipientApprovedSubscriptionProposal** - Recipient & Processor have approved, waiting for Subscriber
 
 ```mermaid
-graph TB
+%%{init: {'theme':'base', 'themeVariables': { 'fontSize':'18px', 'fontFamily':'arial'}}}%%
+flowchart TD
     Factory["🏭 SubscriptionFactory"]
     
-    SubInit["👤 Subscriber Initiates"]
-    RecInit["👤 Recipient Initiates"]
-    ProcInit["🤖 Processor Initiates"]
+    SubProposal["<b>SubscriberSubscriptionProposal</b><br/><small>Signatory: Subscriber<br/>Observer: Recipient, Processor</small>"]
     
-    Factory --> SubInit
-    Factory --> RecInit
-    Factory --> ProcInit
+    RecProposal["<b>RecipientSubscriptionProposal</b><br/><small>Signatory: Recipient<br/>Observer: Subscriber, Processor</small>"]
     
-    SubInit -->|"Processor approves"| SubApproved["✓ SubscriberApprovedSubscriptionProposal<br/><br/>Signatory: Subscriber, Processor<br/>Observer: Recipient"]
+    ProcProposal["<b>ProcessorSubscriptionProposal</b><br/><small>Signatory: Processor<br/>Observer: Subscriber, Recipient</small>"]
     
-    RecInit -->|"Processor approves"| RecApproved["✓ RecipientApprovedSubscriptionProposal<br/><br/>Signatory: Recipient, Processor<br/>Observer: Subscriber"]
+    SubApproved["<b>SubscriberApprovedSubscriptionProposal</b><br/><small>Signatory: Subscriber, Processor<br/>Observer: Recipient</small>"]
     
-    ProcInit -->|"Subscriber accepts"| SubApproved
-    ProcInit -->|"Recipient accepts"| RecApproved
+    RecApproved["<b>RecipientApprovedSubscriptionProposal</b><br/><small>Signatory: Recipient, Processor<br/>Observer: Subscriber</small>"]
     
-    SubApproved -->|"👤 Recipient accepts"| Success["✅ Active Subscription<br/>(Paid or FreeTrial)"]
-    RecApproved -->|"👤 Subscriber accepts"| Success
+    Success["<b>Active Subscription</b><br/><small>FreeTrialSubscription or PaidSubscription</small>"]
     
-    classDef factory fill:#e1f5ff,stroke:#0288d1,stroke-width:3px
-    classDef init fill:#fff9c4,stroke:#f57f17,stroke-width:2px
-    classDef approved fill:#c8e6c9,stroke:#388e3c,stroke-width:3px
-    classDef success fill:#81c784,stroke:#2e7d32,stroke-width:4px
+    Factory -- "👤 Subscriber<br/>initiates" --> SubProposal
+    Factory -- "🏢 Recipient<br/>initiates" --> RecProposal
+    Factory -- "🤖 Processor<br/>initiates" --> ProcProposal
+    
+    SubProposal -- "🤖 Processor<br/>approves" --> SubApproved
+    ProcProposal -- "👤 Subscriber<br/>accepts" --> SubApproved
+    
+    RecProposal -- "🤖 Processor<br/>approves" --> RecApproved
+    ProcProposal -- "🏢 Recipient<br/>accepts" --> RecApproved
+    
+    SubApproved -- "🏢 Recipient<br/>accepts" --> Success
+    RecApproved -- "👤 Subscriber<br/>accepts" --> Success
+    
+    classDef factory fill:#b3e5fc,stroke:#01579b,stroke-width:4px,color:#000
+    classDef proposal fill:#a5d6a7,stroke:#1b5e20,stroke-width:3px,color:#000
+    classDef approved fill:#81c784,stroke:#1b5e20,stroke-width:4px,color:#000
+    classDef success fill:#66bb6a,stroke:#1b5e20,stroke-width:5px,color:#000
     
     class Factory factory
-    class SubInit,RecInit,ProcInit init
+    class SubProposal,RecProposal,ProcProposal proposal
     class SubApproved,RecApproved approved
     class Success success
 ```
