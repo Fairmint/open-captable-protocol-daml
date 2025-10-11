@@ -39,10 +39,8 @@ template FreeTrialSubscription
       -- ^ Free trial ends at this time (not optional - this is the contract's purpose)
     paidUntil : Time
       -- ^ Trial is advanced through this time (extends by one period with each processing)
-    recipientProvider : Party
-      -- ^ Provider party for recipient's Amulet transfers (set during acceptance)
     config : SubscriptionConfig
-      -- ^ Subscription configuration (without freeTrialEndsAt field)
+      -- ^ Subscription configuration (includes recipientProvider)
     context : ProcessorContext
       -- ^ Processor and DSO context (includes processorProvider, set during processor approval)
   where
@@ -50,7 +48,9 @@ template FreeTrialSubscription
     
     ensure
       validateSubscriptionConfig config &&
-      trialEndsAt <= config.expiresAt
+      (case config.expiresAt of
+        Some exp -> trialEndsAt <= exp
+        None -> True)
 
     -- | Process free trial period
     -- Advances paidUntil without requiring payment
@@ -77,8 +77,9 @@ template FreeTrialSubscription
           (now < trialEndsAt)
         
         -- Validate subscription hasn't expired
-        assertMsg "Cannot process free trial after subscription expiration" 
-          (now <= config.expiresAt)
+        case config.expiresAt of
+          Some exp -> assertMsg "Cannot process free trial after subscription expiration" (now <= exp)
+          None -> pure ()
         
         -- Validate subscription period has elapsed (paid through time has passed)
         assertMsg "Cannot process free trial before subscription period elapses (still paid through current paidUntil time)" 
@@ -99,17 +100,18 @@ template FreeTrialSubscription
               if cappedPaidUntil > trialEndsAt
               then trialEndsAt
               else cappedPaidUntil
-        let newPaidUntil = 
-              if cappedPaidUntil2 > config.expiresAt
-              then config.expiresAt
-              else cappedPaidUntil2
+        let newPaidUntil = case config.expiresAt of
+              Some exp -> if cappedPaidUntil2 > exp then exp else cappedPaidUntil2
+              None -> cappedPaidUntil2
         
         -- Determine if free trial ends with this processing
         let trialEnded = newPaidUntil >= trialEndsAt
         
         -- Create activity markers for provided FeaturedAppRights
         case recipientFeaturedAppRight of
-          Some farCid -> createActivityMarker recipientProvider farCid
+          Some farCid -> case config.recipientProvider of
+            Some provider -> createActivityMarker provider farCid
+            None -> pure ()
           None -> pure ()
         
         case processorFeaturedAppRight of
@@ -122,7 +124,6 @@ template FreeTrialSubscription
             -- Trial ended - create PaidSubscription
             paidSubscriptionCid <- create PaidSubscription with
               paidUntil = newPaidUntil
-              recipientProvider
               config
               context
             pure SubscriptionCreationResult with
@@ -164,8 +165,9 @@ template FreeTrialSubscription
           (newTrialEndsAt > trialEndsAt)
         now <- getTime
         assertMsg "New trial end must be in the future" (newTrialEndsAt > now)
-        assertMsg "Trial end cannot exceed subscription expiration" 
-          (newTrialEndsAt <= config.expiresAt)
+        case config.expiresAt of
+          Some exp -> assertMsg "Trial end cannot exceed subscription expiration" (newTrialEndsAt <= exp)
+          None -> pure ()
         create this with trialEndsAt = newTrialEndsAt
 
     -- | Subscriber updates subscription expiration date
@@ -177,7 +179,7 @@ template FreeTrialSubscription
         now <- getTime
         assertMsg "New expiration must be in the future" (newExpiresAt > now)
         assertMsg "Trial end cannot exceed new expiration" (trialEndsAt <= newExpiresAt)
-        create this with config = config with expiresAt = newExpiresAt
+        create this with config = config with expiresAt = Some newExpiresAt
 
     -- | Subscriber increases prepay window
     choice FreeTrialSubscription_SubscriberIncreasePrepayWindow : ContractId FreeTrialSubscription
@@ -281,7 +283,7 @@ template FreeTrialSubscription
         newRecipientProvider : Party
       controller config.recipient
       do
-        create this with recipientProvider = newRecipientProvider
+        create this with config = config with recipientProvider = Some newRecipientProvider
 
 
 -- | Active paid subscription contract for recurring payments
@@ -299,10 +301,8 @@ template PaidSubscription
   with
     paidUntil : Time
       -- ^ Subscription is paid through this time (extends by one period with each payment)
-    recipientProvider : Party
-      -- ^ Provider party for recipient's Amulet transfers (set during acceptance)
     config : SubscriptionConfig
-      -- ^ Subscription configuration (without freeTrialEndsAt field)
+      -- ^ Subscription configuration (includes recipientProvider)
     context : ProcessorContext
       -- ^ Processor and DSO context (set during processor approval)
   where
@@ -330,7 +330,9 @@ template PaidSubscription
         openRound <- exercise paymentCtx.openMiningRoundCid (OpenMiningRound_Fetch with p = context.processor)
         let amuletPrice = openRound.amuletPrice
         
-        assertMsg "Cannot process payments after subscription expiration" (now <= config.expiresAt)
+        case config.expiresAt of
+          Some exp -> assertMsg "Cannot process payments after subscription expiration" (now <= exp)
+          None -> pure ()
         assertMsg "Cannot process payment before subscription period elapses (still paid through current paidUntil time)" (now > paidUntil)
         assertMsg "Must provide at least one amulet input for payment" (not (null paymentCtx.amuletInputs))
         assertMsg "USD to Amulet conversion rate must be positive" (amuletPrice > 0.0)
@@ -338,7 +340,9 @@ template PaidSubscription
         let maxAllowedPaidUntil = addRelTime now config.prepayWindow
         let desiredPaidUntil = addRelTime paidUntil processingPeriod
         let cappedPaidUntil = if desiredPaidUntil > maxAllowedPaidUntil then maxAllowedPaidUntil else desiredPaidUntil
-        let newPaidUntil = if cappedPaidUntil > config.expiresAt then config.expiresAt else cappedPaidUntil
+        let newPaidUntil = case config.expiresAt of
+              Some exp -> if cappedPaidUntil > exp then exp else cappedPaidUntil
+              None -> cappedPaidUntil
         let actualPeriod = subTime newPaidUntil paidUntil
 
         let feeAmountForThisPeriod = calculateAmountForPeriod config.processorPaymentPerDay actualPeriod amuletPrice
@@ -346,10 +350,16 @@ template PaidSubscription
         
         -- Pay recipient (always uses recipient's provider and FeaturedAppRight)
         let amountForThisPeriod = calculateAmountForPeriod config.recipientPaymentPerDay actualPeriod amuletPrice
+        
+        -- Get recipient provider (required for payment)
+        recipientProviderParty <- case config.recipientProvider of
+          Some p -> pure p
+          None -> abort "Recipient provider must be set"
+        
         recipientTransferResult <- paymentTo PaymentRequest with
           sender = config.subscriber
           receiver = config.recipient
-          provider = recipientProvider
+          provider = recipientProviderParty
           amount = amountForThisPeriod
           featuredAppRight = recipientFeaturedAppRight
           expectedDso = context.dso
@@ -393,7 +403,9 @@ template PaidSubscription
       do
         now <- getTime
         assertMsg "Trial end must be in the future" (trialEndsAt > now)
-        assertMsg "Trial end cannot exceed subscription expiration" (trialEndsAt <= config.expiresAt)
+        case config.expiresAt of
+          Some exp -> assertMsg "Trial end cannot exceed subscription expiration" (trialEndsAt <= exp)
+          None -> pure ()
         create FreeTrialSubscription with trialEndsAt = trialEndsAt; paidUntil = paidUntil; ..
 
     -- | Subscriber updates subscription expiration date
@@ -404,7 +416,7 @@ template PaidSubscription
       do
         now <- getTime
         assertMsg "New expiration must be in the future" (newExpiresAt > now)
-        create this with config = config with expiresAt = newExpiresAt
+        create this with config = config with expiresAt = Some newExpiresAt
 
     -- | Subscriber increases prepay window
     choice PaidSubscription_SubscriberIncreasePrepayWindow : ContractId PaidSubscription
@@ -484,7 +496,7 @@ template PaidSubscription
         newRecipientProvider : Party
       controller config.recipient
       do
-        create this with recipientProvider = newRecipientProvider
+        create this with config = config with recipientProvider = Some newRecipientProvider
 
     -- | Subscriber cancels
     choice PaidSubscription_CancelBySubscriber : Optional (ContractId Prepaid.PrepaidCanceledSubscription)
