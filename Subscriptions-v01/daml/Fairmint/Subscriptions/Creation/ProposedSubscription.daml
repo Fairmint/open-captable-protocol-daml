@@ -1,23 +1,23 @@
 module Fairmint.Subscriptions.Creation.ProposedSubscription where
 
 import Fairmint.Subscriptions.Active.Subscriptions (FreeTrialSubscription(..), PaidSubscription(..), SubscriptionCreationResult(..))
-import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), updateSubscriptionProposalWithChanges, validateChanges)
+import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal)
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.SubscriptionTime (resolveOptionalSubscriptionTime, validateOptionalTimeInFuture)
-import Fairmint.Subscriptions.Types.ApprovalState (ApprovalState(..), validateAtLeastOneApproved, validateAllApproved, updateApprovalsAfterEdit, assertIsPartyToSubscription, getSignatories, getObservers)
+import Fairmint.Subscriptions.Types.SubscriptionTime (resolveAndAssertOptionalTimeInFuture, resolveAndAssertTimeInFuture)
+import Fairmint.Subscriptions.Types.ApprovalState (ApprovalState(..), validateAtLeastOneApproved, assertAllApproved, addApprovalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscription, getApprovedUsers, getUnapprovedUsers)
 
--- | Unified subscription proposal with approval tracking
+-- | Subscription proposal with approval tracking
 template ProposedSubscription
   with
     proposal : SubscriptionProposal
     processorContext : ProcessorContext
     approvals : ApprovalState
   where
-    signatory getSignatories proposal processorContext approvals
-    observer getObservers proposal approvals
+    signatory [processorContext.processor] ++ getApprovedUsers proposal approvals
+    observer getUnapprovedUsers proposal approvals
     
     ensure validateSubscriptionProposal proposal && validateAtLeastOneApproved approvals
 
@@ -28,19 +28,14 @@ template ProposedSubscription
       controller actor
       do
         assertIsPartyToSubscription actor proposal processorContext
-        assertMsg "Actor has already approved"
-          (not ((actor == proposal.subscriber && approvals.subscriberApproved) ||
-                (actor == proposal.recipient && approvals.recipientApproved) ||
-                (actor == processorContext.processor && approvals.processorApproved)))
+
+        newApprovals <- addApprovalAndAssertChanged approvals actor proposal processorContext
         
         create this with
-          approvals = ApprovalState with
-            subscriberApproved = approvals.subscriberApproved || actor == proposal.subscriber
-            recipientApproved = approvals.recipientApproved || actor == proposal.recipient
-            processorApproved = approvals.processorApproved || actor == processorContext.processor
+          approvals = newApprovals
 
     -- | Edit the proposal - intelligently revokes approvals from impacted parties
-    -- The editor retains their approval
+    -- The editor retains (or adds) their approval
     choice ProposedSubscription_EditSubscriptionProposal : ContractId ProposedSubscription
       with
         actor : Party
@@ -50,10 +45,9 @@ template ProposedSubscription
       do
         assertIsPartyToSubscription actor proposal processorContext
         assertValidOptionalText reason
-        assertMsg "All changes must differ from current values" (validateChanges changes proposal)
         
-        let updatedProposal = updateSubscriptionProposalWithChanges changes proposal
-        let newApprovals = updateApprovalsAfterEdit approvals actor changes proposal processorContext
+        (updatedProposal, impactedParties) <- applyChangesAndAssertChanged changes proposal processorContext
+        let newApprovals = updateApprovalsAfterImpact approvals actor impactedParties proposal processorContext
         
         create this with
           proposal = updatedProposal
@@ -65,15 +59,11 @@ template ProposedSubscription
         actor : Party
       controller actor
       do
-        assertMsg "All parties must approve before creating subscription" (validateAllApproved approvals)
         assertIsPartyToSubscription actor proposal processorContext
+        assertAllApproved approvals
         
         -- Resolve and validate times
-        resolvedExpiresAt <- resolveOptionalSubscriptionTime proposal.expiresAt
-        assertMsg "Subscription expiration must be in the future" =<< validateOptionalTimeInFuture resolvedExpiresAt
-        
-        -- Get current time for paidUntil initialization
-        now <- getTime
+        resolvedExpiresAt <- resolveAndAssertOptionalTimeInFuture proposal.expiresAt
         
         -- Build the Subscription config
         let subscription = Subscription with
@@ -87,10 +77,12 @@ template ProposedSubscription
               description = proposal.description
               metadata = proposal.metadata
         
+        -- Get current time for paidUntil initialization
+        now <- getTime
+        
         case proposal.freeTrialExpiration of
           Some trialEndsAt -> do
-            resolvedFreeTrialExpiration <- resolveSubscriptionTime trialEndsAt
-            assertMsg "Free trial end must be in the future" =<< validateTimeInFuture resolvedFreeTrialExpiration
+            resolvedFreeTrialExpiration <- resolveAndAssertTimeInFuture trialEndsAt
             
             -- Create free trial subscription
             freeTrialCid <- create FreeTrialSubscription with
