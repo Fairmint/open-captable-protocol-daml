@@ -1,10 +1,9 @@
 module Subscriptions.TestSubscriberInitiatedLifecycle where
 
 import Daml.Script
-import Fairmint.Subscriptions.Creation.SubscriberSubscriptionProposal
-import Fairmint.Subscriptions.Creation.ProcessorApprovedSubscriptionProposal
+import Fairmint.Subscriptions.Creation.ProposedSubscription
 import Fairmint.Subscriptions.Active.Subscriptions
-import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionAmount(..))
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
 import Subscriptions.TestUtils
 
 -- | Test the full happy path: factory → proposal → approval → acceptance
@@ -13,14 +12,16 @@ testFactoryProposalAcceptance = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  fullyApprovedCid <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
   result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
+    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
   
   -- Result is Either FreeTrialSubscription PaidSubscription - should be Right (PaidSubscription) since no trial
   case result.subscription of
@@ -30,7 +31,7 @@ testFactoryProposalAcceptance = script do
       assertMsg "Recipient should be bob" (subscription.config.recipient == bob)
       assertMsg "Processor should match" (subscription.context.processor == processor)
       assertMsg "Amount per day should be 1.0" (subscription.config.recipientPaymentPerDay == AmuletAmount 1.0)
-      assertMsg "Fee amount per day should be 0.2" (subscription.config.processorPaymentPerDay == AmuletAmount 0.2)
+      assertMsg "Fee amount per day should be 0.2" (subscription.config.processorPaymentPerDay == Some (AmuletAmount 0.2))
     Left _ -> assertFail "Expected PaidSubscription, got FreeTrialSubscription"
   
   pure ()
@@ -41,10 +42,10 @@ testProposalRejectionByRecipient = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   submit bob do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_RecipientReject with reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = bob; reason = None
   
   proposal <- queryContractId bob proposalCid
   assertMsg "Proposal should be archived" (proposal == None)
@@ -57,10 +58,10 @@ testProposalRejectionByProcessor = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorReject with reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = processor; reason = None
   
   proposal <- queryContractId processor proposalCid
   assertMsg "Proposal should be archived" (proposal == None)
@@ -73,10 +74,10 @@ testProposalWithdrawBySubscriber = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   submit alice do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_SubscriberWithdraw with reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = alice; reason = None
   
   proposal <- queryContractId alice proposalCid
   assertMsg "Proposal should be archived" (proposal == None)
@@ -89,13 +90,13 @@ testProcessorApprovedProposalProcessorWithdraw = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
   submit processor do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_ProcessorWithdraw with reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = processor; reason = None
   
   pure ()
 
@@ -105,13 +106,13 @@ testProcessorApprovedProposalRecipientReject = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
   submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientReject with reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = bob; reason = None
   
   pure ()
 
@@ -121,13 +122,13 @@ testProcessorApprovedProposalSubscriberWithdraw = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
   approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
   submit alice do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_SubscriberWithdraw with reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = alice; reason = None
   
   pure ()
 
@@ -137,14 +138,16 @@ testCancelBySubscriber = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  fullyApprovedCid <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
   result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
+    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
   
   -- Extract PaidSubscription contract ID
   subscriptionCid <- case result.subscription of
@@ -166,14 +169,16 @@ testCancelByRecipient = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  fullyApprovedCid <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
   result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
+    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
   
   -- Extract PaidSubscription contract ID
   subscriptionCid <- case result.subscription of
@@ -195,14 +200,16 @@ testCancelByProcessor = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  fullyApprovedCid <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
   result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
+    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
   
   -- Extract PaidSubscription contract ID
   subscriptionCid <- case result.subscription of

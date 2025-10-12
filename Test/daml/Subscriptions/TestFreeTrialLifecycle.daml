@@ -2,10 +2,11 @@ module Subscriptions.TestFreeTrialLifecycle where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
-import Fairmint.Subscriptions.Creation.SubscriberSubscriptionProposal
-import Fairmint.Subscriptions.Creation.ProcessorApprovedSubscriptionProposal
+import Fairmint.Subscriptions.Creation.ProposedSubscription
 import Fairmint.Subscriptions.Active.Subscriptions
-import Fairmint.Subscriptions.SubscriptionConfig (SubscriptionAmount(..), ProcessorContext(..), SubscriptionExpiration(..))
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Fairmint.Subscriptions.Creation.SubscriptionFactory
 import Subscriptions.TestUtils
 
@@ -15,21 +16,24 @@ createFreeTrialSubscription processor subscriber recipient dso = do
   now <- getTime
   expiresAt <- getExpirationTime 365
   let freeTrialEndsAt = addRelTime now (days 30)
-  let config = defaultSubscriptionConfig subscriber recipient expiresAt
+  let proposal = (defaultSubscriptionProposal subscriber recipient expiresAt) with
+        freeTrialExpiration = Some (PerciseTime freeTrialEndsAt)
   
   proposalCid <- submitMulti [subscriber, processor] [] do
     createAndExerciseCmd
-      (SubscriptionFactory with context = ProcessorContext processor dso)
-      (SubscriptionFactory_CreateSubscriberProposal with
-        config = config
-        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt))
+      (SubscriptionFactory with processorContext = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposedSubscription with
+        actor = subscriber
+        proposal = proposal)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  fullyApprovedCid <- submit recipient do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = recipient
   
   result <- submit recipient do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = recipient
+    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = recipient
   
   case result.subscription of
     Left cid -> pure cid  -- FreeTrialSubscription
@@ -94,8 +98,8 @@ testFreeTrialSubscriberIncreasePayments = script do
       newProcessorPaymentPerDay = AmuletAmount 0.5
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should be increased" (updated.config.recipientPaymentPerDay == AmuletAmount 2.0)
-  assertMsg "Processor payment should be increased" (updated.config.processorPaymentPerDay == AmuletAmount 0.5)
+  assertMsg "Recipient payment should be increased" (updated.subscription.recipientPaymentPerDay == AmuletAmount 2.0)
+  assertMsg "Processor payment should be increased" (updated.subscription.processorPaymentPerDay == Some (AmuletAmount 0.5))
   
   pure ()
 
@@ -110,7 +114,7 @@ testFreeTrialRecipientDecreasePayment = script do
       newRecipientPaymentPerDay = AmuletAmount 0.5
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should be decreased" (updated.config.recipientPaymentPerDay == AmuletAmount 0.5)
+  assertMsg "Recipient payment should be decreased" (updated.subscription.recipientPaymentPerDay == AmuletAmount 0.5)
   
   pure ()
 
@@ -125,7 +129,7 @@ testFreeTrialProcessorDecreasePayment = script do
       newProcessorPaymentPerDay = AmuletAmount 0.1
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Processor payment should be decreased" (updated.config.processorPaymentPerDay == AmuletAmount 0.1)
+  assertMsg "Processor payment should be decreased" (updated.subscription.processorPaymentPerDay == Some (AmuletAmount 0.1))
   
   pure ()
 
@@ -161,7 +165,7 @@ testFreeTrialSubscriberUpdateExpiration = script do
       newExpiresAt = newExpiresAt
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Expiration should be updated" (updated.config.expiresAt == newExpiresAt)
+  assertMsg "Expiration should be updated" (updated.subscription.expiresAt == Some newExpiresAt)
   
   pure ()
 
@@ -178,7 +182,7 @@ testFreeTrialRecipientUpdateProvider = script do
       newRecipientProvider = charlie
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Provider should be updated" (updated.recipientProvider == charlie)
+  assertMsg "Provider should be updated" (updated.subscription.recipientProvider == Some charlie)
   
   pure ()
 
