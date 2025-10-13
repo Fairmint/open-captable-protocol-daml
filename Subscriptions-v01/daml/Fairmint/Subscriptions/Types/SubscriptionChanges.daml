@@ -1,0 +1,329 @@
+module Fairmint.Subscriptions.Types.SubscriptionChanges where
+
+import DA.Set (Set, fromList)
+import DA.Set qualified as Set
+import DA.Time (RelTime, convertRelTimeToMicroseconds, days)
+import DA.TextMap (TextMap)
+import DA.Optional (isSome)
+import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), validateSubscriptionAmount)
+import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Shared.TypeHelpers (validateOptionalMetadata)
+
+-- | Proposed changes to an active subscription
+data SubscriptionChanges = SubscriptionChanges
+  with
+    subscriber : Optional Party
+      -- ^ Change subscriber (requires approval from both old and new subscriber)
+    recipient : Optional Party
+      -- ^ Change recipient (requires approval from both old and new recipient)
+    processor : Optional Party
+      -- ^ Change processor (requires approval from both old and new processor)
+    dso : Optional Party
+      -- ^ Change DSO (requires approval from all parties: subscriber, recipient, processor)
+    recipientProvider : Optional Party
+      -- ^ Change recipient's provider
+    recipientPaymentPerDay : Optional SubscriptionAmount
+      -- ^ Change daily payment to recipient
+    processorPaymentPerDay : Optional (Optional SubscriptionAmount)
+      -- ^ Change daily payment to processor (Some None = remove fee)
+    paymentsEndAt : Optional (Optional SubscriptionTime)
+      -- ^ Change payments end time (Some None = make perpetual, relative to acceptance time)
+    prepayWindow : Optional (Optional RelTime)
+      -- ^ Change prepay window
+    trialEndsAt : Optional (Optional SubscriptionTime)
+      -- ^ Change trial end time (Some None = end trial now, relative to acceptance time)
+    processedAndPaidUntilAdjustment : Optional RelTime
+      -- ^ Adjust processedAndPaidUntil by this amount (positive = extend, negative = reduce)
+      -- Applied to the current value at approval time, not a fixed time
+    description : Optional (Optional Text)
+      -- ^ Change description
+    metadata : Optional (Optional (TextMap Text))
+      -- ^ Change metadata
+  deriving (Eq, Show)
+
+-- | Helper to compare SubscriptionAmount values
+-- Returns: (sameUnit, increased)
+compareAmounts : SubscriptionAmount -> SubscriptionAmount -> (Bool, Bool)
+compareAmounts oldAmt newAmt = case (oldAmt, newAmt) of
+  (AmuletAmount old, AmuletAmount new) -> (True, new > old)
+  (USDAmount old, USDAmount new) -> (True, new > old)
+  _ -> (False, False)  -- Different units
+
+-- | Determine which parties are impacted by proposed changes
+-- Returns set of impacted parties (includes both old and new parties for role changes)
+getImpactedPartiesForSubscription : SubscriptionChanges -> Subscription -> ProcessorContext -> Set Party
+getImpactedPartiesForSubscription changes config context =
+  let
+    impacted = Set.empty
+    
+    -- Changes to subscriber require approval from both old and new subscriber
+    impacted1 = case changes.subscriber of
+      Some newSubscriber -> fromList [config.subscriber, newSubscriber] <> impacted
+      None -> impacted
+    
+    -- Changes to recipient require approval from both old and new recipient
+    impacted2 = case changes.recipient of
+      Some newRecipient -> fromList [config.recipient, newRecipient] <> impacted1
+      None -> impacted1
+    
+    -- Changes to processor require approval from both old and new processor
+    impacted3 = case changes.processor of
+      Some newProcessor -> fromList [context.processor, newProcessor] <> impacted2
+      None -> impacted2
+    
+    -- Changes to DSO require approval from ALL parties (subscriber, recipient, processor)
+    impacted4 = case changes.dso of
+      Some _ -> fromList [config.subscriber, config.recipient, context.processor] <> impacted3
+      None -> impacted3
+    
+    -- Changes to recipient provider only affect recipient (their choice)
+    impacted5 = case changes.recipientProvider of
+      Some _ -> fromList [config.recipient] <> impacted4
+      None -> impacted4
+    
+    -- Changes to recipient payment: same unit + increase -> subscriber, same unit + decrease -> recipient, unit change -> both
+    impacted6 = case changes.recipientPaymentPerDay of
+      Some newAmt -> 
+        let (sameUnit, increased) = compareAmounts config.recipientPaymentPerDay newAmt
+        in if sameUnit
+           then if increased
+                then fromList [config.subscriber] <> impacted5  -- Pays more
+                else fromList [config.recipient] <> impacted5   -- Gets less
+           else fromList [config.subscriber, config.recipient] <> impacted5  -- Unit changed, affects both
+      None -> impacted5
+    
+    -- Changes to processor payment: same unit + increase -> subscriber, same unit + decrease -> processor, unit change -> both
+    impacted7 = case changes.processorPaymentPerDay of
+      Some maybeNewAmt -> case (config.processorPaymentPerDay, maybeNewAmt) of
+        (Some oldAmt, Some newAmt) ->
+          let (sameUnit, increased) = compareAmounts oldAmt newAmt
+          in if sameUnit
+             then if increased
+                  then fromList [config.subscriber] <> impacted6  -- Pays more
+                  else fromList [context.processor] <> impacted6  -- Gets less
+             else fromList [config.subscriber, context.processor] <> impacted6  -- Unit changed
+        (None, Some _) -> fromList [config.subscriber, context.processor] <> impacted6  -- Adding processor fee affects both
+        (Some _, None) -> fromList [config.subscriber, context.processor] <> impacted6  -- Removing processor fee affects both
+        (None, None) -> impacted6  -- No change (shouldn't happen if validation is correct)
+      None -> impacted6
+    
+    -- Changes to payments end impact subscriber (commitment change)
+    impacted8 = case changes.paymentsEndAt of
+      Some _ -> fromList [config.subscriber] <> impacted7
+      None -> impacted7
+    
+    -- Changes to prepay window: increase -> subscriber benefits, decrease -> recipient benefits
+    impacted9 = case changes.prepayWindow of
+      Some maybeNewWindow -> 
+        let oldWindow = case config.prepayWindow of
+              Some w -> w
+              None -> days 0
+            newWindow = case maybeNewWindow of
+              Some w -> w
+              None -> days 0
+        in if newWindow > oldWindow
+           then fromList [config.subscriber] <> impacted8  -- Subscriber increases prepayWindow
+           else fromList [config.recipient] <> impacted8   -- Recipient decreases prepayWindow
+      None -> impacted8
+    
+    -- Changes to free trial affect both subscriber and recipient
+    impacted10 = case changes.trialEndsAt of
+      Some _ -> fromList [config.subscriber, config.recipient] <> impacted9
+      None -> impacted9
+    
+    -- Adjusting processedAndPaidUntil affects subscriber and recipient (financial change)
+    impacted11 = case changes.processedAndPaidUntilAdjustment of
+      Some _ -> fromList [config.subscriber, config.recipient] <> impacted10
+      None -> impacted10
+    
+    -- Changes to description impact subscriber and recipient  
+    impacted12 = case changes.description of
+      Some _ -> fromList [config.subscriber, config.recipient] <> impacted11
+      None -> impacted11
+    
+    -- Changes to metadata impact all parties
+    impacted13 = case changes.metadata of
+      Some _ -> fromList [config.subscriber, config.recipient, context.processor] <> impacted12
+      None -> impacted12
+    
+  in impacted13
+
+-- | Validate that individual change values are valid
+validateChangeValues : SubscriptionChanges -> Bool
+validateChangeValues changes =
+  let
+    validRecipientPayment = case changes.recipientPaymentPerDay of
+      Some amt -> validateSubscriptionAmount amt False
+      None -> True
+    validProcessorPayment = case changes.processorPaymentPerDay of
+      Some maybeAmt -> case maybeAmt of
+        None -> True
+        Some amt -> validateSubscriptionAmount amt False
+      None -> True
+    validPrepayWindow = case changes.prepayWindow of
+      Some maybePrepayWindow -> case maybePrepayWindow of
+        None -> True
+        Some window -> convertRelTimeToMicroseconds window > 0
+      None -> True
+    validMetadata = case changes.metadata of
+      Some maybeMeta -> validateOptionalMetadata maybeMeta
+      None -> True
+  in validRecipientPayment && validProcessorPayment && validPrepayWindow && validMetadata
+
+-- | Assert that change values are valid and at least one change is specified
+assertChangeValuesValidAndNonEmpty : SubscriptionChanges -> Update ()
+assertChangeValuesValidAndNonEmpty changes = do
+  assertMsg "All change values must be valid" (validateChangeValues changes)
+  
+  -- Check that at least one field is being changed
+  let hasChange = 
+        isSome changes.subscriber ||
+        isSome changes.recipient ||
+        isSome changes.processor ||
+        isSome changes.dso ||
+        isSome changes.recipientProvider ||
+        isSome changes.recipientPaymentPerDay ||
+        isSome changes.processorPaymentPerDay ||
+        isSome changes.paymentsEndAt ||
+        isSome changes.prepayWindow ||
+        isSome changes.trialEndsAt ||
+        isSome changes.processedAndPaidUntilAdjustment ||
+        isSome changes.description ||
+        isSome changes.metadata
+  
+  assertMsg "Changes must specify at least one field to modify" hasChange
+
+-- | Apply changes to subscription
+-- Note: SubscriptionTime values for paymentsEndAt and trialEndsAt must be resolved before calling this
+-- This function expects Time values, not SubscriptionTime values
+applyChangesToSubscription : SubscriptionChanges -> Subscription -> Subscription
+applyChangesToSubscription changes subscription =
+  let
+    -- Party changes
+    subscriber = optional subscription.subscriber identity changes.subscriber
+    recipient = optional subscription.recipient identity changes.recipient
+    -- Other fields
+    recipientProvider = optional subscription.recipientProvider Some changes.recipientProvider
+    recipientPaymentPerDay = optional subscription.recipientPaymentPerDay identity changes.recipientPaymentPerDay
+    processorPaymentPerDay = optional subscription.processorPaymentPerDay identity changes.processorPaymentPerDay
+    prepayWindow = optional subscription.prepayWindow identity changes.prepayWindow
+    description = optional subscription.description identity changes.description
+    metadata = optional subscription.metadata identity changes.metadata
+    -- Note: paymentsEndAt and trialEndsAt are NOT updated here - they must be resolved and updated separately
+    -- in the Update monad by the caller (SubscriptionChangeProposal_Apply or ActiveSubscription_ProposeChanges)
+    paymentsEndAt = subscription.paymentsEndAt
+    trialEndsAt = subscription.trialEndsAt
+  in Subscription with ..
+
+-- | Apply processor and DSO changes to ProcessorContext
+applyChangesToProcessorContext : SubscriptionChanges -> ProcessorContext -> ProcessorContext
+applyChangesToProcessorContext changes context =
+  let
+    processor = optional context.processor identity changes.processor
+    dso = optional context.dso identity changes.dso
+  in ProcessorContext with ..
+
+{-
+## Handling Prepaid Time When Granting Free Trials
+
+### The Challenge
+
+When a subscriber has already paid for future service (processedAndPaidUntil > now) and receives 
+a free trial, we must account for the overlap to avoid losing their prepaid value.
+
+### Example Scenario
+
+Current state:
+- Current time (now): Jan 1
+- processedAndPaidUntil: Feb 1 (subscriber paid for all of January)
+- New free trial granted: 1 week (7 days)
+
+Expected behavior:
+- User should not pay during the trial week
+- User should retain the value they already paid for
+- After trial ends, user should have 3 weeks of prepaid time remaining
+
+### Solution: Extend processedAndPaidUntil
+
+When granting a free trial with `trialEndsAt` set to a future time:
+
+```daml
+-- In ActiveSubscription_RestartWithFreeTrial or similar choice
+grantFreeTrialWithPrepaidExtension : ContractId ActiveSubscription -> RelTime -> Update (ContractId ActiveSubscription)
+grantFreeTrialWithPrepaidExtension activeSub trialDuration = do
+  subscription <- fetch activeSub
+  now <- getTime
+  
+  -- Calculate new trial end
+  let newTrialEndsAt = addRelTime now trialDuration
+  
+  -- If already prepaid beyond now, extend by trial duration
+  let newProcessedAndPaidUntil = 
+        if subscription.processedAndPaidUntil > now
+        then addRelTime subscription.processedAndPaidUntil trialDuration
+        else subscription.processedAndPaidUntil
+  
+  -- Update subscription
+  archive activeSub
+  create subscription with
+    trialEndsAt = Some newTrialEndsAt
+    processedAndPaidUntil = newProcessedAndPaidUntil
+```
+
+### Timeline Visualization
+
+Before free trial:
+```
+Jan 1          Feb 1
+now            processedAndPaidUntil
+|--------------|
+  Paid period
+```
+
+After granting 1-week free trial (WRONG approach - losing value):
+```
+Jan 1   Jan 8           Feb 1
+now     trial ends      old processedAndPaidUntil
+|-------|               
+ Trial  (lost 3 weeks of prepaid value!)
+```
+
+After granting 1-week free trial (CORRECT approach):
+```
+Jan 1   Jan 8           Feb 1   Feb 8
+now     trial ends      old     new processedAndPaidUntil
+|-------|---------------|-------|
+ Trial   Prepaid period (extended)
+```
+
+### Key Implementation Points
+
+1. **Check if prepaid**: `if processedAndPaidUntil > now`
+2. **Calculate trial duration**: Use the trial period being granted
+3. **Extend processedAndPaidUntil**: Add trial duration to existing processedAndPaidUntil
+4. **Set trialEndsAt**: Set to `now + trialDuration`
+
+This ensures:
+- ✅ Subscriber doesn't pay during trial
+- ✅ Subscriber keeps all prepaid value
+- ✅ After trial, subscription continues with remaining prepaid time
+- ✅ No refunds needed - value is preserved through extension
+
+### Alternative Approaches (Not Recommended)
+
+1. **Refund approach**: Calculate refund amount and transfer back to subscriber
+   - ❌ Complex: requires amulet transfers, fee calculations
+   - ❌ Price risk: amulet price may have changed
+   - ❌ More transactions: more fees, more complexity
+
+2. **Credit approach**: Track a credit balance to offset future payments
+   - ❌ Complex state: need to track credits separately
+   - ❌ Payment logic complexity: every payment must check credits
+   - ❌ Harder to reason about: less transparent to users
+
+The extension approach is cleanest because it preserves the simple invariant that 
+`processedAndPaidUntil` represents "the subscriber has service through this time".
+-}
+

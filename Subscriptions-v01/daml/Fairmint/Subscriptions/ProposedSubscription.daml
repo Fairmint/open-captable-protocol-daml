@@ -1,20 +1,20 @@
-module Fairmint.Subscriptions.Creation.ProposedSubscription where
+module Fairmint.Subscriptions.ProposedSubscription where
 
-import Fairmint.Subscriptions.Active.Subscriptions (FreeTrialSubscription(..), PaidSubscription(..), SubscriptionCreationResult(..))
+import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
 import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal)
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.SubscriptionTime (resolveAndAssertOptionalTimeInFuture, resolveAndAssertTimeInFuture)
-import Fairmint.Subscriptions.Types.ApprovalState (ApprovalState(..), validateAtLeastOneApproved, assertAllApproved, addApprovalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscription, getApprovedUsers, getUnapprovedUsers)
+import Fairmint.Subscriptions.Types.Approvals (Approvals(..), validateAtLeastOneApproved, assertAllApproved, addApprovalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscriptionProposal, getApprovedUsers, getUnapprovedUsers)
 
 -- | Subscription proposal with approval tracking
 template ProposedSubscription
   with
     proposal : SubscriptionProposal
     processorContext : ProcessorContext
-    approvals : ApprovalState
+    approvals : Approvals
   where
     signatory [processorContext.processor] ++ getApprovedUsers proposal approvals
     observer getUnapprovedUsers proposal approvals
@@ -27,7 +27,7 @@ template ProposedSubscription
         actor : Party
       controller actor
       do
-        assertIsPartyToSubscription actor proposal processorContext
+        assertIsPartyToSubscriptionProposal actor proposal processorContext
 
         newApprovals <- addApprovalAndAssertChanged approvals actor proposal processorContext
         
@@ -40,11 +40,11 @@ template ProposedSubscription
       with
         actor : Party
         changes : SubscriptionProposalChanges
-        reason : Optional Text
+        description : Optional Text
       controller actor
       do
-        assertIsPartyToSubscription actor proposal processorContext
-        assertValidOptionalText reason
+        assertIsPartyToSubscriptionProposal actor proposal processorContext
+        assertValidOptionalText description
         
         (updatedProposal, impactedParties) <- applyChangesAndAssertChanged changes proposal processorContext
         let newApprovals = updateApprovalsAfterImpact approvals actor impactedParties proposal processorContext
@@ -54,66 +54,57 @@ template ProposedSubscription
           approvals = newApprovals
 
     -- | Create the active subscription once all parties have approved
-    choice ProposedSubscription_CreateSubscription : SubscriptionCreationResult
+    choice ProposedSubscription_CreateSubscription : ContractId ActiveSubscription
       with
         actor : Party
       controller actor
       do
-        assertIsPartyToSubscription actor proposal processorContext
+        assertIsPartyToSubscriptionProposal actor proposal processorContext
         assertAllApproved approvals
         
         -- Resolve and validate times
-        resolvedExpiresAt <- resolveAndAssertOptionalTimeInFuture proposal.expiresAt
+        resolvedPaymentsEndAt <- resolveAndAssertOptionalTimeInFuture proposal.paymentsEndAt
         
-        -- Build the Subscription config
-        let subscription = Subscription with
+        -- Build the Subscription config (without trialEndsAt - set below)
+        let config = Subscription with
               subscriber = proposal.subscriber
               recipient = proposal.recipient
               recipientProvider = proposal.recipientProvider
               recipientPaymentPerDay = proposal.recipientPaymentPerDay
               processorPaymentPerDay = proposal.processorPaymentPerDay
               prepayWindow = proposal.prepayWindow
-              expiresAt = resolvedExpiresAt
+              paymentsEndAt = resolvedPaymentsEndAt
+              trialEndsAt = None  -- Will be set after resolution
               description = proposal.description
               metadata = proposal.metadata
         
-        -- Get current time for paidUntil initialization
+        -- Get current time for processedUntil initialization
         now <- getTime
         
-        case proposal.freeTrialExpiration of
-          Some trialEndsAt -> do
-            resolvedFreeTrialExpiration <- resolveAndAssertTimeInFuture trialEndsAt
-            
-            -- Create free trial subscription
-            freeTrialCid <- create FreeTrialSubscription with
-              subscription = subscription 
-                with 
-                  expiresAt = resolvedExpiresAt
-                  paidUntil = now
-              freeTrialExpiration = resolvedFreeTrialExpiration
-              ..
-            pure SubscriptionCreationResult with
-              subscription = Left freeTrialCid
-          
-          None -> do
-            -- Create paid subscription
-            paidSubscriptionCid <- create PaidSubscription with
-              subscription = subscription
-                with
-                  expiresAt = resolvedExpiresAt
-                  paidUntil = now
-              ..
-            pure SubscriptionCreationResult with
-              subscription = Right paidSubscriptionCid
+        -- Resolve free trial expiration if present
+        trialEndsAt <- case proposal.freeTrialExpiration of
+          Some trialEndsAtSpec -> do
+            resolved <- resolveAndAssertTimeInFuture trialEndsAtSpec
+            pure (Some resolved)
+          None -> pure None
+        
+        -- Build final subscription with trialEndsAt
+        let subscription = config with trialEndsAt = trialEndsAt
+        
+        -- Create active subscription
+        create ActiveSubscription with
+          processedAndPaidUntil = now
+          processorContext
+          ..
 
 
     -- | Withdraw proposal (any party can withdraw, archives the proposal)
     choice ProposedSubscription_Withdraw : ()
       with
         actor : Party
-        reason : Optional Text
+        description : Optional Text
       controller actor
       do
-        assertIsPartyToSubscription actor proposal processorContext
-        assertValidOptionalText reason
+        assertIsPartyToSubscriptionProposal actor proposal processorContext
+        assertValidOptionalText description
         pure ()

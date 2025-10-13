@@ -1,0 +1,221 @@
+module Fairmint.Subscriptions.Types.SubscriptionHelpers where
+
+import DA.Time (Time, RelTime, addRelTime, days)
+import DA.Optional (isSome)
+import Splice.Amulet qualified as Amulet
+import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
+import Fairmint.Subscriptions.Types.Subscription (Subscription)
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount, calculateAmountForPeriod)
+import Fairmint.Subscriptions.Types.Approvals (Approvals(..))
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
+
+-- | Validates that trial ends before or at payments end
+validateTrialEndsBeforePaymentsEnd : Subscription -> Bool
+validateTrialEndsBeforePaymentsEnd subscription =
+  case subscription.trialEndsAt of
+    Some trial -> case subscription.paymentsEndAt of
+      Some end -> trial <= end
+      None -> True
+    None -> True
+
+-- | Checks if subscription is currently in free trial state
+isInFreeTrial : Optional Time -> Time -> Bool
+isInFreeTrial trialEndsAt now =
+  case trialEndsAt of
+    Some trial -> trial >= now
+    None -> False
+
+-- | Checks if subscription is in PrepaidCanceled state
+isInPrepaidCanceled : Optional Time -> Time -> Time -> Bool
+isInPrepaidCanceled paymentsEndAt processedAndPaidUntil now =
+  case paymentsEndAt of
+    Some end -> end <= now && processedAndPaidUntil >= now
+    None -> False
+
+-- | Calculate new processedAndPaidUntil with all capping logic
+-- Caps at: prepay window, trial end (if applicable), and payments end (if applicable)
+calculateNewProcessedAndPaidUntil : Time -> RelTime -> Optional RelTime -> Optional Time -> Optional Time -> Time -> Time
+calculateNewProcessedAndPaidUntil 
+  now 
+  processingPeriod 
+  prepayWindow 
+  trialEndsAt 
+  paymentsEndAt 
+  currentProcessedAndPaidUntil =
+    let
+      effectivePrepayWindow = case prepayWindow of
+        Some window -> window
+        None -> days 0
+      maxAllowedProcessedAndPaidUntil = addRelTime now effectivePrepayWindow
+      desiredProcessedAndPaidUntil = addRelTime currentProcessedAndPaidUntil processingPeriod
+      
+      -- Cap at prepay window
+      cappedAtPrepay = 
+        if desiredProcessedAndPaidUntil > maxAllowedProcessedAndPaidUntil 
+        then maxAllowedProcessedAndPaidUntil 
+        else desiredProcessedAndPaidUntil
+      
+      -- Cap at trial end if applicable
+      cappedAtTrial = case trialEndsAt of
+        Some trial -> if cappedAtPrepay > trial then trial else cappedAtPrepay
+        None -> cappedAtPrepay
+      
+      -- Cap at payments end if applicable
+      cappedAtPaymentsEnd = case paymentsEndAt of
+        Some end -> if cappedAtTrial > end then end else cappedAtTrial
+        None -> cappedAtTrial
+    in
+      cappedAtPaymentsEnd
+
+-- | Create activity marker for recipient if applicable
+createRecipientActivityMarker : Optional (ContractId Amulet.FeaturedAppRight) -> Optional Party -> Update ()
+createRecipientActivityMarker recipientFAR recipientProvider =
+  case recipientFAR of
+    Some farCid -> case recipientProvider of
+      Some provider -> createActivityMarker provider farCid
+      None -> pure ()
+    None -> pure ()
+
+-- | Create activity marker for processor
+createProcessorActivityMarker : Optional (ContractId Amulet.FeaturedAppRight) -> Party -> Update ()
+createProcessorActivityMarker processorFAR processorProvider =
+  case processorFAR of
+    Some farCid -> createActivityMarker processorProvider farCid
+    None -> pure ()
+
+-- | Asserts that payments haven't ended
+assertPaymentsNotEnded : Optional Time -> Time -> Update ()
+assertPaymentsNotEnded paymentsEndAt now =
+  case paymentsEndAt of
+    Some end -> assertMsg "Cannot process after payments end" (now <= end)
+    None -> pure ()
+
+-- | Checks if processor payment amount is zero
+isProcessorPaymentZero : Optional a -> Bool
+isProcessorPaymentZero processorPaymentPerDay = not (isSome processorPaymentPerDay)
+
+-- | Assert that subscription is currently in free trial state
+assertInFreeTrial : Optional Time -> Time -> Update ()
+assertInFreeTrial trialEndsAt now =
+  assertMsg "Can only process free trial when subscription.trialEndsAt is Some and >= now" 
+    (isInFreeTrial trialEndsAt now)
+
+-- | Assert that subscription is in free trial and trial hasn't ended yet
+-- Returns the trial end time for further use
+assertInFreeTrialAndNotEnded : Optional Time -> Time -> Update Time
+assertInFreeTrialAndNotEnded trialEndsAt now = do
+  assertInFreeTrial trialEndsAt now
+  let Some trialEnd = trialEndsAt
+  assertMsg "Free trial has already ended" (now < trialEnd)
+  pure trialEnd
+
+-- | Assert that subscription is NOT in free trial state
+assertNotInFreeTrial : Optional Time -> Time -> Update ()
+assertNotInFreeTrial trialEndsAt now =
+  assertMsg "Cannot process payment while in free trial (subscription.trialEndsAt is Some and >= now)" 
+    (not (isInFreeTrial trialEndsAt now))
+
+-- | Assert that subscription period has elapsed (can process next payment)
+assertPeriodHasElapsed : Time -> Time -> Update ()
+assertPeriodHasElapsed now processedAndPaidUntil =
+  assertMsg "Cannot process before subscription period elapses (still processed through current processedAndPaidUntil time)" 
+    (now > processedAndPaidUntil)
+
+-- | Assert that party is authorized for subscription actions
+assertIsSubscriptionParty : Party -> Party -> Party -> Party -> Update ()
+assertIsSubscriptionParty party subscriber recipient processor =
+  assertMsg "Only subscriber, recipient, or processor can perform this action" 
+    (party == subscriber || party == recipient || party == processor)
+
+-- | Assert that amulet inputs are provided
+assertHasAmuletInputs : [a] -> Update ()
+assertHasAmuletInputs inputs =
+  assertMsg "Must provide at least one amulet input" (not (null inputs))
+
+-- | Assert that amulet price is valid
+assertValidAmuletPrice : Decimal -> Update ()
+assertValidAmuletPrice price =
+  assertMsg "USD to Amulet conversion rate must be positive" (price > 0.0)
+
+-- | Assert that subscription is in PrepaidCanceled state and ready to archive
+assertCanArchivePrepaidCanceled : Time -> Time -> Update ()
+assertCanArchivePrepaidCanceled processedAndPaidUntil now =
+  assertMsg "Cannot archive PrepaidCanceled until processed period (processedAndPaidUntil) has passed" 
+    (now > processedAndPaidUntil)
+
+-- | Assert that we're in PrepaidCanceled state for refund
+assertInPrepaidCanceledForRefund : Optional Time -> Time -> Time -> Update ()
+assertInPrepaidCanceledForRefund paymentsEndAt processedAndPaidUntil now = do
+  case paymentsEndAt of
+    Some end -> assertMsg "Can only refund in PrepaidCanceled state (paymentsEndAt <= now)" (end <= now)
+    None -> abort "Cannot refund: subscription has no payments end date"
+  assertMsg "Can only refund in PrepaidCanceled state (processedAndPaidUntil >= now)" (processedAndPaidUntil >= now)
+  assertMsg "No processed time remaining - use Archive instead" (processedAndPaidUntil > now)
+
+-- | Calculate the new trialEndsAt after processing (clears if trial ended)
+clearTrialIfEnded : Time -> Time -> Optional Time -> Optional Time
+clearTrialIfEnded newProcessedAndPaidUntil trialEnd currentTrialEndsAt =
+  if newProcessedAndPaidUntil >= trialEnd then None else currentTrialEndsAt
+
+-- | Resolve recipient provider from subscription config or runtime parameter
+-- Exactly one of these must be set (stored in config XOR provided at runtime)
+resolveRecipientProvider : Optional Party -> Optional Party -> Update Party
+resolveRecipientProvider storedProvider runtimeProvider =
+  case (storedProvider, runtimeProvider) of
+    (Some stored, None) -> pure stored
+    (None, Some runtime) -> pure runtime
+    (Some _, Some _) -> abort "Cannot specify recipientProvider when subscription.recipientProvider is already set"
+    (None, None) -> abort "Must provide recipientProvider when subscription.recipientProvider is not set"
+
+-- | Assert that change amulet is available
+assertHasChangeAmulet : Optional a -> Update ()
+assertHasChangeAmulet senderChangeAmulet =
+  assertMsg "Expected change amulet from recipient transfer" (isSome senderChangeAmulet)
+
+-- | Calculate processor fee amount for a period
+calculateProcessorFee : Optional SubscriptionAmount -> RelTime -> Decimal -> Decimal
+calculateProcessorFee processorPaymentPerDay period amuletPrice =
+  case processorPaymentPerDay of
+    Some amt -> calculateAmountForPeriod amt period amuletPrice
+    None -> 0.0
+
+-- | Calculate refund amount for unused period (recipient + processor)
+calculateRefundAmount : SubscriptionAmount -> Optional SubscriptionAmount -> RelTime -> Decimal -> Decimal
+calculateRefundAmount recipientPaymentPerDay processorPaymentPerDay unusedPeriod amuletPrice =
+  let recipientRefund = calculateAmountForPeriod recipientPaymentPerDay unusedPeriod amuletPrice
+      processorRefund = calculateProcessorFee processorPaymentPerDay unusedPeriod amuletPrice
+  in recipientRefund + processorRefund
+
+-- | Create initial approvals for a proposal (only proposer approved)
+createInitialApprovals : Party -> Party -> Party -> Party -> Approvals
+createInitialApprovals proposer subscriber recipient processor =
+  Approvals with
+    subscriberApproved = proposer == subscriber
+    recipientApproved = proposer == recipient
+    processorApproved = proposer == processor
+
+-- | Assert that subscription can be archived (expired state validation)
+assertCanArchiveExpired : Optional Time -> Time -> Time -> Update ()
+assertCanArchiveExpired paymentsEndAt processedAndPaidUntil now =
+  assertMsg "Can only archive expired subscriptions or PrepaidCanceled after time passes" 
+    (case paymentsEndAt of
+      Some end -> end < now && processedAndPaidUntil < now
+      None -> False)
+
+-- | Validate common processing prerequisites (payments not ended, period elapsed)
+validateProcessingPrerequisites : Optional Time -> Time -> Time -> Update ()
+validateProcessingPrerequisites paymentsEndAt processedAndPaidUntil now = do
+  assertPaymentsNotEnded paymentsEndAt now
+  assertPeriodHasElapsed now processedAndPaidUntil
+
+-- | Create activity markers for both recipient and processor
+createActivityMarkers : 
+  Optional (ContractId Amulet.FeaturedAppRight) -> 
+  Party -> 
+  Optional (ContractId Amulet.FeaturedAppRight) -> 
+  Party -> 
+  Update ()
+createActivityMarkers recipientFAR recipientProvider processorFAR processorProvider = do
+  createRecipientActivityMarker recipientFAR (Some recipientProvider)
+  createProcessorActivityMarker processorFAR processorProvider
+

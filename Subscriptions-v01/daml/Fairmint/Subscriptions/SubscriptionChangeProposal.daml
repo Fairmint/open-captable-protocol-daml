@@ -1,0 +1,189 @@
+module Fairmint.Subscriptions.SubscriptionChangeProposal where
+
+import DA.Set (Set, member)
+import DA.Set qualified as Set
+import DA.Time (addRelTime, subTime)
+import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
+import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
+import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, validateChangeValues, assertChangeValuesValidAndNonEmpty, applyChangesToSubscription, applyChangesToProcessorContext)
+import Fairmint.Subscriptions.Types.SubscriptionTime (resolveOptionalSubscriptionTime, assertOptionalTimeIsNoneOrInFuture)
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.Approvals (Approvals(..))
+
+-- | Subscription change proposal with approval tracking
+-- 
+-- When a party proposes changes that impact other parties, this contract
+-- tracks approvals. Once all impacted parties approve, the changes can be
+-- applied to the active subscription.
+template SubscriptionChangeProposal
+  with
+    proposer : Party
+      -- ^ Party who proposed the changes
+    changes : SubscriptionChanges
+      -- ^ Proposed changes
+    originalSubscription : Subscription
+      -- ^ Original subscription (for validation when applying, includes trialEndsAt)
+    processorContext : ProcessorContext
+      -- ^ Processor and DSO context
+    approvals : Approvals
+      -- ^ Tracking which parties have approved
+    impactedParties : Set Party
+      -- ^ Parties that are impacted by these changes
+  where
+    signatory processorContext.processor, getApprovedUsers originalSubscription approvals
+    observer getUnapprovedUsers originalSubscription approvals impactedParties
+    
+    ensure validateChangeValues changes
+
+    -- | Any impacted party approves the changes
+    -- Handles approvals from both current parties and new parties (when roles are changing)
+    choice SubscriptionChangeProposal_Approve : ContractId SubscriptionChangeProposal
+      with
+        actor : Party
+      controller actor
+      do
+        -- Validate actor is impacted
+        assertMsg "Only impacted parties can approve" (member actor impactedParties)
+        
+        -- Determine if actor is approving as current party or new party in a role
+        let isCurrentSubscriber = actor == originalSubscription.subscriber
+        let isNewSubscriber = case changes.subscriber of
+              Some newSub -> actor == newSub
+              None -> False
+        let isCurrentRecipient = actor == originalSubscription.recipient
+        let isNewRecipient = case changes.recipient of
+              Some newRec -> actor == newRec
+              None -> False
+        let isCurrentProcessor = actor == processorContext.processor
+        let isNewProcessor = case changes.processor of
+              Some newProc -> actor == newProc
+              None -> False
+        
+        -- Add approval (actor can approve if they are current OR new party in a role)
+        let newApprovals = Approvals with
+              subscriberApproved = approvals.subscriberApproved || isCurrentSubscriber || isNewSubscriber
+              recipientApproved = approvals.recipientApproved || isCurrentRecipient || isNewRecipient
+              processorApproved = approvals.processorApproved || isCurrentProcessor || isNewProcessor
+        
+        assertMsg "Actor has already approved" (newApprovals /= approvals)
+        
+        create this with approvals = newApprovals
+
+    -- | Apply approved changes to an active subscription
+    -- Validates that the subscription's original state matches what we expect
+    -- Resolves SubscriptionTime values and handles prepaid time extension for free trials
+    choice SubscriptionChangeProposal_Apply : ContractId ActiveSubscription
+      with
+        activeSubscriptionCid : ContractId ActiveSubscription
+      controller processorContext.processor
+      do
+        -- Fetch the subscription
+        activeSubscription <- fetch activeSubscriptionCid
+        now <- getTime
+        
+        -- Validate all impacted parties have approved
+        -- For party changes, both old and new party must have approved
+        -- (They both show up in impactedParties, but we track approval by role not by party identity)
+        let subscriberRoleImpacted = 
+              member originalSubscription.subscriber impactedParties ||
+              (case changes.subscriber of Some newSub -> member newSub impactedParties; None -> False)
+        let recipientRoleImpacted = 
+              member originalSubscription.recipient impactedParties ||
+              (case changes.recipient of Some newRec -> member newRec impactedParties; None -> False)
+        let processorRoleImpacted = 
+              member processorContext.processor impactedParties ||
+              (case changes.processor of Some newProc -> member newProc impactedParties; None -> False)
+        
+        let allApproved = 
+              (not subscriberRoleImpacted || approvals.subscriberApproved) &&
+              (not recipientRoleImpacted || approvals.recipientApproved) &&
+              (not processorRoleImpacted || approvals.processorApproved)
+        assertMsg "All impacted parties must approve before applying changes" allApproved
+        
+        -- Validate original state matches (excluding processedAndPaidUntil which can change)
+        assertMsg "Subscription has changed - proposal is stale" 
+          (activeSubscription.subscription == originalSubscription)
+        assertMsg "Processor context has changed - proposal is stale" 
+          (activeSubscription.processorContext == processorContext)
+        
+        -- Resolve SubscriptionTime values to absolute Time
+        resolvedPaymentsEndAt <- case changes.paymentsEndAt of
+          Some optTime -> do
+            resolved <- resolveOptionalSubscriptionTime optTime
+            assertOptionalTimeIsNoneOrInFuture resolved
+            pure resolved
+          None -> pure originalSubscription.paymentsEndAt
+        
+        resolvedTrialEndsAt <- case changes.trialEndsAt of
+          Some optTime -> do
+            resolved <- resolveOptionalSubscriptionTime optTime
+            assertOptionalTimeIsNoneOrInFuture resolved
+            pure resolved
+          None -> pure originalSubscription.trialEndsAt
+        
+        -- Apply changes to subscription and processor context
+        let baseSubscription = applyChangesToSubscription changes originalSubscription
+        let updatedSubscription = baseSubscription with
+              paymentsEndAt = resolvedPaymentsEndAt
+              trialEndsAt = resolvedTrialEndsAt
+        
+        let newProcessorContext = applyChangesToProcessorContext changes processorContext
+        
+        -- Calculate new processedAndPaidUntil (trial extension + adjustment)
+        -- Step 1: Handle free trial extension if applicable
+        let afterTrialAdjustment = case (changes.trialEndsAt, resolvedTrialEndsAt, originalSubscription.trialEndsAt) of
+              -- Granting or extending trial: calculate trial duration and extend prepaid time
+              (Some (Some newTrialEnd), _, optOldTrialEnd) ->
+                let oldTrialEnd = case optOldTrialEnd of
+                      Some t -> t
+                      None -> now  -- No previous trial, so trial starts now
+                    -- Calculate the net extension (new trial end - old trial end)
+                    trialExtension = subTime newTrialEnd oldTrialEnd
+                in if activeSubscription.processedAndPaidUntil > now && trialExtension > subTime now now
+                   then addRelTime activeSubscription.processedAndPaidUntil trialExtension
+                   else activeSubscription.processedAndPaidUntil
+              -- Not changing trial or removing trial: keep existing processedAndPaidUntil
+              _ -> activeSubscription.processedAndPaidUntil
+        
+        -- Step 2: Apply explicit processedAndPaidUntil adjustment if specified
+        let newProcessedAndPaidUntil = case changes.processedAndPaidUntilAdjustment of
+              Some adjustment -> addRelTime afterTrialAdjustment adjustment
+              None -> afterTrialAdjustment
+        
+        -- Create updated subscription
+        archive activeSubscriptionCid
+        create activeSubscription with 
+          subscription = updatedSubscription
+          processorContext = newProcessorContext
+          processedAndPaidUntil = newProcessedAndPaidUntil
+
+    -- | Proposer withdraws the change proposal
+    choice SubscriptionChangeProposal_Withdraw : ()
+      with
+        description : Optional Text
+      controller proposer
+      do
+        pure ()
+
+    -- | Any impacted party rejects the change proposal
+    choice SubscriptionChangeProposal_Reject : ()
+      with
+        rejecter : Party
+        description : Optional Text
+      controller rejecter
+      do
+        assertMsg "Only impacted parties can reject" (member rejecter impactedParties)
+        pure ()
+
+-- | Get users who have approved, excluding the processor
+getApprovedUsers : Subscription -> Approvals -> [Party]
+getApprovedUsers subscription state =
+  (if state.subscriberApproved then [subscription.subscriber] else []) ++
+  (if state.recipientApproved then [subscription.recipient] else [])
+
+-- | Get users who have not yet approved but are impacted, excluding the processor
+getUnapprovedUsers : Subscription -> Approvals -> Set Party -> [Party]
+getUnapprovedUsers subscription state impacted =
+  (if not state.subscriberApproved && member subscription.subscriber impacted then [subscription.subscriber] else []) ++
+  (if not state.recipientApproved && member subscription.recipient impacted then [subscription.recipient] else [])
+

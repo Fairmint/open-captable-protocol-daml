@@ -1,0 +1,97 @@
+module Fairmint.Subscriptions.Types.PaymentHelpers where
+
+import DA.Optional (fromSome)
+import DA.Time (RelTime, subTime)
+import qualified DA.Map as Map
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Fairmint.Shared.Splice.SpliceAmuletHelpers (PaymentRequest(..), paymentTo, TransferResult)
+import Fairmint.Subscriptions.Types.Subscription (Subscription)
+import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod)
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.SubscriptionHelpers (assertHasChangeAmulet, calculateProcessorFee, createProcessorActivityMarker)
+
+-- | Pay subscription recipient
+payRecipient : 
+  Subscription -> 
+  ProcessorContext -> 
+  Party -> 
+  Decimal -> 
+  RelTime -> 
+  Decimal -> 
+  Optional (ContractId Amulet.FeaturedAppRight) -> 
+  PaymentContext -> 
+  Update TransferResult
+payRecipient subscription processorContext recipientProviderParty amountForPeriod actualPeriod amuletPrice recipientFAR paymentCtx = do
+  paymentTo PaymentRequest with
+    sender = subscription.subscriber
+    receiver = subscription.recipient
+    provider = recipientProviderParty
+    amount = amountForPeriod
+    featuredAppRight = recipientFAR
+    expectedDso = processorContext.dso
+    amuletInputs = paymentCtx.amuletInputs
+    amuletRulesCid = paymentCtx.amuletRulesCid
+    openMiningRoundCid = paymentCtx.openMiningRoundCid
+
+-- | Pay processor fee or create activity marker
+payProcessorFee :
+  Subscription ->
+  ProcessorContext ->
+  Party ->
+  Decimal ->
+  Decimal ->
+  Optional (ContractId Amulet.FeaturedAppRight) ->
+  PaymentContext ->
+  TransferResult ->
+  Update (Optional TransferResult)
+payProcessorFee subscription processorContext processorProvider feeAmount amuletPrice processorFAR paymentCtx recipientResult = do
+  if feeAmount == 0.0
+  then do
+    createProcessorActivityMarker processorFAR processorProvider
+    pure None
+  else do
+    assertHasChangeAmulet recipientResult.senderChangeAmulet
+    let changeAmuletCid = fromSome recipientResult.senderChangeAmulet
+    result <- paymentTo PaymentRequest with
+      sender = subscription.subscriber
+      receiver = processorContext.processor
+      provider = processorProvider
+      amount = feeAmount
+      featuredAppRight = processorFAR
+      expectedDso = processorContext.dso
+      amuletInputs = [changeAmuletCid]
+      amuletRulesCid = paymentCtx.amuletRulesCid
+      openMiningRoundCid = paymentCtx.openMiningRoundCid
+    pure (Some result)
+
+-- | Create refund transfer from recipient to subscriber
+createRefundTransfer :
+  Party ->
+  Party ->
+  Decimal ->
+  [ContractId Amulet.Amulet] ->
+  ContractId Amulet.OpenMiningRound ->
+  Transfer
+createRefundTransfer recipientSender subscriberReceiver refundAmount amuletInputs openMiningRoundCid =
+  Transfer with
+    sender = recipientSender
+    provider = subscriberReceiver
+    inputs = map InputAmulet amuletInputs
+    outputs = [TransferOutput with
+      receiver = subscriberReceiver
+      receiverFeeRatio = 1.0
+      amount = refundAmount
+      lock = None]
+    beneficiaries = None
+
+-- | Create transfer context for refund
+createRefundTransferContext : ContractId Amulet.OpenMiningRound -> TransferContext
+createRefundTransferContext openMiningRoundCid =
+  TransferContext with
+    openMiningRound = openMiningRoundCid
+    featuredAppRight = None
+    issuingMiningRounds = Map.empty
+    validatorRights = Map.empty
+

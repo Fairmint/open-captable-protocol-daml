@@ -1,0 +1,196 @@
+module Fairmint.Subscriptions.ActiveSubscription where
+
+import DA.Time (subTime, RelTime)
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), TransferResult(..))
+import Splice.Round (OpenMiningRound_Fetch(..))
+import Fairmint.Subscriptions.Types.Subscription (Subscription, validateSubscription)
+import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod)
+import Fairmint.Subscriptions.Types.SubscriptionHelpers (validateTrialEndsBeforePaymentsEnd, isInFreeTrial, isInPrepaidCanceled, calculateNewProcessedAndPaidUntil, assertInFreeTrialAndNotEnded, assertNotInFreeTrial, assertIsSubscriptionParty, assertHasAmuletInputs, assertValidAmuletPrice, assertCanArchivePrepaidCanceled, assertInPrepaidCanceledForRefund, clearTrialIfEnded, calculateProcessorFee, calculateRefundAmount, createInitialApprovals, assertCanArchiveExpired, validateProcessingPrerequisites, resolveRecipientProvider, createActivityMarkers)
+import Fairmint.Subscriptions.Types.PaymentHelpers (payRecipient, payProcessorFee, createRefundTransfer, createRefundTransferContext)
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty)
+import Fairmint.Subscriptions.Types.PaymentResult (ProcessPaymentResult(..))
+import Fairmint.Subscriptions.Types.Approvals (assertIsPartyToActiveSubscription)
+import Fairmint.Subscriptions.SubscriptionChangeProposal (SubscriptionChangeProposal(..))
+
+-- | Active subscription contract
+-- 
+-- Three-party model:
+-- - Subscriber: pays the subscription (provides amulet inputs for payments)
+-- - Recipient: provides the service
+-- - Processor: processes payments
+--
+-- State is implicit based on timestamps:
+-- - FreeTrial:.subscription.trialEndsAt is Some and >= now
+-- - PrepaidCanceled: subscription.paymentsEndAt <= now and processedAndPaidUntil >= now
+-- - Should be archived: subscription.paymentsEndAt < now AND processedAndPaidUntil < now
+-- - Paid: All other cases
+template ActiveSubscription
+  with
+    subscription : Subscription
+      -- ^ Subscription configuration
+    processorContext : ProcessorContext
+      -- ^ Processor and DSO context
+    processedAndPaidUntil : Time
+      -- ^ Subscription has been processed through this time (both payments and free trial)
+  where
+    signatory subscription.subscriber, subscription.recipient, processorContext.processor
+    
+    ensure
+      validateSubscription subscription &&
+      validateTrialEndsBeforePaymentsEnd subscription
+
+    -- | Process free trial period (advances processedAndPaidUntil without payment)
+    -- Transitions out of trial when subscription.trialEndsAt is reached
+    choice ActiveSubscription_ProcessFreeTrial : ContractId ActiveSubscription
+      with
+        processingContext : ProcessingContext
+      controller processorContext.processor
+      do
+        now <- getTime
+        
+        -- Validate we're in free trial state
+        trialEnd <- assertInFreeTrialAndNotEnded subscription.trialEndsAt now
+        
+        -- Validate prerequisites (payments not ended, period elapsed)
+        validateProcessingPrerequisites subscription.paymentsEndAt processedAndPaidUntil now
+        
+        -- Resolve which recipient provider to use (stored vs runtime)
+        recipientProviderParty <- resolveRecipientProvider subscription.recipientProvider processingContext.recipientProvider
+        
+        -- Calculate new processedAndPaidUntil
+        let newprocessedAndPaidUntil = calculateNewProcessedAndPaidUntil 
+              now processingContext.processingPeriod subscription.prepayWindow 
+              subscription.trialEndsAt subscription.paymentsEndAt processedAndPaidUntil
+        
+        -- Create activity markers
+        createActivityMarkers processingContext.recipientFeaturedAppRight recipientProviderParty processingContext.processorFeaturedAppRight processingContext.processorProvider
+        
+        -- Clear subscription.trialEndsAt if trial ended
+        let newTrialEndsAt = clearTrialIfEnded newprocessedAndPaidUntil trialEnd subscription.trialEndsAt
+        
+        create this with 
+          subscription.trialEndsAt = newTrialEndsAt
+          processedAndPaidUntil = newprocessedAndPaidUntil
+
+    -- | Process payment for paid subscription
+    choice ActiveSubscription_ProcessPayment : ProcessPaymentResult ActiveSubscription
+      with
+        processingContext : ProcessingContext
+        paymentContext : PaymentContext
+      controller processorContext.processor
+      do
+        now <- getTime
+        
+        -- Validate we're not in free trial state
+        assertNotInFreeTrial subscription.trialEndsAt now
+        
+        -- Fetch amulet price
+        openRound <- exercise paymentContext.openMiningRoundCid (OpenMiningRound_Fetch with p = processorContext.processor)
+        let amuletPrice = openRound.amuletPrice
+        assertHasAmuletInputs paymentContext.amuletInputs
+        assertValidAmuletPrice amuletPrice
+
+        -- Validate prerequisites (payments not ended, period elapsed)
+        validateProcessingPrerequisites subscription.paymentsEndAt processedAndPaidUntil now
+        
+        -- Resolve which recipient provider to use (stored vs runtime)
+        recipientProviderParty <- resolveRecipientProvider subscription.recipientProvider processingContext.recipientProvider
+        
+        -- Calculate new processedAndPaidUntil and payment amounts
+        let newprocessedAndPaidUntil = calculateNewProcessedAndPaidUntil 
+              now processingContext.processingPeriod subscription.prepayWindow 
+              None subscription.paymentsEndAt processedAndPaidUntil
+        let actualPeriod = subTime newprocessedAndPaidUntil processedAndPaidUntil
+        let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay actualPeriod amuletPrice
+        let processorFee = calculateProcessorFee subscription.processorPaymentPerDay actualPeriod amuletPrice
+        
+        -- Execute payments
+        recipientTransferResult <- payRecipient subscription processorContext recipientProviderParty recipientAmount actualPeriod amuletPrice processingContext.recipientFeaturedAppRight paymentContext
+        processorTransferResult <- payProcessorFee subscription processorContext processingContext.processorProvider processorFee amuletPrice processingContext.processorFeaturedAppRight paymentContext recipientTransferResult
+        
+        subscriptionCid <- create this with processedAndPaidUntil = newprocessedAndPaidUntil
+        pure ProcessPaymentResult with ..
+
+    -- | Propose changes to the subscription
+    -- Always creates a SubscriptionChangeProposal for tracking approvals
+    -- Creating the proposal directly from ActiveSubscription ensures we have all three signatories
+    -- Application can check impactedParties and auto-apply if only proposer is impacted
+    choice ActiveSubscription_ProposeChanges : ContractId SubscriptionChangeProposal
+      with
+        proposer : Party
+        changes : SubscriptionChanges
+      controller proposer
+      do
+        assertIsPartyToActiveSubscription proposer subscription processorContext
+        assertChangeValuesValidAndNonEmpty changes
+        
+        let impactedParties = getImpactedPartiesForSubscription changes subscription processorContext
+        let approvals = createInitialApprovals proposer subscription.subscriber subscription.recipient processorContext.processor
+        
+        create SubscriptionChangeProposal with ..
+
+    -- | Cancel subscription
+    -- Sets paymentsEndAt to now to transition to PrepaidCanceled state if processedAndPaidUntil >= now
+    -- Archives immediately if processedAndPaidUntil < now (nothing prepaid)
+    choice ActiveSubscription_Cancel : Optional (ContractId ActiveSubscription)
+      with
+        cancelingParty : Party
+        description : Optional Text
+      controller cancelingParty
+      do
+        now <- getTime
+        assertIsSubscriptionParty cancelingParty subscription.subscriber subscription.recipient processorContext.processor
+        
+        -- If in free trial, archive immediately (no prepaid amount)
+        if isInFreeTrial subscription.trialEndsAt now
+        then pure None  -- Archive immediately
+        else
+          if processedAndPaidUntil > now
+          then do
+            -- Transition to PrepaidCanceled by setting paymentsEndAt to now
+            canceledCid <- create this with subscription.paymentsEndAt = Some now
+            pure (Some canceledCid)
+          else pure None  -- Archive immediately
+
+    -- | Archive prepaid canceled subscription (once processed period passes)
+    choice ActiveSubscription_Archive : ()
+      with
+        archivingParty : Party
+      controller archivingParty
+      do
+        now <- getTime
+        assertIsSubscriptionParty archivingParty subscription.subscriber subscription.recipient processorContext.processor
+        
+        -- Can archive if: (1) PrepaidCanceled and time passed, or (2) expired with no prepaid time
+        if isInPrepaidCanceled subscription.paymentsEndAt processedAndPaidUntil now
+        then assertCanArchivePrepaidCanceled processedAndPaidUntil now
+        else assertCanArchiveExpired subscription.paymentsEndAt processedAndPaidUntil now
+
+    -- | Recipient refunds unused processed time and archives immediately
+    choice ActiveSubscription_RecipientRefundAndArchive : TransferResult
+      with
+        paymentContext : PaymentContext
+      controller subscription.recipient
+      do
+        now <- getTime
+        assertInPrepaidCanceledForRefund subscription.paymentsEndAt processedAndPaidUntil now
+        
+        openRound <- exercise paymentContext.openMiningRoundCid (OpenMiningRound_Fetch with p = processorContext.processor)
+        let amuletPrice = openRound.amuletPrice
+        assertValidAmuletPrice amuletPrice
+        assertHasAmuletInputs paymentContext.amuletInputs
+        
+        -- Calculate and execute refund
+        let unusedPeriod = subTime processedAndPaidUntil now
+        let refundAmount = calculateRefundAmount subscription.recipientPaymentPerDay subscription.processorPaymentPerDay unusedPeriod amuletPrice
+        let transfer = createRefundTransfer subscription.recipient subscription.subscriber refundAmount paymentContext.amuletInputs paymentContext.openMiningRoundCid
+        let transferContext = createRefundTransferContext paymentContext.openMiningRoundCid
+        
+        exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = transfer
+          context = transferContext
+          expectedDso = Some processorContext.dso

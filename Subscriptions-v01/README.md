@@ -36,7 +36,7 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
   - Can be increased by the subscriber and decreased by the recipient
 
 **Duration:**
-- **`expiresAt`**: When the subscription terminates (can be far in the future for ongoing subscriptions)
+- **`paymentsEndAt`**: When payments end (can be far in the future for ongoing subscriptions)
   - Can only be changed by the subscriber (to any time)
 - **Free trial**: Optional trial period (specified at proposal creation) where no payment is required
   - Specified using `SubscriptionExpiration` which can be either:
@@ -82,11 +82,11 @@ The processor can use any period length, so long as it does not exceed the prepa
 - **Standard mode** (`processorPaymentPerDay > 0`): Processor and recipient each receive a separate payment and AppRewardCoupon (issued to their respective providers)
 - **Zero-fee mode** (`processorPaymentPerDay = 0`): Recipient receives normal payment and AppRewardCoupon. Processor receives a FeaturedAppActivityMarker (no payment) to offset traffic costs.
 
-**Prepay Window:** Controls how far ahead `paidUntil` can extend beyond current time:
-- **Large window (e.g., 7 days):** Creates buffer before service interruption; `paidUntil` stays ahead of now
-- **Zero window:** Payments only cover past usage (`paidUntil ≤ now`); recipient manages grace period
-- **Small window (≤ processing period):** `paidUntil` may trail current time since processing must wait until period elapses
-- **Limits:** `paidUntil` capped at `min(now + prepayWindow, expiresAt)`
+**Prepay Window:** Controls how far ahead `processedUntil` can extend beyond current time:
+- **Large window (e.g., 7 days):** Creates buffer before service interruption; `processedUntil` stays ahead of now
+- **Zero window:** Payments only cover past usage (`processedUntil ≤ now`); recipient manages grace period
+- **Small window (≤ processing period):** `processedUntil` may trail current time since processing must wait until period elapses
+- **Limits:** `processedUntil` capped at `min(now + prepayWindow, paymentsEndAt)`
 
 ## Contract Templates
 
@@ -102,14 +102,21 @@ The subscription system uses separate templates for each lifecycle state:
 - `OnePartyApprovedProcessorSubscriptionProposal` - Awaits second party acceptance (after one party accepted processor proposal)
 
 **Active Subscriptions:**
-- `FreeTrialSubscription` - Active trial period (no payments, creates activity markers)
-- `PaidSubscription` - Active paid subscription (processes payments)
-- `PrepaidCanceledSubscription` - Canceled with remaining prepaid time
+- `ActiveSubscription` - Unified subscription template with implicit state based on timestamps:
+  - FreeTrial: `trialEndsAt` is Some and >= now (no payments, creates activity markers)
+  - PrepaidCanceled: `paymentsEndAt` <= now and `processedUntil` >= now (can be restarted)
+  - Paid: All other cases (active paid subscription)
+  - Should be archived: `paymentsEndAt` < now AND `processedUntil` < now
 
 **Configuration Updates:**
-- `PaymentChangeProposal` - Recipient proposes payment increases (requires subscriber acceptance)
-- `ExpirationExtensionProposal` - Recipient proposes extending subscription (requires subscriber acceptance)
-- `MetadataChangeProposal` - Either party proposes metadata changes (requires processor approval, then other party acceptance)
+- `ActiveSubscription_ProposeChanges` - Unified change system:
+  - Determines impacted parties based on proposed changes
+  - If only proposer is impacted: applies changes directly
+  - If others are impacted: creates `SubscriptionChangeProposal` for approval
+- `SubscriptionChangeProposal` - Multi-party approval contract for changes:
+  - Tracks approvals from impacted parties
+  - Once approved, validates and applies changes to active subscription
+  - Validates original state matches (allows `processedUntil` to change during approval)
 
 ## Flow Diagrams
 
@@ -119,14 +126,17 @@ The subscription system uses separate templates for each lifecycle state:
 2. **Approval/Acceptance:**
    - **Subscriber/Recipient-initiated:** Processor validates and approves, then the other party accepts
    - **Processor-initiated:** Either party accepts first, then the other party accepts
-3. **Active Subscription:** Creates either `FreeTrialSubscription` or `PaidSubscription`
+3. **Active Subscription:** Creates `ActiveSubscription` with `trialEndsAt` set if free trial, None otherwise
 4. **Processing:**
-   - Free trial: Processor advances `paidUntil` and creates activity markers (no payments)
+   - Free trial: Processor advances `processedUntil` and creates activity markers (no payments)
    - Paid: Processor executes transfers from subscriber to recipient and processor (with app rewards)
 5. **Lifecycle:** Continues until expiration or cancellation by any party
-6. **Transitions:** Trial converts to paid when `trialEndsAt` reached; paid subscription can convert back to trial
+6. **Transitions:** 
+   - Trial converts to paid when `trialEndsAt` reached
+   - Paid subscription can convert back to trial
+   - Canceled subscriptions can be restarted with all parties' approval
 
-**Cancellation:** Any party can cancel anytime. Paid subscriptions with `paidUntil > now` create `PrepaidCanceledSubscription`.
+**Cancellation:** Any party can cancel anytime. Canceling sets `paymentsEndAt` to now. If `processedUntil > now`, the subscription enters PrepaidCanceled state (and can optionally be restarted with all parties' approval).
 
 ## Contract Lifecycle Diagrams
 
@@ -137,15 +147,13 @@ flowchart LR
     Start(( )) --> |"propose (subscriber)"|SP["Proposal<br>(via factory)"]
     SP -->|"approve (processor)"| PA[Processor Approved]
     SP -->|"reject (any)"| End(( ))
-    PA -->|"accept (recipient)"| Choice{with trial?}
+    PA -->|"accept (recipient)"| AS["ActiveSubscription<br>(FreeTrial or Paid state)"]
     PA -->|"reject (any)"| End
-    Choice -->|yes| FT[Free Trial]
-    Choice -->|no| PS[Paid Subscription]
     
     classDef proposal fill:#fff9e6,stroke:#666
     classDef active fill:#e6f3ff,stroke:#666
     class SP,PA proposal
-    class FT,PS active
+    class AS active
 ```
 
 ### Recipient-Initiated Flow
@@ -155,15 +163,13 @@ flowchart LR
     Start(( )) --> |"propose (recipient)"| RP["Proposal<br>(via factory)"]
     RP -->|"approve (processor)"| PA[Processor Approved]
     RP -->|"reject (any)"| End(( ))
-    PA -->|"accept (subscriber)"| Choice{with trial?}
+    PA -->|"accept (subscriber)"| AS["ActiveSubscription<br>(FreeTrial or Paid state)"]
     PA -->|"reject (any)"| End
-    Choice -->|yes| FT[Free Trial]
-    Choice -->|no| PS[Paid Subscription]
     
     classDef proposal fill:#fff9e6,stroke:#666
     classDef active fill:#e6f3ff,stroke:#666
     class RP,PA proposal
-    class FT,PS active
+    class AS active
 ```
 
 ### Processor-Initiated Flow
@@ -174,27 +180,25 @@ flowchart LR
     PP -->|"accept (subscriber or recipient)"| OneApproved[One Party Approved]
     PP -->|"reject (any)"| End(( ))
     PP -->|"withdraw (processor)"| End
-    OneApproved -->|"accept (other party)"| Choice{with trial?}
+    OneApproved -->|"accept (other party)"| AS["ActiveSubscription<br>(FreeTrial or Paid state)"]
     OneApproved -->|"reject (any)"| End
     OneApproved -->|"withdraw (first acceptor or processor)"| End
-    Choice -->|yes| FT[Free Trial]
-    Choice -->|no| PS[Paid Subscription]
     
     classDef proposal fill:#fff9e6,stroke:#666
     classDef active fill:#e6f3ff,stroke:#666
     class PP,OneApproved proposal
-    class FT,PS active
+    class AS active
 ```
 
 ### Free Trial Lifecycle
 
 ```mermaid
 flowchart LR
-    FT[Free Trial]
+    FT["ActiveSubscription<br>(FreeTrial state)"]
     FT -->|"process (processor)"| Marker[FeaturedAppMarker<br/>created]
     Marker --> Choice{trial<br/>complete?}
     Choice -.->|no| FT
-    Choice -->|yes| PS[Paid Subscription]
+    Choice -->|yes| PS["ActiveSubscription<br>(Paid state)"]
     FT -->|"cancel (any party)"| End(( ))
     
     classDef active fill:#e6f3ff,stroke:#666
@@ -207,15 +211,15 @@ flowchart LR
 
 ```mermaid
 flowchart LR
-    PS[Paid Subscription]
+    PS["ActiveSubscription<br>(Paid state)"]
     PS -->|"process (processor)"| Marker[Transfer & AppRewardCoupon<br/>created]
     Marker --> Choice1{subscription<br/>expired?}
     Choice1 -.->|no| PS
     Choice1 -->|yes| End1(( ))
-    PS -->|"cancel (any party)"| Choice2{paidUntil<br/>> now?}
-    Choice2 -->|yes| PC[Prepaid Canceled]
+    PS -->|"cancel (any party)"| Choice2{processedUntil<br/>> now?}
+    Choice2 -->|yes| PC["ActiveSubscription<br>(PrepaidCanceled: paymentsEndAt=now)"]
     Choice2 -->|no| End2(( ))
-    PC -->|"wait or refund"| End3(( ))
+    PC -->|"wait, refund, or restart"| End3(( ))
     
     classDef active fill:#e6f3ff,stroke:#666
     classDef canceled fill:#fff3e0,stroke:#666
@@ -232,10 +236,10 @@ proposalCid <- submit subscriber do
     config = Subscription with
       subscriber, recipient
       recipientPaymentPerDay = AmuletAmount 10.0
-      processorPaymentPerDay = AmuletAmount 1.0
-      prepayWindow = days 7
-      expiresAt = farFutureTime
-      description = Some "Premium membership"
+    processorPaymentPerDay = AmuletAmount 1.0
+    prepayWindow = days 7
+    paymentsEndAt = farFutureTime
+    description = Some "Premium membership"
       metadata = TM.empty  -- Can add RewardShare references later
     -- Flexible free trial expiration (resolved when subscription is created)
     freeTrialExpiration = Some (RelativeExpiration (days 30))  -- 30 days from acceptance
@@ -250,23 +254,23 @@ acceptResult <- submit recipient do
   exerciseCmd approvedCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
     recipientProvider = recipient
 
--- Result is Either: Left FreeTrialSubscription | Right PaidSubscription
--- For this example, we have a trial so it's Left freeTrialCid
+-- Result is ActiveSubscription (in FreeTrial state for this example)
+let activeSubscriptionCid = acceptResult
 
 -- 4. Process trial period (creates activity markers, no payments)
-trialResult <- submit processor do
-  exerciseCmd freeTrialCid FreeTrialSubscription_Process with
+activeSubscriptionCid <- submit processor do
+  exerciseCmd activeSubscriptionCid ActiveSubscription_ProcessFreeTrial with
     processingPeriod = days 1
     processorProvider = processor
     recipientFeaturedAppRight = Some recipientFARCid
     processorFeaturedAppRight = Some processorFARCid
 
--- When trial ends, trialResult.result is Right paidSubscriptionCid
+-- When trial ends, subscription automatically transitions to Paid state
 
 -- 5. Process payments periodically (after trial ends)
 -- Standard mode with processor fees:
 paymentResult <- submit processor do
-  exerciseCmd paidSubscriptionCid PaidSubscription_ProcessPayment with
+  exerciseCmd activeSubscriptionCid ActiveSubscription_ProcessPayment with
     processingPeriod = days 1
     paymentCtx = PaymentContext with
       amuletInputs = subscriberAmuletCids
@@ -293,9 +297,9 @@ approvedMetadataProposalCid <- submit processor do
   exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
 
 -- Subscriber accepts the metadata change (requires both processor and subscriber authority)
-updatedPaidSubscriptionCid <- submit processor, subscriber do
-  exerciseCmd approvedMetadataProposalCid ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription with
-    paidSubscriptionCid
+updatedActiveSubscriptionCid <- submit processor, subscriber do
+  exerciseCmd approvedMetadataProposalCid ProcessorApprovedMetadataChangeProposal_Accept with
+    activeSubscriptionCid
     accepter = subscriber
 
 ```
@@ -304,18 +308,23 @@ updatedPaidSubscriptionCid <- submit processor, subscriber do
 
 ### Cancellation with Prepaid Time
 
-When any party cancels a `PaidSubscription` with `paidUntil > now`, a `PrepaidCanceledSubscription` contract is created, tracking who canceled and when. The recipient then chooses:
+When any party cancels an `ActiveSubscription` with `processedUntil > now`, canceling sets `paymentsEndAt` to now which transitions the subscription to PrepaidCanceled state. The recipient then has several options:
 
 **Option 1: Honor Prepaid Period**
-- Subscriber retains access until `paidUntil`
-- Any party archives once `paidUntil` passes
+- Subscriber retains access until `processedUntil`
+- Any party archives once `processedUntil` passes using `ActiveSubscription_Archive`
 - Common for content services (e.g., streaming platforms)
 
 **Option 2: Refund and Archive Immediately**  
-- Recipient calls `PrepaidCanceledSubscription_RecipientRefundAndArchive`
-- Refund: `(paidUntil - now) × (recipientPaymentPerDay + processorPaymentPerDay)`
+- Recipient calls `ActiveSubscription_RecipientRefundAndArchive`
+- Refund: `(processedUntil - now) × (recipientPaymentPerDay + processorPaymentPerDay)`
 - Contract archives after refund transfer
 - Common for usage-based services (e.g., insurance, utilities)
+
+**Option 3: Restart the Subscription (New)**
+- All three parties can use `ActiveSubscription_RestartAsFreeTrial` or `ActiveSubscription_RestartAsPaid`
+- Preserves the prepaid period
+- Useful for resolving cancellation disputes or re-engaging customers
 
 The choice depends on the recipient's business model and customer relationship.
 
@@ -325,10 +334,10 @@ The choice depends on the recipient's business model and customer relationship.
 
 **The prepayWindow provides security without LockedAmulets:**
 
-The `prepayWindow` parameter allows payments to advance up to a specified duration ahead of the current time (e.g., 7 days, 1 hour). This creates a prepaid buffer that effectively accomplishes the security that using `LockedAmulet` would offer, without the complexity:
+The `prepayWindow` parameter allows processing to advance up to a specified duration ahead of the current time (e.g., 7 days, 1 hour). This creates a prepaid buffer that effectively accomplishes the security that using `LockedAmulet` would offer, without the complexity:
 
-- **With prepayWindow > 0**: Payments advance ahead of current time, giving recipients revenue certainty
-- **With prepayWindow = 0**: Payments only advance up to current time, covering past usage with no prepayment
+- **With prepayWindow > 0**: Processing advances ahead of current time, giving recipients revenue certainty
+- **With prepayWindow = 0**: Processing only advances up to current time, covering past usage with no prepayment
 
 **Why not use LockedAmulets?**
 
@@ -353,7 +362,7 @@ We don't need full `LockedAmulet` security because that would only guarantee sub
 
 **Benefit:** This pay-as-you-go approach is particularly well-suited for Canton Network's frequent polling mechanism.
 
-With each process transaction, we're securing additional funds and advancing the `paidUntil` timestamp. This transactional approach makes sense because:
+With each process transaction, we're securing additional funds and advancing the `processedUntil` timestamp. This transactional approach makes sense because:
 - **Incremental fund capture**: Each polling cycle can capture newly available funds from the subscriber's account, minimizing their initial obligation.
 
 The transactional approach trades some efficiency for better UX and works naturally with Canton's polling-based processing model.
@@ -395,92 +404,90 @@ The transactional approach trades some efficiency for better UX and works natura
 - Should both refund and payment guarantees be paired, or offered independently?
 - Does the guaranteed refund model conflict with business models that rely on prepaid non-refundable revenue?
 
-### Change Proposal Contracts
+### Unified Change System
 
-The subscription system includes proposal contracts for changes that require negotiation between subscriber and recipient:
+The subscription system uses a unified change system that intelligently determines which parties need to approve based on the proposed changes:
 
-#### PaymentChangeProposal
+#### How It Works
 
-Recipient proposes payment increases (requires subscriber acceptance):
+1. **Propose Changes**: Any party calls `ActiveSubscription_ProposeChanges` with desired changes
+2. **Determine Impact**: System analyzes which parties are impacted by the changes
+3. **Apply or Create Proposal**:
+   - If only proposer is impacted (or no one): Apply changes immediately
+   - If others are impacted: Create `SubscriptionChangeProposal` for approval
 
-```daml
--- Recipient proposes payment increase
-proposalCid <- submit recipient do
-  createCmd PaymentChangeProposal with
-    subscriber, recipient, processor
-    previousRecipientPaymentPerDay = AmuletAmount 10.0
-    previousProcessorPaymentPerDay = AmuletAmount 1.0
-    newRecipientPaymentPerDay = AmuletAmount 15.0
-    newProcessorPaymentPerDay = AmuletAmount 1.5
-    expiresAt = futureTime
-
--- Subscriber accepts or rejects
-updatedSubscriptionCid <- submit subscriber, recipient do
-  exerciseCmd proposalCid PaymentChangeProposal_AcceptForPaidSubscription with
-    paidSubscriptionCid
-```
-
-#### ExpirationExtensionProposal
-
-Recipient proposes extending subscription beyond current expiration:
+#### Example: Recipient Increases Payment
 
 ```daml
--- Recipient proposes extending subscription
-proposalCid <- submit recipient do
-  createCmd ExpirationExtensionProposal with
-    subscriber, recipient
-    newExpiresAt = farFutureTime
-    incentive = Some "Lock in current rate for 2 years"
-    subscriptionCid = Left paidSubscriptionCid
-
--- Subscriber accepts or rejects
-updatedSubscriptionCid <- submit subscriber, recipient do
-  exerciseCmd proposalCid ExpirationExtensionProposal_AcceptForPaidSubscription with
-    paidSubscriptionCid
-```
-
-**Benefits:**
-- On-chain audit trail of all change requests
-- Async negotiation without real-time communication
-- Clear intent signaling through contract state
-- Works with both `PaidSubscription` and `FreeTrialSubscription`
-
-#### MetadataChangeProposal
-
-Either party proposes metadata changes (requires processor approval, then the other party's acceptance):
-
-```daml
--- Example: Recipient proposes adding RewardShare references
-proposalCid <- submit recipient do
-  createCmd MetadataChangeProposal with
-    subscriber, recipient, processor
+-- Recipient proposes payment increase (impacts subscriber who pays more)
+result <- submit recipient do
+  exerciseCmd activeSubscriptionCid ActiveSubscription_ProposeChanges with
     proposer = recipient
-    newMetadata = TM.fromList 
-      [ ("recipient_reward_agreement_cid", "00abc123...")
-      , ("processor_reward_agreement_cid", "00def456...")
-      ]
-    proposalExpiresAt = futureTime
+    changes = SubscriptionChanges with
+      recipientPaymentPerDay = Some (USDAmount 15.0)
+      -- All other fields None (no change)
+      recipientProvider = None
+      processorPaymentPerDay = None
+      expiresAt = None
+      prepayWindow = None
+      trialEndsAt = None
+      description = None
+      metadata = None
 
--- Processor approves the metadata change
-approvedProposalCid <- submit processor do
-  exerciseCmd proposalCid MetadataChangeProposal_ProcessorApprove
+-- Result is Right proposalCid (subscriber approval needed)
+let Right proposalCid = result
 
--- Subscriber accepts or rejects
-updatedSubscriptionCid <- submit processor, subscriber do
-  exerciseCmd approvedProposalCid ProcessorApprovedMetadataChangeProposal_AcceptForPaidSubscription with
-    paidSubscriptionCid
-    accepter = subscriber
+-- Subscriber approves
+proposalCid <- submit subscriber do
+  exerciseCmd proposalCid SubscriptionChangeProposal_Approve with actor = subscriber
+
+-- Apply changes (both parties are controllers since both approved)
+updatedSubscriptionCid <- submit subscriber, recipient do
+  exerciseCmd proposalCid SubscriptionChangeProposal_Apply with
+    activeSubscriptionCid
 ```
 
-The two-stage approval process (processor first, then other party) ensures:
-1. **Processor validation**: Processor verifies metadata follows expected format and business rules
-2. **Party consent**: Both subscriber and recipient must agree to metadata changes
-3. **Audit trail**: All metadata changes are recorded on-chain with all parties' signatures
+#### Example: Subscriber Increases Prepay Window
 
-**Single-Party Changes (No Proposal Required):**
-- Subscriber: increase payments, extend expiration, increase prepay window
-- Recipient: decrease their payment, start free trial, decrease prepay window
-- Processor: decrease their payment
+```daml
+-- Subscriber increases prepay window (only impacts themselves)
+result <- submit subscriber do
+  exerciseCmd activeSubscriptionCid ActiveSubscription_ProposeChanges with
+    proposer = subscriber
+    changes = SubscriptionChanges with
+      prepayWindow = Some (Some (days 30))
+      recipientProvider = None
+      recipientPaymentPerDay = None
+      processorPaymentPerDay = None
+      paymentsEndAt = None
+      trialEndsAt = None
+      description = None
+      metadata = None
+
+-- Result is Left updatedCid (applied immediately, only subscriber impacted)
+let Left updatedActiveSubscriptionCid = result
+```
+
+#### Impact Rules
+
+The system determines impacted parties using these rules:
+
+**Recipient Provider**: Recipient only  
+**Recipient Payment**: Subscriber (increase) or Recipient (decrease)  
+**Processor Payment**: Subscriber (increase) or Processor (decrease)  
+**Payments End**: Subscriber (commitment change)  
+**Prepay Window**: Subscriber (increase) or Recipient (decrease)  
+**Trial**: Both Subscriber and Recipient  
+**Description**: Both Subscriber and Recipient  
+**Metadata**: All three parties
+
+#### Benefits
+
+- **Intelligent**: Only requires approvals when necessary
+- **Flexible**: Handles all change scenarios with one system
+- **Safe**: Validates original state before applying (allows `processedUntil` to change)
+- **Clear**: Explicit impact rules make behavior predictable
+- **Audit trail**: All multi-party changes recorded on-chain with signatures
 
 ### Flexible Free Trial Expiration
 
