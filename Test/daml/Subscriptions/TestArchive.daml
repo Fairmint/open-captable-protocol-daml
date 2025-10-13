@@ -8,6 +8,7 @@ import Fairmint.Subscriptions.ProposedSubscription
 import Fairmint.Subscriptions.ActiveSubscription
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
 import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
 import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
 
@@ -121,9 +122,12 @@ testArchiveInactiveSubscriptionWithPrepaidTime : Script ()
 testArchiveInactiveSubscriptionWithPrepaidTime = script do
   TestParties{..} <- allocateTestParties
   
-  -- Create and approve subscription
+  -- Create and approve subscription with smaller processing period
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  let proposal = (defaultSubscriptionProposal alice bob expiresAt) with
+        recipientPaymentPerDay = AmuletAmount 10.0
+        processorPaymentPerDay = Some (AmuletAmount 2.0)
+  proposalCid <- createSubscriberProposal processor alice dso proposal
   
   result1 <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
@@ -150,10 +154,7 @@ testArchiveInactiveSubscriptionWithPrepaidTime = script do
   let (openRoundCid, _) = head currentOpenRounds
   amuletRulesCid <- getAmuletRules dso
   
-  -- Wait for processing period to elapse
-  now2 <- getTime
-  setTime (addRelTime now2 (days 31))
-  
+  -- Process immediately to create 1 day of prepaid time
   -- Get disclosures
   Some amuletDisclosure <- queryDisclosure alice amuletCid
   Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
@@ -164,7 +165,7 @@ testArchiveInactiveSubscriptionWithPrepaidTime = script do
     exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
       processingContext = ProcessingContext with
         processorProvider = processor
-        processingPeriod = days 30
+        processingPeriod = days 1  -- Process just 1 day to keep amounts manageable
         recipientProvider = Some bob
         recipientFeaturedAppRight = None
         processorFeaturedAppRight = None
@@ -175,7 +176,12 @@ testArchiveInactiveSubscriptionWithPrepaidTime = script do
   
   let updatedSubscriptionCid = paymentResult.subscriptionCid
   
-  -- Cancel the subscription
+  -- Verify the subscription has prepaid time (processedAndPaidUntil is in the future)
+  Some updatedSub <- queryContractId alice updatedSubscriptionCid
+  now4 <- getTime
+  assertMsg "Should have prepaid time" (updatedSub.processedAndPaidUntil > now4)
+  
+  -- Cancel the subscription (should return Some because processedAndPaidUntil > now)
   maybeCanceledCid <- submit alice do
     exerciseCmd updatedSubscriptionCid ActiveSubscription_Cancel with
       actor = alice
@@ -186,9 +192,9 @@ testArchiveInactiveSubscriptionWithPrepaidTime = script do
     Some cid -> pure cid
     None -> error "Expected canceled subscription with prepaid time"
   
-  -- Wait for prepaid time to pass
+  -- Wait for prepaid time to pass (wait 2 days since we have 1 day prepaid)
   now3 <- getTime
-  setTime (addRelTime now3 (days 31))
+  setTime (addRelTime now3 (days 2))
   
   -- Archive the inactive subscription using the custom choice
   submit alice do
