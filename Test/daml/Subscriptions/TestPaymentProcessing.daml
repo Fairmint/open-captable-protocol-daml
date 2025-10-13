@@ -4,14 +4,32 @@ import Daml.Script
 import DA.Time (days, addRelTime)
 import DA.List (head)
 import Splice.Round (OpenMiningRound)
-import Fairmint.Subscriptions.Creation.ProposedSubscription
-import Fairmint.Subscriptions.Active.Subscriptions
-import Fairmint.Subscriptions.Creation.SubscriptionFactory
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.SubscriptionFactory
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
 import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
+
+-- | Helper to fully approve a proposal and return the ActiveSubscription
+approveProposalFully : ContractId ProposedSubscription -> Party -> Party -> Script (ContractId ActiveSubscription)
+approveProposalFully proposalCid processor recipient = do
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedCid <- case result1 of
+    Left cid -> pure cid
+    Right activeCid -> pure activeCid  -- If processor is last to approve
+  
+  result2 <- submit recipient do
+    exerciseCmd approvedCid ProposedSubscription_Approve with actor = recipient
+  
+  case result2 of
+    Right activeCid -> pure activeCid
+    Left _ -> error "Expected subscription to be created after all approvals"
 
 -- | Test processing a subscription payment
 testProcessPayment : Script ()
@@ -20,18 +38,9 @@ testProcessPayment = script do
   
   expiresAt <- getExpirationTime 365
   now <- getTime
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription"
+  subscriptionCid <- approveProposalFully proposalCid processor bob
   
   -- Alice creates amulet for payment (before advancing time so mining rounds exist)
   amuletCid <- tapWithDso dso alice 100.0
@@ -55,20 +64,21 @@ testProcessPayment = script do
   
   -- Process payment with explicit contract disclosures
   paymentResult <- submitWithDisclosures processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
-    exerciseCmd subscriptionCid PaidSubscription_ProcessPayment with
-      processingPeriod = days 30
-      paymentCtx = PaymentContext with
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 30
+        recipientProvider = None
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+      paymentContext = PaymentContext with
         amuletInputs = [amuletCid]
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
-      processorProvider = processor
-      recipientFeaturedAppRight = None
-      processorFeaturedAppRight = None
-      processorActivityMarkerFAR = None
   
   -- Verify the subscription was updated
   Some updatedSubscription <- queryContractId alice paymentResult.subscriptionCid
-  assertMsg "Subscription should be updated" (updatedSubscription.paidUntil > now)
+  assertMsg "Subscription should be updated" (updatedSubscription.processedAndPaidUntil > now)
   
   pure ()
 
@@ -78,18 +88,9 @@ testProcessPaymentFailsBeforePeriodElapses = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription"
+  subscriptionCid <- approveProposalFully proposalCid processor bob
   
   -- Create amulet for payment
   amuletCid <- tapWithDso dso alice 50.0
@@ -109,16 +110,17 @@ testProcessPaymentFailsBeforePeriodElapses = script do
   
   -- Try to process payment immediately (should fail - period hasn't elapsed)
   submitWithDisclosuresMustFail processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
-    exerciseCmd subscriptionCid PaidSubscription_ProcessPayment with
-      processingPeriod = days 30
-      paymentCtx = PaymentContext with
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 30
+        recipientProvider = None
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+      paymentContext = PaymentContext with
         amuletInputs = [amuletCid]
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
-      processorProvider = processor
-      recipientFeaturedAppRight = None
-      processorFeaturedAppRight = None
-      processorActivityMarkerFAR = None
   
   pure ()
 
@@ -130,18 +132,9 @@ testProcessPaymentFailsAfterExpiration = script do
   now <- getTime
   let expiresAt = addRelTime now (days 60)  -- Expires in 60 days
   proposalCid <- createSubscriberProposal processor alice dso 
-    ((defaultSubscriptionConfig alice bob expiresAt) with expiresAt = expiresAt)
+    ((defaultSubscriptionProposal alice bob expiresAt) with paymentsEndAt = Some (PerciseTime expiresAt))
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription"
+  subscriptionCid <- approveProposalFully proposalCid processor bob
   
   -- Create amulet for payment before advancing time
   amuletCid <- tapWithDso dso alice 50.0
@@ -165,16 +158,17 @@ testProcessPaymentFailsAfterExpiration = script do
   
   -- Try to process payment after expiration (should fail)
   submitWithDisclosuresMustFail processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
-    exerciseCmd subscriptionCid PaidSubscription_ProcessPayment with
-      processingPeriod = days 30
-      paymentCtx = PaymentContext with
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 30
+        recipientProvider = None
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+      paymentContext = PaymentContext with
         amuletInputs = [amuletCid]
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
-      processorProvider = processor
-      recipientFeaturedAppRight = None
-      processorFeaturedAppRight = None
-      processorActivityMarkerFAR = None
   
   pure ()
 
@@ -186,44 +180,33 @@ testProcessFreeTrial = script do
   now <- getTime
   expiresAt <- getExpirationTime 365
   let freeTrialEndsAt = addRelTime now (days 30)
-  let config = defaultSubscriptionConfig alice bob expiresAt
+  let proposal = (defaultSubscriptionProposal alice bob expiresAt) with
+        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt)
   
-  -- Create factory and proposal with free trial
+  -- Create proposal with free trial
   proposalCid <- submitMulti [alice, processor] [] do
     createAndExerciseCmd
-      (SubscriptionFactory with context = ProcessorContext processor dso)
-      (SubscriptionFactory_CreateSubscriberProposal with
-        config = config
-        freeTrialExpiration = Some (AbsoluteExpiration freeTrialEndsAt))
+      (SubscriptionFactory with processorContext = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposedSubscription with
+        actor = alice
+        subscriptionProposal = proposal)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  
-  subscriptionCid <- case result.subscription of
-    Left cid -> pure cid  -- FreeTrialSubscription
-    Right _ -> error "Expected FreeTrialSubscription"
+  subscriptionCid <- approveProposalFully proposalCid processor bob
   
   -- Wait 10 days then process free trial
   setTime (addRelTime now (days 10))
   
-  trialResult <- submit processor do
-    exerciseCmd subscriptionCid FreeTrialSubscription_Process with
-      processingPeriod = days 7
-      processorProvider = processor
-      recipientFeaturedAppRight = None
-      processorFeaturedAppRight = None
-  
-  -- Extract the updated subscription CID from result
-  updatedCid <- case trialResult.result of
-    Left cid -> pure cid  -- Still FreeTrialSubscription
-    Right _ -> error "Expected FreeTrialSubscription to remain in trial"
+  updatedCid <- submit processor do
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessFreeTrial with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 7
+        recipientProvider = None
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "paidUntil should advance" (updated.paidUntil > now)
+  assertMsg "processedAndPaidUntil should advance" (updated.processedAndPaidUntil > now)
   
   pure ()
 

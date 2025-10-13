@@ -2,8 +2,8 @@ module Subscriptions.TestCancellationWithRefund where
 
 import Daml.Script
 import DA.Time (days)
-import Fairmint.Subscriptions.Creation.ProposedSubscription
-import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
 import Subscriptions.TestUtils
 
 -- | Test recipient canceling with refund
@@ -17,22 +17,27 @@ testRecipientCancelWithRefund = script do
   
   proposalCid <- createSubscriberProposal processor alice dso proposal
   
-  processorApprovedCid <- submit processor do
+  result1 <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit bob do
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
     exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
-  result <- submit bob do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
-  
-  -- Extract PaidSubscription contract ID
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription, got FreeTrialSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- TODO: This test needs to be rewritten for the new cancellation/refund flow
-  -- The new flow creates a PrepaidCanceledSubscription and uses PrepaidCanceledSubscription_RecipientRefundAndArchive
+  -- Cancel subscription
+  maybeUpdatedCid <- submit bob do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = False
+      description = Some "Canceling with refund test"
+  
   pure ()
 
 -- | Test recipient canceling without refund
@@ -46,20 +51,31 @@ testRecipientCancelWithoutRefund = script do
   
   proposalCid <- createSubscriberProposal processor alice dso proposal
   
-  processorApprovedCid <- submit processor do
+  result1 <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit bob do
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
     exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
-  result <- submit bob do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
-  
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- TODO: This test needs to be rewritten for the new cancellation/refund flow
+  -- Cancel subscription without refund
+  maybeUpdatedCid <- submit bob do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = True  -- Don't keep prepaid time
+      description = None
+  
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected - archived immediately
+    Some _ -> error "Expected subscription to be archived"
+  
   pure ()
 
 -- | Test recipient canceling when no prepaid time (immediate cancel)
@@ -70,26 +86,31 @@ testRecipientCancelImmediate = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  processorApprovedCid <- submit processor do
+  result1 <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit bob do
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
     exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
-  result <- submit bob do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = bob
-  
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- Test immediate cancellation (when paidUntil <= now, subscription archives immediately)
-  submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_CancelByRecipient with
-      reason = None
+  -- Test immediate cancellation (when processedAndPaidUntil <= now, subscription archives immediately)
+  maybeUpdatedCid <- submit bob do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = False
+      description = None
   
-  -- Verify subscription is archived
-  subscription <- queryContractId bob subscriptionCid
-  assertMsg "Subscription should be archived" (subscription == None)
+  -- Verify subscription is archived (no prepaid time, so returns None)
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected
+    Some _ -> error "Expected subscription to be archived immediately"
   
   pure ()
+

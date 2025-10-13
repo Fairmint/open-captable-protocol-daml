@@ -2,17 +2,18 @@ module Subscriptions.TestFreeTrialLifecycle where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
-import Fairmint.Subscriptions.Creation.ProposedSubscription
-import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
-import Fairmint.Subscriptions.Creation.SubscriptionFactory
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Fairmint.Subscriptions.SubscriptionFactory
 import Subscriptions.TestUtils
 
--- | Helper to create a FreeTrialSubscription
-createFreeTrialSubscription : Party -> Party -> Party -> Party -> Script (ContractId FreeTrialSubscription)
-createFreeTrialSubscription processor subscriber recipient dso = do
+-- | Helper to create an ActiveSubscription with free trial
+createActiveSubscriptionWithFreeTrial : Party -> Party -> Party -> Party -> Script (ContractId ActiveSubscription)
+createActiveSubscriptionWithFreeTrial processor subscriber recipient dso = do
   now <- getTime
   expiresAt <- getExpirationTime 365
   let freeTrialEndsAt = addRelTime now (days 30)
@@ -24,165 +25,107 @@ createFreeTrialSubscription processor subscriber recipient dso = do
       (SubscriptionFactory with processorContext = ProcessorContext processor dso)
       (SubscriptionFactory_CreateProposedSubscription with
         actor = subscriber
-        proposal = proposal)
+        subscriptionProposal = proposal)
   
-  processorApprovedCid <- submit processor do
+  result1 <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit recipient do
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right activeCid -> pure activeCid
+  
+  result2 <- submit recipient do
     exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = recipient
   
-  result <- submit recipient do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = recipient
-  
-  case result.subscription of
-    Left cid -> pure cid  -- FreeTrialSubscription
-    Right _ -> error "Expected FreeTrialSubscription"
+  case result2 of
+    Right cid -> pure cid  -- ActiveSubscription (with trial info in subscription.trialEndsAt)
+    Left _ -> error "Expected ActiveSubscription to be created"
 
--- | Test FreeTrialSubscription Archive choice
+-- | Test ActiveSubscription with free trial - Archive choice
 testFreeTrialSubscriptionArchive : Script ()
 testFreeTrialSubscriptionArchive = script do
   TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
+  subscriptionCid <- createActiveSubscriptionWithFreeTrial processor alice bob dso
   
   submitMulti [alice, bob, processor] [] do
     archiveCmd subscriptionCid
   
   pure ()
 
--- | Test subscriber can cancel during free trial
-testFreeTrialCancelBySubscriber : Script ()
-testFreeTrialCancelBySubscriber = script do
+-- | Test cancellation during free trial
+testFreeTrialCancellationBySubscriber : Script ()
+testFreeTrialCancellationBySubscriber = script do
   TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
+  subscriptionCid <- createActiveSubscriptionWithFreeTrial processor alice bob dso
   
-  submit alice do
-    exerciseCmd subscriptionCid FreeTrialSubscription_CancelBySubscriber with
-      reason = Some "No longer need this service"
+  maybeUpdatedCid <- submit alice do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = False
+      description = Some "Canceling during trial"
+  
+  -- During free trial with no prepaid time, subscription archives immediately
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected
+    Some _ -> error "Expected subscription to archive"
   
   pure ()
 
--- | Test recipient can cancel during free trial
-testFreeTrialCancelByRecipient : Script ()
-testFreeTrialCancelByRecipient = script do
+-- | Test cancellation during free trial by recipient
+testFreeTrialCancellationByRecipient : Script ()
+testFreeTrialCancellationByRecipient = script do
   TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
+  subscriptionCid <- createActiveSubscriptionWithFreeTrial processor alice bob dso
   
-  submit bob do
-    exerciseCmd subscriptionCid FreeTrialSubscription_CancelByRecipient with
-      reason = Some "Service discontinued"
+  maybeUpdatedCid <- submit bob do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = False
+      description = None
+  
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected
+    Some _ -> error "Expected subscription to archive"
   
   pure ()
 
--- | Test processor can cancel during free trial
-testFreeTrialCancelByProcessor : Script ()
-testFreeTrialCancelByProcessor = script do
+-- | Test cancellation during free trial by processor
+testFreeTrialCancellationByProcessor : Script ()
+testFreeTrialCancellationByProcessor = script do
   TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
+  subscriptionCid <- createActiveSubscriptionWithFreeTrial processor alice bob dso
   
-  submit processor do
-    exerciseCmd subscriptionCid FreeTrialSubscription_CancelByProcessor with
-      reason = None
+  maybeUpdatedCid <- submit processor do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = processor
+      disregardAvailablePaidPeriod = False
+      description = None
+  
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected
+    Some _ -> error "Expected subscription to archive"
   
   pure ()
 
--- | Test subscriber can increase payments during free trial
-testFreeTrialSubscriberIncreasePayments : Script ()
-testFreeTrialSubscriberIncreasePayments = script do
+-- | Test processing free trial period
+testFreeTrialProcess : Script ()
+testFreeTrialProcess = script do
   TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
+  now <- getTime
+  subscriptionCid <- createActiveSubscriptionWithFreeTrial processor alice bob dso
   
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid FreeTrialSubscription_SubscriberIncreasePayments with
-      newRecipientPaymentPerDay = AmuletAmount 2.0
-      newProcessorPaymentPerDay = AmuletAmount 0.5
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should be increased" (updated.subscription.recipientPaymentPerDay == AmuletAmount 2.0)
-  assertMsg "Processor payment should be increased" (updated.subscription.processorPaymentPerDay == Some (AmuletAmount 0.5))
-  
-  pure ()
-
--- | Test recipient can decrease their payment during free trial
-testFreeTrialRecipientDecreasePayment : Script ()
-testFreeTrialRecipientDecreasePayment = script do
-  TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
-  
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid FreeTrialSubscription_RecipientDecreasePayment with
-      newRecipientPaymentPerDay = AmuletAmount 0.5
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should be decreased" (updated.subscription.recipientPaymentPerDay == AmuletAmount 0.5)
-  
-  pure ()
-
--- | Test processor can decrease their payment during free trial
-testFreeTrialProcessorDecreasePayment : Script ()
-testFreeTrialProcessorDecreasePayment = script do
-  TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
-  
+  -- Process the free trial
   updatedCid <- submit processor do
-    exerciseCmd subscriptionCid FreeTrialSubscription_ProcessorDecreasePayment with
-      newProcessorPaymentPerDay = AmuletAmount 0.1
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessFreeTrial with
+      processingContext = ProcessingContext with
+        processingPeriod = days 7
+        recipientProvider = None
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+        processorProvider = processor
   
   Some updated <- queryContractId alice updatedCid
-  assertMsg "Processor payment should be decreased" (updated.subscription.processorPaymentPerDay == Some (AmuletAmount 0.1))
-  
-  pure ()
-
--- | Test recipient can extend the free trial period
-testFreeTrialRecipientExtendTrial : Script ()
-testFreeTrialRecipientExtendTrial = script do
-  TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
-  
-  now <- getTime
-  let newTrialEndsAt = addRelTime now (days 45)
-  
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid FreeTrialSubscription_RecipientExtendTrial with
-      newTrialEndsAt = newTrialEndsAt
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Trial end should be extended" (updated.trialEndsAt == newTrialEndsAt)
-  
-  pure ()
-
--- | Test subscriber can update expiration during free trial
-testFreeTrialSubscriberUpdateExpiration : Script ()
-testFreeTrialSubscriberUpdateExpiration = script do
-  TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
-  
-  now <- getTime
-  let newExpiresAt = addRelTime now (days 500)
-  
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid FreeTrialSubscription_SubscriberUpdateExpiration with
-      newExpiresAt = newExpiresAt
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Expiration should be updated" (updated.subscription.expiresAt == Some newExpiresAt)
-  
-  pure ()
-
--- | Test recipient can update their provider during free trial
-testFreeTrialRecipientUpdateProvider : Script ()
-testFreeTrialRecipientUpdateProvider = script do
-  TestParties{..} <- allocateTestParties
-  subscriptionCid <- createFreeTrialSubscription processor alice bob dso
-  
-  charlie <- allocateParty "Charlie"
-  
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid FreeTrialSubscription_RecipientUpdateProvider with
-      newRecipientProvider = charlie
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Provider should be updated" (updated.subscription.recipientProvider == Some charlie)
+  assertMsg "processedAndPaidUntil should advance" (updated.processedAndPaidUntil > now)
   
   pure ()
 

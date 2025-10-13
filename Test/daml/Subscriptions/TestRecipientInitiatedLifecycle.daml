@@ -1,8 +1,8 @@
 module Subscriptions.TestRecipientInitiatedLifecycle where
 
 import Daml.Script
-import Fairmint.Subscriptions.Creation.ProposedSubscription
-import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
 import Subscriptions.TestUtils
 
 -- | Test the full happy path: recipient creates proposal → processor approves → subscriber accepts
@@ -15,26 +15,26 @@ testRecipientProposalAcceptance = script do
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
   -- Processor approves the proposal
-  processorApprovedCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  -- Alice (subscriber) approves
-  fullyApprovedCid <- submit alice do
+  processorApprovedCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
+  
+  -- Alice (subscriber) approves - this creates the subscription
+  result <- submit alice do
     exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
   
-  -- Create the subscription
-  result <- submit alice do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = alice
-  
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
   -- Verify subscription was created
   Some subscription <- queryContractId alice subscriptionCid
-  assertMsg "Subscriber should be alice" (subscription.config.subscriber == alice)
-  assertMsg "Recipient should be bob" (subscription.config.recipient == bob)
-  assertMsg "Processor should match" (subscription.context.processor == processor)
+  assertMsg "Subscriber should be alice" (subscription.subscription.subscriber == alice)
+  assertMsg "Recipient should be bob" (subscription.subscription.recipient == bob)
+  assertMsg "Processor should match" (subscription.processorContext.processor == processor)
   
   pure ()
 
@@ -49,7 +49,7 @@ testRecipientProposalRejectionBySubscriber = script do
   
   -- Alice (subscriber) rejects before processor approval
   submit alice do
-    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = alice; reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = alice; description = None
   
   -- Verify proposal is archived
   proposal <- queryContractId alice proposalCid
@@ -68,7 +68,7 @@ testRecipientProposalWithdrawByRecipient = script do
   
   -- Bob withdraws before processor approval
   submit bob do
-    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = bob; reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = bob; description = None
   
   -- Verify proposal is archived
   proposal <- queryContractId bob proposalCid
@@ -87,7 +87,7 @@ testRecipientProposalProcessorReject = script do
   
   -- Processor rejects
   submit processor do
-    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = processor; reason = None
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = processor; description = None
   
   -- Verify proposal is archived
   proposal <- queryContractId processor proposalCid
@@ -104,12 +104,16 @@ testProcessorApprovedRecipientProposalSubscriberReject = script do
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
   -- Processor approves
-  approvedProposalCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   -- Alice (subscriber) rejects after processor approval
   submit alice do
-    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = alice; reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = alice; description = None
   
   pure ()
 
@@ -121,12 +125,16 @@ testProcessorApprovedRecipientProposalRecipientWithdraw = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   -- Bob (recipient) withdraws after processor approval
   submit bob do
-    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = bob; reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = bob; description = None
   
   pure ()
 
@@ -138,12 +146,16 @@ testProcessorApprovedRecipientProposalProcessorWithdraw = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   -- Processor withdraws their approval
   submit processor do
-    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = processor; reason = None
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = processor; description = None
   
   pure ()
 
@@ -156,23 +168,26 @@ testRecipientInitiatedCancellationBySubscriber = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  processorApprovedCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit alice do
-    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
+  processorApprovedCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   result <- submit alice do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = alice
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
   
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
   -- Alice (subscriber) can cancel
   submit alice do
-    exerciseCmd subscriptionCid PaidSubscription_CancelBySubscriber with
-      reason = None
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = True
+      description = None
   
   subscription <- queryContractId alice subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
@@ -187,23 +202,26 @@ testRecipientInitiatedCancellationByRecipient = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  processorApprovedCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit alice do
-    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
+  processorApprovedCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   result <- submit alice do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = alice
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
   
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
   -- Bob (recipient) can cancel without refund
   submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_CancelByRecipient with
-      reason = None
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = True
+      description = None
   
   subscription <- queryContractId bob subscriptionCid
   assertMsg "Subscription should be archived" (subscription == None)
@@ -218,22 +236,25 @@ testRecipientInitiatedCancellationByProcessor = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  processorApprovedCid <- submit processor do
+  processorResult <- submit processor do
     exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  fullyApprovedCid <- submit alice do
-    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
+  processorApprovedCid <- case processorResult of
+    Left cid -> pure cid
+    Right _ -> error "Expected proposal to remain pending"
   
   result <- submit alice do
-    exerciseCmd fullyApprovedCid ProposedSubscription_CreateSubscription with actor = alice
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = alice
   
-  subscriptionCid <- case result.subscription of
+  subscriptionCid <- case result of
     Right cid -> pure cid
-    Left _ -> assertFail "Expected PaidSubscription"
+    Left _ -> error "Expected subscription to be created"
   
   -- Processor can cancel
   submit processor do
-    exerciseCmd subscriptionCid PaidSubscription_CancelByProcessor with
-      reason = None
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = processor
+      disregardAvailablePaidPeriod = True
+      description = None
   
   pure ()

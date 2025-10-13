@@ -2,395 +2,184 @@ module Subscriptions.TestConfigurationUpdates where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
-import Fairmint.Subscriptions.Creation.ProposedSubscription
-import Fairmint.Subscriptions.Active.Subscriptions
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..))
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
+import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Subscriptions.TestUtils
 
--- | Test recipient decreasing expiration
-testDecreaseExpiration : Script ()
-testDecreaseExpiration = script do
+-- | Test proposing and applying a simple configuration change
+testProposeAndApplyExpirationChange : Script ()
+testProposeAndApplyExpirationChange = script do
   TestParties{..} <- allocateTestParties
   
-  now <- getTime
   expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- Recipient decreases expiration (not supported - only subscriber can change)
-  -- This test is invalid - only subscriber can update expiration
-  let newExpiresAt = addRelTime now (days 180)
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid PaidSubscription_SubscriberUpdateExpiration with
-      newExpiresAt = newExpiresAt
+  -- Alice proposes extending the expiration
+  newExpiresAt <- getExpirationTime 500
+  let changes = SubscriptionChanges with
+        subscriber = None
+        recipient = None
+        processor = None
+        recipientProvider = None
+        recipientPaymentPerDay = None
+        processorPaymentPerDay = None
+        prepayWindow = None
+        paymentsEndAt = Some (Some (PerciseTime newExpiresAt))
+        trialEndsAt = None
+        description = None
+        metadata = None
+        processedAndPaidUntilAdjustment = None
   
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Expiration should be decreased" (updated.config.expiresAt == newExpiresAt)
+  changeProposalCid <- submit alice do
+    exerciseCmd subscriptionCid ActiveSubscription_ProposeChanges with
+      proposer = alice
+      changes = changes
+  
+  -- Processor and recipient approve
+  changeProposalCid2 <- submit processor do
+    exerciseCmd changeProposalCid SubscriptionChangeProposal_Approve with actor = processor
+  
+  changeProposalCid3 <- submit bob do
+    exerciseCmd changeProposalCid2 SubscriptionChangeProposal_Approve with actor = bob
+  
+  -- Processor applies the changes
+  updatedSubscriptionCid <- submit processor do
+    exerciseCmd changeProposalCid3 SubscriptionChangeProposal_Apply with
+      activeSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedSubscriptionCid
+  assertMsg "Expiration should be updated" (updated.subscription.paymentsEndAt == Some newExpiresAt)
   
   pure ()
 
--- | Test processor decreasing their payment
-testProcessorDecreasePayment : Script ()
-testProcessorDecreasePayment = script do
+-- | Test proposing a payment decrease (impacts recipient)
+testProposePaymentDecrease : Script ()
+testProposePaymentDecrease = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        processorPaymentPerDay = AmuletAmount 0.5
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  proposalCid <- createSubscriberProposal processor alice dso config
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
   
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- Processor decreases their payment
-  updatedCid <- submit processor do
-    exerciseCmd subscriptionCid PaidSubscription_ProcessorDecreasePayment with
-      newProcessorPaymentPerDay = AmuletAmount 0.3
+  -- Subscriber proposes decreasing payment
+  let changes = SubscriptionChanges with
+        subscriber = None
+        recipient = None
+        processor = None
+        recipientProvider = None
+        recipientPaymentPerDay = Some (AmuletAmount 0.5)  -- Decrease from 1.0
+        processorPaymentPerDay = None
+        prepayWindow = None
+        paymentsEndAt = None
+        trialEndsAt = None
+        description = None
+        metadata = None
+        processedAndPaidUntilAdjustment = None
   
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Processor payment should decrease" (updated.config.processorPaymentPerDay == AmuletAmount 0.3)
+  changeProposalCid <- submit alice do
+    exerciseCmd subscriptionCid ActiveSubscription_ProposeChanges with
+      proposer = alice
+      changes = changes
+  
+  -- Bob (recipient) must approve since they're impacted
+  changeProposalCid2 <- submit bob do
+    exerciseCmd changeProposalCid SubscriptionChangeProposal_Approve with actor = bob
+  
+  -- Processor must also approve
+  changeProposalCid3 <- submit processor do
+    exerciseCmd changeProposalCid2 SubscriptionChangeProposal_Approve with actor = processor
+  
+  -- Apply changes
+  updatedSubscriptionCid <- submit processor do
+    exerciseCmd changeProposalCid3 SubscriptionChangeProposal_Apply with
+      activeSubscriptionCid = subscriptionCid
+  
+  Some updated <- queryContractId alice updatedSubscriptionCid
+  assertMsg "Payment should be decreased" (updated.subscription.recipientPaymentPerDay == AmuletAmount 0.5)
   
   pure ()
 
--- | Test recipient decreasing their payment
-testRecipientDecreasePayment : Script ()
-testRecipientDecreasePayment = script do
+-- | Test rejecting a proposed change
+testRejectProposedChange : Script ()
+testRejectProposedChange = script do
   TestParties{..} <- allocateTestParties
   
   expiresAt <- getExpirationTime 365
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        recipientPaymentPerDay = AmuletAmount 5.0
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  proposalCid <- createSubscriberProposal processor alice dso config
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
   
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- Recipient decreases their payment
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_RecipientDecreasePayment with
-      newRecipientPaymentPerDay = AmuletAmount 3.0
+  -- Alice proposes a change
+  let changes = SubscriptionChanges with
+        subscriber = None
+        recipient = None
+        processor = None
+        recipientProvider = None
+        recipientPaymentPerDay = Some (AmuletAmount 0.1)  -- Big decrease
+        processorPaymentPerDay = None
+        prepayWindow = None
+        paymentsEndAt = None
+        trialEndsAt = None
+        description = None
+        metadata = None
+        processedAndPaidUntilAdjustment = None
   
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should decrease" (updated.config.recipientPaymentPerDay == AmuletAmount 3.0)
+  changeProposalCid <- submit alice do
+    exerciseCmd subscriptionCid ActiveSubscription_ProposeChanges with
+      proposer = alice
+      changes = changes
+  
+  -- Bob rejects the change
+  submit bob do
+    exerciseCmd changeProposalCid SubscriptionChangeProposal_Reject with
+      rejecter = bob
+      description = Some "Payment too low"
+  
+  -- Verify proposal is archived
+  result <- queryContractId bob changeProposalCid
+  assertMsg "Proposal should be archived" (result == None)
   
   pure ()
 
--- | Test recipient updating free trial
-testRecipientUpdateFreeTrial : Script ()
-testRecipientUpdateFreeTrial = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Recipient starts free trial
-  let newFreeTrialEndsAt = addRelTime now (days 14)
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_RecipientStartFreeTrial with
-      trialEndsAt = newFreeTrialEndsAt
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Free trial should be set" (updated.trialEndsAt == newFreeTrialEndsAt)
-  
-  pure ()
-
--- | Test subscriber increasing payments
-testSubscriberIncreasePayments : Script ()
-testSubscriberIncreasePayments = script do
-  TestParties{..} <- allocateTestParties
-  
-  expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Subscriber increases payments
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid PaidSubscription_SubscriberIncreasePayments with
-      newRecipientPaymentPerDay = AmuletAmount 2.0
-      newProcessorPaymentPerDay = AmuletAmount 0.3
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Recipient payment should increase" (updated.config.recipientPaymentPerDay == AmuletAmount 2.0)
-  assertMsg "Processor payment should increase" (updated.config.processorPaymentPerDay == AmuletAmount 0.3)
-  
-  pure ()
-
--- | Test subscriber reducing free trial
-testSubscriberReduceFreeTrial : Script ()
-testSubscriberReduceFreeTrial = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  expiresAt <- getExpirationTime 365
-  let freeTrialEndsAt = addRelTime now (days 30)
-  
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  paidSubscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Recipient starts free trial first
-  freeTrialCid <- submit bob do
-    exerciseCmd paidSubscriptionCid PaidSubscription_RecipientStartFreeTrial with
-      trialEndsAt = freeTrialEndsAt
-  
-  -- Subscriber reduces free trial
-  let newFreeTrialEndsAt = addRelTime now (days 15)
-  updatedCid <- submit alice do
-    exerciseCmd freeTrialCid FreeTrialSubscription_SubscriberReduceTrial with
-      newTrialEndsAt = Some newFreeTrialEndsAt
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Free trial should be reduced" (updated.trialEndsAt == newFreeTrialEndsAt)
-  
-  pure ()
-
--- | Test recipient updating provider for PaidSubscription
-testPaidSubscriptionRecipientUpdateProvider : Script ()
-testPaidSubscriptionRecipientUpdateProvider = script do
-  TestParties{..} <- allocateTestParties
-  
-  expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription"
-  
-  charlie <- allocateParty "Charlie"
-  
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_RecipientUpdateProvider with
-      newRecipientProvider = charlie
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Provider should be updated" (updated.recipientProvider == charlie)
-  
-  pure ()
-
--- | Test subscriber updating expiration
-testUpdateExpiration : Script ()
-testUpdateExpiration = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  expiresAt <- getExpirationTime 365
-  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionConfig alice bob expiresAt)
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Subscriber updates expiration
-  let newExpiresAt = addRelTime now (days 730)
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid PaidSubscription_SubscriberUpdateExpiration with
-      newExpiresAt = newExpiresAt
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Expiration should be updated" (updated.config.expiresAt == newExpiresAt)
-  
-  pure ()
-
--- | Test subscriber increasing prepay window
-testSubscriberIncreasePrepayWindow : Script ()
-testSubscriberIncreasePrepayWindow = script do
-  TestParties{..} <- allocateTestParties
-  
-  expiresAt <- getExpirationTime 365
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        prepayWindow = days 7
-  
-  proposalCid <- createSubscriberProposal processor alice dso config
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Subscriber increases prepay window
-  updatedCid <- submit alice do
-    exerciseCmd subscriptionCid PaidSubscription_SubscriberIncreasePrepayWindow with
-      newPrepayWindow = days 14
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Prepay window should increase" (updated.config.prepayWindow == days 14)
-  
-  pure ()
-
--- | Test recipient decreasing prepay window
-testRecipientDecreasePrepayWindow : Script ()
-testRecipientDecreasePrepayWindow = script do
-  TestParties{..} <- allocateTestParties
-  
-  expiresAt <- getExpirationTime 365
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        prepayWindow = days 14
-  
-  proposalCid <- createSubscriberProposal processor alice dso config
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  subscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Recipient decreases prepay window
-  updatedCid <- submit bob do
-    exerciseCmd subscriptionCid PaidSubscription_RecipientDecreasePrepayWindow with
-      newPrepayWindow = days 7
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Prepay window should decrease" (updated.config.prepayWindow == days 7)
-  
-  pure ()
-
--- | Test subscriber increasing prepay window on free trial
-testFreeTrialSubscriberIncreasePrepayWindow : Script ()
-testFreeTrialSubscriberIncreasePrepayWindow = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  expiresAt <- getExpirationTime 365
-  let freeTrialEndsAt = addRelTime now (days 30)
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        prepayWindow = days 7
-  
-  proposalCid <- createSubscriberProposal processor alice dso config
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  paidSubscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Recipient starts free trial
-  freeTrialCid <- submit bob do
-    exerciseCmd paidSubscriptionCid PaidSubscription_RecipientStartFreeTrial with
-      trialEndsAt = freeTrialEndsAt
-  
-  -- Subscriber increases prepay window during free trial
-  updatedCid <- submit alice do
-    exerciseCmd freeTrialCid FreeTrialSubscription_SubscriberIncreasePrepayWindow with
-      newPrepayWindow = days 14
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Prepay window should increase during free trial" (updated.config.prepayWindow == days 14)
-  
-  pure ()
-
--- | Test recipient decreasing prepay window on free trial
-testFreeTrialRecipientDecreasePrepayWindow : Script ()
-testFreeTrialRecipientDecreasePrepayWindow = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  expiresAt <- getExpirationTime 365
-  let freeTrialEndsAt = addRelTime now (days 30)
-  let config = (defaultSubscriptionConfig alice bob expiresAt) with
-        prepayWindow = days 14
-  
-  proposalCid <- createSubscriberProposal processor alice dso config
-  
-  approvedProposalCid <- submit processor do
-    exerciseCmd proposalCid SubscriberSubscriptionProposal_ProcessorApprove
-  
-  result <- submit bob do
-    exerciseCmd approvedProposalCid ProcessorApprovedSubscriptionProposal_RecipientAccept with
-      recipientProvider = bob
-  paidSubscriptionCid <- case result.subscription of
-    Right cid -> pure cid
-    Left _ -> error "Expected PaidSubscription, got FreeTrialSubscription"
-  
-  -- Recipient starts free trial
-  freeTrialCid <- submit bob do
-    exerciseCmd paidSubscriptionCid PaidSubscription_RecipientStartFreeTrial with
-      trialEndsAt = freeTrialEndsAt
-  
-  -- Recipient decreases prepay window during free trial
-  updatedCid <- submit bob do
-    exerciseCmd freeTrialCid FreeTrialSubscription_RecipientDecreasePrepayWindow with
-      newPrepayWindow = days 7
-  
-  Some updated <- queryContractId alice updatedCid
-  assertMsg "Prepay window should decrease during free trial" (updated.config.prepayWindow == days 7)
-  
-  pure ()
