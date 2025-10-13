@@ -308,11 +308,15 @@ updatedActiveSubscriptionCid <- submit processor, subscriber do
 
 ### Cancellation with Prepaid Time
 
-When any party cancels an `ActiveSubscription` with `processedUntil > now`, canceling sets `paymentsEndAt` to now which transitions the subscription to PrepaidCanceled state. The recipient then has several options:
+When any party cancels an `ActiveSubscription` with `processedUntil > now`, they can either:
+- **Honor prepaid period**: Sets `paymentsEndAt` to now (by passing `disregardAvailablePaidPeriod = False`), transitioning to PrepaidCanceled state
+- **Immediately archive** (subscriber only): Subscriber can pass `disregardAvailablePaidPeriod = True` to forgo the prepaid period and archive immediately
+
+If the subscription transitions to PrepaidCanceled state, the recipient has several options:
 
 **Option 1: Honor Prepaid Period**
 - Subscriber retains access until `processedUntil`
-- Any party archives once `processedUntil` passes using `ActiveSubscription_Archive`
+- Any party archives once `processedUntil` passes using `ActiveSubscription_ArchiveInactiveSubscription`
 - Common for content services (e.g., streaming platforms)
 
 **Option 2: Refund and Archive Immediately**  

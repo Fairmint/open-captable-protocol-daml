@@ -1,12 +1,15 @@
 module Fairmint.Subscriptions.Types.SubscriptionHelpers where
 
-import DA.Time (Time, RelTime, addRelTime, days)
+import DA.Time (RelTime, addRelTime, subTime, days)
 import DA.Optional (isSome)
 import Splice.Amulet qualified as Amulet
 import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
+import Splice.Round qualified as Round
+import Splice.Round (OpenMiningRound_Fetch(..))
 import Fairmint.Subscriptions.Types.Subscription (Subscription)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount, calculateAmountForPeriod)
 import Fairmint.Subscriptions.Types.Approvals (Approvals(..))
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
 
 -- | Validates that trial ends before or at payments end
@@ -72,7 +75,9 @@ createRecipientActivityMarker : Optional (ContractId Amulet.FeaturedAppRight) ->
 createRecipientActivityMarker recipientFAR recipientProvider =
   case recipientFAR of
     Some farCid -> case recipientProvider of
-      Some provider -> createActivityMarker provider farCid
+      Some provider -> do
+        let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+        createActivityMarker provider farApiCid
       None -> pure ()
     None -> pure ()
 
@@ -80,12 +85,15 @@ createRecipientActivityMarker recipientFAR recipientProvider =
 createProcessorActivityMarker : Optional (ContractId Amulet.FeaturedAppRight) -> Party -> Update ()
 createProcessorActivityMarker processorFAR processorProvider =
   case processorFAR of
-    Some farCid -> createActivityMarker processorProvider farCid
+    Some farCid -> do
+      let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+      createActivityMarker processorProvider farApiCid
     None -> pure ()
 
 -- | Asserts that payments haven't ended
-assertPaymentsNotEnded : Optional Time -> Time -> Update ()
-assertPaymentsNotEnded paymentsEndAt now =
+assertPaymentsNotEnded : Optional Time -> Update ()
+assertPaymentsNotEnded paymentsEndAt = do
+  now <- getTime
   case paymentsEndAt of
     Some end -> assertMsg "Cannot process after payments end" (now <= end)
     None -> pure ()
@@ -122,10 +130,16 @@ assertPeriodHasElapsed now processedAndPaidUntil =
     (now > processedAndPaidUntil)
 
 -- | Assert that party is authorized for subscription actions
-assertIsSubscriptionParty : Party -> Party -> Party -> Party -> Update ()
-assertIsSubscriptionParty party subscriber recipient processor =
+assertIsPartyToSubscription : Party -> Subscription -> ProcessorContext -> Update ()
+assertIsPartyToSubscription party subscription context =
   assertMsg "Only subscriber, recipient, or processor can perform this action" 
-    (party == subscriber || party == recipient || party == processor)
+    (party == subscription.subscriber || party == subscription.recipient || party == context.processor)
+
+-- | Assert that only subscriber can disregard available paid period
+assertOnlySubscriberCanDisregardPaidPeriod : Bool -> Party -> Party -> Update ()
+assertOnlySubscriberCanDisregardPaidPeriod disregard actor subscriber =
+  assertMsg "Only subscriber can set disregardAvailablePaidPeriod to true"
+    (not disregard || actor == subscriber)
 
 -- | Assert that amulet inputs are provided
 assertHasAmuletInputs : [a] -> Update ()
@@ -137,20 +151,42 @@ assertValidAmuletPrice : Decimal -> Update ()
 assertValidAmuletPrice price =
   assertMsg "USD to Amulet conversion rate must be positive" (price > 0.0)
 
+-- | Fetch and validate amulet price from open mining round
+fetchAndValidateAmuletPrice : ContractId Round.OpenMiningRound -> Party -> Update Decimal
+fetchAndValidateAmuletPrice openMiningRoundCid actor = do
+  openRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = actor)
+  let amuletPrice = openRound.amuletPrice
+  assertValidAmuletPrice amuletPrice
+  pure amuletPrice
+
 -- | Assert that subscription is in PrepaidCanceled state and ready to archive
 assertCanArchivePrepaidCanceled : Time -> Time -> Update ()
 assertCanArchivePrepaidCanceled processedAndPaidUntil now =
   assertMsg "Cannot archive PrepaidCanceled until processed period (processedAndPaidUntil) has passed" 
     (now > processedAndPaidUntil)
 
--- | Assert that we're in PrepaidCanceled state for refund
-assertInPrepaidCanceledForRefund : Optional Time -> Time -> Time -> Update ()
-assertInPrepaidCanceledForRefund paymentsEndAt processedAndPaidUntil now = do
+-- | Assert that subscription payments have ended and paid period has passed
+assertPaymentsEndedAndPaidPeriodPassed : Optional Time -> Time -> Update ()
+assertPaymentsEndedAndPaidPeriodPassed paymentsEndAt processedAndPaidUntil = do
+  now <- getTime
   case paymentsEndAt of
-    Some end -> assertMsg "Can only refund in PrepaidCanceled state (paymentsEndAt <= now)" (end <= now)
+    Some end -> assertMsg "Payments must have ended (paymentsEndAt <= now)" (end <= now)
+    None -> abort "Subscription has no payments end date"
+  assertMsg "Paid period must have passed (now > processedAndPaidUntil)" (processedAndPaidUntil < now)
+
+-- | Assert that payments have ended (subscription is canceled/expired)
+assertPaymentsHaveEnded : Optional Time -> Update ()
+assertPaymentsHaveEnded paymentsEndAt = do
+  now <- getTime
+  case paymentsEndAt of
+    Some end -> assertMsg "Can only refund when payments have ended (paymentsEndAt <= now)" (end <= now)
     None -> abort "Cannot refund: subscription has no payments end date"
-  assertMsg "Can only refund in PrepaidCanceled state (processedAndPaidUntil >= now)" (processedAndPaidUntil >= now)
-  assertMsg "No processed time remaining - use Archive instead" (processedAndPaidUntil > now)
+
+-- | Assert that there is prepaid time remaining to refund
+assertHasPrepaidTimeRemaining : Time -> Update ()
+assertHasPrepaidTimeRemaining processedAndPaidUntil = do
+  now <- getTime
+  assertMsg "No prepaid time remaining - use Archive instead" (processedAndPaidUntil > now)
 
 -- | Calculate the new trialEndsAt after processing (clears if trial ended)
 clearTrialIfEnded : Time -> Time -> Optional Time -> Optional Time
@@ -186,6 +222,13 @@ calculateRefundAmount recipientPaymentPerDay processorPaymentPerDay unusedPeriod
       processorRefund = calculateProcessorFee processorPaymentPerDay unusedPeriod amuletPrice
   in recipientRefund + processorRefund
 
+-- | Calculate refund amount for prepaid period
+calculateRefundForPrepaidPeriod : Time -> Subscription -> Decimal -> Update Decimal
+calculateRefundForPrepaidPeriod processedAndPaidUntil subscription amuletPrice = do
+  now <- getTime
+  let unusedPeriod = subTime processedAndPaidUntil now
+  pure $ calculateRefundAmount subscription.recipientPaymentPerDay subscription.processorPaymentPerDay unusedPeriod amuletPrice
+
 -- | Create initial approvals for a proposal (only proposer approved)
 createInitialApprovals : Party -> Party -> Party -> Party -> Approvals
 createInitialApprovals proposer subscriber recipient processor =
@@ -205,7 +248,7 @@ assertCanArchiveExpired paymentsEndAt processedAndPaidUntil now =
 -- | Validate common processing prerequisites (payments not ended, period elapsed)
 validateProcessingPrerequisites : Optional Time -> Time -> Time -> Update ()
 validateProcessingPrerequisites paymentsEndAt processedAndPaidUntil now = do
-  assertPaymentsNotEnded paymentsEndAt now
+  assertPaymentsNotEnded paymentsEndAt
   assertPeriodHasElapsed now processedAndPaidUntil
 
 -- | Create activity markers for both recipient and processor
