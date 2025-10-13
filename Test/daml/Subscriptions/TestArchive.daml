@@ -1,7 +1,14 @@
 module Subscriptions.TestArchive where
 
 import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.List (head)
+import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
 
 -- | Test SubscriptionFactory Archive choice
@@ -105,5 +112,87 @@ testProcessorApprovedRecipientInitiatedProposalArchive = script do
   
   submitMulti [bob, processor] [alice] do
     archiveCmd approvedProposalCid
+  
+  pure ()
+
+-- | Test ActiveSubscription_ArchiveInactiveSubscription with prepaid time
+-- After processing a payment and canceling, wait for prepaid time to pass and archive
+testArchiveInactiveSubscriptionWithPrepaidTime : Script ()
+testArchiveInactiveSubscriptionWithPrepaidTime = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create and approve subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Alice creates amulet for payment
+  amuletCid <- tapWithDso dso alice 100.0
+  
+  -- Get payment context
+  openRounds <- query @OpenMiningRound dso
+  now <- getTime
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  amuletRulesCid <- getAmuletRules dso
+  
+  -- Wait for processing period to elapse
+  now2 <- getTime
+  setTime (addRelTime now2 (days 31))
+  
+  -- Get disclosures
+  Some amuletDisclosure <- queryDisclosure alice amuletCid
+  Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
+  Some openRoundDisclosure <- queryDisclosure dso openRoundCid
+  
+  -- Process payment to create prepaid time
+  paymentResult <- submitWithDisclosures processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 30
+        recipientProvider = Some bob
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+      paymentContext = PaymentContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  let updatedSubscriptionCid = paymentResult.subscriptionCid
+  
+  -- Cancel the subscription
+  maybeCanceledCid <- submit alice do
+    exerciseCmd updatedSubscriptionCid ActiveSubscription_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = False
+      description = Some "Canceling subscription"
+  
+  canceledCid <- case maybeCanceledCid of
+    Some cid -> pure cid
+    None -> error "Expected canceled subscription with prepaid time"
+  
+  -- Wait for prepaid time to pass
+  now3 <- getTime
+  setTime (addRelTime now3 (days 31))
+  
+  -- Archive the inactive subscription using the custom choice
+  submit alice do
+    exerciseCmd canceledCid ActiveSubscription_ArchiveInactiveSubscription with
+      actor = alice
   
   pure ()

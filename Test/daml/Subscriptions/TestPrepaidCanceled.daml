@@ -1,8 +1,14 @@
 module Subscriptions.TestPrepaidCanceled where
 
 import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.List (head)
+import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.ProposedSubscription
 import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
 
 -- | Test standard archive of subscription with prepaid time after cancellation
@@ -93,11 +99,12 @@ testCanceledSubscriptionArchiveChoice = script do
   pure ()
 
 -- | Test recipient refund during canceled state
--- TODO: This test needs actual payment processing and refund logic
+-- Tests the full flow: payment → cancel → refund → archive
 testCanceledSubscriptionRecipientRefundAndArchive : Script ()
 testCanceledSubscriptionRecipientRefundAndArchive = script do
   TestParties{..} <- allocateTestParties
   
+  -- Create and approve subscription
   expiresAt <- getExpirationTime 365
   let proposal = defaultSubscriptionProposal alice bob expiresAt
   proposalCid <- createSubscriberProposal processor alice dso proposal
@@ -116,25 +123,73 @@ testCanceledSubscriptionRecipientRefundAndArchive = script do
     Right cid -> pure cid
     Left _ -> error "Expected subscription to be created"
   
-  -- TODO: This test would need to:
-  -- 1. Process a payment to create prepaid time
-  -- 2. Cancel the subscription (returns Some with prepaid time)
-  -- 3. Recipient issues refund using ActiveSubscription_Refund
-  -- 4. Verify refund completed and contract archived
+  -- Alice creates amulet for payment
+  amuletCid <- tapWithDso dso alice 100.0
   
-  -- For now, just demonstrate the cancel flow
-  maybeUpdatedCid <- submit alice do
-    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+  -- Get payment context
+  openRounds <- query @OpenMiningRound dso
+  now <- getTime
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  amuletRulesCid <- getAmuletRules dso
+  
+  -- Wait for processing period to elapse
+  now2 <- getTime
+  setTime (addRelTime now2 (days 31))
+  
+  -- Get disclosures for payment processing
+  Some amuletDisclosure <- queryDisclosure alice amuletCid
+  Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
+  Some openRoundDisclosure <- queryDisclosure dso openRoundCid
+  
+  -- Process payment to create prepaid time
+  paymentResult <- submitWithDisclosures processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
+      processingContext = ProcessingContext with
+        processorProvider = processor
+        processingPeriod = days 30
+        recipientProvider = Some bob
+        recipientFeaturedAppRight = None
+        processorFeaturedAppRight = None
+      paymentContext = PaymentContext with
+        amuletInputs = [amuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  let updatedSubscriptionCid = paymentResult.subscriptionCid
+  
+  -- Cancel the subscription
+  maybeCanceledCid <- submit alice do
+    exerciseCmd updatedSubscriptionCid ActiveSubscription_Cancel with
       actor = alice
       disregardAvailablePaidPeriod = False
-      description = None
+      description = Some "Canceling to test refund"
   
-  case maybeUpdatedCid of
-    None -> pure ()  -- No prepaid time case
-    Some canceledCid -> do
-      -- Would call ActiveSubscription_Refund here with payment context
-      -- The refund would archive the subscription
-      pure ()
+  canceledCid <- case maybeCanceledCid of
+    Some cid -> pure cid
+    None -> error "Expected canceled subscription with prepaid time"
+  
+  -- Bob (recipient) creates amulet for refund
+  bobAmuletCid <- tapWithDso dso bob 100.0
+  
+  -- Get fresh disclosures for refund
+  Some bobAmuletDisclosure <- queryDisclosure bob bobAmuletCid
+  Some amuletRulesDisclosure2 <- queryDisclosure dso amuletRulesCid
+  Some openRoundDisclosure2 <- queryDisclosure dso openRoundCid
+  
+  -- Recipient issues refund and archives the subscription
+  transferResult <- submitWithDisclosures bob [bobAmuletDisclosure, amuletRulesDisclosure2, openRoundDisclosure2] do
+    exerciseCmd canceledCid ActiveSubscription_Refund with
+      paymentContext = PaymentContext with
+        amuletInputs = [bobAmuletCid]
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientFeaturedAppRight = None
+  
+  -- Verify the subscription was archived after refund
+  canceledExists <- queryContractId alice canceledCid
+  assertMsg "Subscription should be archived after refund" (canceledExists == None)
   
   pure ()
 
