@@ -5,17 +5,17 @@ import DA.Time (subTime, addRelTime)
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules_Transfer(..), TransferResult(..))
 import Splice.Round()
-import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubscription, activeSubscriptionSignatories)
+import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubscription)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod)
 import Fairmint.Subscriptions.Types.SubscriptionHelpers (validateTrialEndsBeforePaymentsEnd, calculateNewProcessedAndPaidUntil, assertInFreeTrialAndNotEnded, assertNotInFreeTrial, assertIsPartyToSubscription, assertOnlySubscriberCanDisregardPaidPeriod, assertHasAmuletInputs, fetchAndValidateAmuletPrice, assertPaymentsNotEnded, assertPaymentsEndedAndPaidPeriodPassed, assertPaymentsHaveEnded, assertHasPrepaidTimeRemaining, clearTrialIfEnded, calculateProcessorFee, calculateRefundForPrepaidPeriod, createInitialApprovals, validateProcessingPrerequisites, resolveRecipientProvider, createActivityMarkers)
 import Fairmint.Subscriptions.Types.PaymentHelpers (payRecipient, payProcessorFee, createTransferAndContext)
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
-import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToSubscription, applyChangesToProcessorContext)
+import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToSubscriptionUpdate, applyChangesToProcessorContext)
 import Fairmint.Subscriptions.Types.SubscriptionTime (resolveOptionalSubscriptionTime, assertOptionalTimeIsNoneOrInFuture)
 import Fairmint.Subscriptions.Types.PaymentResult (ProcessPaymentResult(..))
-import Fairmint.Subscriptions.Types.Approvals (assertIsPartyToActiveSubscription, Approvals(..), changeProposalSignatories, changeProposalObservers)
+import Fairmint.Subscriptions.Types.Approvals (assertIsPartyToActiveSubscription, Approvals(..), changeProposalSignatories, changeProposalObservers, addApprovalForActiveSubscriptionAndAssertChanged, areAllApproved)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 
 -- | Active subscription contract
@@ -39,7 +39,7 @@ template ActiveSubscription
     processedAndPaidUntil : Time
       -- ^ Subscription has been processed through this time (both payments and free trial)
   where
-    signatory activeSubscriptionSignatories subscription processorContext
+    signatory [subscription.subscriber, subscription.recipient, processorContext.processor]
     observer subscription.observers
     
     ensure
@@ -128,21 +128,25 @@ template ActiveSubscription
     -- | Propose changes to the subscription
     -- Always creates a SubscriptionChangeProposal for tracking approvals
     -- Creating the proposal directly from ActiveSubscription ensures we have all three signatories
-    -- Application can check impactedParties and auto-apply if only proposer is impacted
     nonconsuming choice ActiveSubscription_ProposeChanges : ContractId SubscriptionChangeProposal
       with
-        proposer : Party
-        changes : SubscriptionChanges
-      controller proposer
+        actor : Party
+        subscriptionChanges : SubscriptionChanges
+        description : Optional Text
+      controller actor
       do
-        assertIsPartyToActiveSubscription proposer subscription processorContext
-        assertChangeValuesValidAndNonEmpty changes
+        assertIsPartyToActiveSubscription actor subscription processorContext
+        assertChangeValuesValidAndNonEmpty subscriptionChanges
+        assertValidOptionalText description
         
-        let impactedParties = getImpactedPartiesForSubscription changes subscription processorContext
-        let approvals = createInitialApprovals proposer subscription.subscriber subscription.recipient processorContext.processor
-        let originalSubscription = subscription
+        let impactedParties = getImpactedPartiesForSubscription subscriptionChanges subscription processorContext
+        let approvals = createInitialApprovals actor subscription.subscriber subscription.recipient processorContext.processor impactedParties
         
-        create SubscriptionChangeProposal with ..
+        create SubscriptionChangeProposal with
+          subscriptionChanges
+          subscription
+          processorContext
+          approvals
 
     -- | Cancel subscription
     -- Sets paymentsEndAt to max(trialEndsAt, now) to transition to Canceled state if processedAndPaidUntil >= now
@@ -216,55 +220,29 @@ template ActiveSubscription
 -- applied to the active subscription.
 template SubscriptionChangeProposal
   with
-    proposer : Party
-      -- ^ Party who proposed the changes
-    changes : SubscriptionChanges
-      -- ^ Proposed changes
-    originalSubscription : Subscription
-      -- ^ Original subscription (for validation when applying, includes trialEndsAt)
+    subscription : Subscription
+      -- ^ Original subscription (for validation when applying)
     processorContext : ProcessorContext
-      -- ^ Processor and DSO context
+      -- ^ Original processor and DSO context (may be changing)
+    subscriptionChanges : SubscriptionChanges
+      -- ^ Proposed changes
     approvals : Approvals
       -- ^ Tracking which parties have approved
-    impactedParties : Set Party
-      -- ^ Parties that are impacted by these changes
   where
-    signatory changeProposalSignatories processorContext originalSubscription approvals
-    observer changeProposalObservers originalSubscription approvals impactedParties
+    signatory [subscription.subscriber, subscription.recipient, processorContext.processor]
     
-    ensure validateChangeValues changes
+    ensure validateChangeValues subscriptionChanges
 
-    -- | Any impacted party approves the changes
-    -- Handles approvals from both current parties and new parties (when roles are changing)
+    -- | Any party to the subscription approves the changes
     choice SubscriptionChangeProposal_Approve : ContractId SubscriptionChangeProposal
       with
         actor : Party
       controller actor
       do
-        -- Validate actor is impacted
-        assertMsg "Only impacted parties can approve" (member actor impactedParties)
+        assertIsPartyToActiveSubscription actor subscription processorContext
         
-        -- Determine if actor is approving as current party or new party in a role
-        let isCurrentSubscriber = actor == originalSubscription.subscriber
-        let isNewSubscriber = case changes.subscriber of
-              Some newSub -> actor == newSub
-              None -> False
-        let isCurrentRecipient = actor == originalSubscription.recipient
-        let isNewRecipient = case changes.recipient of
-              Some newRec -> actor == newRec
-              None -> False
-        let isCurrentProcessor = actor == processorContext.processor
-        let isNewProcessor = case changes.processor of
-              Some newProc -> actor == newProc
-              None -> False
-        
-        -- Add approval (actor can approve if they are current OR new party in a role)
-        let newApprovals = Approvals with
-              subscriberApproved = approvals.subscriberApproved || isCurrentSubscriber || isNewSubscriber
-              recipientApproved = approvals.recipientApproved || isCurrentRecipient || isNewRecipient
-              processorApproved = approvals.processorApproved || isCurrentProcessor || isNewProcessor
-        
-        assertMsg "Actor has already approved" (newApprovals /= approvals)
+        -- Add approval and assert they haven't already approved
+        newApprovals <- addApprovalForActiveSubscriptionAndAssertChanged approvals actor subscription processorContext
         
         create this with approvals = newApprovals
 
@@ -280,74 +258,20 @@ template SubscriptionChangeProposal
         activeSubscription <- fetch activeSubscriptionCid
         now <- getTime
         
-        -- Validate all impacted parties have approved
-        -- For party changes, both old and new party must have approved
-        -- (They both show up in impactedParties, but we track approval by role not by party identity)
-        let subscriberRoleImpacted = 
-              member originalSubscription.subscriber impactedParties ||
-              (case changes.subscriber of Some newSub -> member newSub impactedParties; None -> False)
-        let recipientRoleImpacted = 
-              member originalSubscription.recipient impactedParties ||
-              (case changes.recipient of Some newRec -> member newRec impactedParties; None -> False)
-        let processorRoleImpacted = 
-              member processorContext.processor impactedParties ||
-              (case changes.processor of Some newProc -> member newProc impactedParties; None -> False)
-        
-        let allApproved = 
-              (not subscriberRoleImpacted || approvals.subscriberApproved) &&
-              (not recipientRoleImpacted || approvals.recipientApproved) &&
-              (not processorRoleImpacted || approvals.processorApproved)
-        assertMsg "All impacted parties must approve before applying changes" allApproved
+        -- Validate all parties have approved
+        assertMsg "All parties must approve before applying changes" (areAllApproved approvals)
         
         -- Validate original state matches (excluding processedAndPaidUntil which can change)
         assertMsg "Subscription has changed - proposal is stale" 
-          (activeSubscription.subscription == originalSubscription)
+          (activeSubscription.subscription == subscription)
         assertMsg "Processor context has changed - proposal is stale" 
           (activeSubscription.processorContext == processorContext)
         
-        -- Resolve SubscriptionTime values to absolute Time
-        resolvedPaymentsEndAt <- case changes.paymentsEndAt of
-          Some optTime -> do
-            resolved <- resolveOptionalSubscriptionTime optTime
-            assertOptionalTimeIsNoneOrInFuture resolved
-            pure resolved
-          None -> pure originalSubscription.paymentsEndAt
+        -- Apply changes to subscription and calculate new processedAndPaidUntil
+        (updatedSubscription, newProcessedAndPaidUntil) <- 
+          applyChangesToSubscriptionUpdate subscriptionChanges subscription activeSubscription.processedAndPaidUntil
         
-        resolvedTrialEndsAt <- case changes.trialEndsAt of
-          Some optTime -> do
-            resolved <- resolveOptionalSubscriptionTime optTime
-            assertOptionalTimeIsNoneOrInFuture resolved
-            pure resolved
-          None -> pure originalSubscription.trialEndsAt
-        
-        -- Apply changes to subscription and processor context
-        let baseSubscription = applyChangesToSubscription changes originalSubscription
-        let updatedSubscription = baseSubscription with
-              paymentsEndAt = resolvedPaymentsEndAt
-              trialEndsAt = resolvedTrialEndsAt
-        
-        let newProcessorContext = applyChangesToProcessorContext changes processorContext
-        
-        -- Calculate new processedAndPaidUntil (trial extension + adjustment)
-        -- Step 1: Handle free trial extension if applicable
-        let afterTrialAdjustment = case (resolvedTrialEndsAt, originalSubscription.trialEndsAt) of
-              -- Granting or extending trial: calculate trial duration and extend prepaid time
-              (Some newTrialEnd, optOldTrialEnd) ->
-                let oldTrialEnd = case optOldTrialEnd of
-                      Some t -> t
-                      None -> now  -- No previous trial, so trial starts now
-                    -- Calculate the net extension (new trial end - old trial end)
-                    trialExtension = subTime newTrialEnd oldTrialEnd
-                in if activeSubscription.processedAndPaidUntil > now && trialExtension > subTime now now
-                   then addRelTime activeSubscription.processedAndPaidUntil trialExtension
-                   else activeSubscription.processedAndPaidUntil
-              -- Not changing trial or removing trial: keep existing processedAndPaidUntil
-              _ -> activeSubscription.processedAndPaidUntil
-        
-        -- Step 2: Apply explicit processedAndPaidUntil adjustment if specified
-        let newProcessedAndPaidUntil = case changes.processedAndPaidUntilAdjustment of
-              Some adjustment -> addRelTime afterTrialAdjustment adjustment
-              None -> afterTrialAdjustment
+        let newProcessorContext = applyChangesToProcessorContext subscriptionChanges processorContext
         
         -- Create updated subscription
         archive activeSubscriptionCid
@@ -356,20 +280,14 @@ template SubscriptionChangeProposal
           processorContext = newProcessorContext
           processedAndPaidUntil = newProcessedAndPaidUntil
 
-    -- | Proposer withdraws the change proposal
-    choice SubscriptionChangeProposal_Withdraw : ()
-      with
-        description : Optional Text
-      controller proposer
-      do
-        pure ()
-
-    -- | Any impacted party rejects the change proposal
+    -- | Any party in the subscription rejects the change proposal
     choice SubscriptionChangeProposal_Reject : ()
       with
-        rejecter : Party
+        actor : Party
         description : Optional Text
-      controller rejecter
+      controller actor
       do
-        assertMsg "Only impacted parties can reject" (member rejecter impactedParties)
+        assertIsPartyToActiveSubscription actor subscription processorContext
+        assertValidOptionalText description
+
         pure ()

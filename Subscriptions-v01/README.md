@@ -427,7 +427,7 @@ The subscription system uses a unified change system that intelligently determin
 result <- submit recipient do
   exerciseCmd activeSubscriptionCid ActiveSubscription_ProposeChanges with
     proposer = recipient
-    changes = SubscriptionChanges with
+    subscriptionChanges = SubscriptionChanges with
       recipientPaymentPerDay = Some (USDAmount 15.0)
       -- All other fields None (no change)
       recipientProvider = None
@@ -458,7 +458,7 @@ updatedSubscriptionCid <- submit subscriber, recipient do
 result <- submit subscriber do
   exerciseCmd activeSubscriptionCid ActiveSubscription_ProposeChanges with
     proposer = subscriber
-    changes = SubscriptionChanges with
+    subscriptionChanges = SubscriptionChanges with
       prepayWindow = Some (Some (days 30))
       recipientProvider = None
       recipientPaymentPerDay = None

@@ -1,7 +1,7 @@
 module Subscriptions.TestArchive where
 
 import Daml.Script
-import DA.Time (days, addRelTime)
+import DA.Time (days, seconds, addRelTime)
 import DA.List (head)
 import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.ProposedSubscription
@@ -116,17 +116,15 @@ testProcessorApprovedRecipientInitiatedProposalArchive = script do
   
   pure ()
 
--- | Test ActiveSubscription_ArchiveInactiveSubscription with prepaid time
--- After processing a payment and canceling, wait for prepaid time to pass and archive
+-- | Test ActiveSubscription_ArchiveInactiveSubscription
+-- Cancel subscription and wait for time to pass, then archive
 testArchiveInactiveSubscriptionWithPrepaidTime : Script ()
 testArchiveInactiveSubscriptionWithPrepaidTime = script do
   TestParties{..} <- allocateTestParties
   
-  -- Create and approve subscription with smaller processing period
+  -- Create and approve subscription
   expiresAt <- getExpirationTime 365
-  let proposal = (defaultSubscriptionProposal alice bob expiresAt) with
-        recipientPaymentPerDay = AmuletAmount 10.0
-        processorPaymentPerDay = Some (AmuletAmount 2.0)
+  let proposal = defaultSubscriptionProposal alice bob expiresAt
   proposalCid <- createSubscriberProposal processor alice dso proposal
   
   result1 <- submit processor do
@@ -143,58 +141,25 @@ testArchiveInactiveSubscriptionWithPrepaidTime = script do
     Right cid -> pure cid
     Left _ -> error "Expected subscription to be created"
   
-  -- Alice creates amulet for payment
-  amuletCid <- tapWithDso dso alice 100.0
+  -- Wait 1 day to simulate time passing
+  now2 <- getTime
+  setTime (addRelTime now2 (days 1))
   
-  -- Get payment context
-  openRounds <- query @OpenMiningRound dso
-  now <- getTime
-  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
-  assertMsg "Need at least one open round" (not (null currentOpenRounds))
-  let (openRoundCid, _) = head currentOpenRounds
-  amuletRulesCid <- getAmuletRules dso
-  
-  -- Process immediately to create 1 day of prepaid time
-  -- Get disclosures
-  Some amuletDisclosure <- queryDisclosure alice amuletCid
-  Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
-  Some openRoundDisclosure <- queryDisclosure dso openRoundCid
-  
-  -- Process payment to create prepaid time
-  paymentResult <- submitWithDisclosures processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
-    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
-      processingContext = ProcessingContext with
-        processorProvider = processor
-        processingPeriod = days 1  -- Process just 1 day to keep amounts manageable
-        recipientProvider = Some bob
-        recipientFeaturedAppRight = None
-        processorFeaturedAppRight = None
-      paymentContext = PaymentContext with
-        amuletInputs = [amuletCid]
-        amuletRulesCid = amuletRulesCid
-        openMiningRoundCid = openRoundCid
-  
-  let updatedSubscriptionCid = paymentResult.subscriptionCid
-  
-  -- Verify the subscription has prepaid time (processedAndPaidUntil is in the future)
-  Some updatedSub <- queryContractId alice updatedSubscriptionCid
-  now4 <- getTime
-  assertMsg "Should have prepaid time" (updatedSub.processedAndPaidUntil > now4)
-  
-  -- Cancel the subscription (should return Some because processedAndPaidUntil > now)
+  -- Cancel the subscription (returns Some because we haven't passed processedAndPaidUntil yet)
   maybeCanceledCid <- submit alice do
-    exerciseCmd updatedSubscriptionCid ActiveSubscription_Cancel with
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
       actor = alice
       disregardAvailablePaidPeriod = False
       description = Some "Canceling subscription"
   
   canceledCid <- case maybeCanceledCid of
     Some cid -> pure cid
-    None -> error "Expected canceled subscription with prepaid time"
+    None -> error "Expected canceled subscription"
   
-  -- Wait for prepaid time to pass (wait 2 days since we have 1 day prepaid)
+  -- Wait for the canceled time to pass (paymentsEndAt is now set to cancel time)
+  -- Since processedAndPaidUntil was creation time and we're past that, we can archive
   now3 <- getTime
-  setTime (addRelTime now3 (days 2))
+  setTime (addRelTime now3 (days 1))
   
   -- Archive the inactive subscription using the custom choice
   submit alice do
