@@ -164,14 +164,22 @@ assertChangeValuesValidAndNonEmpty changes = do
   
   assertMsg "Changes must specify at least one field to modify" hasChange
 
+-- | Data type needed to apply changes (avoiding circular dependency)
+data ActiveSubscriptionData = ActiveSubscriptionData
+  with
+    subscription : Subscription
+    processorContext : ProcessorContext
+    processedAndPaidUntil : Time
+  deriving (Eq, Show)
+
 -- | Apply changes to subscription in the Update monad
 -- This function handles:
 -- - Resolving SubscriptionTime values to absolute Time
 -- - Applying all subscription field changes
 -- - Calculating new processedAndPaidUntil with trial extension logic
 -- - Applying processedAndPaidUntilAdjustment
-applyChangesToSubscription : SubscriptionChanges -> ActiveSubscription -> Update (Subscription, Time)
-applyChangesToSubscription changes activeSubscription = do
+applyChangesToSubscription : SubscriptionChanges -> ActiveSubscriptionData -> Update (Subscription, Time)
+applyChangesToSubscription changes activeSubscriptionData = do
   now <- getTime
   
   -- Resolve SubscriptionTime values to absolute Time
@@ -180,30 +188,30 @@ applyChangesToSubscription changes activeSubscription = do
       resolved <- resolveOptionalSubscriptionTime optTime
       assertOptionalTimeIsNoneOrInFuture resolved
       pure resolved
-    None -> pure activeSubscription.subscription.paymentsEndAt
+    None -> pure activeSubscriptionData.subscription.paymentsEndAt
   
   resolvedTrialEndsAt <- case changes.trialEndsAt of
     Some optTime -> do
       resolved <- resolveOptionalSubscriptionTime optTime
       assertOptionalTimeIsNoneOrInFuture resolved
       pure resolved
-    None -> pure activeSubscription.subscription.trialEndsAt
+    None -> pure activeSubscriptionData.subscription.trialEndsAt
   
   -- Apply base subscription changes
-  let baseSubscription = activeSubscription.subscription with
-        recipientProvider = optional activeSubscription.subscription.recipientProvider Some changes.recipientProvider
-        recipientPaymentPerDay = optional activeSubscription.subscription.recipientPaymentPerDay identity changes.recipientPaymentPerDay
-        processorPaymentPerDay = optional activeSubscription.subscription.processorPaymentPerDay identity changes.processorPaymentPerDay
-        prepayWindow = optional activeSubscription.subscription.prepayWindow identity changes.prepayWindow
-        description = optional activeSubscription.subscription.description identity changes.description
-        metadata = optional activeSubscription.subscription.metadata identity changes.metadata
-        observers = optional activeSubscription.subscription.observers identity changes.observers
+  let baseSubscription = activeSubscriptionData.subscription with
+        recipientProvider = optional activeSubscriptionData.subscription.recipientProvider Some changes.recipientProvider
+        recipientPaymentPerDay = optional activeSubscriptionData.subscription.recipientPaymentPerDay identity changes.recipientPaymentPerDay
+        processorPaymentPerDay = optional activeSubscriptionData.subscription.processorPaymentPerDay identity changes.processorPaymentPerDay
+        prepayWindow = optional activeSubscriptionData.subscription.prepayWindow identity changes.prepayWindow
+        description = optional activeSubscriptionData.subscription.description identity changes.description
+        metadata = optional activeSubscriptionData.subscription.metadata identity changes.metadata
+        observers = optional activeSubscriptionData.subscription.observers identity changes.observers
         paymentsEndAt = resolvedPaymentsEndAt
         trialEndsAt = resolvedTrialEndsAt
   
   -- Calculate new processedAndPaidUntil (trial extension + adjustment)
   -- Step 1: Handle free trial extension if applicable
-  let afterTrialAdjustment = case (resolvedTrialEndsAt, subscription.trialEndsAt) of
+  let afterTrialAdjustment = case (resolvedTrialEndsAt, activeSubscriptionData.subscription.trialEndsAt) of
         -- Granting or extending trial: calculate trial duration and extend prepaid time
         (Some newTrialEnd, optOldTrialEnd) ->
           let oldTrialEnd = case optOldTrialEnd of
@@ -211,11 +219,11 @@ applyChangesToSubscription changes activeSubscription = do
                 None -> now  -- No previous trial, so trial starts now
               -- Calculate the net extension (new trial end - old trial end)
               trialExtension = subTime newTrialEnd oldTrialEnd
-          in if currentProcessedAndPaidUntil > now && trialExtension > subTime now now
-             then addRelTime currentProcessedAndPaidUntil trialExtension
-             else currentProcessedAndPaidUntil
+          in if activeSubscriptionData.processedAndPaidUntil > now && trialExtension > subTime now now
+             then addRelTime activeSubscriptionData.processedAndPaidUntil trialExtension
+             else activeSubscriptionData.processedAndPaidUntil
         -- Not changing trial or removing trial: keep existing processedAndPaidUntil
-        _ -> currentProcessedAndPaidUntil
+        _ -> activeSubscriptionData.processedAndPaidUntil
   
   -- Step 2: Apply explicit processedAndPaidUntil adjustment if specified
   let newProcessedAndPaidUntil = case changes.processedAndPaidUntilAdjustment of
@@ -223,106 +231,3 @@ applyChangesToSubscription changes activeSubscription = do
         None -> afterTrialAdjustment
   
   pure (baseSubscription, newProcessedAndPaidUntil)
-
-{-
-## Handling Prepaid Time When Granting Free Trials
-
-### The Challenge
-
-When a subscriber has already paid for future service (processedAndPaidUntil > now) and receives 
-a free trial, we must account for the overlap to avoid losing their prepaid value.
-
-### Example Scenario
-
-Current state:
-- Current time (now): Jan 1
-- processedAndPaidUntil: Feb 1 (subscriber paid for all of January)
-- New free trial granted: 1 week (7 days)
-
-Expected behavior:
-- User should not pay during the trial week
-- User should retain the value they already paid for
-- After trial ends, user should have 3 weeks of prepaid time remaining
-
-### Solution: Extend processedAndPaidUntil
-
-When granting a free trial with `trialEndsAt` set to a future time:
-
-```daml
--- In ActiveSubscription_RestartWithFreeTrial or similar choice
-grantFreeTrialWithPrepaidExtension : ContractId ActiveSubscription -> RelTime -> Update (ContractId ActiveSubscription)
-grantFreeTrialWithPrepaidExtension activeSub trialDuration = do
-  subscription <- fetch activeSub
-  now <- getTime
-  
-  -- Calculate new trial end
-  let newTrialEndsAt = addRelTime now trialDuration
-  
-  -- If already prepaid beyond now, extend by trial duration
-  let newProcessedAndPaidUntil = 
-        if subscription.processedAndPaidUntil > now
-        then addRelTime subscription.processedAndPaidUntil trialDuration
-        else subscription.processedAndPaidUntil
-  
-  -- Update subscription
-  archive activeSub
-  create subscription with
-    trialEndsAt = Some newTrialEndsAt
-    processedAndPaidUntil = newProcessedAndPaidUntil
-```
-
-### Timeline Visualization
-
-Before free trial:
-```
-Jan 1          Feb 1
-now            processedAndPaidUntil
-|--------------|
-  Paid period
-```
-
-After granting 1-week free trial (WRONG approach - losing value):
-```
-Jan 1   Jan 8           Feb 1
-now     trial ends      old processedAndPaidUntil
-|-------|               
- Trial  (lost 3 weeks of prepaid value!)
-```
-
-After granting 1-week free trial (CORRECT approach):
-```
-Jan 1   Jan 8           Feb 1   Feb 8
-now     trial ends      old     new processedAndPaidUntil
-|-------|---------------|-------|
- Trial   Prepaid period (extended)
-```
-
-### Key Implementation Points
-
-1. **Check if prepaid**: `if processedAndPaidUntil > now`
-2. **Calculate trial duration**: Use the trial period being granted
-3. **Extend processedAndPaidUntil**: Add trial duration to existing processedAndPaidUntil
-4. **Set trialEndsAt**: Set to `now + trialDuration`
-
-This ensures:
-- ✅ Subscriber doesn't pay during trial
-- ✅ Subscriber keeps all prepaid value
-- ✅ After trial, subscription continues with remaining prepaid time
-- ✅ No refunds needed - value is preserved through extension
-
-### Alternative Approaches (Not Recommended)
-
-1. **Refund approach**: Calculate refund amount and transfer back to subscriber
-   - ❌ Complex: requires amulet transfers, fee calculations
-   - ❌ Price risk: amulet price may have changed
-   - ❌ More transactions: more fees, more complexity
-
-2. **Credit approach**: Track a credit balance to offset future payments
-   - ❌ Complex state: need to track credits separately
-   - ❌ Payment logic complexity: every payment must check credits
-   - ❌ Harder to reason about: less transparent to users
-
-The extension approach is cleanest because it preserves the simple invariant that 
-`processedAndPaidUntil` represents "the subscriber has service through this time".
--}
-
