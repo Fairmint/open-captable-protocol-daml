@@ -1,0 +1,122 @@
+module Fairmint.Subscriptions.ProposedSubscription where
+
+import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
+import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged, getImpactedPartiesForProposal)
+import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
+import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal, assertAndConvertProposalToSubscription)
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.Approvals (Approvals(..), validateAtLeastOneApproved, areAllApproved, addApprovalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscriptionProposal, getApprovedUsers, getUnapprovedUsers)
+import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
+import Fairmint.Subscriptions.Types.SubscriptionStats (emptyStats)
+import Splice.Amulet qualified as Amulet
+
+-- | Subscription proposal with approval tracking
+template ProposedSubscription
+  with
+    subscriptionProposal : SubscriptionProposal
+    processorContext : ProcessorContext
+    approvals : Approvals
+  where
+    signatory getApprovedUsers subscriptionProposal approvals ++ [processorContext.processor]
+    observer getUnapprovedUsers subscriptionProposal approvals ++ subscriptionProposal.observers
+    
+    ensure validateSubscriptionProposal subscriptionProposal && validateAtLeastOneApproved approvals
+
+    -- | Any party approves the proposal
+    -- If this is the final approval, creates an ActiveSubscription
+    -- Otherwise, creates an updated ProposedSubscription
+    choice ProposedSubscription_Approve : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription)
+      with
+        actor : Party
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        
+        newApprovals <- addApprovalAndAssertChanged approvals actor subscriptionProposal processorContext
+        
+        if areAllApproved newApprovals
+        then do
+          -- All parties approved - create active subscription
+          now <- getTime
+          subscription <- assertAndConvertProposalToSubscription subscriptionProposal
+          
+          -- Validate recipient beneficiaries if provided
+          case subscription.recipientBeneficiaries of
+            Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
+            None -> pure ()
+          
+          activeSubscriptionId <- create ActiveSubscription with
+            processedAndPaidUntil = now
+            stats = emptyStats
+            ..
+          
+          pure (Right activeSubscriptionId)
+        else do
+          -- More approvals pending - create updated proposal
+          proposedSubscriptionId <- create this with
+            approvals = newApprovals
+          
+          pure (Left proposedSubscriptionId)
+
+    -- | Edit the proposal
+    -- Intelligently revokes approvals from impacted parties
+    -- The editor retains (or adds) their approval
+    choice ProposedSubscription_EditSubscriptionProposal : ContractId ProposedSubscription
+      with
+        actor : Party
+        changes : SubscriptionProposalChanges
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        assertValidOptionalText description
+        
+        -- Validate recipient beneficiaries in changes if provided
+        case changes.recipientBeneficiaries of
+          Some (Some beneficiaries) -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          _ -> pure ()
+        
+        let impactedParties = getImpactedPartiesForProposal changes subscriptionProposal processorContext
+        updatedProposal <- applyChangesAndAssertChanged changes subscriptionProposal processorContext
+        
+        create this with
+          subscriptionProposal = updatedProposal
+          approvals = updateApprovalsAfterImpact approvals actor impactedParties subscriptionProposal processorContext
+
+    -- | Withdraw proposal (archives the proposal)
+    choice ProposedSubscription_Withdraw : ()
+      with
+        actor : Party
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        assertValidOptionalText description
+        
+        pure ()
+
+    -- | Change one of the parties in the proposal (subscriber, recipient, or processor)
+    -- Requires authorization from both the old and new party
+    -- Typically called via PartyMigrationProposal_MigrateProposedSubscription
+    choice ProposedSubscription_ChangeParty : ContractId ProposedSubscription
+      with
+        partyType : PartyRole
+        oldParty : Party
+        newParty : Party
+      controller [oldParty, newParty]
+      do
+        assertMsg "Old and new party must be different" (oldParty /= newParty)
+        
+        -- Validate oldParty matches the specified partyType and create updated proposal
+        case partyType of
+          Subscriber -> do
+            assertMsg "Old party must be the current subscriber" (oldParty == subscriptionProposal.subscriber)
+            assertMsg "New party cannot be the current recipient" (newParty /= subscriptionProposal.recipient)
+            create this with subscriptionProposal.subscriber = newParty
+          Recipient -> do
+            assertMsg "Old party must be the current recipient" (oldParty == subscriptionProposal.recipient)
+            assertMsg "New party cannot be the current subscriber" (newParty /= subscriptionProposal.subscriber)
+            create this with subscriptionProposal.recipient = newParty
+          Processor -> do
+            assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
+            create this with processorContext.processor = newParty

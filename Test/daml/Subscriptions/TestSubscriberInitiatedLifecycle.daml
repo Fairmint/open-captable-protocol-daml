@@ -1,0 +1,252 @@
+module Subscriptions.TestSubscriberInitiatedLifecycle where
+
+import Daml.Script
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
+import Subscriptions.TestUtils
+
+-- | Test the full happy path: factory → proposal → approval → acceptance
+testFactoryProposalAcceptance : Script ()
+testFactoryProposalAcceptance = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid  -- Subscription automatically created
+    Left _ -> error "Expected subscription to be created"
+  
+  Some subscription <- queryContractId alice subscriptionCid
+  assertMsg "Subscriber should be alice" (subscription.subscription.subscriber == alice)
+  assertMsg "Recipient should be bob" (subscription.subscription.recipient == bob)
+  assertMsg "Processor should match" (subscription.processorContext.processor == processor)
+  assertMsg "Amount per day should be 1.0" (subscription.subscription.recipientPaymentPerDay == AmuletAmount 1.0)
+  assertMsg "Fee amount per day should be 0.2" (subscription.subscription.processorPaymentPerDay == Some (AmuletAmount 0.2))
+  
+  pure ()
+
+-- | Test proposal rejection by recipient (before processor approval)
+testProposalRejectionByRecipient : Script ()
+testProposalRejectionByRecipient = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  submit bob do
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = bob; description = None
+  
+  proposal <- queryContractId bob proposalCid
+  assertMsg "Proposal should be archived" (proposal == None)
+  
+  pure ()
+
+-- | Test proposal rejection by processor
+testProposalRejectionByProcessor : Script ()
+testProposalRejectionByProcessor = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = processor; description = None
+  
+  proposal <- queryContractId processor proposalCid
+  assertMsg "Proposal should be archived" (proposal == None)
+  
+  pure ()
+
+-- | Test subscriber withdrawing proposal (before processor approval)
+testProposalWithdrawBySubscriber : Script ()
+testProposalWithdrawBySubscriber = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  submit alice do
+    exerciseCmd proposalCid ProposedSubscription_Withdraw with actor = alice; description = None
+  
+  proposal <- queryContractId alice proposalCid
+  assertMsg "Proposal should be archived" (proposal == None)
+  
+  pure ()
+
+-- | Test processor withdrawing after approval (but before recipient accepts)
+testProcessorApprovedProposalProcessorWithdraw : Script ()
+testProcessorApprovedProposalProcessorWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case result of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  submit processor do
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = processor; description = None
+  
+  pure ()
+
+-- | Test recipient rejecting after processor approval
+testProcessorApprovedProposalRecipientReject : Script ()
+testProcessorApprovedProposalRecipientReject = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case result of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  submit bob do
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = bob; description = None
+  
+  pure ()
+
+-- | Test subscriber withdrawing after processor approval
+testProcessorApprovedProposalSubscriberWithdraw : Script ()
+testProcessorApprovedProposalSubscriberWithdraw = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case result of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  submit alice do
+    exerciseCmd approvedProposalCid ProposedSubscription_Withdraw with actor = alice; description = None
+  
+  pure ()
+
+-- | Test cancellation by subscriber (after subscription is active)
+testCancelBySubscriber : Script ()
+testCancelBySubscriber = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  maybeUpdatedCid <- submit alice do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = True
+      description = None
+  
+  -- When disregardAvailablePaidPeriod is True and no prepaid time, subscription archives immediately
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected - archived immediately
+    Some _ -> error "Expected subscription to be archived"
+  
+  pure ()
+
+-- | Test cancellation by recipient (after subscription is active)
+testCancelByRecipient : Script ()
+testCancelByRecipient = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  maybeUpdatedCid <- submit bob do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = False
+      description = None
+  
+  -- Since there's no prepaid time, subscription archives immediately
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected - archived immediately
+    Some _ -> error "Expected subscription to be archived"
+  
+  pure ()
+
+-- | Test cancellation by processor (after subscription is active)
+testCancelByProcessor : Script ()
+testCancelByProcessor = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  maybeUpdatedCid <- submit processor do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = processor
+      disregardAvailablePaidPeriod = False
+      description = None
+  
+  -- Since there's no prepaid time, subscription archives immediately
+  case maybeUpdatedCid of
+    None -> pure ()  -- Expected - archived immediately
+    Some _ -> error "Expected subscription to be archived"
+  
+  pure ()
+

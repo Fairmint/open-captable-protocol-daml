@@ -1,0 +1,179 @@
+module Subscriptions.TestProposalEdits where
+
+import Daml.Script
+import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..))
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
+import Subscriptions.TestUtils
+
+-- | Test ProposedSubscription_EditSubscriptionProposal choice
+-- Tests editing a proposal and verifying that approvals are revoked when needed
+testEditSubscriptionProposal : Script ()
+testEditSubscriptionProposal = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a subscription proposal
+  expiresAt <- getExpirationTime 365
+  let originalProposal = defaultSubscriptionProposal alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso originalProposal
+  
+  -- Processor approves the proposal
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  -- Alice edits the proposal (change payment amount)
+  editedProposalCid <- submit alice do
+    exerciseCmd approvedProposalCid ProposedSubscription_EditSubscriptionProposal with
+      actor = alice
+      changes = SubscriptionProposalChanges with
+        subscriber = None
+        recipient = None
+        recipientProvider = None
+        recipientPaymentPerDay = Some (AmuletAmount 2.0)  -- Increase payment
+        processorPaymentPerDay = None
+        paymentsEndAt = None
+        prepayWindow = None
+        freeTrialExpiration = None
+        description = Some (Some "Updated subscription terms")
+        metadata = None
+        recipientBeneficiaries = None
+        observers = None
+      description = Some "Increasing payment amount"
+  
+  -- Verify the edited proposal exists and has updated values
+  Some editedProposal <- queryContractId alice editedProposalCid
+  assertMsg "Payment amount should be updated" 
+    (editedProposal.subscriptionProposal.recipientPaymentPerDay == AmuletAmount 2.0)
+  assertMsg "Description should be updated" 
+    (editedProposal.subscriptionProposal.description == Some "Updated subscription terms")
+  
+  -- Verify that recipient's approval was revoked (since they're affected by payment increase)
+  -- and subscriber's approval is retained (they made the edit)
+  assertMsg "Recipient approval should be revoked after edit" 
+    (not editedProposal.approvals.recipientApproved)
+  assertMsg "Subscriber approval should be retained" 
+    editedProposal.approvals.subscriberApproved
+  -- Processor approval remains since processor fee didn't change
+  assertMsg "Processor approval should remain" 
+    editedProposal.approvals.processorApproved
+  
+  pure ()
+
+-- | Test ProposedSubscription_EditSubscriptionProposal with recipient change
+-- Tests changing the recipient party in a proposal
+testEditSubscriptionProposalWithRecipientChange : Script ()
+testEditSubscriptionProposalWithRecipientChange = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Allocate a new party for the new recipient
+  newRecipient <- allocateParty "NewRecipient"
+  
+  -- Create a subscription proposal
+  expiresAt <- getExpirationTime 365
+  let originalProposal = defaultSubscriptionProposal alice bob expiresAt
+  proposalCid <- createSubscriberProposal processor alice dso originalProposal
+  
+  -- Edit the proposal to change recipient
+  editedProposalCid <- submit alice do
+    exerciseCmd proposalCid ProposedSubscription_EditSubscriptionProposal with
+      actor = alice
+      changes = SubscriptionProposalChanges with
+        subscriber = None
+        recipient = Some newRecipient
+        recipientProvider = None
+        recipientPaymentPerDay = None
+        processorPaymentPerDay = None
+        paymentsEndAt = None
+        prepayWindow = None
+        freeTrialExpiration = None
+        description = None
+        metadata = None
+        recipientBeneficiaries = None
+        observers = None
+      description = Some "Changing recipient"
+  
+  -- Verify the recipient was changed
+  Some editedProposal <- queryContractId alice editedProposalCid
+  assertMsg "Recipient should be changed" 
+    (editedProposal.subscriptionProposal.recipient == newRecipient)
+  
+  -- Approve with processor
+  result1 <- submit processor do
+    exerciseCmd editedProposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  -- New recipient approves to create the subscription
+  result2 <- submit newRecipient do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = newRecipient
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Verify subscription was created with new recipient
+  Some subscription <- queryContractId alice subscriptionCid
+  assertMsg "Active subscription should have new recipient" 
+    (subscription.subscription.recipient == newRecipient)
+  
+  pure ()
+
+-- | Test editing a proposal to reduce payment (should not revoke approvals)
+testEditProposalReducePayment : Script ()
+testEditProposalReducePayment = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create a subscription proposal
+  expiresAt <- getExpirationTime 365
+  let originalProposal = (defaultSubscriptionProposal alice bob expiresAt) with
+        recipientPaymentPerDay = AmuletAmount 2.0
+  proposalCid <- createSubscriberProposal processor alice dso originalProposal
+  
+  -- Processor approves the proposal
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  approvedProposalCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  -- Bob (recipient) edits to reduce payment - this only impacts Bob
+  editedProposalCid <- submit bob do
+    exerciseCmd approvedProposalCid ProposedSubscription_EditSubscriptionProposal with
+      actor = bob
+      changes = SubscriptionProposalChanges with
+        subscriber = None
+        recipient = None
+        recipientProvider = None
+        recipientPaymentPerDay = Some (AmuletAmount 1.0)  -- Reduce payment
+        processorPaymentPerDay = None
+        paymentsEndAt = None
+        prepayWindow = None
+        freeTrialExpiration = None
+        description = None
+        metadata = None
+        recipientBeneficiaries = None
+        observers = None
+      description = Some "Reducing my payment requirement"
+  
+  -- Verify the payment was reduced
+  Some editedProposal <- queryContractId alice editedProposalCid
+  assertMsg "Payment should be reduced" 
+    (editedProposal.subscriptionProposal.recipientPaymentPerDay == AmuletAmount 1.0)
+  
+  -- Processor's approval should still be valid (only recipient is impacted by reduction)
+  assertMsg "Processor approval should remain" 
+    editedProposal.approvals.processorApproved
+  
+  -- Recipient's approval should be present (they made the edit)
+  assertMsg "Recipient approval should be present" 
+    editedProposal.approvals.recipientApproved
+  
+  pure ()
+
