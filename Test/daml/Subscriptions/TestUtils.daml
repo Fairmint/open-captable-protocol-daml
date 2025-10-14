@@ -2,16 +2,20 @@ module Subscriptions.TestUtils where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
+import DA.List (head)
 import Splice.Api.FeaturedAppRightV1 qualified as Featured
 import Splice.AmuletRules qualified
 import Splice.Round qualified
+import Splice.Amulet qualified
 import Fairmint.Subscriptions.SubscriptionFactory
 import Fairmint.Subscriptions.ProposedSubscription
+import Fairmint.Subscriptions.ActiveSubscription
 import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..))
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
-import Shared.TestUtils (setupTestEnv, TestEnv(..))
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Shared.TestUtils (setupTestEnv, TestEnv(..), tapWithDso, getAmuletRules)
 
 -- | Test-only FeaturedAppRight template for testing subscription updates
 template TestFeaturedAppRight
@@ -65,10 +69,8 @@ defaultSubscriptionProposal : Party -> Party -> Time -> SubscriptionProposal
 defaultSubscriptionProposal subscriber recipient expiresAt = SubscriptionProposal with
   subscriber = subscriber
   recipient = recipient
-  recipientProvider = None
-  recipientBeneficiaries = None
-  processorProvider = None
-  processorBeneficiaries = None
+  provider = subscriber  -- Use subscriber as default provider
+  appRewardBeneficiaries = []
   freeTrialExpiration = None
   recipientPaymentPerDay = AmuletAmount 1.0
   processorPaymentPerDay = Some (AmuletAmount 0.2)
@@ -101,5 +103,49 @@ allocateTestParties = do
   processor <- allocateParty "Processor"
   TestEnv{..} <- setupTestEnv
   pure TestParties with ..
+
+-- | Helper to fully approve a proposal and return the ActiveSubscription
+-- Handles the approval flow including escrow locking
+approveProposalFully : ContractId ProposedSubscription -> Party -> Party -> Party -> Party -> Script (ContractId ActiveSubscription)
+approveProposalFully proposalCid processor recipient subscriber dso = do
+  -- Processor approves first (intermediate approval - no resources needed)
+  result1 : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription, Optional (ContractId Splice.Amulet.Amulet)) <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with 
+      actor = processor
+      subscriberAmulets = []
+      amountToLock = 0.0
+      paymentContext = None
+  
+  case result1 of
+    Left proposedCid -> do
+      -- Create amulet for locking
+      amuletCid <- tapWithDso dso subscriber 100.0
+      
+      -- Get payment context
+      openRounds <- query @Splice.Round.OpenMiningRound dso
+      now <- getTime
+      let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+      assertMsg "Need at least one open round" (not (null currentOpenRounds))
+      let (openRoundCid, _) = head currentOpenRounds
+      amuletRulesCid <- getAmuletRules dso
+      
+      -- Get disclosures
+      Some amuletDisclosure <- queryDisclosure subscriber amuletCid
+      Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
+      Some openRoundDisclosure <- queryDisclosure dso openRoundCid
+      
+      -- Recipient gives final approval with resources
+      result2 : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription, Optional (ContractId Splice.Amulet.Amulet)) <- submitWithDisclosures recipient [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
+        exerciseCmd proposedCid ProposedSubscription_Approve with 
+          actor = recipient
+          subscriberAmulets = [amuletCid]
+          amountToLock = 50.0
+          paymentContext = Some PaymentContext with
+            amuletRulesCid = amuletRulesCid
+            openMiningRoundCid = openRoundCid
+      case result2 of
+        Right (activeCid, _) -> pure activeCid
+        Left _ -> error "Expected subscription to be created after all approvals"
+    Right (activeCid, _) -> pure activeCid  -- If processor was last to approve
 
 
