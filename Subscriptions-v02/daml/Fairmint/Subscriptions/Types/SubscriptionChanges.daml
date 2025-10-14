@@ -19,10 +19,10 @@ data SubscriptionChanges = SubscriptionChanges
     processedAndPaidUntilAdjustment : Optional RelTime
       -- ^ Adjust processedAndPaidUntil by this amount (positive = extend, negative = reduce)
       -- Applied to the current value at approval time, not a fixed time
-    recipientProvider : Optional Party
-      -- ^ Change recipient's provider
-    recipientBeneficiaries : Optional (Optional [AppRewardBeneficiary])
-      -- ^ Change recipient beneficiaries (requires approval from recipient only)
+    provider : Optional Party
+      -- ^ Change provider for all transfers
+    appRewardBeneficiaries : Optional [AppRewardBeneficiary]
+      -- ^ Change app reward beneficiaries for all transfers
     recipientPaymentPerDay : Optional SubscriptionAmount
       -- ^ Change daily payment to recipient
     processorPaymentPerDay : Optional (Optional SubscriptionAmount)
@@ -31,7 +31,7 @@ data SubscriptionChanges = SubscriptionChanges
       -- ^ Change prepay window
     paymentsEndAt : Optional (Optional SubscriptionTime)
       -- ^ Change payments end time (Some None = make perpetual, relative to acceptance time)
-    trialEndsAt : Optional (Optional SubscriptionTime)
+    freeTrialExpiration : Optional (Optional SubscriptionTime)
       -- ^ Change trial end time (Some None = end trial now, relative to acceptance time)
     description : Optional (Optional Text)
       -- ^ Change description
@@ -54,9 +54,9 @@ compareAmounts oldAmt newAmt = case (oldAmt, newAmt) of
 getImpactedPartiesForSubscription : SubscriptionChanges -> Subscription -> ProcessorContext -> Set Party
 getImpactedPartiesForSubscription changes config context =
   let
-    -- Changes to recipient provider affect recipient and processor
-    impacted1 = case changes.recipientProvider of
-      Some _ -> fromList [config.recipient, context.processor]
+    -- Changes to provider affect all parties
+    impacted1 = case changes.provider of
+      Some _ -> fromList [config.subscriber, config.recipient, context.processor]
       None -> Set.empty
     
     -- Changes to recipient payment: same unit + increase -> subscriber + processor, same unit + decrease -> recipient + processor, unit change -> all three
@@ -100,7 +100,7 @@ getImpactedPartiesForSubscription changes config context =
       None -> Set.empty
     
     -- Changes to free trial affect both subscriber and recipient
-    impacted6 = impacted5 <> case changes.trialEndsAt of
+    impacted6 = impacted5 <> case changes.freeTrialExpiration of
       Some _ -> fromList [config.subscriber, config.recipient]
       None -> Set.empty
     
@@ -109,9 +109,9 @@ getImpactedPartiesForSubscription changes config context =
       Some _ -> fromList [config.subscriber, config.recipient]
       None -> Set.empty
     
-    -- Changes to recipient beneficiaries impact recipient only
-    impacted8 = impacted7 <> case changes.recipientBeneficiaries of
-      Some _ -> fromList [config.recipient]
+    -- Changes to app reward beneficiaries impact recipient and processor
+    impacted8 = impacted7 <> case changes.appRewardBeneficiaries of
+      Some _ -> fromList [config.recipient, context.processor]
       None -> Set.empty
     
     -- Changes to description impact subscriber and recipient
@@ -160,27 +160,28 @@ assertChangeValuesValidAndNonEmpty changes = do
   
   -- Check that at least one field is being changed
   let hasChange = 
-        isSome changes.recipientProvider ||
+        isSome changes.provider ||
+        isSome changes.appRewardBeneficiaries ||
         isSome changes.recipientPaymentPerDay ||
         isSome changes.processorPaymentPerDay ||
         isSome changes.paymentsEndAt ||
         isSome changes.prepayWindow ||
-        isSome changes.trialEndsAt ||
+        isSome changes.freeTrialExpiration ||
         isSome changes.processedAndPaidUntilAdjustment ||
         isSome changes.description ||
         isSome changes.metadata ||
-        isSome changes.recipientBeneficiaries ||
         isSome changes.observers
   
   assertMsg "Changes must specify at least one field to modify" hasChange
 
--- | Apply changes to subscription in the Update monad
+-- | Apply changes to subscription and processor context in the Update monad
 -- This function handles:
 -- - Resolving SubscriptionTime values to absolute Time
 -- - Applying all subscription field changes
+-- - Applying processor context changes
 -- - Calculating new processedAndPaidUntil with trial extension logic
 -- - Applying processedAndPaidUntilAdjustment
-applyChangesToSubscription : SubscriptionChanges -> ActiveSubscriptionData -> Update (Subscription, Time)
+applyChangesToSubscription : SubscriptionChanges -> ActiveSubscriptionData -> Update (Subscription, ProcessorContext, Time)
 applyChangesToSubscription changes activeSubscriptionData = do
   now <- getTime
   
@@ -192,29 +193,29 @@ applyChangesToSubscription changes activeSubscriptionData = do
       pure resolved
     None -> pure activeSubscriptionData.subscription.paymentsEndAt
   
-  resolvedTrialEndsAt <- case changes.trialEndsAt of
+  resolvedTrialEndsAt <- case changes.freeTrialExpiration of
     Some optTime -> do
       resolved <- resolveOptionalSubscriptionTime optTime
       assertOptionalTimeIsNoneOrInFuture resolved
       pure resolved
-    None -> pure activeSubscriptionData.subscription.trialEndsAt
+    None -> pure activeSubscriptionData.subscription.freeTrialExpiration
   
   -- Apply base subscription changes
   let baseSubscription = activeSubscriptionData.subscription with
-        recipientProvider = optional activeSubscriptionData.subscription.recipientProvider Some changes.recipientProvider
+        provider = optional activeSubscriptionData.subscription.provider identity changes.provider
+        appRewardBeneficiaries = optional activeSubscriptionData.subscription.appRewardBeneficiaries identity changes.appRewardBeneficiaries
         recipientPaymentPerDay = optional activeSubscriptionData.subscription.recipientPaymentPerDay identity changes.recipientPaymentPerDay
         processorPaymentPerDay = optional activeSubscriptionData.subscription.processorPaymentPerDay identity changes.processorPaymentPerDay
         prepayWindow = optional activeSubscriptionData.subscription.prepayWindow identity changes.prepayWindow
         description = optional activeSubscriptionData.subscription.description identity changes.description
         metadata = optional activeSubscriptionData.subscription.metadata identity changes.metadata
-        recipientBeneficiaries = optional activeSubscriptionData.subscription.recipientBeneficiaries identity changes.recipientBeneficiaries
         observers = optional activeSubscriptionData.subscription.observers identity changes.observers
         paymentsEndAt = resolvedPaymentsEndAt
-        trialEndsAt = resolvedTrialEndsAt
+        freeTrialExpiration = resolvedTrialEndsAt
   
   -- Calculate new processedAndPaidUntil (trial extension + adjustment)
   -- Step 1: Handle free trial extension if applicable
-  let afterTrialAdjustment = case (resolvedTrialEndsAt, activeSubscriptionData.subscription.trialEndsAt) of
+  let afterTrialAdjustment = case (resolvedTrialEndsAt, activeSubscriptionData.subscription.freeTrialExpiration) of
         -- Granting or extending trial: calculate trial duration and extend prepaid time
         (Some newTrialEnd, optOldTrialEnd) ->
           let oldTrialEnd = case optOldTrialEnd of
@@ -233,4 +234,5 @@ applyChangesToSubscription changes activeSubscriptionData = do
         Some adjustment -> addRelTime afterTrialAdjustment adjustment
         None -> afterTrialAdjustment
   
-  pure (baseSubscription, newProcessedAndPaidUntil)
+  -- ProcessorContext doesn't change (no processor-specific fields anymore)
+  pure (baseSubscription, activeSubscriptionData.processorContext, newProcessedAndPaidUntil)

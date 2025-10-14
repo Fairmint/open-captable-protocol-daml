@@ -1,14 +1,17 @@
 module Fairmint.Subscriptions.ActiveSubscription where
 
-import DA.Time (addRelTime)
+import DA.Time (addRelTime, days)
+import DA.List (head, last)
+import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
-import Splice.AmuletRules (AmuletRules_Transfer(..), TransferResult(..))
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..), CreatedAmulet(..))
+import Splice.Expiry (TimeLock(..))
 import Splice.Round()
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubscription, calculateAndValidateNewProcessedAndPaidUntil, assertInFreeTrial, assertNotInFreeTrial, assertIsPartyToSubscription, assertOnlySubscriberCanDisregardPaidPeriod, assertPaymentsNotEnded, assertPaymentsEndedAndPaidPeriodPassed, assertPaymentsHaveEnded, assertHasPrepaidTimeRemaining, clearTrialIfEnded)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
-import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), payRecipient, payProcessorFee, createTransferAndContext, assertHasAmuletInputs, fetchAndValidateAmuletPrice)
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..), assertValidProcessingPeriod, createRecipientActivityMarkerIfProvided, createProcessorActivityMarkerIfProvided)
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..), assertValidProcessingPeriod, createActivityMarkerIfProvided)
 import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToSubscription)
 import Fairmint.Subscriptions.Types.ActiveSubscriptionData (ActiveSubscriptionData(..))
 import Fairmint.Subscriptions.Types.PaymentResult (ProcessPaymentResult(..))
@@ -21,12 +24,12 @@ import Fairmint.Subscriptions.Types.SubscriptionStats (SubscriptionStats(..), in
 -- | Active subscription contract
 -- 
 -- Three-party model:
--- - Subscriber: pays the subscription (provides amulet inputs for payments)
+-- - Subscriber: pays the subscription (locks amulets in escrow for payments)
 -- - Recipient: provides the service
 -- - Processor: processes payments
 --
 -- State is implicit based on timestamps:
--- - FreeTrial: subscription.trialEndsAt is Some and >= now
+-- - FreeTrial: subscription.freeTrialExpiration is Some and >= now
 -- - Canceled: subscription.paymentsEndAt <= now and processedAndPaidUntil >= now
 -- - Can be archived: subscription.paymentsEndAt <= now AND processedAndPaidUntil < now (canceled and prepaid time passed)
 -- - Paid: All other cases
@@ -38,25 +41,29 @@ template ActiveSubscription
       -- ^ Processor and DSO context
     processedAndPaidUntil : Time
       -- ^ Subscription has been processed through this time (both payments and free trial)
+    lockedAmuletCid : ContractId Amulet.LockedAmulet
+      -- ^ Locked amulet held in escrow for subscription payments
     stats : SubscriptionStats
       -- ^ Statistics tracking rounds processed and payment totals
   where
     signatory [subscription.subscriber, subscription.recipient, processorContext.processor]
-    observer subscription.observers
+    observer subscription.observers ++ 
+             [subscription.provider] ++ 
+             map (\beneficiary -> beneficiary.party) subscription.appRewardBeneficiaries
     
     ensure validateSubscription subscription
 
     -- | Process free trial period (advances processedAndPaidUntil without payment)
-    -- Transitions out of trial when subscription.trialEndsAt is reached
+    -- Transitions out of trial when subscription.freeTrialExpiration is reached
     -- Can process any period up to trialEnd (now and prepayWindow are not relevant)
     choice ActiveSubscription_ProcessFreeTrial : ProcessFreeTrialResult ActiveSubscription
       with
         processingContext : ProcessingContext
       controller processorContext.processor
       do
-        trialEnd <- assertInFreeTrial subscription.trialEndsAt
+        trialEnd <- assertInFreeTrial subscription.freeTrialExpiration
         assertValidProcessingPeriod processingContext
-        Amulet.validateAppRewardBeneficiaries processingContext.processorBeneficiaries
+        Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
         
         -- Calculate new processedAndPaidUntil: add processingPeriod and assert constraints
         let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingContext.processingPeriod
@@ -64,25 +71,28 @@ template ActiveSubscription
         -- Assert not beyond trial end
         assertMsg "Cannot process beyond trial end" (newProcessedAndPaidUntil <= trialEnd)
         
-        -- Create activity markers for free trial processing
-        recipientActivityMarkerCid <- createRecipientActivityMarkerIfProvided subscription processingContext
-        processorActivityMarkerCid <- createProcessorActivityMarkerIfProvided processingContext
+        -- Create activity marker for free trial processing
+        activityMarkerCid <- createActivityMarkerIfProvided subscription processingContext
         
-        -- Clear subscription.trialEndsAt if trial ended in real time
+        -- Clear subscription.freeTrialExpiration if trial ended in real time
         now <- getTime
-        let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.trialEndsAt
+        let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.freeTrialExpiration
         
         -- Update stats: increment rounds processed
         let newStats = incrementRounds stats
         
         subscriptionCid <- create this with 
-          subscription.trialEndsAt = newTrialEndsAt
+          subscription.freeTrialExpiration = newTrialEndsAt
           processedAndPaidUntil = newProcessedAndPaidUntil
           stats = newStats
         
-        pure ProcessFreeTrialResult with ..
+        pure ProcessFreeTrialResult with
+          subscriptionCid
+          recipientActivityMarkerCid = activityMarkerCid
+          processorActivityMarkerCid = activityMarkerCid
 
     -- | Process payment for paid subscription
+    -- Uses the locked amulet stored in the subscription for payment
     choice ActiveSubscription_ProcessPayment : ProcessPaymentResult ActiveSubscription
       with
         processingContext : ProcessingContext
@@ -93,9 +103,8 @@ template ActiveSubscription
       controller processorContext.processor
       do
         assertValidProcessingPeriod processingContext
-        Amulet.validateAppRewardBeneficiaries processingContext.processorBeneficiaries
-        assertHasAmuletInputs paymentContext.amuletInputs
-        assertNotInFreeTrial subscription.trialEndsAt
+        Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
+        assertNotInFreeTrial subscription.freeTrialExpiration
         
         -- Calculate new processedAndPaidUntil accounting for free trial and validate constraints
         newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingContext.processingPeriod
@@ -104,38 +113,93 @@ template ActiveSubscription
         let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingContext.processingPeriod amuletPrice
         let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingContext.processingPeriod amuletPrice
         
-        -- Execute payments
-        recipientTransferResult <- payRecipient subscription processorContext processingContext recipientAmount amuletPrice paymentContext
+        -- Unlock the locked amulet
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
         
-        (processorTransferResult, processorActivityMarkerCid) <- if skipProcessorPayment || processorFee == 0.0
-          then do
-            -- Create activity marker for processor when no fee is charged or payment is skipped (no transfer = no activity record)
-            markerCid <- createProcessorActivityMarkerIfProvided processingContext
-            pure (None, markerCid)
-          else do
-            -- Processor receives payment, so transfer serves as activity marker
-            result <- payProcessorFee subscription processorContext processingContext processorFee amuletPrice paymentContext recipientTransferResult
-            pure (result, None)
+        -- Create lock for remaining balance
+        now <- getTime
+        let lockExpiresAt = addRelTime now (days 365)
+        let lock = TimeLock with
+              holders = [subscription.recipient, processorContext.processor]
+              expiresAt = lockExpiresAt
+              optContext = Some "Subscription escrow"
         
-        -- Update stats: track payment amounts
-        let statsAfterRecipientPayment = updateStatsWithPayment 
+        -- Build transfer outputs: recipient payment + optional processor fee + locked remainder
+        let outputs = 
+              -- Output 1: Payment to recipient
+              [ TransferOutput with
+                  receiver = subscription.recipient
+                  receiverFeeRatio = 1.0  -- Recipient gets the fees (standard payment)
+                  amount = recipientAmount
+                  lock = None
+              ] ++
+              -- Output 2: Processor fee (if applicable and not skipped)
+              (if skipProcessorPayment || processorFee == 0.0
+               then []
+               else [ TransferOutput with
+                        receiver = processorContext.processor
+                        receiverFeeRatio = 1.0  -- Processor gets the fees
+                        amount = processorFee
+                        lock = None
+                    ]) ++
+              -- Output 3: Lock remaining balance
+              [ TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 0.0  -- Subscriber pays all fees from inputs
+                  amount = 0.0  -- Remaining balance goes to locked output
+                  lock = Some lock
+              ]
+        
+        -- Execute single transfer with all outputs
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = subscription.subscriber
+            provider = subscription.provider  -- Provider facilitates all operations
+            inputs = [InputAmulet unlockResult.amuletSum.amulet]
+            outputs = outputs
+            beneficiaries = Some subscription.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = processingContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        -- Extract locked amulet from transfer result
+        let newLockedAmuletCid = case last transferResult.createdAmulets of
+              Some (TransferResultLockedAmulet cid) -> cid
+              _ -> error "Expected locked amulet as last output"
+        
+        -- Create activity marker if fee was skipped (already created during transfer if fee was charged)
+        activityMarkerCid <- 
+          if skipProcessorPayment || processorFee == 0.0
+          then createActivityMarkerIfProvided subscription processingContext
+          else pure None
+        
+        -- Update stats: track payment amounts from transfer summary
+        let newStats = updateStatsWithPayment 
               subscription.subscriber 
               subscription.recipient 
-              recipientTransferResult.summary
-              stats
-        
-        let newStats = case processorTransferResult of
-              Some processorResult -> 
-                updateStatsWithProcessorFee 
-                  processorContext.processor 
-                  processorResult.summary
-                  statsAfterRecipientPayment
-              None -> statsAfterRecipientPayment
+              transferResult.summary
+              (if skipProcessorPayment || processorFee == 0.0
+               then stats
+               else updateStatsWithProcessorFee 
+                      processorContext.processor 
+                      transferResult.summary
+                      stats)
         
         subscriptionCid <- create this with 
           processedAndPaidUntil = newProcessedAndPaidUntil
           stats = newStats
-        pure ProcessPaymentResult with ..
+          lockedAmuletCid = newLockedAmuletCid
+        
+        pure ProcessPaymentResult with
+          subscriptionCid
+          recipientTransferResult = transferResult
+          processorTransferResult = None  -- No longer a separate transfer
+          recipientActivityMarkerCid = activityMarkerCid
+          processorActivityMarkerCid = activityMarkerCid
 
     -- | Propose changes to the subscription
     -- Always creates a SubscriptionChangeProposal for tracking approvals
@@ -151,9 +215,13 @@ template ActiveSubscription
         assertChangeValuesValidAndNonEmpty subscriptionChanges
         assertValidOptionalText description
         
-        -- Validate recipient beneficiaries in changes if provided
+        -- Validate beneficiaries in changes if provided
         case subscriptionChanges.recipientBeneficiaries of
-          Some (Some beneficiaries) -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          _ -> pure ()
+        
+        case subscriptionChanges.processorBeneficiaries of
+          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
           _ -> pure ()
         
         let impactedParties = getImpactedPartiesForSubscription subscriptionChanges subscription processorContext
@@ -165,15 +233,18 @@ template ActiveSubscription
           processorContext
           approvals
 
-    -- | Cancel subscription
-    -- Sets paymentsEndAt to max(trialEndsAt, now) to transition to Canceled state if processedAndPaidUntil >= now
+    -- | Cancel subscription and unlock locked amulet if archiving immediately
+    -- Sets paymentsEndAt to max(freeTrialExpiration, now) to transition to Canceled state if processedAndPaidUntil >= now
     -- Archives immediately if processedAndPaidUntil < now (nothing prepaid) or if disregardAvailablePaidPeriod is true
-    choice ActiveSubscription_Cancel : Optional (ContractId ActiveSubscription)
+    -- Returns (subscriptionCid, None) if keeping subscription for prepaid period
+    -- Returns (None, Some unlockedAmuletCid) if archiving immediately
+    choice ActiveSubscription_Cancel : (Optional (ContractId ActiveSubscription), Optional (ContractId Amulet.Amulet))
       with
         actor : Party
         disregardAvailablePaidPeriod : Bool
           -- ^ If true, archives immediately regardless of prepaid time (only subscriber can set to true)
         description : Optional Text
+        paymentContext : PaymentContext
       controller actor
       do
         assertIsPartyToSubscription actor subscription processorContext
@@ -182,55 +253,245 @@ template ActiveSubscription
         
         now <- getTime
         if disregardAvailablePaidPeriod || processedAndPaidUntil <= now
-        then pure None  -- Archive immediately
+        then do
+          -- Archive immediately - unlock and return the locked amulet to subscriber
+          unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+            openRoundCid = paymentContext.openMiningRoundCid
+          pure (None, Some unlockResult.amuletSum.amulet)
         else do
           -- Checked after processing disregardAvailablePaidPeriod to allow that after a previous cancelation.
           assertPaymentsNotEnded subscription.paymentsEndAt
 
-          -- Set paymentsEndAt to max(trialEndsAt, now) to honor any remaining trial period
-          let effectivePaymentsEndAt = case subscription.trialEndsAt of
+          -- Set paymentsEndAt to max(freeTrialExpiration, now) to honor any remaining trial period
+          let effectivePaymentsEndAt = case subscription.freeTrialExpiration of
                 Some trialEnd -> max trialEnd now
                 None -> now
           
           canceledCid <- create this with subscription.paymentsEndAt = Some effectivePaymentsEndAt
-          pure (Some canceledCid)
+          pure (Some canceledCid, None)
 
     -- | Recipient refunds unused processed time and archives immediately
     -- The recipient covers any processing fees paid
     -- If priced in USD (or prices were changed), the recipient may owe more than they received
-    choice ActiveSubscription_Refund : TransferResult
+    -- Also unlocks and returns the locked amulet balance to the subscriber
+    choice ActiveSubscription_Refund : (TransferResult, ContractId Amulet.Amulet)
       with
         paymentContext : PaymentContext
+        recipientAmuletInputs : [ContractId Amulet.Amulet]
+          -- ^ Amulets from recipient to cover the refund
         recipientFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
         -- ^ Featured app right for recipient
       controller subscription.recipient
       do
         assertPaymentsHaveEnded subscription.paymentsEndAt
         assertHasPrepaidTimeRemaining processedAndPaidUntil
-        assertHasAmuletInputs paymentContext.amuletInputs
+        assertMsg "Recipient must provide amulets for refund" (not (null recipientAmuletInputs))
         
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid subscription.recipient
         
-        -- Calculate and execute refund
+        -- Calculate refund amount
         refundAmount <- calculateRefundForPrepaidPeriod processedAndPaidUntil subscription.recipientPaymentPerDay subscription.processorPaymentPerDay amuletPrice
-        let (transfer, context) = createTransferAndContext subscription.recipient subscription.subscriber refundAmount paymentContext recipientFeaturedAppRight
         
-        exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+        -- Execute refund transfer from recipient's amulets to subscriber
+        let (transfer, context) = createTransferAndContext subscription.recipient subscription.subscriber refundAmount paymentContext (head recipientAmuletInputs) recipientFeaturedAppRight
+        let transferWithAllInputs = transfer with inputs = map InputAmulet recipientAmuletInputs
+        
+        refundResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = transferWithAllInputs
           expectedDso = Some processorContext.dso
           ..
+        
+        -- Unlock and return the locked amulet balance to subscriber
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        pure (refundResult, unlockResult.amuletSum.amulet)
+
+    -- | Add funds to the locked amulet escrow
+    -- Unlocks existing locked amulet, combines with new amulets, and re-locks specified amount
+    -- Any excess is returned as change to the funder (who provides the amulets)
+    -- Note: Anyone can add funds (e.g., gifting a subscription), but the subscriber can withdraw them at any time
+    -- Requires authorization from funder, subscriber, recipient, and processor (to unlock existing lock)
+    choice ActiveSubscription_AddFunds : (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
+      with
+        actor : Party
+          -- ^ Party providing the amulet inputs (can be anyone, not just subscriber)
+        amuletInputs : [ContractId Amulet.Amulet]
+        amountToLock : Decimal
+          -- ^ Total amount to lock (including existing locked balance + amulet inputs)
+        description : Optional Text
+          -- ^ Optional description of why funds are being added (e.g., "Gift from Alice", "Topping up subscription")
+        paymentContext : PaymentContext
+      controller [actor, subscription.subscriber, subscription.recipient, processorContext.processor]
+      do
+        assertValidOptionalText description
+        assertMsg "Must provide at least one amulet to add" (not (null amuletInputs))
+        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+        
+        -- Unlock existing locked amulet (requires subscriber + lock holders)
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        -- Create new lock with combined amulets and specified amount
+        now <- getTime
+        let lockExpiresAt = addRelTime now (days 365)
+        let lock = TimeLock with
+              holders = [subscription.recipient, processorContext.processor]
+              expiresAt = lockExpiresAt
+              optContext = Some "Subscription escrow"
+        
+        let allAmulets = unlockResult.amuletSum.amulet :: amuletInputs
+        
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = actor  -- Funder provides the amulets
+            provider = subscription.provider  -- Provider facilitates lock creation
+            inputs = map InputAmulet allAmulets
+            outputs = [TransferOutput with
+              receiver = subscription.subscriber  -- Locked amulet owned by subscriber
+              receiverFeeRatio = 0.0  -- Funder pays fees from inputs (predictable costs)
+              amount = amountToLock
+              lock = Some lock]
+            beneficiaries = Some subscription.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = None  -- TODO: Could accept FeaturedAppRight for processor rewards
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        let newLockedAmuletCid = case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> cid
+              _ -> error "Expected exactly one locked amulet output"
+        
+        subscriptionCid <- create this with lockedAmuletCid = newLockedAmuletCid
+        pure (subscriptionCid, transferResult.senderChangeAmulet)
+
+    -- | Withdraw excess funds from the locked amulet
+    -- Unlocks, creates new lock with specified amount, returns change to subscriber
+    -- Fees are paid from inputs (receiverFeeRatio = 0.0) so subscriber knows exact cost
+    choice ActiveSubscription_WithdrawFunds : (ContractId ActiveSubscription, ContractId Amulet.Amulet)
+      with
+        amountToKeepLocked : Decimal
+        paymentContext : PaymentContext
+      controller subscription.subscriber
+      do
+        assertMsg "Amount to keep locked must be positive" (amountToKeepLocked > 0.0)
+        
+        -- Unlock existing locked amulet
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        -- Create transfer that splits: one locked output and one regular output (change to subscriber)
+        now <- getTime
+        let lockExpiresAt = addRelTime now (days 365)
+        let lock = TimeLock with
+              holders = [subscription.recipient, processorContext.processor]
+              expiresAt = lockExpiresAt
+              optContext = Some "Subscription escrow"
+        
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = subscription.subscriber
+            provider = subscription.provider  -- Provider facilitates lock management
+            inputs = [InputAmulet unlockResult.amuletSum.amulet]
+            outputs = 
+              [ TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+                  amount = amountToKeepLocked
+                  lock = Some lock
+              , TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 0.0  -- Fees already paid from inputs
+                  amount = 0.0  -- Remaining balance goes to subscriber as change
+                  lock = None
+              ]
+            beneficiaries = Some subscription.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = None  -- TODO: Could accept FeaturedAppRight for processor rewards
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        case transferResult.createdAmulets of
+          [TransferResultLockedAmulet newLockedCid, TransferResultAmulet changeAmuletCid] -> do
+            subscriptionCid <- create this with lockedAmuletCid = newLockedCid
+            pure (subscriptionCid, changeAmuletCid)
+          _ -> error "Expected one locked and one regular amulet output"
+
+    -- | Replace an expired locked amulet (recovery mechanism)
+    -- Archives the old locked amulet after expiry and creates a new lock with provided amulets
+    -- Any excess balance is returned as change to the subscriber
+    choice ActiveSubscription_ReplaceLockedAmulet : (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
+      with
+        newAmulets : [ContractId Amulet.Amulet]
+        amountToLock : Decimal
+          -- ^ Total amount to lock (from unlocked balance + new amulets)
+        paymentContext : PaymentContext
+      controller subscription.subscriber
+      do
+        assertMsg "Must provide at least one amulet for replacement" (not (null newAmulets))
+        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+        
+        -- Try to unlock via owner expiry (lock must have expired)
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_OwnerExpireLock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        -- Create new lock with provided amulets + unlocked balance
+        now <- getTime
+        let lockExpiresAt = addRelTime now (days 365)
+        let lock = TimeLock with
+              holders = [subscription.recipient, processorContext.processor]
+              expiresAt = lockExpiresAt
+              optContext = Some "Subscription escrow"
+        
+        let allAmulets = unlockResult.amuletSum.amulet :: newAmulets
+        
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = subscription.subscriber
+            provider = subscription.provider  -- Provider facilitates lock replacement
+            inputs = map InputAmulet allAmulets
+            outputs = [TransferOutput with
+              receiver = subscription.subscriber
+              receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+              amount = amountToLock
+              lock = Some lock]
+            beneficiaries = Some subscription.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = None  -- TODO: Could accept FeaturedAppRight for processor rewards
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        let newLockedAmuletCid = case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> cid
+              _ -> error "Expected exactly one locked amulet output"
+        
+        subscriptionCid <- create this with lockedAmuletCid = newLockedAmuletCid
+        pure (subscriptionCid, transferResult.senderChangeAmulet)
 
     -- | Archive an inactive subscription (expired or canceled & prepaid window has passed)
     -- Requires that the subscription has been fully processed through paymentsEndAt before archiving
     -- This ensures any past-due final payments are processed before the subscription is archived
-    choice ActiveSubscription_ArchiveInactiveSubscription : ()
+    -- Also unlocks the remaining locked amulet and returns it to the subscriber
+    choice ActiveSubscription_ArchiveInactiveSubscription : ContractId Amulet.Amulet
       with
         actor : Party
+        paymentContext : PaymentContext
       controller actor
       do
         assertIsPartyToSubscription actor subscription processorContext
         assertPaymentsEndedAndPaidPeriodPassed subscription.paymentsEndAt processedAndPaidUntil
 
-        pure ()
+        -- Unlock and return the locked amulet to subscriber
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        pure unlockResult.amuletSum.amulet
 
     -- | Change one of the parties in the subscription (subscriber, recipient, or processor)
     -- Requires authorization from both the old and new party
@@ -275,6 +536,9 @@ template SubscriptionChangeProposal
       -- ^ Tracking which parties have approved
   where
     signatory [subscription.subscriber, subscription.recipient, processorContext.processor]
+    observer subscription.observers ++ 
+             [subscription.provider] ++ 
+             map (\beneficiary -> beneficiary.party) subscription.appRewardBeneficiaries
     
     ensure validateChangeValues subscriptionChanges
 
@@ -308,23 +572,23 @@ template SubscriptionChangeProposal
         assertMsg "Subscription has changed - proposal is stale or incorrect activeSubscriptionCid provided" 
           (activeSubscription.subscription == subscription && activeSubscription.processorContext == processorContext)
         
-        -- Apply changes to subscription and calculate new processedAndPaidUntil
-        (updatedSubscription, newProcessedAndPaidUntil) <- 
+        -- Apply changes to subscription, processor context, and calculate new processedAndPaidUntil
+        (updatedSubscription, updatedProcessorContext, newProcessedAndPaidUntil) <- 
           applyChangesToSubscription subscriptionChanges (ActiveSubscriptionData with
             subscription = activeSubscription.subscription
             processorContext = activeSubscription.processorContext
             processedAndPaidUntil = activeSubscription.processedAndPaidUntil
             stats = activeSubscription.stats)
         
-        -- Validate recipient beneficiaries if provided in updated subscription
-        case updatedSubscription.recipientBeneficiaries of
-          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
-          None -> pure ()
+        -- Validate beneficiaries in updated subscription and processor context
+        Amulet.validateAppRewardBeneficiaries updatedSubscription.recipientBeneficiaries
+        Amulet.validateAppRewardBeneficiaries updatedProcessorContext.processorBeneficiaries
         
         -- Create updated subscription (preserve stats from original)
         archive activeSubscriptionCid
         create activeSubscription with 
           subscription = updatedSubscription
+          processorContext = updatedProcessorContext
           processedAndPaidUntil = newProcessedAndPaidUntil
           stats = activeSubscription.stats
 

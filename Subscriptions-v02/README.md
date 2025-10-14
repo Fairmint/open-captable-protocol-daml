@@ -88,6 +88,50 @@ The processor can use any period length, so long as it does not exceed the prepa
 - **Small window (≤ processing period):** `processedUntil` may trail current time since processing must wait until period elapses
 - **Limits:** `processedUntil` capped at `min(now + prepayWindow, paymentsEndAt)`
 
+## Escrow Mechanism (LockedAmulet)
+
+Subscriptions use a **LockedAmulet** for payment escrow:
+
+**At Subscription Creation:**
+- When the final approval creates an `ActiveSubscription`, the subscriber provides:
+  - Amulet inputs
+  - Amount to lock in escrow
+- These are combined into a single `LockedAmulet` with:
+  - **Lock holders:** recipient and processor
+  - **Lock expiry:** 365 days (to discourage expiry - this is a recovery mechanism only)
+  - **Context:** "Subscription escrow"
+  - **Fee model:** `receiverFeeRatio = 0.0` - subscriber pays fees from inputs (predictable costs)
+- Any remaining balance from inputs is returned as change to the subscriber
+
+**Cost Predictability:**
+All escrow operations use `receiverFeeRatio = 0.0`, meaning:
+- Transfer fees are paid from the subscriber's input amulets
+- The locked amount is exactly what the subscriber specified
+- The subscriber knows upfront the total cost (amount + fees)
+- No surprises from fees being deducted from the locked balance
+
+**During Payment Processing:**
+- Payments unlock the `LockedAmulet`, make the payment, and re-lock the remaining balance
+- This ensures the recipient and processor maintain control over the escrowed funds
+
+**Fund Management:**
+- **Add funds:** `ActiveSubscription_AddFunds` - Anyone can add amulets to gift/top-up a subscription (requires all party approvals to unlock/relock); excess returned as change to funder. Note: subscriber can withdraw these funds at any time.
+- **Withdraw funds:** `ActiveSubscription_WithdrawFunds` - Subscriber can withdraw excess funds while keeping a specified amount locked; remainder returned as change
+- **Replace lock:** `ActiveSubscription_ReplaceLockedAmulet` - Recovery mechanism if lock expires; specify amount to lock
+
+**At Subscription Termination:**
+- **Refund:** Recipient provides their own amulets for the refund; the locked balance is returned to subscriber
+- **Cancel (immediate):** Locked amulet is unlocked and returned to subscriber
+- **Cancel (with prepaid period):** Locked amulet stays for remaining payments, then returned when archived
+- **Archive:** Locked amulet is unlocked and returned to subscriber
+
+This architecture ensures:
+1. Payments can be processed without subscriber interaction
+2. Recipient and processor maintain control as lock holders
+3. Subscriber retains ownership and can manage the locked balance
+4. Subscriber has predictable costs (fees paid from inputs, not from locked amount)
+5. Funds are returned when the subscription ends
+
 ## Contract Templates
 
 The subscription system uses separate templates for each lifecycle state:
@@ -269,11 +313,11 @@ activeSubscriptionCid <- submit processor do
 
 -- 5. Process payments periodically (after trial ends)
 -- Standard mode with processor fees:
+-- Note: PaymentContext no longer requires amuletInputs since the ActiveSubscription stores a LockedAmulet
 paymentResult <- submit processor do
   exerciseCmd activeSubscriptionCid ActiveSubscription_ProcessPayment with
     processingPeriod = days 1
     paymentCtx = PaymentContext with
-      amuletInputs = subscriberAmuletCids
       amuletRulesCid, openMiningRoundCid
     processorProvider = processor
     recipientFeaturedAppRight = Some recipientFARCid

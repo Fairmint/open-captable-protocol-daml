@@ -1,0 +1,143 @@
+module Fairmint.Subscriptions.Types.LockedAmuletHelpers where
+
+import DA.Time (addRelTime, days)
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
+import Splice.Expiry (TimeLock(..))
+import Splice.Round (OpenMiningRound)
+
+-- | Create a locked amulet for subscription escrow
+-- Locks the specified amount with the recipient and processor as holders
+-- Sets the lock to expire well in the future (365 days) to discourage expiry
+-- Fees are paid from inputs (receiverFeeRatio = 0.0) so subscriber knows exact cost
+-- Any remaining balance is returned as change to the subscriber
+createSubscriptionLockedAmulet :
+  [ContractId Amulet.Amulet] ->
+  Decimal ->
+  Party ->
+  Party ->
+  Party ->
+  ContractId AmuletRules ->
+  ContractId OpenMiningRound ->
+  Update (ContractId Amulet.LockedAmulet, Optional (ContractId Amulet.Amulet))
+createSubscriptionLockedAmulet amuletInputs amountToLock subscriber recipient processor amuletRulesCid openMiningRoundCid = do
+  now <- getTime
+  let lockExpiresAt = addRelTime now (days 365)
+  let lock = TimeLock with
+        holders = [recipient, processor]
+        expiresAt = lockExpiresAt
+        optContext = Some "Subscription escrow"
+  
+  transferResult <- exercise amuletRulesCid AmuletRules_Transfer with
+    transfer = Transfer with
+      sender = subscriber
+      provider = subscriber
+      inputs = map InputAmulet amuletInputs
+      outputs = [TransferOutput with
+        receiver = subscriber
+        receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+        amount = amountToLock
+        lock = Some lock]
+      beneficiaries = None
+    context = TransferContext with
+      openMiningRound = openMiningRoundCid
+      featuredAppRight = None
+      issuingMiningRounds = mempty
+      validatorRights = mempty
+    expectedDso = None
+  
+  case transferResult.createdAmulets of
+    [TransferResultLockedAmulet lockedCid] -> pure (lockedCid, transferResult.senderChangeAmulet)
+    _ -> abort "Expected exactly one locked amulet output"
+
+-- | Unlock a locked amulet and return the unlocked amulet CID
+-- Requires authorization from owner and all lock holders
+unlockSubscriptionAmulet :
+  ContractId Amulet.LockedAmulet ->
+  ContractId OpenMiningRound ->
+  Update (ContractId Amulet.Amulet)
+unlockSubscriptionAmulet lockedAmuletCid openRoundCid = do
+  result <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with openRoundCid
+  pure result.amuletSum.amulet
+
+-- | Replace a locked amulet by unlocking the old one and creating a new lock with additional funds
+-- Used for adding funds to subscription escrow
+-- Returns the new locked amulet and any change
+replaceAndAddFunds :
+  ContractId Amulet.LockedAmulet ->
+  [ContractId Amulet.Amulet] ->
+  Decimal ->
+  Party ->
+  Party ->
+  Party ->
+  ContractId AmuletRules ->
+  ContractId OpenMiningRound ->
+  Update (ContractId Amulet.LockedAmulet, Optional (ContractId Amulet.Amulet))
+replaceAndAddFunds oldLockedCid newAmulets amountToLock subscriber recipient processor amuletRulesCid openMiningRoundCid = do
+  -- Unlock the old locked amulet
+  unlockedAmuletCid <- unlockSubscriptionAmulet oldLockedCid openMiningRoundCid
+  
+  -- Create new lock with old + new amulets
+  createSubscriptionLockedAmulet 
+    (unlockedAmuletCid :: newAmulets)
+    amountToLock
+    subscriber 
+    recipient 
+    processor 
+    amuletRulesCid 
+    openMiningRoundCid
+
+-- | Replace a locked amulet and withdraw funds
+-- Unlocks the old amulet, creates a new lock with specified amount, returns change to subscriber
+-- Fees are paid from inputs (receiverFeeRatio = 0.0) so subscriber knows exact cost
+replaceAndWithdrawFunds :
+  ContractId Amulet.LockedAmulet ->
+  Decimal ->
+  Party ->
+  Party ->
+  Party ->
+  ContractId AmuletRules ->
+  ContractId OpenMiningRound ->
+  Update (ContractId Amulet.LockedAmulet, ContractId Amulet.Amulet)
+replaceAndWithdrawFunds oldLockedCid amountToKeepLocked subscriber recipient processor amuletRulesCid openMiningRoundCid = do
+  -- Unlock the old locked amulet
+  unlockedAmuletCid <- unlockSubscriptionAmulet oldLockedCid openMiningRoundCid
+  
+  -- Create transfer that splits: one locked output (amountToKeepLocked) and one regular output (change to subscriber)
+  now <- getTime
+  let lockExpiresAt = addRelTime now (days 365)
+  let lock = TimeLock with
+        holders = [recipient, processor]
+        expiresAt = lockExpiresAt
+        optContext = Some "Subscription escrow"
+  
+  transferResult <- exercise amuletRulesCid AmuletRules_Transfer with
+    transfer = Transfer with
+      sender = subscriber
+      provider = subscriber
+      inputs = [InputAmulet unlockedAmuletCid]
+      outputs = 
+        [ TransferOutput with
+            receiver = subscriber
+            receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+            amount = amountToKeepLocked
+            lock = Some lock
+        , TransferOutput with
+            receiver = subscriber
+            receiverFeeRatio = 0.0  -- Fees already paid from inputs
+            amount = 0.0  -- Remaining balance goes to subscriber as change
+            lock = None
+        ]
+      beneficiaries = None
+    context = TransferContext with
+      openMiningRound = openMiningRoundCid
+      featuredAppRight = None
+      issuingMiningRounds = mempty
+      validatorRights = mempty
+    expectedDso = None
+  
+  case transferResult.createdAmulets of
+    [TransferResultLockedAmulet newLockedCid, TransferResultAmulet changeAmuletCid] -> 
+      pure (newLockedCid, changeAmuletCid)
+    _ -> abort "Expected one locked and one regular amulet output"
+

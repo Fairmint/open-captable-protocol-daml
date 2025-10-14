@@ -8,29 +8,27 @@ import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary)
 
 -- | Configuration data shared between subscription templates and proposals
--- Note: free trial state is managed by ActiveSubscription template's trialEndsAt field (implicit state)
+-- Note: free trial state is managed by ActiveSubscription template's freeTrialExpiration field (implicit state)
 data Subscription = Subscription
   with
     subscriber : Party
       -- ^ Party paying the subscription bill (customer)
     recipient : Party
       -- ^ Party receiving subscription payments (company/treasury address)
-    recipientProvider : Optional Party
-      -- ^ Provider party for recipient's Amulet transfers.
-      -- When Some: processor must pass None as runtime parameter (uses this stored value).
-      -- When None: processor must pass Some as runtime parameter (selects provider at runtime).
-    recipientBeneficiaries : Optional [AppRewardBeneficiary]
-      -- ^ Optional beneficiaries for recipient's app rewards (validated when used in choices)
     recipientPaymentPerDay : SubscriptionAmount
       -- ^ Amount to pay the recipient per day (in Amulet or USD)
     processorPaymentPerDay : Optional SubscriptionAmount
       -- ^ Amount to pay the processor per day as a fee (in Amulet or USD)
+    freeTrialExpiration : Optional Time
+      -- ^ Free trial ends at this time (None means no trial or trial already ended)
     prepayWindow : Optional RelTime
       -- ^ How much beyond now we can set paidUntil (0 to only pay up to now)
     paymentsEndAt : Optional Time
       -- ^ When payments end (no payment processing allowed after this time)
-    trialEndsAt : Optional Time
-      -- ^ Free trial ends at this time (None means no trial or trial already ended)
+    provider : Party
+      -- ^ Provider party for all Amulet transfers (recipient and processor)
+    appRewardBeneficiaries : [AppRewardBeneficiary]
+      -- ^ Beneficiaries for app rewards (shared for all transfers)
     description : Optional Text
       -- ^ Optional description of the subscription purpose
     metadata : Optional (TextMap Text)
@@ -52,7 +50,7 @@ validateSubscription config =
     None -> True
     Some window -> convertRelTimeToMicroseconds window > 0) &&
   validateOptionalMetadata config.metadata &&
-  (case config.trialEndsAt of
+  (case config.freeTrialExpiration of
     Some trial -> case config.paymentsEndAt of
       Some end -> trial <= end
       None -> True
@@ -60,12 +58,12 @@ validateSubscription config =
 
 -- | Checks if subscription is currently in free trial state
 isInFreeTrial : Optional Time -> Time -> Bool
-isInFreeTrial trialEndsAt now =
-  case trialEndsAt of
+isInFreeTrial freeTrialExpiration now =
+  case freeTrialExpiration of
     Some trial -> trial >= now
     None -> False
 
--- | Calculate the new trialEndsAt after processing (clears if trial ended in real time)
+-- | Calculate the new freeTrialExpiration after processing (clears if trial ended in real time)
 clearTrialIfEnded : Time -> Time -> Optional Time -> Optional Time
 clearTrialIfEnded now trialEnd currentTrialEndsAt =
   if now >= trialEnd then None else currentTrialEndsAt
@@ -76,7 +74,7 @@ clearTrialIfEnded now trialEnd currentTrialEndsAt =
 calculateAndValidateNewProcessedAndPaidUntil : Subscription -> Time -> RelTime -> Update Time
 calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingPeriod = do
   -- Calculate effective start time accounting for free trial
-  let effectiveStartTime = case subscription.trialEndsAt of
+  let effectiveStartTime = case subscription.freeTrialExpiration of
         Some trialEnd -> max trialEnd processedAndPaidUntil
         None -> processedAndPaidUntil
   let newProcessedAndPaidUntil = addRelTime effectiveStartTime processingPeriod
@@ -97,19 +95,19 @@ calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil 
 -- | Assert that subscription is in free trial (trial end is inclusive)
 -- Returns the trial end time for further use
 assertInFreeTrial : Optional Time -> Update Time
-assertInFreeTrial trialEndsAt = do
+assertInFreeTrial freeTrialExpiration = do
   now <- getTime
-  assertMsg "Can only process free trial when subscription.trialEndsAt is Some and >= now" 
-    (isInFreeTrial trialEndsAt now)
-  let Some trialEnd = trialEndsAt
+  assertMsg "Can only process free trial when subscription.freeTrialExpiration is Some and >= now" 
+    (isInFreeTrial freeTrialExpiration now)
+  let Some trialEnd = freeTrialExpiration
   pure trialEnd
 
 -- | Assert that subscription is NOT in free trial state
 assertNotInFreeTrial : Optional Time -> Update ()
-assertNotInFreeTrial trialEndsAt = do
+assertNotInFreeTrial freeTrialExpiration = do
   now <- getTime
-  assertMsg "Cannot process payment while in free trial (subscription.trialEndsAt is Some and >= now)" 
-    (not (isInFreeTrial trialEndsAt now))
+  assertMsg "Cannot process payment while in free trial (subscription.freeTrialExpiration is Some and >= now)" 
+    (not (isInFreeTrial freeTrialExpiration now))
 
 -- | Asserts that payments haven't ended
 assertPaymentsNotEnded : Optional Time -> Update ()

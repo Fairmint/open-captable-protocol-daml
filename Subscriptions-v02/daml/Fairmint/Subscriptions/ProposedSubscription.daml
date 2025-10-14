@@ -1,5 +1,8 @@
 module Fairmint.Subscriptions.ProposedSubscription where
 
+import DA.Optional (isSome, fromSome)
+import DA.Time (addRelTime, days)
+import qualified DA.Map as Map
 import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
 import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged, getImpactedPartiesForProposal)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
@@ -8,7 +11,10 @@ import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.Approvals (Approvals(..), validateAtLeastOneApproved, areAllApproved, addApprovalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscriptionProposal, getApprovedUsers, getUnapprovedUsers)
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
 import Fairmint.Subscriptions.Types.SubscriptionStats (emptyStats)
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
 import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
+import Splice.Expiry (TimeLock(..))
 
 -- | Subscription proposal with approval tracking
 template ProposedSubscription
@@ -18,16 +24,26 @@ template ProposedSubscription
     approvals : Approvals
   where
     signatory getApprovedUsers subscriptionProposal approvals ++ [processorContext.processor]
-    observer getUnapprovedUsers subscriptionProposal approvals ++ subscriptionProposal.observers
+    observer getUnapprovedUsers subscriptionProposal approvals ++ 
+             subscriptionProposal.observers ++ 
+             [subscriptionProposal.provider] ++ 
+             map (\beneficiary -> beneficiary.party) subscriptionProposal.appRewardBeneficiaries
     
     ensure validateSubscriptionProposal subscriptionProposal && validateAtLeastOneApproved approvals
 
     -- | Any party approves the proposal
-    -- If this is the final approval, creates an ActiveSubscription
+    -- If this is the final approval, creates an ActiveSubscription with locked amulet escrow
     -- Otherwise, creates an updated ProposedSubscription
-    choice ProposedSubscription_Approve : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription)
+    -- When giving final approval, must provide subscriber's amulets and amount to lock in escrow
+    choice ProposedSubscription_Approve : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
       with
         actor : Party
+        subscriberAmulets : [ContractId Amulet.Amulet]
+          -- ^ Amulets from subscriber to lock in escrow (required only for final approval)
+        amountToLock : Decimal
+          -- ^ Amount to lock in escrow (required only for final approval)
+        paymentContext : Optional PaymentContext
+          -- ^ Payment context for creating locked amulet (required only for final approval)
       controller actor
       do
         assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
@@ -36,23 +52,61 @@ template ProposedSubscription
         
         if areAllApproved newApprovals
         then do
-          -- All parties approved - create active subscription
+          -- All parties approved - create active subscription with locked amulet
+          assertMsg "Must provide subscriber amulets for final approval" (not (null subscriberAmulets))
+          assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+          assertMsg "Must provide payment context for final approval" (isSome paymentContext)
+          
+          let ctx = fromSome paymentContext
+          
           now <- getTime
           subscription <- assertAndConvertProposalToSubscription subscriptionProposal
           
-          -- Validate recipient beneficiaries if provided
-          case subscription.recipientBeneficiaries of
-            Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
-            None -> pure ()
+          -- Validate beneficiaries
+          Amulet.validateAppRewardBeneficiaries subscription.recipientBeneficiaries
+          Amulet.validateAppRewardBeneficiaries processorContext.processorBeneficiaries
+          
+          -- Create locked amulet from subscriber's amulets with specified amount
+          let lockExpiresAt = addRelTime now (days 365)
+          let lock = TimeLock with
+                holders = [subscription.recipient, processorContext.processor]
+                expiresAt = lockExpiresAt
+                optContext = Some "Subscription escrow"
+          
+          transferResult <- exercise ctx.amuletRulesCid AmuletRules_Transfer with
+            transfer = Transfer with
+              sender = subscription.subscriber
+              provider = processorContext.processorProvider  -- Processor facilitates lock creation
+              inputs = map InputAmulet subscriberAmulets
+              outputs = [TransferOutput with
+                receiver = subscription.subscriber
+                receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+                amount = amountToLock
+                lock = Some lock]
+              beneficiaries = Some processorContext.processorBeneficiaries
+            context = TransferContext with
+              openMiningRound = ctx.openMiningRoundCid
+              featuredAppRight = None  -- TODO: Could accept FeaturedAppRight for processor rewards
+              issuingMiningRounds = Map.empty
+              validatorRights = Map.empty
+            expectedDso = Some processorContext.dso
+          
+          let lockedAmuletCid = case transferResult.createdAmulets of
+                [TransferResultLockedAmulet cid] -> cid
+                _ -> error "Expected exactly one locked amulet output"
           
           activeSubscriptionId <- create ActiveSubscription with
             processedAndPaidUntil = now
             stats = emptyStats
             ..
           
-          pure (Right activeSubscriptionId)
+          pure (Right (activeSubscriptionId, transferResult.senderChangeAmulet))
         else do
           -- More approvals pending - create updated proposal
+          -- Amulets should not be provided for non-final approvals
+          assertMsg "Should not provide amulets for non-final approval" (null subscriberAmulets)
+          assertMsg "Should not specify amount for non-final approval" (amountToLock == 0.0)
+          
           proposedSubscriptionId <- create this with
             approvals = newApprovals
           
@@ -71,16 +125,26 @@ template ProposedSubscription
         assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
         assertValidOptionalText description
         
-        -- Validate recipient beneficiaries in changes if provided
+        -- Validate beneficiaries in changes if provided
         case changes.recipientBeneficiaries of
-          Some (Some beneficiaries) -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          _ -> pure ()
+        
+        case changes.processorBeneficiaries of
+          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
           _ -> pure ()
         
         let impactedParties = getImpactedPartiesForProposal changes subscriptionProposal processorContext
         updatedProposal <- applyChangesAndAssertChanged changes subscriptionProposal processorContext
         
+        -- Apply processor context changes
+        let updatedProcessorContext = processorContext with
+              processorProvider = optional processorContext.processorProvider identity changes.processorProvider
+              processorBeneficiaries = optional processorContext.processorBeneficiaries identity changes.processorBeneficiaries
+        
         create this with
           subscriptionProposal = updatedProposal
+          processorContext = updatedProcessorContext
           approvals = updateApprovalsAfterImpact approvals actor impactedParties subscriptionProposal processorContext
 
     -- | Withdraw proposal (archives the proposal)
