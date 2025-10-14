@@ -73,8 +73,8 @@ async function main() {
   const dsoPartyId = dsoResponse.dso_party_id;
   console.log(`✅ DSO Party: ${dsoPartyId}`);
 
-  const subscriptionFactoryData: any = {
-    context: {
+  const subscriptionFactoryData = {
+    processorContext: {
       processor: intellectPartyId,
       dso: dsoPartyId,
     },

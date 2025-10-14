@@ -13,6 +13,7 @@ const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Inter
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
+const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
 
 function createDirectoryIfNotExists(dirPath: string): void {
 	if (!fs.existsSync(dirPath)) {
@@ -313,6 +314,21 @@ function createBundledDATimeTypesFiles(targetDir: string): void {
 	console.log('✅ Copied DA Time Types modules');
 }
 
+function createBundledDATypesFiles(targetDir: string): void {
+	console.log('📦 Bundling DA Types dependency...');
+	const daDestDir = path.join(targetDir, 'lib/DA/Types');
+	const daSourceDir = path.join(DA_TYPES_DIR, 'lib/DA/Types');
+
+	if (!fs.existsSync(daSourceDir)) {
+		console.log('⚠️  DA Types directory not found');
+		return;
+	}
+
+	// Copy the DA/Types directory
+	copyDirectory(daSourceDir, daDestDir);
+	console.log('✅ Copied DA Types modules');
+}
+
 function updateMainIndex(targetDir: string): void {
 	console.log('📝 Updating main index files...');
 
@@ -467,6 +483,24 @@ function replaceDependencyReferences(targetDir: string): void {
 			}
 		}
 
+		if (content.includes('@daml.js/daml-prim-DA-Types-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Types'))
+				.replace(/\\/g, '/');
+			console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Types path: ${relativePath}`);
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/daml-prim-DA-Types-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/daml-prim-DA-Types-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
 		if (content !== originalContent) {
 			fs.writeFileSync(filePath, content);
 			replacedCount++;
@@ -485,6 +519,7 @@ function removeLocalDependency(targetDir: string): void {
 		'@daml.js/splice-api-featured-app-v1-1.0.0',
 		'@daml.js/splice-amulet-0.1.14',
 		'@daml.js/daml-stdlib-DA-Time-Types-1.0.0',
+		'@daml.js/daml-prim-DA-Types-1.0.0',
 	];
 	let removedCount = 0;
 	for (const dep of localDependencies) {
@@ -517,6 +552,7 @@ function main(): void {
 			if (targetDir.includes('Subscriptions-v02')) {
 				createBundledSpliceAmuletFiles(targetDir);
 				createBundledDATimeTypesFiles(targetDir);
+				createBundledDATypesFiles(targetDir);
 			}
 			updateMainIndex(targetDir);
 			replaceDependencyReferences(targetDir);
