@@ -16,6 +16,7 @@ import Fairmint.Subscriptions.Types.ProcessFreeTrialResult (ProcessFreeTrialResu
 import Fairmint.Subscriptions.Types.Approvals (assertIsPartyToActiveSubscription, Approvals(..), addApprovalForActiveSubscriptionAndAssertChanged, areAllApproved, createInitialApprovalsFromImpactedParties)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
+import Fairmint.Subscriptions.Types.SubscriptionStats (SubscriptionStats(..), emptyStats, incrementRounds, updateStatsWithPayment, updateStatsWithProcessorFee)
 
 -- | Active subscription contract
 -- 
@@ -37,6 +38,8 @@ template ActiveSubscription
       -- ^ Processor and DSO context
     processedAndPaidUntil : Time
       -- ^ Subscription has been processed through this time (both payments and free trial)
+    stats : SubscriptionStats
+      -- ^ Statistics tracking rounds processed and payment totals
   where
     signatory [subscription.subscriber, subscription.recipient, processorContext.processor]
     observer subscription.observers
@@ -69,9 +72,13 @@ template ActiveSubscription
         now <- getTime
         let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.trialEndsAt
         
+        -- Update stats: increment rounds processed
+        let newStats = incrementRounds stats
+        
         subscriptionCid <- create this with 
           subscription.trialEndsAt = newTrialEndsAt
           processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = newStats
         
         pure ProcessFreeTrialResult with ..
 
@@ -110,7 +117,24 @@ template ActiveSubscription
             result <- payProcessorFee subscription processorContext processingContext processorFee amuletPrice paymentContext recipientTransferResult
             pure (result, None)
         
-        subscriptionCid <- create this with processedAndPaidUntil = newProcessedAndPaidUntil
+        -- Update stats: track payment amounts
+        let statsAfterRecipientPayment = updateStatsWithPayment 
+              subscription.subscriber 
+              subscription.recipient 
+              recipientTransferResult.summary
+              stats
+        
+        let newStats = case processorTransferResult of
+              Some processorResult -> 
+                updateStatsWithProcessorFee 
+                  processorContext.processor 
+                  processorResult.summary
+                  statsAfterRecipientPayment
+              None -> statsAfterRecipientPayment
+        
+        subscriptionCid <- create this with 
+          processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = newStats
         pure ProcessPaymentResult with ..
 
     -- | Propose changes to the subscription
@@ -289,18 +313,20 @@ template SubscriptionChangeProposal
           applyChangesToSubscription subscriptionChanges (ActiveSubscriptionData with
             subscription = activeSubscription.subscription
             processorContext = activeSubscription.processorContext
-            processedAndPaidUntil = activeSubscription.processedAndPaidUntil)
+            processedAndPaidUntil = activeSubscription.processedAndPaidUntil
+            stats = activeSubscription.stats)
         
         -- Validate recipient beneficiaries if provided in updated subscription
         case updatedSubscription.recipientBeneficiaries of
           Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
           None -> pure ()
         
-        -- Create updated subscription
+        -- Create updated subscription (preserve stats from original)
         archive activeSubscriptionCid
         create activeSubscription with 
           subscription = updatedSubscription
           processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = activeSubscription.stats
 
     -- | Any party in the subscription rejects the change proposal
     choice SubscriptionChangeProposal_Reject : ()
