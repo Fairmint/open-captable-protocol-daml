@@ -1,8 +1,15 @@
 module Fairmint.Subscriptions.Types.PaymentContext where
 
+import DA.Optional (fromSome, isSome)
+import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
-import Splice.AmuletRules (AmuletRules)
-import Splice.Round (OpenMiningRound)
+import Splice.AmuletRules (AmuletRules, Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round qualified as Round
+import Splice.Round (OpenMiningRound, OpenMiningRound_Fetch(..))
+import Fairmint.Shared.Splice.SpliceAmuletHelpers (PaymentRequest(..), paymentTo)
+import Fairmint.Subscriptions.Types.Subscription (Subscription)
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..), resolveRecipientProvider)
 
 -- | Payment context containing Amulet transfer dependencies
 data PaymentContext = PaymentContext
@@ -11,3 +18,114 @@ data PaymentContext = PaymentContext
     amuletRulesCid : ContractId AmuletRules
     openMiningRoundCid : ContractId OpenMiningRound
   deriving (Eq, Show)
+
+-- | Pay subscription recipient
+-- Note: Does not create activity marker because the payment transfer itself serves as the activity record
+payRecipient : 
+  Subscription -> 
+  ProcessorContext -> 
+  ProcessingContext -> 
+  Decimal -> 
+  Decimal -> 
+  PaymentContext -> 
+  Update TransferResult
+payRecipient subscription processorContext processingContext amountForPeriod amuletPrice paymentCtx = do
+  recipientProviderParty <- resolveRecipientProvider subscription processingContext
+  paymentTo PaymentRequest with
+    sender = subscription.subscriber
+    receiver = subscription.recipient
+    provider = recipientProviderParty
+    amount = amountForPeriod
+    featuredAppRight = processingContext.recipientFeaturedAppRight
+    expectedDso = processorContext.dso
+    amuletInputs = paymentCtx.amuletInputs
+    amuletRulesCid = paymentCtx.amuletRulesCid
+    openMiningRoundCid = paymentCtx.openMiningRoundCid
+
+-- | Pay processor fee
+-- Note: Does not create activity marker because the payment transfer itself serves as the activity record
+payProcessorFee :
+  Subscription ->
+  ProcessorContext ->
+  ProcessingContext ->
+  Decimal ->
+  Decimal ->
+  PaymentContext ->
+  TransferResult ->
+  Update (Optional TransferResult)
+payProcessorFee subscription processorContext processingContext feeAmount amuletPrice paymentCtx recipientResult = do
+  assertHasChangeAmulet recipientResult.senderChangeAmulet
+  let changeAmuletCid = fromSome recipientResult.senderChangeAmulet
+  result <- paymentTo PaymentRequest with
+    sender = subscription.subscriber
+    receiver = processorContext.processor
+    provider = processingContext.processorProvider
+    amount = feeAmount
+    featuredAppRight = processingContext.processorFeaturedAppRight
+    expectedDso = processorContext.dso
+    amuletInputs = [changeAmuletCid]
+    amuletRulesCid = paymentCtx.amuletRulesCid
+    openMiningRoundCid = paymentCtx.openMiningRoundCid
+  pure (Some result)
+
+-- | Create transfer and context for amulet transfer
+createTransferAndContext :
+  Party ->
+  Party ->
+  Decimal ->
+  PaymentContext ->
+  Optional (ContractId Amulet.FeaturedAppRight) ->
+  (Transfer, TransferContext)
+createTransferAndContext sender receiver amount paymentContext featuredAppRight =
+  let
+    transfer = Transfer with
+      sender = sender
+      provider = receiver
+      inputs = map InputAmulet paymentContext.amuletInputs
+      outputs = [TransferOutput with
+        receiver = receiver
+        receiverFeeRatio = 1.0
+        amount = amount
+        lock = None]
+      beneficiaries = None
+    
+    context = TransferContext with
+      openMiningRound = paymentContext.openMiningRoundCid
+      featuredAppRight = featuredAppRight
+      issuingMiningRounds = Map.empty
+      validatorRights = Map.empty
+  in (transfer, context)
+
+-- | Create refund transfer from recipient to subscriber
+createRefundTransfer :
+  Party ->
+  Party ->
+  Decimal ->
+  PaymentContext ->
+  Transfer
+createRefundTransfer recipientSender subscriberReceiver refundAmount paymentContext =
+  let (transfer, _) = createTransferAndContext recipientSender subscriberReceiver refundAmount paymentContext None
+  in transfer
+
+-- | Assert that amulet inputs are provided
+assertHasAmuletInputs : [a] -> Update ()
+assertHasAmuletInputs inputs =
+  assertMsg "Must provide at least one amulet input" (not (null inputs))
+
+-- | Assert that change amulet is available
+assertHasChangeAmulet : Optional a -> Update ()
+assertHasChangeAmulet senderChangeAmulet =
+  assertMsg "Expected change amulet from recipient transfer" (isSome senderChangeAmulet)
+
+-- | Assert that amulet price is valid
+assertValidAmuletPrice : Decimal -> Update ()
+assertValidAmuletPrice price =
+  assertMsg "USD to Amulet conversion rate must be positive" (price > 0.0)
+
+-- | Fetch and validate amulet price from open mining round
+fetchAndValidateAmuletPrice : ContractId Round.OpenMiningRound -> Party -> Update Decimal
+fetchAndValidateAmuletPrice openMiningRoundCid actor = do
+  openRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = actor)
+  let amuletPrice = openRound.amuletPrice
+  assertValidAmuletPrice amuletPrice
+  pure amuletPrice
