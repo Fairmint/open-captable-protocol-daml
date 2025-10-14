@@ -5,6 +5,7 @@ import DA.TextMap (TextMap)
 import Fairmint.Shared.TypeHelpers (validateOptionalText, validateOptionalMetadata)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), validateSubscriptionAmount)
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary)
 
 -- | Configuration data shared between subscription templates and proposals
 -- Note: free trial state is managed by ActiveSubscription template's trialEndsAt field (implicit state)
@@ -18,7 +19,8 @@ data Subscription = Subscription
       -- ^ Provider party for recipient's Amulet transfers.
       -- When Some: processor must pass None as runtime parameter (uses this stored value).
       -- When None: processor must pass Some as runtime parameter (selects provider at runtime).
-      -- Exactly one source (stored XOR runtime) must be set.
+    recipientBeneficiaries : Optional [AppRewardBeneficiary]
+      -- ^ Optional beneficiaries for recipient's app rewards (validated when used in choices)
     recipientPaymentPerDay : SubscriptionAmount
       -- ^ Amount to pay the recipient per day (in Amulet or USD)
     processorPaymentPerDay : Optional SubscriptionAmount
@@ -63,52 +65,10 @@ isInFreeTrial trialEndsAt now =
     Some trial -> trial >= now
     None -> False
 
--- | Checks if subscription is in PrepaidCanceled state
-isInPrepaidCanceled : Optional Time -> Time -> Time -> Bool
-isInPrepaidCanceled paymentsEndAt processedAndPaidUntil now =
-  case paymentsEndAt of
-    Some end -> end <= now && processedAndPaidUntil >= now
-    None -> False
-
 -- | Calculate the new trialEndsAt after processing (clears if trial ended in real time)
 clearTrialIfEnded : Time -> Time -> Optional Time -> Optional Time
 clearTrialIfEnded now trialEnd currentTrialEndsAt =
   if now >= trialEnd then None else currentTrialEndsAt
-
--- | Calculate new processedAndPaidUntil with all capping logic
--- Caps at: prepay window, trial end (if applicable), and payments end (if applicable)
-calculateNewProcessedAndPaidUntil : Time -> RelTime -> Optional RelTime -> Optional Time -> Optional Time -> Time -> Time
-calculateNewProcessedAndPaidUntil 
-  now 
-  processingPeriod 
-  prepayWindow 
-  trialEndsAt 
-  paymentsEndAt 
-  currentProcessedAndPaidUntil =
-    let
-      effectivePrepayWindow = case prepayWindow of
-        Some window -> window
-        None -> days 0
-      maxAllowedProcessedAndPaidUntil = addRelTime now effectivePrepayWindow
-      desiredProcessedAndPaidUntil = addRelTime currentProcessedAndPaidUntil processingPeriod
-      
-      -- Cap at prepay window
-      cappedAtPrepay = 
-        if desiredProcessedAndPaidUntil > maxAllowedProcessedAndPaidUntil 
-        then maxAllowedProcessedAndPaidUntil 
-        else desiredProcessedAndPaidUntil
-      
-      -- Cap at trial end if applicable
-      cappedAtTrial = case trialEndsAt of
-        Some trial -> if cappedAtPrepay > trial then trial else cappedAtPrepay
-        None -> cappedAtPrepay
-      
-      -- Cap at payments end if applicable
-      cappedAtPaymentsEnd = case paymentsEndAt of
-        Some end -> if cappedAtTrial > end then end else cappedAtTrial
-        None -> cappedAtTrial
-    in
-      cappedAtPaymentsEnd
 
 -- | Calculate and validate new processedAndPaidUntil for payment processing
 -- Accounts for trial periods (starts from max of trial end and current processedAndPaidUntil)
@@ -150,13 +110,6 @@ assertNotInFreeTrial trialEndsAt = do
   now <- getTime
   assertMsg "Cannot process payment while in free trial (subscription.trialEndsAt is Some and >= now)" 
     (not (isInFreeTrial trialEndsAt now))
-
--- | Assert that subscription period has elapsed (can process next payment)
-assertPeriodHasElapsed : Time -> Update ()
-assertPeriodHasElapsed processedAndPaidUntil = do
-  now <- getTime
-  assertMsg "Cannot process before subscription period elapses (still processed through current processedAndPaidUntil time)" 
-    (now > processedAndPaidUntil)
 
 -- | Asserts that payments haven't ended
 assertPaymentsNotEnded : Optional Time -> Update ()

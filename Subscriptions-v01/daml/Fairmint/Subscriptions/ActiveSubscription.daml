@@ -46,13 +46,14 @@ template ActiveSubscription
     -- | Process free trial period (advances processedAndPaidUntil without payment)
     -- Transitions out of trial when subscription.trialEndsAt is reached
     -- Can process any period up to trialEnd (now and prepayWindow are not relevant)
-    choice ActiveSubscription_ProcessFreeTrial : ProcessFreeTrialResult
+    choice ActiveSubscription_ProcessFreeTrial : ProcessFreeTrialResult ActiveSubscription
       with
         processingContext : ProcessingContext
       controller processorContext.processor
       do
         trialEnd <- assertInFreeTrial subscription.trialEndsAt
         assertValidProcessingPeriod processingContext
+        Amulet.validateAppRewardBeneficiaries processingContext.processorBeneficiaries
         
         -- Calculate new processedAndPaidUntil: add processingPeriod and assert constraints
         let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingContext.processingPeriod
@@ -65,6 +66,7 @@ template ActiveSubscription
         processorActivityMarkerCid <- createProcessorActivityMarkerIfProvided processingContext
         
         -- Clear subscription.trialEndsAt if trial ended in real time
+        now <- getTime
         let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.trialEndsAt
         
         subscriptionCid <- create this with 
@@ -74,7 +76,7 @@ template ActiveSubscription
         pure ProcessFreeTrialResult with ..
 
     -- | Process payment for paid subscription
-    choice ActiveSubscription_ProcessPayment : ProcessPaymentResult
+    choice ActiveSubscription_ProcessPayment : ProcessPaymentResult ActiveSubscription
       with
         processingContext : ProcessingContext
         paymentContext : PaymentContext
@@ -84,6 +86,7 @@ template ActiveSubscription
       controller processorContext.processor
       do
         assertValidProcessingPeriod processingContext
+        Amulet.validateAppRewardBeneficiaries processingContext.processorBeneficiaries
         assertHasAmuletInputs paymentContext.amuletInputs
         assertNotInFreeTrial subscription.trialEndsAt
         
@@ -123,6 +126,11 @@ template ActiveSubscription
         assertIsPartyToActiveSubscription actor subscription processorContext
         assertChangeValuesValidAndNonEmpty subscriptionChanges
         assertValidOptionalText description
+        
+        -- Validate recipient beneficiaries in changes if provided
+        case subscriptionChanges.recipientBeneficiaries of
+          Some (Some beneficiaries) -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          _ -> pure ()
         
         let impactedParties = getImpactedPartiesForSubscription subscriptionChanges subscription processorContext
         let approvals = createInitialApprovalsFromImpactedParties actor subscription processorContext impactedParties
@@ -180,7 +188,7 @@ template ActiveSubscription
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid subscription.recipient
         
         -- Calculate and execute refund
-        refundAmount <- calculateRefundForPrepaidPeriod processedAndPaidUntil subscription amuletPrice
+        refundAmount <- calculateRefundForPrepaidPeriod processedAndPaidUntil subscription.recipientPaymentPerDay subscription.processorPaymentPerDay amuletPrice
         let (transfer, context) = createTransferAndContext subscription.recipient subscription.subscriber refundAmount paymentContext recipientFeaturedAppRight
         
         exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
@@ -282,6 +290,11 @@ template SubscriptionChangeProposal
             subscription = activeSubscription.subscription
             processorContext = activeSubscription.processorContext
             processedAndPaidUntil = activeSubscription.processedAndPaidUntil)
+        
+        -- Validate recipient beneficiaries if provided in updated subscription
+        case updatedSubscription.recipientBeneficiaries of
+          Some beneficiaries -> Amulet.validateAppRewardBeneficiaries beneficiaries
+          None -> pure ()
         
         -- Create updated subscription
         archive activeSubscriptionCid

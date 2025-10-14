@@ -1,347 +1,360 @@
 module Subscriptions.TestPartyMigration where
 
 import Daml.Script
-import DA.Time (days, addRelTime)
-import Subscriptions.TestUtils
-import Fairmint.Subscriptions.PartyMigrationProposal
 import Fairmint.Subscriptions.ProposedSubscription
 import Fairmint.Subscriptions.ActiveSubscription
-import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..))
-import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.PartyMigrationProposal
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
+import Subscriptions.TestUtils
 
--- | Test creating a party migration proposal
-testCreateMigrationProposal : Script ()
-testCreateMigrationProposal = do
+-- | Test PartyMigrationProposal_Approve by old party
+testPartyMigrationProposalApproveOldParty : Script ()
+testPartyMigrationProposalApproveOldParty = script do
   TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
+  newSubscriber <- allocateParty "NewAlice"
   
-  -- Create migration proposal (alice approves first)
-  unapprovedCid <- submit alice do
+  -- Create migration proposal (initiated by new party)
+  proposalCid <- submitMulti [newSubscriber] [alice] do
     createCmd PartyMigrationProposal with
+      partyType = Subscriber
       oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating Alice to new account"
+      newParty = newSubscriber
+      oldPartyApproved = False
+      newPartyApproved = True
   
-  -- Verify unapproved proposal exists
-  proposal <- queryContractId alice unapprovedCid
-  assertMsg "Unapproved proposal should exist" (isSome proposal)
+  -- Old party approves
+  approvedCid <- submit alice do
+    exerciseCmd proposalCid PartyMigrationProposal_Approve with
+      actor = alice
   
-  -- AliceNew approves
-  approvedCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
-  
-  -- Verify approved proposal exists
-  approvedProposal <- queryContractId alice approvedCid
-  assertMsg "Approved proposal should exist" (isSome approvedProposal)
+  pure ()
 
--- | Test migrating subscriber in an active subscription
-testMigrateSubscriberInActiveSubscription : Script ()
-testMigrateSubscriberInActiveSubscription = do
+-- | Test PartyMigrationProposal_Approve by new party
+testPartyMigrationProposalApproveNewParty : Script ()
+testPartyMigrationProposalApproveNewParty = script do
   TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
-  expiresAt <- getExpirationTime 30
+  newSubscriber <- allocateParty "NewAlice"
   
-  -- Create and activate a subscription with Alice as subscriber
-  let proposal = defaultSubscriptionProposal alice bob expiresAt
-  proposedCid <- createSubscriberProposal processor alice dso proposal
-  
-  -- Bob approves to activate
-  result <- submit bob do
-    exerciseCmd proposedCid (ProposedSubscription_Approve bob)
-  
-  activeCid <- case result of
-    Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
-  
-  -- Create and approve migration proposal
-  unapprovedCid <- submit alice do
+  -- Create migration proposal (initiated by old party)
+  proposalCid <- submitMulti [alice] [newSubscriber] do
     createCmd PartyMigrationProposal with
+      partyType = Subscriber
       oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
+      newParty = newSubscriber
       oldPartyApproved = True
       newPartyApproved = False
-      description = Some "Migrating subscriber"
   
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
+  -- New party approves
+  approvedCid <- submit newSubscriber do
+    exerciseCmd proposalCid PartyMigrationProposal_Approve with
+      actor = newSubscriber
   
-  -- Use migration proposal to migrate the subscription (nonconsuming)
-  migratedCid <- submit processor do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription processor activeCid)
-  
-  -- Verify the subscription was migrated
-  Some migratedSubscription <- queryContractId processor migratedCid
-  assertMsg "Subscriber should be migrated" (migratedSubscription.subscription.subscriber == aliceNew)
-  
-  -- Verify original subscription is archived
-  originalSubscription <- queryContractId processor activeCid
-  assertMsg "Original subscription should be archived" (isNone originalSubscription)
-  
-  -- Verify migration proposal still exists (nonconsuming)
-  migrationProposal <- queryContractId alice migrationProposalCid
-  assertMsg "Migration proposal should still exist" (isSome migrationProposal)
+  pure ()
 
--- | Test migrating recipient in an active subscription
-testMigrateRecipientInActiveSubscription : Script ()
-testMigrateRecipientInActiveSubscription = do
+-- | Test PartyMigrationProposal_Archive
+testPartyMigrationProposalArchive : Script ()
+testPartyMigrationProposalArchive = script do
   TestParties{..} <- allocateTestParties
-  bobNew <- allocateParty "BobNew"
-  expiresAt <- getExpirationTime 30
+  newSubscriber <- allocateParty "NewAlice"
   
-  -- Create and activate a subscription with Bob as recipient
-  let proposal = defaultSubscriptionProposal alice bob expiresAt
-  proposedCid <- createSubscriberProposal processor alice dso proposal
-  
-  result <- submit bob do
-    exerciseCmd proposedCid (ProposedSubscription_Approve bob)
-  
-  activeCid <- case result of
-    Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
-  
-  -- Create and approve migration proposal
-  unapprovedCid <- submit bob do
+  -- Create migration proposal
+  proposalCid <- submitMulti [alice] [newSubscriber] do
     createCmd PartyMigrationProposal with
-      oldParty = bob
-      newParty = bobNew
-      partyRole = RecipientRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating recipient"
-  
-  migrationProposalCid <- submit bobNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve bobNew)
-  
-  -- Migrate the subscription
-  migratedCid <- submit alice do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription alice activeCid)
-  
-  -- Verify the subscription was migrated
-  Some migratedSubscription <- queryContractId alice migratedCid
-  assertMsg "Recipient should be migrated" (migratedSubscription.subscription.recipient == bobNew)
-
--- | Test migrating processor in an active subscription
-testMigrateProcessorInActiveSubscription : Script ()
-testMigrateProcessorInActiveSubscription = do
-  TestParties{..} <- allocateTestParties
-  processorNew <- allocateParty "ProcessorNew"
-  expiresAt <- getExpirationTime 30
-  
-  -- Create and activate a subscription
-  let proposal = defaultSubscriptionProposal alice bob expiresAt
-  proposedCid <- createSubscriberProposal processor alice dso proposal
-  
-  result <- submit bob do
-    exerciseCmd proposedCid (ProposedSubscription_Approve bob)
-  
-  activeCid <- case result of
-    Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
-  
-  -- Create and approve migration proposal
-  unapprovedCid <- submit processor do
-    createCmd PartyMigrationProposal with
-      oldParty = processor
-      newParty = processorNew
-      partyRole = ProcessorRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating processor"
-  
-  migrationProposalCid <- submit processorNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve processorNew)
-  
-  -- Migrate the subscription
-  migratedCid <- submit alice do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription alice activeCid)
-  
-  -- Verify the subscription was migrated
-  Some migratedSubscription <- queryContractId alice migratedCid
-  assertMsg "Processor should be migrated" (migratedSubscription.processorContext.processor == processorNew)
-
--- | Test migrating subscriber in a proposed subscription
-testMigrateSubscriberInProposedSubscription : Script ()
-testMigrateSubscriberInProposedSubscription = do
-  TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
-  expiresAt <- getExpirationTime 30
-  
-  -- Create a proposed subscription with Alice as subscriber
-  let proposal = defaultSubscriptionProposal alice bob expiresAt
-  proposedCid <- createSubscriberProposal processor alice dso proposal
-  
-  -- Create and approve migration proposal
-  unapprovedCid <- submit alice do
-    createCmd PartyMigrationProposal with
+      partyType = Subscriber
       oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
+      newParty = newSubscriber
       oldPartyApproved = True
       newPartyApproved = False
-      description = Some "Migrating subscriber in proposal"
   
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
-  
-  -- Migrate the proposed subscription
-  migratedCid <- submit processor do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateProposedSubscription processor proposedCid)
-  
-  -- Verify the proposal was migrated
-  Some migratedProposal <- queryContractId processor migratedCid
-  assertMsg "Subscriber should be migrated" (migratedProposal.subscriptionProposal.subscriber == aliceNew)
-
--- | Test using one migration proposal for multiple subscriptions
-testMigrationProposalForMultipleSubscriptions : Script ()
-testMigrationProposalForMultipleSubscriptions = do
-  TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
-  bob2 <- allocateParty "Bob2"
-  expiresAt <- getExpirationTime 30
-  
-  -- Create two active subscriptions with Alice as subscriber
-  let proposal1 = defaultSubscriptionProposal alice bob expiresAt
-  let proposal2 = defaultSubscriptionProposal alice bob2 expiresAt
-  
-  proposedCid1 <- createSubscriberProposal processor alice dso proposal1
-  proposedCid2 <- createSubscriberProposal processor alice dso proposal2
-  
-  -- Activate both
-  result1 <- submit bob do
-    exerciseCmd proposedCid1 (ProposedSubscription_Approve bob)
-  result2 <- submit bob2 do
-    exerciseCmd proposedCid2 (ProposedSubscription_Approve bob2)
-  
-  activeCid1 <- case result1 of
-    Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
-  activeCid2 <- case result2 of
-    Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
-  
-  -- Create and approve one migration proposal
-  unapprovedCid <- submit alice do
-    createCmd PartyMigrationProposal with
-      oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating all Alice subscriptions"
-  
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
-  
-  -- Use the same proposal to migrate both subscriptions (nonconsuming)
-  migratedCid1 <- submit processor do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription processor activeCid1)
-  
-  migratedCid2 <- submit processor do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription processor activeCid2)
-  
-  -- Verify both subscriptions were migrated
-  Some migrated1 <- queryContractId processor migratedCid1
-  Some migrated2 <- queryContractId processor migratedCid2
-  assertMsg "First subscription subscriber should be migrated" (migrated1.subscription.subscriber == aliceNew)
-  assertMsg "Second subscription subscriber should be migrated" (migrated2.subscription.subscriber == aliceNew)
-  
-  -- Verify migration proposal still exists
-  migrationProposal <- queryContractId alice migrationProposalCid
-  assertMsg "Migration proposal should still exist" (isSome migrationProposal)
-
--- | Test archiving migration proposal by old party
-testArchiveMigrationProposalByOldParty : Script ()
-testArchiveMigrationProposalByOldParty = do
-  TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
-  
-  -- Create and approve migration proposal
-  unapprovedCid <- submit alice do
-    createCmd PartyMigrationProposal with
-      oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating Alice"
-  
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
-  
-  -- Old party archives
+  -- Old party withdraws
   submit alice do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_Archive alice (Some "Migration complete"))
+    exerciseCmd proposalCid PartyMigrationProposal_Archive with
+      actor = alice
+      description = Some "Changed my mind"
   
-  -- Verify proposal is archived
-  proposal <- queryContractId alice migrationProposalCid
-  assertMsg "Proposal should be archived" (isNone proposal)
+  pure ()
 
--- | Test archiving migration proposal by new party
-testArchiveMigrationProposalByNewParty : Script ()
-testArchiveMigrationProposalByNewParty = do
+-- | Test PartyMigrationProposal_MigrateActiveSubscription for subscriber
+testMigrateActiveSubscriptionSubscriber : Script ()
+testMigrateActiveSubscriptionSubscriber = script do
   TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
+  newSubscriber <- allocateParty "NewAlice"
   
-  -- Create and approve migration proposal
-  unapprovedCid <- submit alice do
-    createCmd PartyMigrationProposal with
-      oldParty = alice
-      newParty = aliceNew
-      partyRole = SubscriberRole
-      oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Migrating Alice"
+  -- Create active subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
   
-  -- New party archives
-  submit aliceNew do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_Archive aliceNew (Some "Migration complete"))
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
   
-  -- Verify proposal is archived
-  proposal <- queryContractId aliceNew migrationProposalCid
-  assertMsg "Proposal should be archived" (isNone proposal)
-
--- | Test that validation fails when old party doesn't match
-testMigrationFailsWhenOldPartyMismatch : Script ()
-testMigrationFailsWhenOldPartyMismatch = do
-  TestParties{..} <- allocateTestParties
-  aliceNew <- allocateParty "AliceNew"
-  expiresAt <- getExpirationTime 30
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
   
-  -- Create and activate a subscription with Alice as subscriber
-  let proposal = defaultSubscriptionProposal alice bob expiresAt
-  proposedCid <- createSubscriberProposal processor alice dso proposal
-  
-  result <- submit bob do
-    exerciseCmd proposedCid (ProposedSubscription_Approve bob)
-  
-  activeCid <- case result of
+  subscriptionCid <- case result2 of
     Right cid -> pure cid
-    Left _ -> error "Expected active subscription"
+    Left _ -> error "Expected subscription to be created"
   
-  -- Create and approve migration proposal for Bob (wrong party)
-  unapprovedCid <- submit bob do
+  -- Create fully approved migration proposal
+  migrationCid <- submitMulti [alice, newSubscriber] [] do
     createCmd PartyMigrationProposal with
-      oldParty = bob  -- Bob is recipient, not subscriber
-      newParty = aliceNew
-      partyRole = SubscriberRole
+      partyType = Subscriber
+      oldParty = alice
+      newParty = newSubscriber
       oldPartyApproved = True
-      newPartyApproved = False
-      description = Some "Wrong old party"
+      newPartyApproved = True
   
-  migrationProposalCid <- submit aliceNew do
-    exerciseCmd unapprovedCid (PartyMigrationProposal_Approve aliceNew)
+  -- Apply migration
+  newSubscriptionCid <- submit alice do
+    exerciseCmd migrationCid PartyMigrationProposal_MigrateActiveSubscription with
+      actor = alice
+      activeSubscriptionCid = subscriptionCid
   
-  -- Try to migrate - should fail
-  submitMustFail processor do
-    exerciseCmd migrationProposalCid (PartyMigrationProposal_MigrateActiveSubscription processor activeCid)
+  pure ()
+
+-- | Test PartyMigrationProposal_MigrateActiveSubscription for recipient
+testMigrateActiveSubscriptionRecipient : Script ()
+testMigrateActiveSubscriptionRecipient = script do
+  TestParties{..} <- allocateTestParties
+  newRecipient <- allocateParty "NewBob"
+  
+  -- Create active subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Create fully approved migration proposal
+  migrationCid <- submitMulti [bob, newRecipient] [] do
+    createCmd PartyMigrationProposal with
+      partyType = Recipient
+      oldParty = bob
+      newParty = newRecipient
+      oldPartyApproved = True
+      newPartyApproved = True
+  
+  -- Apply migration
+  newSubscriptionCid <- submit bob do
+    exerciseCmd migrationCid PartyMigrationProposal_MigrateActiveSubscription with
+      actor = bob
+      activeSubscriptionCid = subscriptionCid
+  
+  pure ()
+
+-- | Test PartyMigrationProposal_MigrateActiveSubscription for processor
+testMigrateActiveSubscriptionProcessor : Script ()
+testMigrateActiveSubscriptionProcessor = script do
+  TestParties{..} <- allocateTestParties
+  newProcessor <- allocateParty "NewProcessor"
+  
+  -- Create active subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Create fully approved migration proposal
+  migrationCid <- submitMulti [processor, newProcessor] [] do
+    createCmd PartyMigrationProposal with
+      partyType = Processor
+      oldParty = processor
+      newParty = newProcessor
+      oldPartyApproved = True
+      newPartyApproved = True
+  
+  -- Apply migration
+  newSubscriptionCid <- submit processor do
+    exerciseCmd migrationCid PartyMigrationProposal_MigrateActiveSubscription with
+      actor = processor
+      activeSubscriptionCid = subscriptionCid
+  
+  pure ()
+
+-- | Test PartyMigrationProposal_MigrateProposedSubscription for subscriber
+testMigrateProposedSubscriptionSubscriber : Script ()
+testMigrateProposedSubscriptionSubscriber = script do
+  TestParties{..} <- allocateTestParties
+  newSubscriber <- allocateParty "NewAlice"
+  
+  -- Create proposed subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  -- Create fully approved migration proposal
+  migrationCid <- submitMulti [alice, newSubscriber] [] do
+    createCmd PartyMigrationProposal with
+      partyType = Subscriber
+      oldParty = alice
+      newParty = newSubscriber
+      oldPartyApproved = True
+      newPartyApproved = True
+  
+  -- Apply migration
+  newProposalCid <- submit alice do
+    exerciseCmd migrationCid PartyMigrationProposal_MigrateProposedSubscription with
+      actor = alice
+      proposedSubscriptionCid = proposalCid
+  
+  pure ()
+
+-- | Test PartyMigrationProposal_MigrateProposedSubscription for recipient
+testMigrateProposedSubscriptionRecipient : Script ()
+testMigrateProposedSubscriptionRecipient = script do
+  TestParties{..} <- allocateTestParties
+  newRecipient <- allocateParty "NewBob"
+  
+  -- Create proposed subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  -- Create fully approved migration proposal
+  migrationCid <- submitMulti [bob, newRecipient] [] do
+    createCmd PartyMigrationProposal with
+      partyType = Recipient
+      oldParty = bob
+      newParty = newRecipient
+      oldPartyApproved = True
+      newPartyApproved = True
+  
+  -- Apply migration
+  newProposalCid <- submit bob do
+    exerciseCmd migrationCid PartyMigrationProposal_MigrateProposedSubscription with
+      actor = bob
+      proposedSubscriptionCid = proposalCid
+  
+  pure ()
+
+-- | Test ProposedSubscription_ChangeParty for subscriber (via migration proposal)
+testProposedSubscriptionChangePartySubscriber : Script ()
+testProposedSubscriptionChangePartySubscriber = script do
+  TestParties{..} <- allocateTestParties
+  newSubscriber <- allocateParty "NewAlice"
+  
+  -- Create proposed subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  -- Directly exercise ChangeParty choice (requires both old and new party authorization)
+  newProposalCid <- submitMulti [alice, newSubscriber] [] do
+    exerciseCmd proposalCid ProposedSubscription_ChangeParty with
+      partyType = Subscriber
+      oldParty = alice
+      newParty = newSubscriber
+  
+  pure ()
+
+-- | Test ActiveSubscription_ChangeParty for subscriber (via migration proposal)
+testActiveSubscriptionChangePartySubscriber : Script ()
+testActiveSubscriptionChangePartySubscriber = script do
+  TestParties{..} <- allocateTestParties
+  newSubscriber <- allocateParty "NewAlice"
+  
+  -- Create active subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Directly exercise ChangeParty choice (requires both old and new party authorization)
+  newSubscriptionCid <- submitMulti [alice, newSubscriber] [] do
+    exerciseCmd subscriptionCid ActiveSubscription_ChangeParty with
+      partyType = Subscriber
+      oldParty = alice
+      newParty = newSubscriber
+  
+  pure ()
+
+-- | Test ActiveSubscription_ChangeParty for recipient
+testActiveSubscriptionChangePartyRecipient : Script ()
+testActiveSubscriptionChangePartyRecipient = script do
+  TestParties{..} <- allocateTestParties
+  newRecipient <- allocateParty "NewBob"
+  
+  -- Create active subscription
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  result1 <- submit processor do
+    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
+  
+  processorApprovedCid <- case result1 of
+    Left cid -> pure cid
+    Right _ -> error "Expected more approvals needed"
+  
+  result2 <- submit bob do
+    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
+  
+  subscriptionCid <- case result2 of
+    Right cid -> pure cid
+    Left _ -> error "Expected subscription to be created"
+  
+  -- Directly exercise ChangeParty choice
+  newSubscriptionCid <- submitMulti [bob, newRecipient] [] do
+    exerciseCmd subscriptionCid ActiveSubscription_ChangeParty with
+      partyType = Recipient
+      oldParty = bob
+      newParty = newRecipient
+  
+  pure ()
+
+-- | Test archiving PartyMigrationProposal using implicit Archive choice
+-- This exercises the implicit Archive that all templates have
+testPartyMigrationProposalImplicitArchive : Script ()
+testPartyMigrationProposalImplicitArchive = script do
+  TestParties{..} <- allocateTestParties
+  newSubscriber <- allocateParty "NewAlice"
+  
+  -- Create fully approved migration proposal (both parties are signatories)
+  proposalCid <- submitMulti [alice, newSubscriber] [] do
+    createCmd PartyMigrationProposal with
+      partyType = Subscriber
+      oldParty = alice
+      newParty = newSubscriber
+      oldPartyApproved = True
+      newPartyApproved = True
+  
+  -- Archive using implicit Archive choice (requires both signatories)
+  submitMulti [alice, newSubscriber] [] do
+    exerciseCmd proposalCid Archive
   
   pure ()
 

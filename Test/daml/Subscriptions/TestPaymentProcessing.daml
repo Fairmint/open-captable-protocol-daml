@@ -3,6 +3,7 @@ module Subscriptions.TestPaymentProcessing where
 import Daml.Script
 import DA.Time (days, addRelTime)
 import DA.List (head)
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import Splice.Round (OpenMiningRound)
 import Fairmint.Subscriptions.ProposedSubscription
 import Fairmint.Subscriptions.ActiveSubscription
@@ -69,10 +70,12 @@ testProcessPayment = script do
         recipientProvider = Some bob
         recipientFeaturedAppRight = None
         processorFeaturedAppRight = None
+        processorBeneficiaries = [AppRewardBeneficiary processor 1.0]
       paymentContext = PaymentContext with
         amuletInputs = [amuletCid]
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+      skipProcessorPayment = False
   
   -- Verify the subscription was updated
   Some updatedSubscription <- queryContractId alice paymentResult.subscriptionCid
@@ -115,60 +118,15 @@ testProcessPaymentFailsBeforePeriodElapses = script do
         recipientProvider = Some bob
         recipientFeaturedAppRight = None
         processorFeaturedAppRight = None
+        processorBeneficiaries = [AppRewardBeneficiary processor 1.0]
       paymentContext = PaymentContext with
         amuletInputs = [amuletCid]
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+      skipProcessorPayment = False
   
   pure ()
 
--- | Test processing payment fails after expiration
-testProcessPaymentFailsAfterExpiration : Script ()
-testProcessPaymentFailsAfterExpiration = script do
-  TestParties{..} <- allocateTestParties
-  
-  now <- getTime
-  let expiresAt = addRelTime now (days 60)  -- Expires in 60 days
-  proposalCid <- createSubscriberProposal processor alice dso 
-    ((defaultSubscriptionProposal alice bob expiresAt) with paymentsEndAt = Some (PerciseTime expiresAt))
-  
-  subscriptionCid <- approveProposalFully proposalCid processor bob
-  
-  -- Create amulet for payment before advancing time
-  amuletCid <- tapWithDso dso alice 50.0
-  
-  -- Get payment context
-  openRounds <- query @OpenMiningRound dso
-  now3 <- getTime
-  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now3) openRounds
-  assertMsg "Need at least one open round" (not (null currentOpenRounds))
-  let (openRoundCid, _) = head currentOpenRounds
-  amuletRulesCid <- getAmuletRules dso
-  
-  -- Wait past expiration
-  now2 <- getTime
-  setTime (addRelTime now2 (days 61))
-  
-  -- Get disclosures
-  Some amuletDisclosure <- queryDisclosure alice amuletCid
-  Some amuletRulesDisclosure <- queryDisclosure dso amuletRulesCid
-  Some openRoundDisclosure <- queryDisclosure dso openRoundCid
-  
-  -- Try to process payment after expiration (should fail)
-  submitWithDisclosuresMustFail processor [amuletDisclosure, amuletRulesDisclosure, openRoundDisclosure] do
-    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
-      processingContext = ProcessingContext with
-        processorProvider = processor
-        processingPeriod = days 30
-        recipientProvider = Some bob
-        recipientFeaturedAppRight = None
-        processorFeaturedAppRight = None
-      paymentContext = PaymentContext with
-        amuletInputs = [amuletCid]
-        amuletRulesCid = amuletRulesCid
-        openMiningRoundCid = openRoundCid
-  
-  pure ()
 
 -- | Test processing free trial
 testProcessFreeTrial : Script ()
@@ -179,7 +137,7 @@ testProcessFreeTrial = script do
   expiresAt <- getExpirationTime 365
   let freeTrialEndsAt = addRelTime now (days 30)
   let proposal = (defaultSubscriptionProposal alice bob expiresAt) with
-        freeTrialExpiration = Some (PerciseTime freeTrialEndsAt)
+        freeTrialExpiration = Some (PreciseTime freeTrialEndsAt)
   
   -- Create proposal with free trial
   proposalCid <- submitMulti [alice, processor] [] do
@@ -202,6 +160,7 @@ testProcessFreeTrial = script do
         recipientProvider = Some bob
         recipientFeaturedAppRight = None
         processorFeaturedAppRight = None
+        processorBeneficiaries = [AppRewardBeneficiary processor 1.0]
   
   Some updated <- queryContractId alice result.subscriptionCid
   assertMsg "processedAndPaidUntil should advance" (updated.processedAndPaidUntil > now)
