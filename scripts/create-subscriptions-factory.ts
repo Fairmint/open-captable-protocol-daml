@@ -56,7 +56,7 @@ async function main() {
   // Import from the combined lib built by scripts/create-root-index.ts
   const { Fairmint } = await import('../lib');
 
-  const client = createLedgerJsonApiClient(network, 'intellect');
+  const client = createLedgerJsonApiClient(network, '5n');
 
   if (!Fairmint?.Subscriptions?.SubscriptionFactory?.SubscriptionFactory) {
     throw new Error('Generated DAML types not found for Subscriptions package. Please run "npm run codegen" first.');
@@ -64,8 +64,8 @@ async function main() {
 
   console.log(`Template ID: ${Fairmint.Subscriptions.SubscriptionFactory.SubscriptionFactory.templateId}`);
 
-  const validatorClient = createValidatorApiClient(network, 'intellect');
-  const intellectPartyId = client.getPartyId();
+  const validatorClient = createValidatorApiClient(network, '5n');
+  const clientPartyId = client.getPartyId();
 
   // Get DSO party ID
   console.log('Looking up DSO party...');
@@ -78,7 +78,7 @@ async function main() {
 
   const subscriptionFactoryData = {
     processorContext: {
-      processor: network === 'devnet' ? 'test-processor::1220cddaf354fb12d4cbdee3d314430aa6fd26d6060b9f35c34a022885e3c681ec63' : intellectPartyId, // TODO; Move to env vars and make network dependent
+      processor: network === 'devnet' ? 'test-subscription-processor::1220ea70ea2cbfe6be431f34c7323e249c624a02fb2209d2b73fabd7eea1fe84df34' : clientPartyId, // TODO; Move to env vars and make network dependent
       dso: dsoPartyId,
     },
   };
