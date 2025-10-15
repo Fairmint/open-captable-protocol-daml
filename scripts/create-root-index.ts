@@ -4,7 +4,7 @@ import path from 'path';
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTable-v25-0.0.1');
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTableReports-v01-0.0.2');
-const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'Subscriptions-v05-0.0.2');
+const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'Subscriptions-v09-0.0.1');
 const OCP_LIB = path.join(OCP_DIR, 'lib');
 const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
 const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
@@ -140,7 +140,7 @@ function ensureJsonDts() {
 	ensureJson(
 		path.join(ROOT_DIR, 'generated', 'subscriptions-factory-contract-id.json'),
 		path.join(ROOT_DIR, 'generated', 'subscriptions-factory-contract-id.json.d.ts'),
-		`declare const data: {\n    devnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n    };\n    mainnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
+		`declare const data: {\n    devnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n        disclosedContract: {\n            templateId: string;\n            contractId: string;\n            createdEventBlob: string;\n            synchronizerId: string;\n        };\n    };\n    mainnet: {\n        subscriptionsFactoryContractId: string;\n        templateId: string;\n        disclosedContract: {\n            templateId: string;\n            contractId: string;\n            createdEventBlob: string;\n            synchronizerId: string;\n        };\n    };\n};\nexport default data;\n`
 	);
 }
 

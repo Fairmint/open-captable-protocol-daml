@@ -4,12 +4,11 @@ import Daml.Script
 import DA.Time (days, addRelTime)
 import DA.List (head)
 import Splice.Round (OpenMiningRound)
-import Fairmint.Subscriptions.ProposedSubscription
-import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.ProposedSubscription qualified as Proposed
+import Fairmint.Subscriptions.ActiveSubscription qualified as Active
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..))
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
-import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
 import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
 
@@ -45,19 +44,9 @@ testProcessorApprovedProposalArchive = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  result <- submit processor do
-    exerciseCmd proposalCid ProposedSubscription_Approve with 
-      actor = processor
-      subscriberAmulets = None
-      amountToLock = 0.0
-      paymentContext = None
-  
-  approvedProposalCid <- case result of
-    Left cid -> pure cid
-    Right _ -> error "Expected more approvals needed"
-  
+  -- Processor is already approved as initiator, can archive directly
   submitMulti [alice, processor] [bob] do
-    archiveCmd approvedProposalCid
+    archiveCmd proposalCid
   
   pure ()
 
@@ -98,23 +87,16 @@ testProcessorApprovedRecipientInitiatedProposalArchive = script do
   expiresAt <- getExpirationTime 365
   proposalCid <- createRecipientProposal processor bob dso (defaultSubscriptionProposal alice bob expiresAt)
   
-  result <- submit processor do
-    exerciseCmd proposalCid ProposedSubscription_Approve with 
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid Proposed.ProposedSubscription_Approve with 
       actor = processor
-      subscriberAmulets = None
-      amountToLock = 0.0
-      paymentContext = None
-  
-  approvedProposalCid <- case result of
-    Left cid -> pure cid
-    Right _ -> error "Expected more approvals needed"
   
   submitMulti [bob, processor] [alice] do
     archiveCmd approvedProposalCid
   
   pure ()
 
--- | Test ActiveSubscription_ArchiveInactiveSubscription choice
+-- | Test Active.ActiveSubscription_ArchiveInactiveSubscription choice
 -- Tests archiving a canceled subscription after the prepaid period has passed
 testActiveSubscriptionArchiveInactive : Script ()
 testActiveSubscriptionArchiveInactive = script do
@@ -144,13 +126,12 @@ testActiveSubscriptionArchiveInactive = script do
   setTime paymentTime
   
   result <- submitMulti [processor] [dso] do
-    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
-      processingContext = ProcessingContext with
-        processingPeriod = days 10  -- Process 10 days ahead
-        featuredAppRight = None
+    exerciseCmd subscriptionCid Active.ActiveSubscription_ProcessPayment with
+      processingPeriod = days 10  -- Process 10 days ahead
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
       skipProcessorPayment = True
   
   -- Cancel the subscription (keep prepaid period)
@@ -160,13 +141,14 @@ testActiveSubscriptionArchiveInactive = script do
   setTime cancelTime
   
   (Some canceledCid, _) <- submitMulti [alice] [dso] do
-    exerciseCmd result.subscriptionCid ActiveSubscription_Cancel with
+    exerciseCmd result.subscriptionCid Active.ActiveSubscription_Cancel with
       actor = alice
       disregardAvailablePaidPeriod = False  -- Keep prepaid period
       description = Some "Testing cancellation"
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
   
   -- Verify subscription has been canceled
   Some canceled <- queryContractId alice canceledCid
@@ -180,11 +162,12 @@ testActiveSubscriptionArchiveInactive = script do
   
   -- Now archive the inactive subscription (any party can do this)
   unlockedAmuletCid <- submitMulti [alice] [dso] do
-    exerciseCmd canceledCid ActiveSubscription_ArchiveInactiveSubscription with
+    exerciseCmd canceledCid Active.ActiveSubscription_ArchiveInactiveSubscription with
       actor = alice
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
   
   -- Verify the subscription was archived
   archivedSub <- queryContractId alice canceledCid
@@ -196,7 +179,7 @@ testActiveSubscriptionArchiveInactive = script do
   
   pure ()
 
--- | Test ActiveSubscription_Refund choice
+-- | Test Active.ActiveSubscription_Refund choice
 -- Tests recipient refunding prepaid time after cancellation
 testActiveSubscriptionRefund : Script ()
 testActiveSubscriptionRefund = script do
@@ -225,13 +208,12 @@ testActiveSubscriptionRefund = script do
   setTime paymentTime
   
   result <- submitMulti [processor] [dso] do
-    exerciseCmd subscriptionCid ActiveSubscription_ProcessPayment with
-      processingContext = ProcessingContext with
-        processingPeriod = days 10  -- Process 10 days ahead
-        featuredAppRight = None
+    exerciseCmd subscriptionCid Active.ActiveSubscription_ProcessPayment with
+      processingPeriod = days 10  -- Process 10 days ahead
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
       skipProcessorPayment = True
   
   -- Cancel subscription (keep prepaid period)
@@ -241,13 +223,14 @@ testActiveSubscriptionRefund = script do
   setTime cancelTime
   
   (Some canceledCid, _) <- submitMulti [alice] [dso] do
-    exerciseCmd result.subscriptionCid ActiveSubscription_Cancel with
+    exerciseCmd result.subscriptionCid Active.ActiveSubscription_Cancel with
       actor = alice
       disregardAvailablePaidPeriod = False
       description = Some "Testing cancellation for refund"
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
   
   -- Verify subscription has prepaid time (processedAndPaidUntil > now)
   Some canceled <- queryContractId bob canceledCid
@@ -259,10 +242,11 @@ testActiveSubscriptionRefund = script do
   
   -- Recipient refunds the prepaid period
   (refundResult, unlockedAmuletCid) <- submitMulti [bob] [dso] do
-    exerciseCmd canceledCid ActiveSubscription_Refund with
+    exerciseCmd canceledCid Active.ActiveSubscription_Refund with
       paymentContext = PaymentContext with
         amuletRulesCid = amuletRulesCid
         openMiningRoundCid = openRoundCid
+        featuredAppRight = None
       recipientAmuletInputs = [recipientAmuletCid]
       recipientFeaturedAppRight = None
   

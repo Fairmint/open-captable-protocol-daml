@@ -3,15 +3,18 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
+import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clients/ledger-json-api/schemas/api/commands';
 
 interface ContractIdData {
   mainnet?: {
     subscriptionsFactoryContractId: string;
     templateId: string;
+    disclosedContract: DisclosedContract;
   };
   devnet?: {
     subscriptionsFactoryContractId: string;
     templateId: string;
+    disclosedContract: DisclosedContract;
   };
 }
 
@@ -53,7 +56,7 @@ async function main() {
   // Import from the combined lib built by scripts/create-root-index.ts
   const { Fairmint } = await import('../lib');
 
-  const client = createLedgerJsonApiClient(network, 'intellect');
+  const client = createLedgerJsonApiClient(network, '5n');
 
   if (!Fairmint?.Subscriptions?.SubscriptionFactory?.SubscriptionFactory) {
     throw new Error('Generated DAML types not found for Subscriptions package. Please run "npm run codegen" first.');
@@ -61,8 +64,8 @@ async function main() {
 
   console.log(`Template ID: ${Fairmint.Subscriptions.SubscriptionFactory.SubscriptionFactory.templateId}`);
 
-  const validatorClient = createValidatorApiClient(network, 'intellect');
-  const intellectPartyId = client.getPartyId();
+  const validatorClient = createValidatorApiClient(network, '5n');
+  const clientPartyId = client.getPartyId();
 
   // Get DSO party ID
   console.log('Looking up DSO party...');
@@ -75,7 +78,7 @@ async function main() {
 
   const subscriptionFactoryData = {
     processorContext: {
-      processor: network === 'devnet' ? 'test-processor::1220cddaf354fb12d4cbdee3d314430aa6fd26d6060b9f35c34a022885e3c681ec63' : intellectPartyId, // TODO; Move to env vars and make network dependent
+      processor: network === 'devnet' ? 'test-subscription-processor::1220ea70ea2cbfe6be431f34c7323e249c624a02fb2209d2b73fabd7eea1fe84df34' : "SubscriptionProcessor::12204a039322c01e9f714b56259c3e68b69058bf5dfe1debbe956c698f905ceba9d7", // TODO; Move to env vars and make network dependent
       dso: dsoPartyId,
     },
   };
@@ -113,14 +116,38 @@ async function main() {
 
     console.log(`✅ SubscriptionFactory contract created with ID: ${contractId}`);
 
+    // Fetch the disclosed contract data
+    // Note: We need to fetch the contract again because CreatedTreeEvent doesn't include
+    // the createdEventBlob field, which is required for disclosed contracts
+    console.log('Fetching disclosed contract data...');
+    const factoryEventsResponse = await client.getEventsByContractId({
+      contractId,
+      readAs: [subscriptionFactoryData.processorContext.processor],
+    });
+
+    const createdEvent = factoryEventsResponse.created?.createdEvent;
+    if (!createdEvent) {
+      throw new Error(`Factory contract ${contractId} not found when fetching disclosed contract data`);
+    }
+
+    const disclosedContract: DisclosedContract = {
+      templateId: createdEvent.templateId,
+      contractId: createdEvent.contractId,
+      createdEventBlob: createdEvent.createdEventBlob,
+      synchronizerId: factoryEventsResponse.created!.synchronizerId,
+    };
+
+    console.log('✅ Disclosed contract data fetched');
+
     const outputPath = getOutputPath();
     const data = loadExistingContractIds(outputPath);
     data[network as 'mainnet' | 'devnet'] = {
       subscriptionsFactoryContractId: contractId,
       templateId: createdTreeEvent.value.templateId,
+      disclosedContract,
     } as any;
     fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
-    console.log(`📝 Saved contract ID to ${outputPath}`);
+    console.log(`📝 Saved contract ID and disclosed contract to ${outputPath}`);
   } catch (error) {
     console.error('❌ Failed to create SubscriptionFactory contract:', error);
     process.exit(1);

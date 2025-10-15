@@ -1,6 +1,5 @@
 module Fairmint.Subscriptions.ProposedSubscription where
 
-import DA.Optional (isSome, fromSome)
 import qualified DA.Map as Map
 import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
 import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged, getImpactedPartiesForProposal)
@@ -11,7 +10,7 @@ import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.Approvals (Approvals(..), validateAtLeastOneApproved, areAllApproved, addApprovalForProposalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscriptionProposal, getApprovedUsers, getUnapprovedUsers)
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
 import Fairmint.Subscriptions.Types.SubscriptionStats (emptyStats)
-import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.LockFundsInput (LockFundsInput(..))
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
 
@@ -29,64 +28,65 @@ template ProposedSubscription
     
     ensure validateSubscriptionProposal subscriptionProposal && validateAtLeastOneApproved approvals
 
-    choice ProposedSubscription_Approve : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
+    choice ProposedSubscription_Approve : ContractId ProposedSubscription
       with
         actor : Party
-        subscriberAmulets : Optional [ContractId Amulet.Amulet]
-        amountToLock : Decimal
-        paymentContext : Optional PaymentContext
       controller actor
       do
+        assertMsg "Subscriber cannot use Approve; use StartSubscription instead" (actor /= subscriptionProposal.subscriber)
         assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
         
         newApprovals <- addApprovalForProposalAndAssertChanged approvals actor subscriptionProposal processorContext
         
-        if areAllApproved newApprovals
-        then do
-          case subscriberAmulets of
-            Some amulets -> assertMsg "Must provide at least one amulet for final approval" (not (null amulets))
-            None -> abort "Must provide subscriber amulets for final approval"
-          assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
-          assertMsg "Must provide payment context for final approval" (isSome paymentContext)
-          
-          let ctx = fromSome paymentContext
-          let amulets = fromSome subscriberAmulets
-          now <- getTime
-          subscription <- assertAndConvertProposalToSubscription subscriptionProposal
-          Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
-          
-          lock <- createSubscriptionLock subscription.recipient processorContext.processor
-          transferResult <- exercise ctx.amuletRulesCid AmuletRules_Transfer with
-            transfer = Transfer with
-              sender = subscription.subscriber
-              provider = subscription.provider
-              inputs = map InputAmulet amulets
-              outputs = [TransferOutput with
-                receiver = subscription.subscriber
-                receiverFeeRatio = 1.0
-                amount = amountToLock
-                lock = Some lock]
-              beneficiaries = Some subscription.appRewardBeneficiaries
-            context = TransferContext with
-              openMiningRound = ctx.openMiningRoundCid
-              featuredAppRight = None
-              issuingMiningRounds = Map.empty
-              validatorRights = Map.empty
-            expectedDso = Some processorContext.dso
-          
-          lockedAmuletCid <- case transferResult.createdAmulets of
-            [TransferResultLockedAmulet cid] -> pure cid
-            _ -> abort "Expected exactly one locked amulet output"
-          
-          activeSubscriptionId <- create ActiveSubscription with
-            processedAndPaidUntil = now
-            stats = emptyStats
-            ..
-          
-          pure (Right (activeSubscriptionId, transferResult.senderChangeAmulet))
-        else do
-          proposedSubscriptionId <- create this with approvals = newApprovals
-          pure (Left proposedSubscriptionId)
+        create this with approvals = newApprovals
+
+    choice ProposedSubscription_StartSubscription : (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
+      with
+        lockFundsInput : LockFundsInput
+      controller subscriptionProposal.subscriber
+      do
+        assertMsg "Must provide at least one amulet" (not (null lockFundsInput.amuletInputs))
+        assertMsg "Amount to lock must be positive" (lockFundsInput.amountToLock > 0.0)
+        
+        -- Add subscriber's approval
+        newApprovals <- addApprovalForProposalAndAssertChanged approvals subscriptionProposal.subscriber subscriptionProposal processorContext
+        
+        -- Assert all parties have now approved
+        assertMsg "All parties must approve before starting subscription" (areAllApproved newApprovals)
+        
+        now <- getTime
+        subscription <- assertAndConvertProposalToSubscription subscriptionProposal
+        Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
+        
+        lock <- createSubscriptionLock subscription.recipient processorContext.processor
+        transferResult <- exercise lockFundsInput.paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = subscription.subscriber
+            provider = subscription.provider
+            inputs = map InputAmulet lockFundsInput.amuletInputs
+            outputs = [TransferOutput with
+              receiver = subscription.subscriber
+              receiverFeeRatio = 1.0
+              amount = lockFundsInput.amountToLock
+              lock = Some lock]
+            beneficiaries = Some subscription.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = lockFundsInput.paymentContext.openMiningRoundCid
+            featuredAppRight = lockFundsInput.paymentContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        lockedAmuletCid <- case transferResult.createdAmulets of
+          [TransferResultLockedAmulet cid] -> pure cid
+          _ -> abort "Expected exactly one locked amulet output"
+        
+        activeSubscriptionId <- create ActiveSubscription with
+          processedAndPaidUntil = now
+          stats = emptyStats
+          ..
+        
+        pure (activeSubscriptionId, transferResult.senderChangeAmulet)
 
     choice ProposedSubscription_EditSubscriptionProposal : ContractId ProposedSubscription
       with

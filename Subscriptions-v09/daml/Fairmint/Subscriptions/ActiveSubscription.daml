@@ -9,7 +9,9 @@ import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubs
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..), assertValidProcessingPeriod, createActivityMarkerIfProvided)
+import DA.Time (RelTime, days)
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker, resolveBeneficiaries)
+import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
 import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToSubscription)
 import Fairmint.Subscriptions.Types.ActiveSubscriptionData (ActiveSubscriptionData(..))
 import Fairmint.Subscriptions.Types.PaymentResult (ProcessPaymentResult(..))
@@ -19,6 +21,7 @@ import Fairmint.Subscriptions.Types.LockHelpers (createSubscriptionLock)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
 import Fairmint.Subscriptions.Types.SubscriptionStats (SubscriptionStats(..), incrementRounds, updateStatsWithPayment)
+import Fairmint.Subscriptions.Types.LockFundsInput (LockFundsInput(..))
 
 -- | Active subscription with locked amulet escrow
 -- 
@@ -43,17 +46,23 @@ template ActiveSubscription
 
     choice ActiveSubscription_ProcessFreeTrial : ProcessFreeTrialResult ActiveSubscription
       with
-        processingContext : ProcessingContext
+        processingPeriod : RelTime
+        featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
       controller processorContext.processor
       do
         trialEnd <- assertInFreeTrial subscription.freeTrialExpiration
-        assertValidProcessingPeriod processingContext
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
         Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
         
-        let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingContext.processingPeriod
+        let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingPeriod
         assertMsg "Cannot process beyond trial end" (newProcessedAndPaidUntil <= trialEnd)
         
-        activityMarkerCid <- createActivityMarkerIfProvided subscription processingContext
+        activityMarkerCid <- case featuredAppRight of
+          Some farCid -> do
+            let beneficiaries = resolveBeneficiaries (Some subscription.appRewardBeneficiaries) subscription.provider
+            let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+            createActivityMarker beneficiaries farApiCid
+          None -> pure None
         
         now <- getTime
         let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.freeTrialExpiration
@@ -69,20 +78,20 @@ template ActiveSubscription
 
     choice ActiveSubscription_ProcessPayment : ProcessPaymentResult ActiveSubscription
       with
-        processingContext : ProcessingContext
+        processingPeriod : RelTime
         paymentContext : PaymentContext
         skipProcessorPayment : Bool
       controller processorContext.processor
       do
-        assertValidProcessingPeriod processingContext
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
         Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
         assertNotInFreeTrial subscription.freeTrialExpiration
         
-        newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingContext.processingPeriod
+        newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingPeriod
         
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid processorContext.processor
-        let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingContext.processingPeriod amuletPrice
-        let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingContext.processingPeriod amuletPrice
+        let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingPeriod amuletPrice
+        let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingPeriod amuletPrice
         let shouldPayProcessor = (not skipProcessorPayment) && processorFee > 0.0
         
         lockedAmulet <- fetch lockedAmuletCid
@@ -125,7 +134,7 @@ template ActiveSubscription
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
             openMiningRound = paymentContext.openMiningRoundCid
-            featuredAppRight = processingContext.featuredAppRight
+            featuredAppRight = paymentContext.featuredAppRight
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso
@@ -235,24 +244,22 @@ template ActiveSubscription
     choice ActiveSubscription_AddFunds : (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
       with
         actor : Party
-        amuletInputs : [ContractId Amulet.Amulet]
-        amountToLock : Decimal
+        lockFundsInput : LockFundsInput
         description : Optional Text
-        paymentContext : PaymentContext
       controller actor
       do
         assertIsPartyToSubscription actor subscription processorContext
         assertValidOptionalText description
-        assertMsg "Must provide at least one amulet to add" (not (null amuletInputs))
-        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+        assertMsg "Must provide at least one amulet to add" (not (null lockFundsInput.amuletInputs))
+        assertMsg "Amount to lock must be positive" (lockFundsInput.amountToLock > 0.0)
         
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
-          openRoundCid = paymentContext.openMiningRoundCid
+          openRoundCid = lockFundsInput.paymentContext.openMiningRoundCid
         
         lock <- createSubscriptionLock subscription.recipient processorContext.processor
-        let allAmulets = unlockResult.amuletSum.amulet :: amuletInputs
+        let allAmulets = unlockResult.amuletSum.amulet :: lockFundsInput.amuletInputs
         
-        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+        transferResult <- exercise lockFundsInput.paymentContext.amuletRulesCid AmuletRules_Transfer with
           transfer = Transfer with
             sender = actor
             provider = subscription.provider
@@ -260,12 +267,12 @@ template ActiveSubscription
             outputs = [TransferOutput with
               receiver = subscription.subscriber
               receiverFeeRatio = 1.0
-              amount = amountToLock
+              amount = lockFundsInput.amountToLock
               lock = Some lock]
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
-            openMiningRound = paymentContext.openMiningRoundCid
-            featuredAppRight = None
+            openMiningRound = lockFundsInput.paymentContext.openMiningRoundCid
+            featuredAppRight = lockFundsInput.paymentContext.featuredAppRight
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso
@@ -314,7 +321,7 @@ template ActiveSubscription
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
             openMiningRound = paymentContext.openMiningRoundCid
-            featuredAppRight = None
+            featuredAppRight = paymentContext.featuredAppRight
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso
@@ -347,6 +354,7 @@ template ActiveSubscription
         partyType : PartyRole
         oldParty : Party
         newParty : Party
+        changePartyPaymentContext : PaymentContext
       controller [oldParty, newParty]
       do
         assertMsg "Old and new party must be different" (oldParty /= newParty)
@@ -355,14 +363,79 @@ template ActiveSubscription
           Subscriber -> do
             assertMsg "Old party must be the current subscriber" (oldParty == subscription.subscriber)
             assertMsg "New party cannot be the current recipient" (newParty /= subscription.recipient)
+            -- Subscriber change doesn't affect lock holders, no need to relock
             create this with subscription.subscriber = newParty
           Recipient -> do
             assertMsg "Old party must be the current recipient" (oldParty == subscription.recipient)
             assertMsg "New party cannot be the current subscriber" (newParty /= subscription.subscriber)
-            create this with subscription.recipient = newParty
+            -- Recipient is a lock holder, must unlock and relock with new party
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createSubscriptionLock newParty processorContext.processor
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = subscription.subscriber
+                provider = subscription.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some subscription.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              subscription.recipient = newParty
+              lockedAmuletCid = newLockedAmuletCid
           Processor -> do
             assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
-            create this with processorContext.processor = newParty
+            -- Processor is a lock holder, must unlock and relock with new party
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createSubscriptionLock subscription.recipient newParty
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = subscription.subscriber
+                provider = subscription.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some subscription.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              processorContext.processor = newParty
+              lockedAmuletCid = newLockedAmuletCid
 
 template SubscriptionChangeProposal
   with
