@@ -19,6 +19,7 @@ import Fairmint.Subscriptions.Types.LockHelpers (createSubscriptionLock)
 import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
 import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
 import Fairmint.Subscriptions.Types.SubscriptionStats (SubscriptionStats(..), incrementRounds, updateStatsWithPayment)
+import Fairmint.Subscriptions.Types.LockFundsInput (LockFundsInput(..))
 
 -- | Active subscription with locked amulet escrow
 -- 
@@ -235,24 +236,22 @@ template ActiveSubscription
     choice ActiveSubscription_AddFunds : (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
       with
         actor : Party
-        amuletInputs : [ContractId Amulet.Amulet]
-        amountToLock : Decimal
+        lockFundsInput : LockFundsInput
         description : Optional Text
-        paymentContext : PaymentContext
       controller actor
       do
         assertIsPartyToSubscription actor subscription processorContext
         assertValidOptionalText description
-        assertMsg "Must provide at least one amulet to add" (not (null amuletInputs))
-        assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+        assertMsg "Must provide at least one amulet to add" (not (null lockFundsInput.amuletInputs))
+        assertMsg "Amount to lock must be positive" (lockFundsInput.amountToLock > 0.0)
         
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
-          openRoundCid = paymentContext.openMiningRoundCid
+          openRoundCid = lockFundsInput.paymentContext.openMiningRoundCid
         
         lock <- createSubscriptionLock subscription.recipient processorContext.processor
-        let allAmulets = unlockResult.amuletSum.amulet :: amuletInputs
+        let allAmulets = unlockResult.amuletSum.amulet :: lockFundsInput.amuletInputs
         
-        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+        transferResult <- exercise lockFundsInput.paymentContext.amuletRulesCid AmuletRules_Transfer with
           transfer = Transfer with
             sender = actor
             provider = subscription.provider
@@ -260,12 +259,12 @@ template ActiveSubscription
             outputs = [TransferOutput with
               receiver = subscription.subscriber
               receiverFeeRatio = 1.0
-              amount = amountToLock
+              amount = lockFundsInput.amountToLock
               lock = Some lock]
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
-            openMiningRound = paymentContext.openMiningRoundCid
-            featuredAppRight = paymentContext.featuredAppRight
+            openMiningRound = lockFundsInput.paymentContext.openMiningRoundCid
+            featuredAppRight = lockFundsInput.paymentContext.featuredAppRight
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso
@@ -347,6 +346,7 @@ template ActiveSubscription
         partyType : PartyRole
         oldParty : Party
         newParty : Party
+        changePartyPaymentContext : PaymentContext
       controller [oldParty, newParty]
       do
         assertMsg "Old and new party must be different" (oldParty /= newParty)
@@ -355,14 +355,79 @@ template ActiveSubscription
           Subscriber -> do
             assertMsg "Old party must be the current subscriber" (oldParty == subscription.subscriber)
             assertMsg "New party cannot be the current recipient" (newParty /= subscription.recipient)
+            -- Subscriber change doesn't affect lock holders, no need to relock
             create this with subscription.subscriber = newParty
           Recipient -> do
             assertMsg "Old party must be the current recipient" (oldParty == subscription.recipient)
             assertMsg "New party cannot be the current subscriber" (newParty /= subscription.subscriber)
-            create this with subscription.recipient = newParty
+            -- Recipient is a lock holder, must unlock and relock with new party
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createSubscriptionLock newParty processorContext.processor
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = subscription.subscriber
+                provider = subscription.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some subscription.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              subscription.recipient = newParty
+              lockedAmuletCid = newLockedAmuletCid
           Processor -> do
             assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
-            create this with processorContext.processor = newParty
+            -- Processor is a lock holder, must unlock and relock with new party
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createSubscriptionLock subscription.recipient newParty
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = subscription.subscriber
+                provider = subscription.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = subscription.subscriber
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some subscription.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              processorContext.processor = newParty
+              lockedAmuletCid = newLockedAmuletCid
 
 template SubscriptionChangeProposal
   with

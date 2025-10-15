@@ -3,15 +3,18 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
+import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clients/ledger-json-api/schemas/api/commands';
 
 interface ContractIdData {
   mainnet?: {
     subscriptionsFactoryContractId: string;
     templateId: string;
+    disclosedContract: DisclosedContract;
   };
   devnet?: {
     subscriptionsFactoryContractId: string;
     templateId: string;
+    disclosedContract: DisclosedContract;
   };
 }
 
@@ -113,14 +116,38 @@ async function main() {
 
     console.log(`✅ SubscriptionFactory contract created with ID: ${contractId}`);
 
+    // Fetch the disclosed contract data
+    // Note: We need to fetch the contract again because CreatedTreeEvent doesn't include
+    // the createdEventBlob field, which is required for disclosed contracts
+    console.log('Fetching disclosed contract data...');
+    const factoryEventsResponse = await client.getEventsByContractId({
+      contractId,
+      readAs: [subscriptionFactoryData.processorContext.processor],
+    });
+
+    const createdEvent = factoryEventsResponse.created?.createdEvent;
+    if (!createdEvent) {
+      throw new Error(`Factory contract ${contractId} not found when fetching disclosed contract data`);
+    }
+
+    const disclosedContract: DisclosedContract = {
+      templateId: createdEvent.templateId,
+      contractId: createdEvent.contractId,
+      createdEventBlob: createdEvent.createdEventBlob,
+      synchronizerId: factoryEventsResponse.created!.synchronizerId,
+    };
+
+    console.log('✅ Disclosed contract data fetched');
+
     const outputPath = getOutputPath();
     const data = loadExistingContractIds(outputPath);
     data[network as 'mainnet' | 'devnet'] = {
       subscriptionsFactoryContractId: contractId,
       templateId: createdTreeEvent.value.templateId,
+      disclosedContract,
     } as any;
     fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
-    console.log(`📝 Saved contract ID to ${outputPath}`);
+    console.log(`📝 Saved contract ID and disclosed contract to ${outputPath}`);
   } catch (error) {
     console.error('❌ Failed to create SubscriptionFactory contract:', error);
     process.exit(1);
