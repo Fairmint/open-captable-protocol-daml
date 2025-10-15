@@ -1,0 +1,139 @@
+module Fairmint.Subscriptions.ProposedSubscription where
+
+import DA.Optional (isSome, fromSome)
+import qualified DA.Map as Map
+import Fairmint.Subscriptions.ActiveSubscription (ActiveSubscription(..))
+import Fairmint.Subscriptions.Types.SubscriptionProposalChanges (SubscriptionProposalChanges(..), applyChangesAndAssertChanged, getImpactedPartiesForProposal)
+import Fairmint.Subscriptions.Types.LockHelpers (createSubscriptionLock)
+import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
+import Fairmint.Subscriptions.Types.SubscriptionProposal (SubscriptionProposal(..), validateSubscriptionProposal, assertAndConvertProposalToSubscription)
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.Approvals (Approvals(..), validateAtLeastOneApproved, areAllApproved, addApprovalForProposalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToSubscriptionProposal, getApprovedUsers, getUnapprovedUsers)
+import Fairmint.Subscriptions.Types.PartyRole (PartyRole(..))
+import Fairmint.Subscriptions.Types.SubscriptionStats (emptyStats)
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
+
+template ProposedSubscription
+  with
+    subscriptionProposal : SubscriptionProposal
+    processorContext : ProcessorContext
+    approvals : Approvals
+  where
+    signatory getApprovedUsers subscriptionProposal approvals ++ [processorContext.processor]
+    observer getUnapprovedUsers subscriptionProposal approvals ++ 
+             subscriptionProposal.observers ++ 
+             [subscriptionProposal.provider] ++ 
+             map (\beneficiary -> beneficiary.beneficiary) subscriptionProposal.appRewardBeneficiaries
+    
+    ensure validateSubscriptionProposal subscriptionProposal && validateAtLeastOneApproved approvals
+
+    choice ProposedSubscription_Approve : Either (ContractId ProposedSubscription) (ContractId ActiveSubscription, Optional (ContractId Amulet.Amulet))
+      with
+        actor : Party
+        subscriberAmulets : Optional [ContractId Amulet.Amulet]
+        amountToLock : Decimal
+        paymentContext : Optional PaymentContext
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        
+        newApprovals <- addApprovalForProposalAndAssertChanged approvals actor subscriptionProposal processorContext
+        
+        if areAllApproved newApprovals
+        then do
+          case subscriberAmulets of
+            Some amulets -> assertMsg "Must provide at least one amulet for final approval" (not (null amulets))
+            None -> abort "Must provide subscriber amulets for final approval"
+          assertMsg "Amount to lock must be positive" (amountToLock > 0.0)
+          assertMsg "Must provide payment context for final approval" (isSome paymentContext)
+          
+          let ctx = fromSome paymentContext
+          let amulets = fromSome subscriberAmulets
+          now <- getTime
+          subscription <- assertAndConvertProposalToSubscription subscriptionProposal
+          Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
+          
+          lock <- createSubscriptionLock subscription.recipient processorContext.processor
+          transferResult <- exercise ctx.amuletRulesCid AmuletRules_Transfer with
+            transfer = Transfer with
+              sender = subscription.subscriber
+              provider = subscription.provider
+              inputs = map InputAmulet amulets
+              outputs = [TransferOutput with
+                receiver = subscription.subscriber
+                receiverFeeRatio = 1.0
+                amount = amountToLock
+                lock = Some lock]
+              beneficiaries = Some subscription.appRewardBeneficiaries
+            context = TransferContext with
+              openMiningRound = ctx.openMiningRoundCid
+              featuredAppRight = None
+              issuingMiningRounds = Map.empty
+              validatorRights = Map.empty
+            expectedDso = Some processorContext.dso
+          
+          lockedAmuletCid <- case transferResult.createdAmulets of
+            [TransferResultLockedAmulet cid] -> pure cid
+            _ -> abort "Expected exactly one locked amulet output"
+          
+          activeSubscriptionId <- create ActiveSubscription with
+            processedAndPaidUntil = now
+            stats = emptyStats
+            ..
+          
+          pure (Right (activeSubscriptionId, transferResult.senderChangeAmulet))
+        else do
+          proposedSubscriptionId <- create this with approvals = newApprovals
+          pure (Left proposedSubscriptionId)
+
+    choice ProposedSubscription_EditSubscriptionProposal : ContractId ProposedSubscription
+      with
+        actor : Party
+        changes : SubscriptionProposalChanges
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        assertValidOptionalText description
+        
+        let impactedParties = getImpactedPartiesForProposal changes subscriptionProposal processorContext
+        updatedProposal <- applyChangesAndAssertChanged changes subscriptionProposal processorContext
+        
+        create this with
+          subscriptionProposal = updatedProposal
+          approvals = updateApprovalsAfterImpact approvals actor impactedParties subscriptionProposal processorContext
+
+    choice ProposedSubscription_Withdraw : ()
+      with
+        actor : Party
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToSubscriptionProposal actor subscriptionProposal processorContext
+        assertValidOptionalText description
+        pure ()
+
+    -- Called via PartyMigrationProposal to migrate party identities
+    choice ProposedSubscription_ChangeParty : ContractId ProposedSubscription
+      with
+        partyType : PartyRole
+        oldParty : Party
+        newParty : Party
+      controller [oldParty, newParty]
+      do
+        assertMsg "Old and new party must be different" (oldParty /= newParty)
+        
+        case partyType of
+          Subscriber -> do
+            assertMsg "Old party must be the current subscriber" (oldParty == subscriptionProposal.subscriber)
+            assertMsg "New party cannot be the current recipient" (newParty /= subscriptionProposal.recipient)
+            create this with subscriptionProposal.subscriber = newParty
+          Recipient -> do
+            assertMsg "Old party must be the current recipient" (oldParty == subscriptionProposal.recipient)
+            assertMsg "New party cannot be the current subscriber" (newParty /= subscriptionProposal.subscriber)
+            create this with subscriptionProposal.recipient = newParty
+          Processor -> do
+            assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
+            create this with processorContext.processor = newParty

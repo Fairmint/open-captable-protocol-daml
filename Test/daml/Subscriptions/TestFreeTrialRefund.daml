@@ -2,9 +2,7 @@ module Subscriptions.TestFreeTrialRefund where
 
 import Daml.Script
 import DA.Time (days, addRelTime)
-import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import Fairmint.Subscriptions.ActiveSubscription
-import Fairmint.Subscriptions.ProposedSubscription
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
 import Fairmint.Subscriptions.SubscriptionFactory
@@ -33,29 +31,14 @@ testFreeTrialProcessAndCancelNoRefund = script do
         actor = alice
         subscriptionProposal = proposal)
   
-  approveResult1 <- submit processor do
-    exerciseCmd proposalCid ProposedSubscription_Approve with actor = processor
-  
-  processorApprovedCid <- case approveResult1 of
-    Left cid -> pure cid
-    Right _ -> error "Expected ProposedSubscription, got ActiveSubscription"
-  
-  approveResult2 <- submit bob do
-    exerciseCmd processorApprovedCid ProposedSubscription_Approve with actor = bob
-  
-  activeSubscriptionCid <- case approveResult2 of
-    Right cid -> pure cid
-    Left _ -> error "Expected ActiveSubscription, got ProposedSubscription"
+  -- Use the shared approval helper
+  activeSubscriptionCid <- approveProposalFully proposalCid processor bob alice dso
   
   -- Process the entire free trial period (advance processedAndPaidUntil to freeTrialEndsAt)
   let processingPeriod = days 30
   let processingContext = ProcessingContext with
         processingPeriod = processingPeriod
-        recipientProvider = Some bob
-        recipientFeaturedAppRight = None
-        processorFeaturedAppRight = None
-        processorProvider = processor
-        processorBeneficiaries = [AppRewardBeneficiary processor 1.0]
+        featuredAppRight = None
   
   result <- submit processor do
     exerciseCmd activeSubscriptionCid ActiveSubscription_ProcessFreeTrial with ..
@@ -65,11 +48,14 @@ testFreeTrialProcessAndCancelNoRefund = script do
   assertMsg "processedAndPaidUntil should be at freeTrialEndsAt" (processed.processedAndPaidUntil == freeTrialEndsAt)
   
   -- Cancel immediately after processing (still on day 0/1)
-  Some canceledCid <- submit alice do
+  (Some canceledCid, _) <- submit alice do
     exerciseCmd result.subscriptionCid ActiveSubscription_Cancel with
       actor = alice
       disregardAvailablePaidPeriod = False
       description = Some "Testing cancellation"
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
   
   -- Verify paymentsEndAt is set to freeTrialEndsAt (to honor the trial period)
   Some canceled <- queryContractId alice canceledCid
@@ -83,14 +69,12 @@ testFreeTrialProcessAndCancelNoRefund = script do
   
   -- Attempt to refund - this should fail because there's no prepaid time remaining
   -- The free trial period was free, so there's nothing to refund
-  let paymentContext = PaymentContext with
-        amuletRulesCid = amuletRulesCid
-        openMiningRoundCid = openRoundCid
-        amuletInputs = []  -- Won't get here anyway
-  
   submitMustFail bob do
     exerciseCmd canceledCid ActiveSubscription_Refund with
-      paymentContext = paymentContext
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+      recipientAmuletInputs = []  -- Won't need amulets since refund should fail
       recipientFeaturedAppRight = None
   
   pure ()

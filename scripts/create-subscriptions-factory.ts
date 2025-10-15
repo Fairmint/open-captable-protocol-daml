@@ -73,9 +73,9 @@ async function main() {
   const dsoPartyId = dsoResponse.dso_party_id;
   console.log(`✅ DSO Party: ${dsoPartyId}`);
 
-  const subscriptionFactoryData: any = {
-    context: {
-      processor: intellectPartyId,
+  const subscriptionFactoryData = {
+    processorContext: {
+      processor: network === 'devnet' ? 'test-processor::1220cddaf354fb12d4cbdee3d314430aa6fd26d6060b9f35c34a022885e3c681ec63' : intellectPartyId, // TODO; Move to env vars and make network dependent
       dso: dsoPartyId,
     },
   };
@@ -92,6 +92,7 @@ async function main() {
       commands: [{
         CreateCommand: createCommand,
       }],
+      actAs: [subscriptionFactoryData.processorContext.processor],
     });
 
     const eventsById = response.transactionTree?.eventsById;
