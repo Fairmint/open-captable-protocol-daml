@@ -14,6 +14,12 @@ const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-f
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
+const TOKEN_METADATA_DIR = path.join(__dirname, '../generated/js/splice-api-token-metadata-v1-1.0.0');
+const TOKEN_HOLDING_DIR = path.join(__dirname, '../generated/js/splice-api-token-holding-v1-1.0.0');
+const TOKEN_ALLOCATION_INSTRUCTION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-instruction-v1-1.0.0');
+const TOKEN_TRANSFER_INSTRUCTION_DIR = path.join(__dirname, '../generated/js/splice-api-token-transfer-instruction-v1-1.0.0');
+const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-v1-1.0.0');
+const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
 
 function createDirectoryIfNotExists(dirPath: string): void {
 	if (!fs.existsSync(dirPath)) {
@@ -329,6 +335,75 @@ function createBundledDATypesFiles(targetDir: string): void {
 	console.log('✅ Copied DA Types modules');
 }
 
+function createBundledSpliceApiTokenDependencies(targetDir: string): void {
+	console.log('📦 Bundling Splice API Token dependencies...');
+	
+	// Copy token metadata
+	if (fs.existsSync(TOKEN_METADATA_DIR)) {
+		const destDir = path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1');
+		const sourceDir = path.join(TOKEN_METADATA_DIR, 'lib/Splice/Api/Token/MetadataV1');
+		if (fs.existsSync(sourceDir)) {
+			copyDirectory(sourceDir, destDir);
+			console.log('✅ Copied token-metadata-v1');
+		}
+	}
+	
+	// Copy token holding
+	if (fs.existsSync(TOKEN_HOLDING_DIR)) {
+		const destDir = path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1');
+		const sourceDir = path.join(TOKEN_HOLDING_DIR, 'lib/Splice/Api/Token/HoldingV1');
+		if (fs.existsSync(sourceDir)) {
+			copyDirectory(sourceDir, destDir);
+			console.log('✅ Copied token-holding-v1');
+		}
+	}
+	
+	// Copy token allocation instruction
+	if (fs.existsSync(TOKEN_ALLOCATION_INSTRUCTION_DIR)) {
+		const destDir = path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1');
+		const sourceDir = path.join(TOKEN_ALLOCATION_INSTRUCTION_DIR, 'lib/Splice/Api/Token/AllocationInstructionV1');
+		if (fs.existsSync(sourceDir)) {
+			copyDirectory(sourceDir, destDir);
+			console.log('✅ Copied token-allocation-instruction-v1');
+		}
+	}
+	
+	// Copy token transfer instruction
+	if (fs.existsSync(TOKEN_TRANSFER_INSTRUCTION_DIR)) {
+		const destDir = path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1');
+		const sourceDir = path.join(TOKEN_TRANSFER_INSTRUCTION_DIR, 'lib/Splice/Api/Token/TransferInstructionV1');
+		if (fs.existsSync(sourceDir)) {
+			copyDirectory(sourceDir, destDir);
+			console.log('✅ Copied token-transfer-instruction-v1');
+		}
+	}
+	
+	// Copy token allocation
+	if (fs.existsSync(TOKEN_ALLOCATION_DIR)) {
+		const destDir = path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1');
+		const sourceDir = path.join(TOKEN_ALLOCATION_DIR, 'lib/Splice/Api/Token/AllocationV1');
+		if (fs.existsSync(sourceDir)) {
+			copyDirectory(sourceDir, destDir);
+			console.log('✅ Copied token-allocation-v1');
+		}
+	}
+}
+
+function createBundledDASetTypesFiles(targetDir: string): void {
+	console.log('📦 Bundling DA Set Types dependency...');
+	const daDestDir = path.join(targetDir, 'lib/DA/Set');
+	const daSourceDir = path.join(DA_SET_TYPES_DIR, 'lib/DA/Set');
+
+	if (!fs.existsSync(daSourceDir)) {
+		console.log('⚠️  DA Set Types directory not found');
+		return;
+	}
+
+	// Copy the DA/Set directory
+	copyDirectory(daSourceDir, daDestDir);
+	console.log('✅ Copied DA Set Types modules');
+}
+
 function updateMainIndex(targetDir: string): void {
 	console.log('📝 Updating main index files...');
 
@@ -501,6 +576,108 @@ function replaceDependencyReferences(targetDir: string): void {
 			}
 		}
 
+		if (content.includes('@daml.js/splice-api-token-metadata-v1-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-api-token-metadata-v1-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/splice-api-token-holding-v1-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-api-token-holding-v1-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-api-token-holding-v1-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/splice-api-token-allocation-instruction-v1-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-api-token-allocation-instruction-v1-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-api-token-allocation-instruction-v1-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/splice-api-token-transfer-instruction-v1-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-api-token-transfer-instruction-v1-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-api-token-transfer-instruction-v1-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/splice-api-token-allocation-v1-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/splice-api-token-allocation-v1-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/splice-api-token-allocation-v1-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
+		if (content.includes('@daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
+			const relativePath = path
+				.relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Set/Types'))
+				.replace(/\\/g, '/');
+			if (isDts) {
+				content = content.replace(
+					/from '@daml\.js\/daml-stdlib-DA-Set-Types-1\.0\.0';/g,
+					`from '${relativePath}';`,
+				);
+			} else {
+				content = content.replace(
+					/require\('@daml\.js\/daml-stdlib-DA-Set-Types-1\.0\.0'\)/g,
+					`require('${relativePath}')`,
+				);
+			}
+		}
+
 		if (content !== originalContent) {
 			fs.writeFileSync(filePath, content);
 			replacedCount++;
@@ -520,6 +697,12 @@ function removeLocalDependency(targetDir: string): void {
 		'@daml.js/splice-amulet-0.1.14',
 		'@daml.js/daml-stdlib-DA-Time-Types-1.0.0',
 		'@daml.js/daml-prim-DA-Types-1.0.0',
+		'@daml.js/splice-api-token-metadata-v1-1.0.0',
+		'@daml.js/splice-api-token-holding-v1-1.0.0',
+		'@daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
+		'@daml.js/splice-api-token-transfer-instruction-v1-1.0.0',
+		'@daml.js/splice-api-token-allocation-v1-1.0.0',
+		'@daml.js/daml-stdlib-DA-Set-Types-1.0.0',
 	];
 	let removedCount = 0;
 	for (const dep of localDependencies) {
@@ -548,11 +731,13 @@ function main(): void {
 			console.log(`📦 Processing package: ${targetDir}`);
 			createBundledFiles(targetDir);
 			createBundledSpliceFiles(targetDir);
-			// Only bundle splice-amulet and DA Time Types for Subscriptions package
+			// Only bundle splice-amulet and additional dependencies for Subscriptions package
 			if (targetDir.includes('Subscriptions-v03')) {
 				createBundledSpliceAmuletFiles(targetDir);
 				createBundledDATimeTypesFiles(targetDir);
 				createBundledDATypesFiles(targetDir);
+				createBundledSpliceApiTokenDependencies(targetDir);
+				createBundledDASetTypesFiles(targetDir);
 			}
 			updateMainIndex(targetDir);
 			replaceDependencyReferences(targetDir);
@@ -570,4 +755,4 @@ if (require.main === module) {
 	main();
 }
 
-export { createBundledFiles, createBundledSpliceFiles, createBundledSpliceAmuletFiles, createBundledDATimeTypesFiles, updateMainIndex, replaceDependencyReferences, removeLocalDependency, main };
+export { createBundledFiles, createBundledSpliceFiles, createBundledSpliceAmuletFiles, createBundledDATimeTypesFiles, createBundledDATypesFiles, createBundledSpliceApiTokenDependencies, createBundledDASetTypesFiles, updateMainIndex, replaceDependencyReferences, removeLocalDependency, main };

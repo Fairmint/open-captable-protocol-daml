@@ -44,9 +44,14 @@ function buildCombinedLib() {
 	rimraf(DEST_LIB);
 	fs.mkdirSync(DEST_LIB, { recursive: true });
 
-	// Copy DA and Splice from OCP (identical across packages)
+	// Copy DA and Splice from OCP first
 	copyDir(path.join(OCP_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
 	copyDir(path.join(OCP_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
+	
+	// Copy additional DA and Splice modules from Subscriptions (DA/Types, DA/Time/Types, etc.)
+	// This will merge with what was already copied from OCP
+	copyDir(path.join(SUBSCRIPTIONS_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
+	copyDir(path.join(SUBSCRIPTIONS_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
 
 	// Combine Fairmint sub-namespaces
 	const destFairmint = path.join(DEST_LIB, 'Fairmint');
