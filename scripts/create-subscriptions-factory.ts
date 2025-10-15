@@ -78,7 +78,7 @@ async function main() {
 
   const subscriptionFactoryData = {
     processorContext: {
-      processor: network === 'devnet' ? 'test-subscription-processor::1220ea70ea2cbfe6be431f34c7323e249c624a02fb2209d2b73fabd7eea1fe84df34' : clientPartyId, // TODO; Move to env vars and make network dependent
+      processor: network === 'devnet' ? 'test-subscription-processor::1220ea70ea2cbfe6be431f34c7323e249c624a02fb2209d2b73fabd7eea1fe84df34' : "SubscriptionProcessor::12204a039322c01e9f714b56259c3e68b69058bf5dfe1debbe956c698f905ceba9d7", // TODO; Move to env vars and make network dependent
       dso: dsoPartyId,
     },
   };

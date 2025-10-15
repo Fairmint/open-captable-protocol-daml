@@ -9,7 +9,9 @@ import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubs
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..), assertValidProcessingPeriod, createActivityMarkerIfProvided)
+import DA.Time (RelTime, days)
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker, resolveBeneficiaries)
+import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
 import Fairmint.Subscriptions.Types.SubscriptionChanges (SubscriptionChanges(..), getImpactedPartiesForSubscription, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToSubscription)
 import Fairmint.Subscriptions.Types.ActiveSubscriptionData (ActiveSubscriptionData(..))
 import Fairmint.Subscriptions.Types.PaymentResult (ProcessPaymentResult(..))
@@ -44,17 +46,23 @@ template ActiveSubscription
 
     choice ActiveSubscription_ProcessFreeTrial : ProcessFreeTrialResult ActiveSubscription
       with
-        processingContext : ProcessingContext
+        processingPeriod : RelTime
+        featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
       controller processorContext.processor
       do
         trialEnd <- assertInFreeTrial subscription.freeTrialExpiration
-        assertValidProcessingPeriod processingContext
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
         Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
         
-        let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingContext.processingPeriod
+        let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingPeriod
         assertMsg "Cannot process beyond trial end" (newProcessedAndPaidUntil <= trialEnd)
         
-        activityMarkerCid <- createActivityMarkerIfProvided subscription processingContext
+        activityMarkerCid <- case featuredAppRight of
+          Some farCid -> do
+            let beneficiaries = resolveBeneficiaries (Some subscription.appRewardBeneficiaries) subscription.provider
+            let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+            createActivityMarker beneficiaries farApiCid
+          None -> pure None
         
         now <- getTime
         let newTrialEndsAt = clearTrialIfEnded now trialEnd subscription.freeTrialExpiration
@@ -70,20 +78,20 @@ template ActiveSubscription
 
     choice ActiveSubscription_ProcessPayment : ProcessPaymentResult ActiveSubscription
       with
-        processingContext : ProcessingContext
+        processingPeriod : RelTime
         paymentContext : PaymentContext
         skipProcessorPayment : Bool
       controller processorContext.processor
       do
-        assertValidProcessingPeriod processingContext
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
         Amulet.validateAppRewardBeneficiaries subscription.appRewardBeneficiaries
         assertNotInFreeTrial subscription.freeTrialExpiration
         
-        newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingContext.processingPeriod
+        newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil subscription processedAndPaidUntil processingPeriod
         
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid processorContext.processor
-        let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingContext.processingPeriod amuletPrice
-        let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingContext.processingPeriod amuletPrice
+        let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingPeriod amuletPrice
+        let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingPeriod amuletPrice
         let shouldPayProcessor = (not skipProcessorPayment) && processorFee > 0.0
         
         lockedAmulet <- fetch lockedAmuletCid
@@ -126,7 +134,7 @@ template ActiveSubscription
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
             openMiningRound = paymentContext.openMiningRoundCid
-            featuredAppRight = processingContext.featuredAppRight
+            featuredAppRight = paymentContext.featuredAppRight
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso

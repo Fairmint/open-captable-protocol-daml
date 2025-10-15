@@ -7,7 +7,6 @@ import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import Splice.Api.FeaturedAppRightV1 qualified as Featured
 import Splice.AmuletRules qualified
 import Splice.Round qualified
-import Splice.Amulet qualified
 import Fairmint.Subscriptions.SubscriptionFactory qualified as Factory
 import Fairmint.Subscriptions.ProposedSubscription qualified as Proposed
 import Fairmint.Subscriptions.ActiveSubscription qualified as Active
@@ -39,14 +38,15 @@ createSubscriptionFactory processor dso = do
     createCmd Factory.SubscriptionFactory with
       processorContext = ProcessorContext with ..
 
--- | Helper to create a subscription proposal (subscriber-initiated)
+-- | Helper to create a subscription proposal (processor-initiated, for subscriber)
 -- Uses createAndExerciseCmd to create factory and proposal in one transaction, avoiding divulgence issues
+-- NOTE: Subscribers cannot create proposals - only processor or recipient can initiate
 createSubscriberProposal : Party -> Party -> Party -> SubscriptionProposal -> Script (ContractId Proposed.ProposedSubscription)
 createSubscriberProposal processor subscriber dso proposal = do
-  result <- submitMulti [subscriber, processor] [] do
+  result <- submit processor do
     createAndExerciseCmd
       (Factory.SubscriptionFactory with processorContext = ProcessorContext with ..)
-      (Factory.SubscriptionFactory_CreateProposedSubscription with actor = subscriber; subscriptionProposal = proposal; Factory.lockFundsInput = None)
+      (Factory.SubscriptionFactory_CreateProposedSubscription with actor = processor; subscriptionProposal = proposal; Factory.lockFundsInput = None)
   case result of
     Left proposedCid -> pure proposedCid
     Right _ -> error "Expected ProposedSubscription but got ActiveSubscription"
@@ -117,12 +117,19 @@ allocateTestParties = do
 
 -- | Helper to fully approve a proposal and return the ActiveSubscription
 -- Handles the approval flow including escrow locking
+-- NOTE: Assumes processor may already be approved (if they initiated the proposal)
 approveProposalFully : ContractId Proposed.ProposedSubscription -> Party -> Party -> Party -> Party -> Script (ContractId Active.ActiveSubscription)
 approveProposalFully proposalCid processor recipient subscriber dso = do
-  -- Processor approves first
-  proposedCid1 <- submit processor do
-    exerciseCmd proposalCid Proposed.ProposedSubscription_Approve with 
-      actor = processor
+  -- Check if processor is already approved
+  Some proposal <- queryContractId processor proposalCid
+  let processorAlreadyApproved = proposal.approvals.processorApproved
+  
+  -- Processor approves if not already approved
+  proposedCid1 <- if processorAlreadyApproved
+    then pure proposalCid
+    else submit processor do
+      exerciseCmd proposalCid Proposed.ProposedSubscription_Approve with 
+        actor = processor
   
   -- Recipient approves next
   proposedCid2 <- submit recipient do
