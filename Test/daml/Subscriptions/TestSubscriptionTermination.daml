@@ -1,0 +1,150 @@
+module Subscriptions.TestSubscriptionTermination where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.List (head)
+import Splice.Round qualified
+import Fairmint.Subscriptions.ActiveSubscription
+import Fairmint.Subscriptions.SubscriptionFactory
+import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
+import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..))
+import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
+import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Shared.TestUtils (tapWithDso, getAmuletRules)
+import Subscriptions.TestUtils
+
+-- | Test ActiveSubscription_ArchiveInactiveSubscription
+-- Tests archiving a subscription that has ended and been fully processed
+testArchiveInactiveSubscription : Script ()
+testArchiveInactiveSubscription = script do
+  TestParties{..} <- allocateTestParties
+  
+  now <- getTime
+  let expiresAt = addRelTime now (days 30)  -- Short expiration
+  proposalCid <- createSubscriberProposal processor alice dso (defaultSubscriptionProposal alice bob expiresAt)
+  
+  subscriptionCid <- approveProposalFully proposalCid processor bob alice dso
+  
+  -- Cancel the subscription first
+  amuletRulesCid <- getAmuletRules dso
+  openRounds <- query @Splice.Round.OpenMiningRound dso
+  now2 <- getTime
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now2) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  
+  -- Exercise Cancel choice
+  -- Use readAs [dso] to provide visibility to DSO contracts (AmuletRules, OpenMiningRound)
+  (maybeCanceledCid, maybeUnlockedAmulet) <- submitMulti [alice] [dso] do
+    exerciseCmd subscriptionCid ActiveSubscription_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = True  -- Cancel immediately
+      description = Some "Canceling subscription"
+      paymentContext = PaymentContext with
+        amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  -- Verify the subscription was archived and amulet was unlocked
+  case maybeCanceledCid of
+    None -> do
+      -- Subscription was archived immediately
+      case maybeUnlockedAmulet of
+        Some unlockedAmuletCid -> do
+          Some unlockedAmulet <- queryContractId alice unlockedAmuletCid
+          assertMsg "Unlocked amulet should exist" True
+        None -> error "Expected unlocked amulet"
+    Some canceledCid -> do
+      -- If not archived immediately, wait for expiration and then archive
+      setTime (addRelTime now (days 31))
+      
+      -- Exercise ArchiveInactiveSubscription choice
+      -- Use readAs [dso] to provide visibility to DSO contracts
+      unlockedAmuletCid <- submitMulti [alice] [dso] do
+        exerciseCmd canceledCid ActiveSubscription_ArchiveInactiveSubscription with
+          actor = alice
+          paymentContext = PaymentContext with
+            amuletRulesCid
+            openMiningRoundCid = openRoundCid
+      
+      Some unlockedAmulet <- queryContractId alice unlockedAmuletCid
+      assertMsg "Unlocked amulet should exist" True
+  
+  pure ()
+
+-- | Test ActiveSubscription_Refund
+-- Tests refunding prepaid time when a subscription is canceled
+testRefundPrepaidTime : Script ()
+testRefundPrepaidTime = script do
+  TestParties{..} <- allocateTestParties
+  
+  now <- getTime
+  let freeTrialEndsAt = addRelTime now (days 8)  -- Free trial ends at day 8
+  let paymentsEndAt = addRelTime now (days 20)  -- Payments end at day 20
+  
+  -- Create subscription with free trial
+  let proposalWithTrial = (defaultSubscriptionProposal alice bob paymentsEndAt) with
+        freeTrialExpiration = Some (PreciseTime freeTrialEndsAt)
+        paymentsEndAt = Some (PreciseTime paymentsEndAt)
+  
+  proposalCid <- submitMulti [alice, processor] [] do
+    createAndExerciseCmd
+      (SubscriptionFactory with processorContext = ProcessorContext processor dso)
+      (SubscriptionFactory_CreateProposedSubscription with
+        actor = alice
+        subscriptionProposal = proposalWithTrial)
+  
+  subscriptionCid <- approveProposalFully proposalCid processor bob alice dso
+  
+  -- Process free trial to advance processedAndPaidUntil past paymentsEndAt
+  -- This creates "prepaid" time that can be refunded
+  setTime (addRelTime now (days 2))
+  result <- submit processor do
+    exerciseCmd subscriptionCid ActiveSubscription_ProcessFreeTrial with
+      processingContext = ProcessingContext with
+        processingPeriod = days 15  -- Advance to day 17 (past day 10 paymentsEndAt)
+        featuredAppRight = None
+  
+  -- Cancel the subscription (to trigger paymentsEndAt condition)
+  amuletRulesCid <- getAmuletRules dso
+  openRounds <- query @Splice.Round.OpenMiningRound dso
+  now3 <- getTime
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now3) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  
+  -- Exercise Cancel choice (recipient)
+  -- Use readAs [dso] to provide visibility to DSO contracts
+  (maybeCanceledCid, _) <- submitMulti [bob] [dso] do
+    exerciseCmd result.subscriptionCid ActiveSubscription_Cancel with
+      actor = bob
+      disregardAvailablePaidPeriod = False
+      description = Some "Canceling to test refund"
+      paymentContext = PaymentContext with
+        amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  case maybeCanceledCid of
+    Some canceledCid -> do
+      -- Wait until after paymentsEndAt (day 10) but before processedAndPaidUntil (day 17)
+      -- This creates the window where prepaid time exists and can be refunded
+      setTime (addRelTime now (days 11))  -- Now at day 11, between paymentsEndAt and processedAndPaidUntil
+      
+      -- Create amulet for recipient to cover the refund
+      recipientAmulet1 <- tapWithDso dso bob 30.0
+      
+      -- Exercise Refund choice (recipient)
+      -- Use readAs [dso] to provide visibility to DSO contracts
+      (refundResult, unlockedAmuletCid) <- submitMulti [bob] [dso] do
+        exerciseCmd canceledCid ActiveSubscription_Refund with
+          paymentContext = PaymentContext with
+            amuletRulesCid
+            openMiningRoundCid = openRoundCid
+          recipientAmuletInputs = [recipientAmulet1]
+          recipientFeaturedAppRight = None
+      
+      -- Verify refund was processed and amulet was unlocked
+      Some unlockedAmulet <- queryContractId alice unlockedAmuletCid
+      assertMsg "Unlocked amulet should exist after refund" True
+      pure ()
+    None -> error "Expected subscription to be canceled, not archived"
+

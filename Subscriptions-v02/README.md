@@ -503,7 +503,7 @@ result <- submit subscriber do
   exerciseCmd activeSubscriptionCid ActiveSubscription_ProposeChanges with
     proposer = subscriber
     subscriptionChanges = SubscriptionChanges with
-      prepayWindow = Some (Some (days 30))
+      prepayWindow = Some (days 30)
       recipientProvider = None
       recipientPaymentPerDay = None
       processorPaymentPerDay = None
