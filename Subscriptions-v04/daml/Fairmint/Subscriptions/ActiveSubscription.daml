@@ -1,10 +1,10 @@
 module Fairmint.Subscriptions.ActiveSubscription where
 
-import DA.List (head, last)
+import DA.List (last)
+import DA.Time (addRelTime)
 import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..), CreatedAmulet(..))
-import Splice.Round()
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubscription, calculateAndValidateNewProcessedAndPaidUntil, assertInFreeTrial, assertNotInFreeTrial, assertIsPartyToSubscription, assertOnlySubscriberCanDisregardPaidPeriod, assertPaymentsNotEnded, assertPaymentsEndedAndPaidPeriodPassed, assertPaymentsHaveEnded, assertHasPrepaidTimeRemaining, clearTrialIfEnded)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
@@ -83,34 +83,33 @@ template ActiveSubscription
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid processorContext.processor
         let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingContext.processingPeriod amuletPrice
         let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingContext.processingPeriod amuletPrice
+        let shouldPayProcessor = (not skipProcessorPayment) && processorFee > 0.0
         
         lockedAmulet <- fetch lockedAmuletCid
         let currentBalance = lockedAmulet.amulet.amount.initialAmount
-        let totalPaymentAmount = recipientAmount + (if skipProcessorPayment then 0.0 else processorFee)
+        let totalPaymentAmount = recipientAmount + (if shouldPayProcessor then processorFee else 0.0)
         let remainingForLock = currentBalance - totalPaymentAmount
-        -- Ensure locked balance remains positive after payment to maintain escrow
         assertMsg "Insufficient locked balance for payment" (remainingForLock > 0.0)
         
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
           openRoundCid = paymentContext.openMiningRoundCid
         
         lock <- createSubscriptionLock subscription.recipient processorContext.processor
-        -- Build transfer outputs: recipient payment, optional processor fee, remaining balance back to lock
-        let outputs = 
+        let paymentOutputs = 
               [ TransferOutput with
                   receiver = subscription.recipient
                   receiverFeeRatio = 1.0
                   amount = recipientAmount
                   lock = None
               ] ++
-              (if skipProcessorPayment || processorFee == 0.0
-               then []
-               else [ TransferOutput with
+              (if shouldPayProcessor
+               then [ TransferOutput with
                         receiver = processorContext.processor
                         receiverFeeRatio = 1.0
                         amount = processorFee
                         lock = None
-                    ]) ++
+                    ]
+               else []) ++
               [ TransferOutput with
                   receiver = subscription.subscriber
                   receiverFeeRatio = 1.0
@@ -122,7 +121,7 @@ template ActiveSubscription
             sender = subscription.subscriber
             provider = subscription.provider
             inputs = [InputAmulet unlockResult.amuletSum.amulet]
-            outputs = outputs
+            outputs = paymentOutputs
             beneficiaries = Some subscription.appRewardBeneficiaries
           context = TransferContext with
             openMiningRound = paymentContext.openMiningRoundCid
@@ -130,20 +129,19 @@ template ActiveSubscription
             issuingMiningRounds = Map.empty
             validatorRights = Map.empty
           expectedDso = Some processorContext.dso
-        
-        -- Extract locked amulet from transfer result (always the last output per construction)
         assertMsg "No outputs in transfer result" (not (null transferResult.createdAmulets))
         newLockedAmuletCid <- case last transferResult.createdAmulets of
           TransferResultLockedAmulet cid -> pure cid
           _ -> abort "Expected locked amulet as last output"
         
-        let newStats = updateStatsWithPayment 
-              subscription.subscriber 
-              subscription.recipient 
+        let statsAfterRecipient = updateStatsWithPayment 
+              subscription.subscriber
+              subscription.recipient
               transferResult.summary
-              (if skipProcessorPayment || processorFee == 0.0
-               then stats
-               else updateStatsWithProcessorFee processorContext.processor transferResult.summary stats)
+              stats
+        let newStats = if shouldPayProcessor
+              then updateStatsWithProcessorFee processorContext.processor transferResult.summary statsAfterRecipient
+              else statsAfterRecipient
         
         subscriptionCid <- create this with 
           processedAndPaidUntil = newProcessedAndPaidUntil
@@ -217,11 +215,18 @@ template ActiveSubscription
         amuletPrice <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid subscription.recipient
         refundAmount <- calculateRefundForPrepaidPeriod processedAndPaidUntil subscription.recipientPaymentPerDay subscription.processorPaymentPerDay amuletPrice
         
-        let (transfer, context) = createTransferAndContext subscription.recipient subscription.subscriber refundAmount paymentContext (head recipientAmuletInputs) recipientFeaturedAppRight
-        let transferWithAllInputs = transfer with inputs = map InputAmulet recipientAmuletInputs
+        let (transfer, context) = createTransferAndContext 
+              subscription.recipient 
+              subscription.subscriber 
+              subscription.provider
+              (Some subscription.appRewardBeneficiaries)
+              refundAmount 
+              paymentContext 
+              recipientAmuletInputs 
+              recipientFeaturedAppRight
         
         refundResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
-          transfer = transferWithAllInputs
+          transfer = transfer
           expectedDso = Some processorContext.dso
           ..
         
