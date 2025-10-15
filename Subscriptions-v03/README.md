@@ -100,11 +100,11 @@ Subscriptions use a **LockedAmulet** for payment escrow:
   - **Lock holders:** recipient and processor
   - **Lock expiry:** 365 days (to discourage expiry - this is a recovery mechanism only)
   - **Context:** "Subscription escrow"
-  - **Fee model:** `receiverFeeRatio = 0.0` - subscriber pays fees from inputs (predictable costs)
+  - **Fee model:** `receiverFeeRatio = 1.0` - subscriber pays fees from inputs (predictable costs)
 - Any remaining balance from inputs is returned as change to the subscriber
 
 **Cost Predictability:**
-All escrow operations use `receiverFeeRatio = 0.0`, meaning:
+All escrow operations use `receiverFeeRatio = 1.0`, meaning:
 - Transfer fees are paid from the subscriber's input amulets
 - The locked amount is exactly what the subscriber specified
 - The subscriber knows upfront the total cost (amount + fees)

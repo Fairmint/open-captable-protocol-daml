@@ -9,12 +9,9 @@ import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..))
 import Shared.TestUtils (tapWithDso, getAmuletRules)
 import Subscriptions.TestUtils
 
--- | Test ActiveSubscription_AddFunds choice signature
--- Note: This choice requires multi-party authorization (subscriber, recipient, processor)
--- AND visibility to DSO-owned contracts (OpenMiningRound, AmuletRules). 
--- Full integration testing requires infrastructure support for multi-party submissions
--- with disclosure propagation that isn't available in basic unit tests.
--- This test verifies the choice exists and the subscription structure is correct.
+-- | Test ActiveSubscription_AddFunds
+-- Tests adding funds to an active subscription's escrow
+-- This choice requires multi-party authorization (actor, subscriber, recipient, processor)
 testAddFunds : Script ()
 testAddFunds = script do
   TestParties{..} <- allocateTestParties
@@ -24,16 +21,36 @@ testAddFunds = script do
   
   subscriptionCid <- approveProposalFully proposalCid processor bob alice dso
   
-  -- Verify the subscription was created with locked amulet
+  -- Get the subscription to check initial state
   Some subscription <- queryContractId alice subscriptionCid
-  assertMsg "Subscription should have locked amulet available for adding funds" True
+  assertMsg "Subscription should have locked amulet" True
   
-  -- Full test of ActiveSubscription_AddFunds requires:
-  -- 1. Multi-party authorization (submitMulti)
-  -- 2. Visibility to DSO contracts (OpenMiningRound, AmuletRules)  
-  -- 3. Without DSO as readAs party (production constraint)
-  -- This combination requires infrastructure support beyond basic unit tests.
-  -- The choice is tested in integration tests with proper disclosure propagation.
+  -- Create amulets to add to the subscription
+  newAmulet <- tapWithDso dso alice 50.0
+  
+  -- Get payment context
+  amuletRulesCid <- getAmuletRules dso
+  openRounds <- query @Splice.Round.OpenMiningRound dso
+  now <- getTime
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  
+  -- Exercise AddFunds choice with multi-party authorization
+  -- Use readAs [dso] to provide visibility to DSO contracts (AmuletRules, OpenMiningRound)
+  (newSubscriptionCid, changeAmulet) <- submitMulti [alice, bob, processor] [dso] do
+    exerciseCmd subscriptionCid ActiveSubscription_AddFunds with
+      actor = alice  -- Alice is providing the funds
+      amuletInputs = [newAmulet]
+      amountToLock = 90.0  -- Lock 90 total (50 existing + 50 new - fees)
+      description = Some "Adding more funds"
+      paymentContext = PaymentContext with
+        amuletRulesCid
+        openMiningRoundCid = openRoundCid
+  
+  -- Verify the subscription was updated
+  Some updatedSubscription <- queryContractId alice newSubscriptionCid
+  assertMsg "Subscription should have updated locked amulet" True
   
   pure ()
 
@@ -61,7 +78,7 @@ testWithdrawFunds = script do
   -- Use readAs [dso] to provide visibility to DSO contracts (AmuletRules, OpenMiningRound)
   (newSubscriptionCid, withdrawnAmuletCid) <- submitMulti [alice] [dso] do
     exerciseCmd subscriptionCid ActiveSubscription_WithdrawFunds with
-      amountToKeepLocked = 30.0  -- Keep 30 locked, withdraw ~20 minus fees (ensures change > fees)
+      amountToKeepLocked = 20.0  -- Keep 20 locked, withdraw ~30 minus fees (ensures change > fees)
       paymentContext = PaymentContext with
         amuletRulesCid
         openMiningRoundCid = openRoundCid

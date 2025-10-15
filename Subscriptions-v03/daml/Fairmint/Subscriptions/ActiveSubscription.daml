@@ -113,6 +113,15 @@ template ActiveSubscription
         let recipientAmount = calculateAmountForPeriod subscription.recipientPaymentPerDay processingContext.processingPeriod amuletPrice
         let processorFee = calculateProcessorFee subscription.processorPaymentPerDay processingContext.processingPeriod amuletPrice
         
+        -- Fetch locked amulet to get current balance
+        lockedAmulet <- fetch lockedAmuletCid
+        let currentBalance = lockedAmulet.amulet.amount.initialAmount
+        
+        -- Calculate remaining balance after payments
+        let totalPaymentAmount = recipientAmount + (if skipProcessorPayment then 0.0 else processorFee)
+        let remainingForLock = currentBalance - totalPaymentAmount
+        assertMsg "Insufficient locked balance for payment" (remainingForLock > 0.0)
+        
         -- Unlock the locked amulet
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
           openRoundCid = paymentContext.openMiningRoundCid
@@ -130,7 +139,7 @@ template ActiveSubscription
               -- Output 1: Payment to recipient
               [ TransferOutput with
                   receiver = subscription.recipient
-                  receiverFeeRatio = 1.0  -- Recipient gets the fees (standard payment)
+                  receiverFeeRatio = 1.0  -- Recipient pays fees from their payment amount
                   amount = recipientAmount
                   lock = None
               ] ++
@@ -139,15 +148,15 @@ template ActiveSubscription
                then []
                else [ TransferOutput with
                         receiver = processorContext.processor
-                        receiverFeeRatio = 1.0  -- Processor gets the fees
+                        receiverFeeRatio = 1.0  -- Processor pays fees from their fee amount
                         amount = processorFee
                         lock = None
                     ]) ++
-              -- Output 3: Lock remaining balance
+              -- Output 3: Lock remaining balance (calculated from current balance minus payments)
               [ TransferOutput with
                   receiver = subscription.subscriber
-                  receiverFeeRatio = 0.0  -- Subscriber pays all fees from inputs
-                  amount = 0.0  -- Remaining balance goes to locked output
+                  receiverFeeRatio = 1.0  -- Subscriber pays fees from inputs (any rounding difference)
+                  amount = remainingForLock  -- Explicit remaining amount after payments
                   lock = Some lock
               ]
         
@@ -170,12 +179,6 @@ template ActiveSubscription
         let newLockedAmuletCid = case last transferResult.createdAmulets of
               TransferResultLockedAmulet cid -> cid
               _ -> error "Expected locked amulet as last output"
-        
-        -- Create activity marker if fee was skipped (already created during transfer if fee was charged)
-        activityMarkerCid <- 
-          if skipProcessorPayment || processorFee == 0.0
-          then createActivityMarkerIfProvided subscription processingContext
-          else pure None
         
         -- Update stats: track payment amounts from transfer summary
         let newStats = updateStatsWithPayment 
@@ -344,7 +347,7 @@ template ActiveSubscription
             inputs = map InputAmulet allAmulets
             outputs = [TransferOutput with
               receiver = subscription.subscriber  -- Locked amulet owned by subscriber
-              receiverFeeRatio = 0.0  -- Funder pays fees from inputs (predictable costs)
+              receiverFeeRatio = 1.0  -- Funder pays fees from inputs (predictable costs)
               amount = amountToLock
               lock = Some lock]
             beneficiaries = Some subscription.appRewardBeneficiaries
@@ -364,7 +367,7 @@ template ActiveSubscription
 
     -- | Withdraw excess funds from the locked amulet
     -- Unlocks, creates new lock with specified amount, returns change to subscriber
-    -- Fees are paid from inputs (receiverFeeRatio = 0.0) so subscriber knows exact cost
+    -- Fees are paid from inputs (receiverFeeRatio = 1.0) so subscriber knows exact cost
     choice ActiveSubscription_WithdrawFunds : (ContractId ActiveSubscription, ContractId Amulet.Amulet)
       with
         amountToKeepLocked : Decimal
@@ -372,6 +375,14 @@ template ActiveSubscription
       controller subscription.subscriber
       do
         assertMsg "Amount to keep locked must be positive" (amountToKeepLocked > 0.0)
+        
+        -- Fetch locked amulet to get current balance
+        lockedAmulet <- fetch lockedAmuletCid
+        let currentBalance = lockedAmulet.amulet.amount.initialAmount
+        
+        -- Calculate change amount (remaining after keeping locked amount)
+        let changeAmount = currentBalance - amountToKeepLocked
+        assertMsg "Insufficient balance to withdraw funds" (changeAmount > 0.0)
         
         -- Unlock existing locked amulet
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
@@ -393,13 +404,13 @@ template ActiveSubscription
             outputs = 
               [ TransferOutput with
                   receiver = subscription.subscriber
-                  receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+                  receiverFeeRatio = 1.0  -- Subscriber pays fees from inputs (predictable costs)
                   amount = amountToKeepLocked
                   lock = Some lock
               , TransferOutput with
                   receiver = subscription.subscriber
-                  receiverFeeRatio = 0.0  -- Fees already paid from inputs
-                  amount = 0.0  -- Remaining balance goes to subscriber as change
+                  receiverFeeRatio = 1.0  -- Fees already paid from inputs
+                  amount = changeAmount  -- Explicit remaining amount to withdraw
                   lock = None
               ]
             beneficiaries = Some subscription.appRewardBeneficiaries
@@ -451,7 +462,7 @@ template ActiveSubscription
             inputs = map InputAmulet allAmulets
             outputs = [TransferOutput with
               receiver = subscription.subscriber
-              receiverFeeRatio = 0.0  -- Subscriber pays fees from inputs (predictable costs)
+              receiverFeeRatio = 1.0  -- Subscriber pays fees from inputs (predictable costs)
               amount = amountToLock
               lock = Some lock]
             beneficiaries = Some subscription.appRewardBeneficiaries
