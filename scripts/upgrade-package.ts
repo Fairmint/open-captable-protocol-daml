@@ -69,7 +69,7 @@ function findPackageFolder(packageName: string): string {
   
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "Subscriptions-v07", "OpenCapTable-v25", etc.
+      // Match patterns like "Subscriptions-v08", "OpenCapTable-v25", etc.
       const match = entry.name.match(new RegExp(`^${packageName}-(v\\d+)$`, 'i'));
       if (match) {
         return entry.name;
@@ -226,13 +226,13 @@ function performMajorUpgrade(info: PackageInfo): void {
   // Step 3: Search and replace version strings
   console.log('Updating references across the repository...\n');
 
-  // Replace full version strings (e.g., "Subscriptions-v07-0.2.3" → "Subscriptions-v08-0.0.1")
+  // Replace full version strings (e.g., "Subscriptions-v08-0.2.3" → "Subscriptions-v08-0.0.1")
   const oldFullVersionString = `${info.currentFolder}-${info.currentFullVersion}`;
   const newFullVersionString = `${info.newFolder}-${info.newFullVersion}`;
   console.log(`Replacing: ${oldFullVersionString} → ${newFullVersionString}`);
   searchAndReplaceInFiles(ROOT_DIR, oldFullVersionString, newFullVersionString);
 
-  // Replace major version strings (e.g., "Subscriptions-v07" → "Subscriptions-v08")
+  // Replace major version strings (e.g., "Subscriptions-v08" → "Subscriptions-v08")
   console.log(`\nReplacing: ${info.currentFolder} → ${info.newFolder}`);
   searchAndReplaceInFiles(ROOT_DIR, info.currentFolder, info.newFolder!);
 

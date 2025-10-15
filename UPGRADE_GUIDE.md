@@ -19,7 +19,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 ## What Gets Changed
 
 ### Major Upgrade
-- ✅ Folder renamed (e.g., `Subscriptions-v07/` → `Subscriptions-v08/`)
+- ✅ Folder renamed (e.g., `Subscriptions-v08/` → `Subscriptions-v08/`)
 - ✅ Package name updated in `daml.yaml`
 - ✅ Version reset to `0.0.1` in `daml.yaml`
 - ✅ All file references updated across the repository
@@ -32,7 +32,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 ## Available Packages
 
 Current packages that can be upgraded:
-- `Subscriptions` (currently at `Subscriptions-v07`)
+- `Subscriptions` (currently at `Subscriptions-v08`)
 - `OpenCapTable` (currently at `OpenCapTable-v25`)
 - `OpenCapTableReports` (currently at `OpenCapTableReports-v01`)
 - `OpenCapTableProofOfOwnership` (currently at `OpenCapTableProofOfOwnership-v01`)
@@ -70,29 +70,29 @@ Current packages that can be upgraded:
 ### Example 1: Major Upgrade
 
 ```bash
-# Before: Subscriptions-v07 (version 0.2.3)
+# Before: Subscriptions-v08 (version 0.2.3)
 npm run upgrade-package -- --package Subscriptions --type major
 # After: Subscriptions-v08 (version 0.0.1)
 ```
 
 Files changed:
-- `Subscriptions-v07/` → `Subscriptions-v08/`
+- `Subscriptions-v08/` → `Subscriptions-v08/`
 - `Subscriptions-v08/daml.yaml` (name and version fields)
 - `multi-package.yaml`
-- All scripts referencing `Subscriptions-v07`
+- All scripts referencing `Subscriptions-v08`
 - README files
 - Test files
 
 ### Example 2: Minor Upgrade
 
 ```bash
-# Before: Subscriptions-v07 (version 0.2.3)
+# Before: Subscriptions-v08 (version 0.2.3)
 npm run upgrade-package -- --package Subscriptions --type minor
-# After: Subscriptions-v07 (version 0.2.4)
+# After: Subscriptions-v08 (version 0.2.4)
 ```
 
 Files changed:
-- `Subscriptions-v07/daml.yaml` (version field only)
+- `Subscriptions-v08/daml.yaml` (version field only)
 - Any files with hardcoded version strings
 
 ## Script Details

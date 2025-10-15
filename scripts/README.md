@@ -27,13 +27,13 @@ npm run upgrade-package -- --package Subscriptions --type major
 ```
 
 **What it does:**
-1. Renames folder: `Subscriptions-v07/` → `Subscriptions-v08/`
+1. Renames folder: `Subscriptions-v08/` → `Subscriptions-v08/`
 2. Updates `daml.yaml`:
-   - `name`: `Subscriptions-v07` → `Subscriptions-v08`
+   - `name`: `Subscriptions-v08` → `Subscriptions-v08`
    - `version`: `0.2.3` → `0.0.1`
 3. Searches and replaces across all files:
-   - `Subscriptions-v07-0.2.3` → `Subscriptions-v08-0.0.1`
-   - `Subscriptions-v07` → `Subscriptions-v08`
+   - `Subscriptions-v08-0.2.3` → `Subscriptions-v08-0.0.1`
+   - `Subscriptions-v08` → `Subscriptions-v08`
 4. Updates references in:
    - `daml.yaml` files
    - TypeScript files (`.ts`)
@@ -56,7 +56,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 2. Increments patch version: `0.2.3` → `0.2.4`
 3. Updates `daml.yaml` with the new version
 4. Searches and replaces across all files:
-   - `Subscriptions-v07-0.2.3` → `Subscriptions-v07-0.2.4`
+   - `Subscriptions-v08-0.2.3` → `Subscriptions-v08-0.2.4`
 
 ### Files Modified
 
@@ -105,13 +105,13 @@ After running the script, you should:
 **Upgrade Subscriptions from v07 to v08:**
 ```bash
 npm run upgrade-package -- --package Subscriptions --type major
-# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v08 (0.0.1)
+# Output: Subscriptions-v08 (0.2.3) → Subscriptions-v08 (0.0.1)
 ```
 
 **Bump Subscriptions patch version:**
 ```bash
 npm run upgrade-package -- --package Subscriptions --type minor
-# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v07 (0.2.4)
+# Output: Subscriptions-v08 (0.2.3) → Subscriptions-v08 (0.2.4)
 ```
 
 **Upgrade OpenCapTable from v25 to v26:**
@@ -123,7 +123,7 @@ npm run upgrade-package -- --package OpenCapTable --type major
 ### Troubleshooting
 
 **Error: "Package folder not found"**
-- Ensure the package name matches a folder in the repository (e.g., `Subscriptions`, not `Subscriptions-v07`)
+- Ensure the package name matches a folder in the repository (e.g., `Subscriptions`, not `Subscriptions-v08`)
 - Check that the folder follows the pattern `<PackageName>-v<NN>`
 
 **Error: "Target folder already exists"**
