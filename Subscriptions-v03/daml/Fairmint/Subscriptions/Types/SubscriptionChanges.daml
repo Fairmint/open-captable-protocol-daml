@@ -6,7 +6,7 @@ import DA.Time (RelTime, convertRelTimeToMicroseconds, subTime, addRelTime)
 import DA.TextMap (TextMap)
 import DA.Optional (isSome)
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..))
-import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), validateSubscriptionAmount)
+import Fairmint.Subscriptions.Types.SubscriptionAmount (SubscriptionAmount(..), validateSubscriptionAmount, compareAmounts)
 import Fairmint.Subscriptions.Types.SubscriptionTime (SubscriptionTime(..), resolveOptionalSubscriptionTime, assertOptionalTimeIsNoneOrInFuture)
 import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
 import Fairmint.Subscriptions.Types.ActiveSubscriptionData (ActiveSubscriptionData(..))
@@ -41,16 +41,8 @@ data SubscriptionChanges = SubscriptionChanges
       -- ^ Change observers (requires approval from all parties: subscriber, recipient, processor)
   deriving (Eq, Show)
 
--- | Helper to compare SubscriptionAmount values
--- Returns: (sameUnit, increased)
-compareAmounts : SubscriptionAmount -> SubscriptionAmount -> (Bool, Bool)
-compareAmounts oldAmt newAmt = case (oldAmt, newAmt) of
-  (AmuletAmount old, AmuletAmount new) -> (True, new > old)
-  (USDAmount old, USDAmount new) -> (True, new > old)
-  _ -> (False, False)  -- Different units
-
--- | Determine which parties are impacted by proposed changes
--- Returns set of impacted parties
+-- | Determine which parties are impacted by proposed changes to an active subscription
+-- A party is impacted if the change materially affects their obligations, benefits, or control
 getImpactedPartiesForSubscription : SubscriptionChanges -> Subscription -> ProcessorContext -> Set Party
 getImpactedPartiesForSubscription changes config context =
   let
@@ -205,20 +197,18 @@ applyChangesToSubscription changes activeSubscriptionData = do
         paymentsEndAt = resolvedPaymentsEndAt
         freeTrialExpiration = resolvedTrialEndsAt
   
-  -- Calculate new processedAndPaidUntil (trial extension + adjustment)
-  -- Step 1: Handle free trial extension if applicable
+  -- Calculate new processedAndPaidUntil accounting for trial extensions and explicit adjustments
+  -- When extending a trial, we also extend processedAndPaidUntil by the same duration
+  -- to preserve prepaid time. This ensures subscriber doesn't lose paid time when trial is extended.
   let afterTrialAdjustment = case (resolvedTrialEndsAt, activeSubscriptionData.subscription.freeTrialExpiration) of
-        -- Granting or extending trial: calculate trial duration and extend prepaid time
         (Some newTrialEnd, optOldTrialEnd) ->
           let oldTrialEnd = case optOldTrialEnd of
                 Some t -> t
-                None -> now  -- No previous trial, so trial starts now
-              -- Calculate the net extension (new trial end - old trial end)
+                None -> now
               trialExtension = subTime newTrialEnd oldTrialEnd
           in if activeSubscriptionData.processedAndPaidUntil > now && trialExtension > subTime now now
              then addRelTime activeSubscriptionData.processedAndPaidUntil trialExtension
              else activeSubscriptionData.processedAndPaidUntil
-        -- Not changing trial or removing trial: keep existing processedAndPaidUntil
         _ -> activeSubscriptionData.processedAndPaidUntil
   
   -- Step 2: Apply explicit processedAndPaidUntil adjustment if specified

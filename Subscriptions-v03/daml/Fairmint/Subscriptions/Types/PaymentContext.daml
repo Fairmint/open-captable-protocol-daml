@@ -1,188 +1,19 @@
 module Fairmint.Subscriptions.Types.PaymentContext where
 
-import DA.Optional (fromSome, isSome)
-import DA.Time (addRelTime, days)
 import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
-import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..), CreatedAmulet(..))
-import Splice.Expiry (TimeLock(..))
-import Splice.Round qualified as Round
+import Splice.AmuletRules (AmuletRules, Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..))
 import Splice.Round (OpenMiningRound, OpenMiningRound_Fetch(..))
-import Fairmint.Shared.Splice.SpliceAmuletHelpers (PaymentRequest(..), paymentTo)
-import Fairmint.Subscriptions.Types.Subscription (Subscription)
-import Fairmint.Subscriptions.Types.ProcessorContext (ProcessorContext(..))
-import Fairmint.Subscriptions.Types.ProcessingContext (ProcessingContext(..))
+import Splice.Round qualified as Round
 
 -- | Payment context containing Amulet transfer dependencies
--- Note: amuletInputs are no longer needed as payments use the LockedAmulet stored in the subscription
 data PaymentContext = PaymentContext
   with
     amuletRulesCid : ContractId AmuletRules
     openMiningRoundCid : ContractId OpenMiningRound
   deriving (Eq, Show)
 
--- | Pay subscription recipient using locked amulet
--- Unlocks the amulet, makes payment, and re-locks the change
--- Note: Does not create activity marker because the payment transfer itself serves as the activity record
-payRecipientFromLockedAmulet : 
-  Subscription -> 
-  ProcessorContext -> 
-  ProcessingContext -> 
-  Decimal -> 
-  Decimal -> 
-  PaymentContext ->
-  ContractId Amulet.LockedAmulet ->
-  Update (TransferResult, ContractId Amulet.LockedAmulet)
-payRecipientFromLockedAmulet subscription processorContext processingContext amountForPeriod amuletPrice paymentCtx lockedAmuletCid = do
-  -- Unlock the amulet for payment
-  unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
-    openRoundCid = paymentCtx.openMiningRoundCid
-  
-  -- Make the payment using the unlocked amulet
-  paymentResult <- paymentTo PaymentRequest with
-    sender = subscription.subscriber
-    receiver = subscription.recipient
-    provider = subscription.provider
-    amount = amountForPeriod
-    featuredAppRight = processingContext.featuredAppRight
-    beneficiaries = Some subscription.appRewardBeneficiaries
-    expectedDso = processorContext.dso
-    amuletInputs = [unlockResult.amuletSum.amulet]
-    amuletRulesCid = paymentCtx.amuletRulesCid
-    openMiningRoundCid = paymentCtx.openMiningRoundCid
-  
-  -- Re-lock the change amulet
-  assertHasChangeAmulet paymentResult.senderChangeAmulet
-  let changeAmuletCid = fromSome paymentResult.senderChangeAmulet
-  
-  now <- getTime
-  let lockExpiresAt = addRelTime now (days 365)
-  let lock = TimeLock with
-        holders = [subscription.recipient, processorContext.processor]
-        expiresAt = lockExpiresAt
-        optContext = Some "Subscription escrow"
-  
-  relockResult <- exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
-    transfer = Transfer with
-      sender = subscription.subscriber
-      provider = subscription.provider  -- Processor facilitates re-locking
-      inputs = [InputAmulet changeAmuletCid]
-      outputs = [TransferOutput with
-        receiver = subscription.subscriber
-        receiverFeeRatio = 1.0
-        amount = 0.0  -- Transfer entire balance to locked output
-        lock = Some lock]
-      beneficiaries = Some subscription.appRewardBeneficiaries
-    context = TransferContext with
-      openMiningRound = paymentCtx.openMiningRoundCid
-      featuredAppRight = None
-      issuingMiningRounds = Map.empty
-      validatorRights = Map.empty
-    expectedDso = Some processorContext.dso
-  
-  let newLockedAmuletCid = case relockResult.createdAmulets of
-        [TransferResultLockedAmulet cid] -> cid
-        _ -> error "Expected exactly one locked amulet output"
-  
-  pure (paymentResult, newLockedAmuletCid)
-
--- | Pay processor fee from a regular (already unlocked) change amulet
--- Re-locks the final change after fee payment
--- Note: Does not create activity marker because the payment transfer itself serves as the activity record
-payProcessorFeeAndRelock :
-  Subscription ->
-  ProcessorContext ->
-  ProcessingContext ->
-  Decimal ->
-  Decimal ->
-  PaymentContext ->
-  ContractId Amulet.Amulet ->
-  Update (Optional TransferResult, ContractId Amulet.LockedAmulet)
-payProcessorFeeAndRelock subscription processorContext processingContext feeAmount amuletPrice paymentCtx changeAmuletCid = do
-  if feeAmount == 0.0
-  then do
-    -- No fee to pay, just re-lock the change
-    now <- getTime
-    let lockExpiresAt = addRelTime now (days 365)
-    let lock = TimeLock with
-          holders = [subscription.recipient, processorContext.processor]
-          expiresAt = lockExpiresAt
-          optContext = Some "Subscription escrow"
-    
-    relockResult <- exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
-      transfer = Transfer with
-        sender = subscription.subscriber
-        provider = subscription.provider  -- Processor facilitates re-locking
-        inputs = [InputAmulet changeAmuletCid]
-        outputs = [TransferOutput with
-          receiver = subscription.subscriber
-          receiverFeeRatio = 1.0
-          amount = 0.0
-          lock = Some lock]
-        beneficiaries = Some subscription.appRewardBeneficiaries
-      context = TransferContext with
-        openMiningRound = paymentCtx.openMiningRoundCid
-        featuredAppRight = None
-        issuingMiningRounds = Map.empty
-        validatorRights = Map.empty
-      expectedDso = Some processorContext.dso
-    
-    let newLockedCid = case relockResult.createdAmulets of
-          [TransferResultLockedAmulet cid] -> cid
-          _ -> error "Expected exactly one locked amulet output"
-    
-    pure (None, newLockedCid)
-  else do
-    -- Pay processor fee
-    feePaymentResult <- paymentTo PaymentRequest with
-      sender = subscription.subscriber
-      receiver = processorContext.processor
-      provider = subscription.provider
-      amount = feeAmount
-      featuredAppRight = processingContext.featuredAppRight
-      beneficiaries = Some subscription.appRewardBeneficiaries
-      expectedDso = processorContext.dso
-      amuletInputs = [changeAmuletCid]
-      amuletRulesCid = paymentCtx.amuletRulesCid
-      openMiningRoundCid = paymentCtx.openMiningRoundCid
-    
-    -- Re-lock the remaining change
-    assertHasChangeAmulet feePaymentResult.senderChangeAmulet
-    let finalChangeAmuletCid = fromSome feePaymentResult.senderChangeAmulet
-    
-    now <- getTime
-    let lockExpiresAt = addRelTime now (days 365)
-    let lock = TimeLock with
-          holders = [subscription.recipient, processorContext.processor]
-          expiresAt = lockExpiresAt
-          optContext = Some "Subscription escrow"
-    
-    relockResult <- exercise paymentCtx.amuletRulesCid AmuletRules_Transfer with
-      transfer = Transfer with
-        sender = subscription.subscriber
-        provider = subscription.provider  -- Processor facilitates re-locking
-        inputs = [InputAmulet finalChangeAmuletCid]
-        outputs = [TransferOutput with
-          receiver = subscription.subscriber
-          receiverFeeRatio = 1.0
-          amount = 0.0
-          lock = Some lock]
-        beneficiaries = Some subscription.appRewardBeneficiaries
-      context = TransferContext with
-        openMiningRound = paymentCtx.openMiningRoundCid
-        featuredAppRight = None
-        issuingMiningRounds = Map.empty
-        validatorRights = Map.empty
-      expectedDso = Some processorContext.dso
-    
-    let newLockedCid = case relockResult.createdAmulets of
-          [TransferResultLockedAmulet cid] -> cid
-          _ -> error "Expected exactly one locked amulet output"
-    
-    pure (Some feePaymentResult, newLockedCid)
-
--- | Create transfer and context for amulet transfer from a single unlocked amulet input
--- Used for refunds
+-- | Create transfer and context for amulet transfer (used for refunds)
 createTransferAndContext :
   Party ->
   Party ->
@@ -211,20 +42,10 @@ createTransferAndContext sender receiver amount paymentContext amuletInput featu
       validatorRights = Map.empty
   in (transfer, context)
 
--- | Assert that change amulet is available
-assertHasChangeAmulet : Optional a -> Update ()
-assertHasChangeAmulet senderChangeAmulet =
-  assertMsg "Expected change amulet from recipient transfer" (isSome senderChangeAmulet)
-
--- | Assert that amulet price is valid
-assertValidAmuletPrice : Decimal -> Update ()
-assertValidAmuletPrice price =
-  assertMsg "USD to Amulet conversion rate must be positive" (price > 0.0)
-
 -- | Fetch and validate amulet price from open mining round
 fetchAndValidateAmuletPrice : ContractId Round.OpenMiningRound -> Party -> Update Decimal
 fetchAndValidateAmuletPrice openMiningRoundCid actor = do
   openRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = actor)
   let amuletPrice = openRound.amuletPrice
-  assertValidAmuletPrice amuletPrice
+  assertMsg "USD to Amulet conversion rate must be positive" (amuletPrice > 0.0)
   pure amuletPrice
