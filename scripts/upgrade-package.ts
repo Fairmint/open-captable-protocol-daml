@@ -226,7 +226,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   // Step 3: Search and replace version strings
   console.log('Updating references across the repository...\n');
 
-  // Replace full version strings (e.g., "Subscriptions-v09-0.2.3" → "Subscriptions-v09-0.0.1")
+  // Replace full version strings (e.g., "Subscriptions-v09-0.2.3" → "Subscriptions-v09-0.0.2")
   const oldFullVersionString = `${info.currentFolder}-${info.currentFullVersion}`;
   const newFullVersionString = `${info.newFolder}-${info.newFullVersion}`;
   console.log(`Replacing: ${oldFullVersionString} → ${newFullVersionString}`);

@@ -32,7 +32,7 @@ npm run upgrade-package -- --package Subscriptions --type major
    - `name`: `Subscriptions-v09` → `Subscriptions-v09`
    - `version`: `0.2.3` → `0.0.1`
 3. Searches and replaces across all files:
-   - `Subscriptions-v09-0.2.3` → `Subscriptions-v09-0.0.1`
+   - `Subscriptions-v09-0.2.3` → `Subscriptions-v09-0.0.2`
    - `Subscriptions-v09` → `Subscriptions-v09`
 4. Updates references in:
    - `daml.yaml` files
