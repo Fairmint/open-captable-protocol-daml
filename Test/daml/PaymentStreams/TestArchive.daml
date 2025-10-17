@@ -1,0 +1,260 @@
+module PaymentStreams.TestArchive where
+
+import Daml.Script
+import DA.Time (days, addRelTime)
+import DA.List (head)
+import Splice.Round (OpenMiningRound)
+import CantonPayments.PaymentStream.ProposedPaymentStream qualified as Proposed
+import CantonPayments.PaymentStream.ActivePaymentStream qualified as Active
+import CantonPayments.PaymentStream.Types.PaymentStreamTime (PaymentStreamExpiration(..))
+import CantonPayments.PaymentStream.Types.PaymentStreamAmount (PaymentStreamAmount(..))
+import CantonPayments.PaymentStream.Types.PaymentContext (PaymentContext(..))
+import Shared.TestUtils (tapWithDso, getAmuletRules)
+import PaymentStreams.TestUtils
+
+-- | Test PaymentStreamFactory Archive choice
+testPaymentStreamFactoryArchive : Script ()
+testPaymentStreamFactoryArchive = script do
+  TestParties{..} <- allocateTestParties
+  factoryCid <- createPaymentStreamFactory processor dso
+  
+  submit processor do
+    archiveCmd factoryCid
+  
+  pure ()
+
+-- | Test PaymentStreamProposal Archive choice
+testPaymentStreamProposalArchive : Script ()
+testPaymentStreamProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createPayerPaymentStreamProposal processor alice dso (defaultPaymentStreamProposal alice bob expiresAt)
+  
+  submitMulti [alice, processor] [bob] do
+    archiveCmd proposalCid
+  
+  pure ()
+
+-- | Test ProcessorApprovedPaymentStreamProposal Archive choice
+testProcessorApprovedProposalArchive : Script ()
+testProcessorApprovedProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createPayerPaymentStreamProposal processor alice dso (defaultPaymentStreamProposal alice bob expiresAt)
+  
+  -- Processor is already approved as initiator, can archive directly
+  submitMulti [alice, processor] [bob] do
+    archiveCmd proposalCid
+  
+  pure ()
+
+-- | Test PaymentStream Archive choice
+testPaymentStreamArchive : Script ()
+testPaymentStreamArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createPayerPaymentStreamProposal processor alice dso (defaultPaymentStreamProposal alice bob expiresAt)
+  
+  -- Use helper to fully approve proposal with proper amulet escrow
+  paymentStreamCid <- approveProposalFully proposalCid processor bob alice dso
+  
+  submitMulti [alice, bob, processor] [] do
+    archiveCmd paymentStreamCid
+  
+  pure ()
+
+-- | Test RecipientInitiatedPaymentStreamProposal Archive choice
+testRecipientInitiatedPaymentStreamProposalArchive : Script ()
+testRecipientInitiatedPaymentStreamProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createRecipientPaymentStreamProposal processor bob dso (defaultPaymentStreamProposal alice bob expiresAt)
+  
+  submitMulti [bob, processor] [alice] do
+    archiveCmd proposalCid
+  
+  pure ()
+
+-- | Test ProcessorApprovedRecipientInitiatedPaymentStreamProposal Archive choice
+testProcessorApprovedRecipientInitiatedProposalArchive : Script ()
+testProcessorApprovedRecipientInitiatedProposalArchive = script do
+  TestParties{..} <- allocateTestParties
+  
+  expiresAt <- getExpirationTime 365
+  proposalCid <- createRecipientPaymentStreamProposal processor bob dso (defaultPaymentStreamProposal alice bob expiresAt)
+  
+  approvedProposalCid <- submit processor do
+    exerciseCmd proposalCid Proposed.ProposedPaymentStream_Approve with 
+      actor = processor
+  
+  submitMulti [bob, processor] [alice] do
+    archiveCmd approvedProposalCid
+  
+  pure ()
+
+-- | Test Active.ActivePaymentStream_ArchiveInactivePaymentStream choice
+-- Tests archiving a canceled paymentStream after the prepaid period has passed
+testActivePaymentStreamArchiveInactive : Script ()
+testActivePaymentStreamArchiveInactive = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create paymentStream that expires in 30 days
+  now <- getTime
+  let expiresAt = addRelTime now (days 30)
+  let proposal = (defaultPaymentStreamProposal alice bob expiresAt) with
+        recipientPaymentPerDay = AmuletAmount 2.0
+        processorPaymentPerDay = Some (AmuletAmount 0.5)
+        paymentsEndAt = Some (PreciseTime expiresAt)
+        prepayWindow = days 15  -- Allow processing up to 15 days ahead
+  
+  proposalCid <- createPayerPaymentStreamProposal processor alice dso proposal
+  paymentStreamCid <- approveProposalFully proposalCid processor bob alice dso
+  
+  -- Process a payment to advance processedAndPaidUntil
+  amuletRulesCid <- getAmuletRules dso
+  openRounds <- query @OpenMiningRound dso
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  
+  -- Advance 7 days and process payment for 10 days
+  let paymentTime = addRelTime now (days 7)
+  setTime paymentTime
+  
+  result <- submitMulti [processor] [dso] do
+    exerciseCmd paymentStreamCid Active.ActivePaymentStream_ProcessPayment with
+      activityMarkerFeaturedAppRightCid = None
+      processingPeriod = days 10  -- Process 10 days ahead
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+        featuredAppRight = None
+      skipProcessorPayment = True
+  
+  -- Cancel the paymentStream (keep prepaid period)
+  -- processedAndPaidUntil is now day 17 (day 7 + 10 days)
+  -- Cancel at day 8 (after payment processing, but before processedAndPaidUntil)
+  let cancelTime = addRelTime now (days 8)
+  setTime cancelTime
+  
+  (Some canceledCid, _) <- submitMulti [alice] [dso] do
+    exerciseCmd result.paymentStreamCid Active.ActivePaymentStream_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = False  -- Keep prepaid period
+      description = Some "Testing cancellation"
+      openMiningRoundCid = None  -- Don't need to unlock since we're keeping prepaid period
+  
+  -- Verify paymentStream has been canceled
+  Some canceled <- queryContractId alice canceledCid
+  assertMsg "Should be in canceled state" (canceled.paymentStream.paymentsEndAt <= Some cancelTime)
+  
+  -- Wait for prepaid period to pass
+  -- processedAndPaidUntil is at day 11 (day 1 + 10 days)
+  -- We need to wait until after day 11
+  let archiveTime = addRelTime now (days 12)
+  setTime archiveTime
+  
+  -- Now archive the inactive paymentStream (any party can do this)
+  unlockedAmuletCid <- submitMulti [alice] [dso] do
+    exerciseCmd canceledCid Active.ActivePaymentStream_ArchiveInactivePaymentStream with
+      actor = alice
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+        featuredAppRight = None
+  
+  -- Verify the paymentStream was archived
+  archivedSub <- queryContractId alice canceledCid
+  assertMsg "PaymentStream should be archived" (archivedSub == None)
+  
+  -- Verify the locked amulet was returned
+  Some unlockedAmulet <- queryContractId alice unlockedAmuletCid
+  assertMsg "Amulet should belong to Payer" (unlockedAmulet.owner == alice)
+  
+  pure ()
+
+-- | Test Active.ActivePaymentStream_Refund choice
+-- Tests recipient refunding prepaid time after cancellation
+testActivePaymentStreamRefund : Script ()
+testActivePaymentStreamRefund = script do
+  TestParties{..} <- allocateTestParties
+  
+  -- Create paymentStream
+  now <- getTime
+  let expiresAt = addRelTime now (days 365)
+  let proposal = (defaultPaymentStreamProposal alice bob expiresAt) with
+        recipientPaymentPerDay = AmuletAmount 2.0
+        processorPaymentPerDay = Some (AmuletAmount 0.5)
+        prepayWindow = days 15  -- Allow processing up to 15 days ahead
+  
+  proposalCid <- createPayerPaymentStreamProposal processor alice dso proposal
+  paymentStreamCid <- approveProposalFully proposalCid processor bob alice dso
+  
+  -- Get payment context
+  amuletRulesCid <- getAmuletRules dso
+  openRounds <- query @OpenMiningRound dso
+  let currentOpenRounds = filter (\(_, r) -> r.opensAt <= now) openRounds
+  assertMsg "Need at least one open round" (not (null currentOpenRounds))
+  let (openRoundCid, _) = head currentOpenRounds
+  
+  -- Process a payment to advance processedAndPaidUntil
+  let paymentTime = addRelTime now (days 7)
+  setTime paymentTime
+  
+  result <- submitMulti [processor] [dso] do
+    exerciseCmd paymentStreamCid Active.ActivePaymentStream_ProcessPayment with
+      activityMarkerFeaturedAppRightCid = None
+      processingPeriod = days 10  -- Process 10 days ahead
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+        featuredAppRight = None
+      skipProcessorPayment = True
+  
+  -- Cancel paymentStream (keep prepaid period)
+  -- processedAndPaidUntil is now day 11 (day 1 + 10 days)
+  -- Cancel at day 8 (after payment at day 7, but before processedAndPaidUntil at day 11)
+  let cancelTime = addRelTime now (days 8)
+  setTime cancelTime
+  
+  (Some canceledCid, _) <- submitMulti [alice] [dso] do
+    exerciseCmd result.paymentStreamCid Active.ActivePaymentStream_Cancel with
+      actor = alice
+      disregardAvailablePaidPeriod = False
+      description = Some "Testing cancellation for refund"
+      openMiningRoundCid = None  -- Don't need to unlock since we're keeping prepaid period
+  
+  -- Verify paymentStream has prepaid time (processedAndPaidUntil > now)
+  Some canceled <- queryContractId bob canceledCid
+  assertMsg "Should have prepaid time" (canceled.processedAndPaidUntil > cancelTime)
+  assertMsg "Payments should have ended" (canceled.paymentStream.paymentsEndAt <= Some cancelTime)
+  
+  -- Create amulets for recipient to refund with
+  recipientAmuletCid <- tapWithDso dso bob 100.0
+  
+  -- Recipient refunds the prepaid period
+  (refundResult, unlockedAmuletCid) <- submitMulti [bob] [dso] do
+    exerciseCmd canceledCid Active.ActivePaymentStream_Refund with
+      paymentContext = PaymentContext with
+        amuletRulesCid = amuletRulesCid
+        openMiningRoundCid = openRoundCid
+        featuredAppRight = None
+      recipientAmuletInputs = [recipientAmuletCid]
+      recipientFeaturedAppRight = None
+  
+  -- Verify the paymentStream was archived
+  archivedSub <- queryContractId bob canceledCid
+  assertMsg "PaymentStream should be archived after refund" (archivedSub == None)
+  
+  -- Verify locked amulet was returned to Payer
+  Some unlockedAmulet <- queryContractId alice unlockedAmuletCid
+  assertMsg "Amulet should belong to Payer" (unlockedAmulet.owner == alice)
+  
+  -- Verify refund was processed (check that some amulets were transferred)
+  assertMsg "Refund should have created amulets" (not (null refundResult.createdAmulets))
+  
+  pure ()

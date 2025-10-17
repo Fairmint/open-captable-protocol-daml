@@ -1,0 +1,69 @@
+module CantonPayments.PaymentStream.Types.PaymentStreamAmount where
+
+import DA.Time (convertRelTimeToMicroseconds, RelTime, subTime)
+
+-- | Represents an amount in either Amulet or USD
+data PaymentStreamAmount
+  = AmuletAmount Decimal
+      -- ^ Amount denominated in Amulet
+  | USDAmount Decimal
+      -- ^ Amount denominated in USD
+  deriving (Eq, Show)
+
+-- | Validate a PaymentStreamAmount is positive (or non-negative for fees)
+validatePaymentStreamAmount : PaymentStreamAmount -> Bool -> Bool
+validatePaymentStreamAmount amount allowZero =
+  case amount of
+    AmuletAmount amt -> if allowZero then amt >= 0.0 else amt > 0.0
+    USDAmount amt -> if allowZero then amt >= 0.0 else amt > 0.0
+
+-- | Compare two PaymentStreamAmount values
+-- Returns: (sameUnit, increased)
+compareAmounts : PaymentStreamAmount -> PaymentStreamAmount -> (Bool, Bool)
+compareAmounts oldAmt newAmt = case (oldAmt, newAmt) of
+  (AmuletAmount old, AmuletAmount new) -> (True, new > old)
+  (USDAmount old, USDAmount new) -> (True, new > old)
+  _ -> (False, False)
+
+-- | Convert a per-day rate to the actual amount for the processing period
+-- Calculates: (amountPerDay * processingPeriod) / 1 day
+-- Note: The third parameter is amuletPrice (USD per CC), so we divide to get CC
+calculateAmountForPeriod : PaymentStreamAmount -> RelTime -> Decimal -> Decimal
+calculateAmountForPeriod amountPerDay processingPeriod amuletPrice =
+  let
+    -- Convert to Amulet first
+    dailyAmountInAmulet = case amountPerDay of
+      AmuletAmount amt -> amt
+      USDAmount usdAmt -> usdAmt / amuletPrice  -- amuletPrice is USD/CC, so divide to get CC
+    
+    -- One day in microseconds (24 * 60 * 60 * 1000000)
+    oneDayMicros = 86400000000
+    
+    -- Get processing period in microseconds
+    periodMicros = convertRelTimeToMicroseconds processingPeriod
+    
+    -- Calculate pro-rata amount: (dailyRate * periodDays)
+    periodDays = intToDecimal periodMicros / intToDecimal oneDayMicros
+  in
+    dailyAmountInAmulet * periodDays
+
+-- | Calculate processor fee amount for a period
+calculateProcessorFee : Optional PaymentStreamAmount -> RelTime -> Decimal -> Decimal
+calculateProcessorFee processorPaymentPerDay period amuletPrice =
+  case processorPaymentPerDay of
+    Some amt -> calculateAmountForPeriod amt period amuletPrice
+    None -> 0.0
+
+-- | Calculate refund amount for unused period (recipient + processor)
+calculateRefundAmount : PaymentStreamAmount -> Optional PaymentStreamAmount -> RelTime -> Decimal -> Decimal
+calculateRefundAmount recipientPaymentPerDay processorPaymentPerDay unusedPeriod amuletPrice =
+  let recipientRefund = calculateAmountForPeriod recipientPaymentPerDay unusedPeriod amuletPrice
+      processorRefund = calculateProcessorFee processorPaymentPerDay unusedPeriod amuletPrice
+  in recipientRefund + processorRefund
+
+-- | Calculate refund amount for prepaid period
+calculateRefundForPrepaidPeriod : Time -> PaymentStreamAmount -> Optional PaymentStreamAmount -> Decimal -> Update Decimal
+calculateRefundForPrepaidPeriod processedAndPaidUntil recipientPaymentPerDay processorPaymentPerDay amuletPrice = do
+  now <- getTime
+  let unusedPeriod = subTime processedAndPaidUntil now
+  pure $ calculateRefundAmount recipientPaymentPerDay processorPaymentPerDay unusedPeriod amuletPrice

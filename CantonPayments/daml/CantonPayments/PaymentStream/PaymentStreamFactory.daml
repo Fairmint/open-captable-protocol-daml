@@ -1,0 +1,86 @@
+module CantonPayments.PaymentStream.PaymentStreamFactory where
+
+import DA.Optional (fromSome)
+import qualified DA.Map as Map
+import CantonPayments.PaymentStream.ProposedPaymentStream
+import CantonPayments.PaymentStream.ActivePaymentStream (ActivePaymentStream(..))
+import CantonPayments.PaymentStream.Types.PaymentStreamProposal (PaymentStreamProposal(..), assertAndConvertProposalToPaymentStream)
+import CantonPayments.PaymentStream.Types.PaymentStreamTime (assertOptionalPaymentStreamExpirationIsValid)
+import CantonPayments.PaymentStream.Types.ProcessorContext (ProcessorContext(..))
+import CantonPayments.PaymentStream.Types.Approvals (initializeApprovalsForActor, assertIsPartyToPaymentStreamProposal, areAllApproved)
+import CantonPayments.PaymentStream.Types.LockFundsInput (LockFundsInput(..))
+import CantonPayments.PaymentStream.Types.LockHelpers (createPaymentStreamLock)
+import CantonPayments.PaymentStream.Types.PaymentStreamStats (emptyStats)
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
+
+template PaymentStreamFactory
+  with
+    processorContext : ProcessorContext
+  where
+    signatory processorContext.processor
+
+    nonconsuming choice PaymentStreamFactory_CreatePaymentStreamProposal : Either (ContractId ProposedPaymentStream) (ContractId ActivePaymentStream, Optional (ContractId Amulet.Amulet))
+      with
+        actor : Party
+        paymentStreamProposal : PaymentStreamProposal
+        lockFundsInput : Optional LockFundsInput
+      controller actor
+      do
+        assertIsPartyToPaymentStreamProposal actor paymentStreamProposal processorContext
+        assertMsg "Payer cannot create paymentStream proposal; only Processor or Recipient can propose" (actor /= paymentStreamProposal.payer)
+        assertOptionalPaymentStreamExpirationIsValid paymentStreamProposal.freeTrialExpiration
+        assertOptionalPaymentStreamExpirationIsValid paymentStreamProposal.paymentsEndAt
+        Amulet.validateAppRewardBeneficiaries paymentStreamProposal.appRewardBeneficiaries
+
+        let approvals = initializeApprovalsForActor actor paymentStreamProposal processorContext
+
+        if areAllApproved approvals
+        then do
+          case lockFundsInput of
+            Some input -> assertMsg "Must provide at least one amulet when all parties approve" (not (null input.amuletInputs))
+            None -> abort "Must provide lock funds input when all parties approve at creation"
+          
+          let input = fromSome lockFundsInput
+          assertMsg "Amount to lock must be positive" (input.amountToLock > 0.0)
+          
+          now <- getTime
+          paymentStream <- assertAndConvertProposalToPaymentStream paymentStreamProposal
+          
+          lock <- createPaymentStreamLock paymentStream.recipient processorContext.processor
+          transferResult <- exercise input.paymentContext.amuletRulesCid AmuletRules_Transfer with
+            transfer = Transfer with
+              sender = paymentStream.payer
+              provider = paymentStream.provider
+              inputs = map InputAmulet input.amuletInputs
+              outputs = [TransferOutput with
+                receiver = paymentStream.payer
+                receiverFeeRatio = 1.0
+                amount = input.amountToLock
+                lock = Some lock]
+              beneficiaries = Some paymentStream.appRewardBeneficiaries
+            context = TransferContext with
+              openMiningRound = input.paymentContext.openMiningRoundCid
+              featuredAppRight = input.paymentContext.featuredAppRight
+              issuingMiningRounds = Map.empty
+              validatorRights = Map.empty
+            expectedDso = Some processorContext.dso
+          
+          lockedAmuletCid <- case transferResult.createdAmulets of
+            [TransferResultLockedAmulet cid] -> pure cid
+            _ -> abort "Expected exactly one locked amulet output"
+          
+          activePaymentStreamCid <- create ActivePaymentStream with
+            paymentStream
+            processorContext
+            lockedAmuletCid
+            processedAndPaidUntil = now
+            stats = emptyStats
+          
+          pure (Right (activePaymentStreamCid, transferResult.senderChangeAmulet))
+        else do
+          proposedPaymentStreamCid <- create ProposedPaymentStream with
+            paymentStreamProposal
+            processorContext
+            approvals
+          pure (Left proposedPaymentStreamCid)

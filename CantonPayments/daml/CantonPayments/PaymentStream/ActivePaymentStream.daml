@@ -1,0 +1,525 @@
+module CantonPayments.PaymentStream.ActivePaymentStream where
+
+import DA.List (last)
+import DA.Optional (fromSomeNote)
+import DA.Time (addRelTime)
+import qualified DA.Map as Map
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..), CreatedAmulet(..))
+import Splice.Round (OpenMiningRound_Fetch(..))
+import Splice.Round qualified as Round
+import Fairmint.Shared.Splice.SpliceAmuletHelpers (actualAmount)
+import CantonPayments.PaymentStream.Types.PaymentStream (PaymentStream(..), validatePaymentStream, calculateAndValidateNewProcessedAndPaidUntil, assertInFreeTrial, assertNotInFreeTrial, assertIsPartyToPaymentStream, assertOnlyPayerCanDisregardPaidPeriod, assertPaymentsNotEnded, assertPaymentsEndedAndPaidPeriodPassed, assertPaymentsHaveEnded, assertHasPrepaidTimeRemaining, clearTrialIfEnded)
+import CantonPayments.PaymentStream.Types.PaymentStreamAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
+import CantonPayments.PaymentStream.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
+import CantonPayments.PaymentStream.Types.ProcessorContext (ProcessorContext(..))
+import DA.Time (RelTime, days)
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
+import Splice.Api.FeaturedAppRightV1 qualified as FeaturedAppRightApi
+import CantonPayments.PaymentStream.Types.PaymentStreamChanges (PaymentStreamChanges(..), getImpactedPartiesForPaymentStream, assertChangeValuesValidAndNonEmpty, validateChangeValues, applyChangesToPaymentStream)
+import CantonPayments.PaymentStream.Types.ActivePaymentStreamData (ActivePaymentStreamData(..))
+import CantonPayments.PaymentStream.Types.PaymentResult (ProcessPaymentResult(..))
+import CantonPayments.PaymentStream.Types.ProcessFreeTrialResult (ProcessFreeTrialResult(..))
+import CantonPayments.PaymentStream.Types.Approvals (assertIsPartyToActivePaymentStream, Approvals(..), addApprovalForActivePaymentStreamAndAssertChanged, areAllApproved, createInitialApprovalsFromImpactedParties)
+import CantonPayments.PaymentStream.Types.LockHelpers (createPaymentStreamLock)
+import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
+import CantonPayments.PaymentStream.Types.PartyRole (PartyRole(..))
+import CantonPayments.PaymentStream.Types.PaymentStreamStats (PaymentStreamStats(..), incrementRounds, updateStatsWithPayment)
+import CantonPayments.PaymentStream.Types.LockFundsInput (LockFundsInput(..))
+
+-- | Active payment stream with locked amulet escrow
+-- 
+-- Three-party model:
+-- - Payer: pays the payment stream (locks amulets in escrow)
+-- - Recipient: receives payments for providing the service
+-- - Processor: processes payments and charges fees
+template ActivePaymentStream
+  with
+    paymentStream : PaymentStream
+    processorContext : ProcessorContext
+    processedAndPaidUntil : Time
+    lockedAmuletCid : ContractId Amulet.LockedAmulet
+    stats : PaymentStreamStats
+  where
+    signatory [paymentStream.payer, paymentStream.recipient, processorContext.processor]
+    observer paymentStream.observers ++ 
+             [paymentStream.provider] ++ 
+             map (\beneficiary -> beneficiary.beneficiary) paymentStream.appRewardBeneficiaries
+    
+    ensure validatePaymentStream paymentStream
+
+    choice ActivePaymentStream_ProcessFreeTrial : ProcessFreeTrialResult ActivePaymentStream
+      with
+        processingPeriod : RelTime
+        featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+      controller processorContext.processor
+      do
+        trialEnd <- assertInFreeTrial paymentStream.freeTrialExpiration
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
+        Amulet.validateAppRewardBeneficiaries paymentStream.appRewardBeneficiaries
+        
+        let newProcessedAndPaidUntil = addRelTime processedAndPaidUntil processingPeriod
+        assertMsg "Cannot process beyond trial end" (newProcessedAndPaidUntil <= trialEnd)
+        
+        activityMarkerCid <- case featuredAppRight of
+          Some farCid -> do
+            let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+            createActivityMarker paymentStream.appRewardBeneficiaries farApiCid
+          None -> pure None
+        
+        now <- getTime
+        let newTrialEndsAt = clearTrialIfEnded now trialEnd paymentStream.freeTrialExpiration
+        let newStats = incrementRounds stats
+        
+        paymentStreamCid <- create this with 
+          paymentStream.freeTrialExpiration = newTrialEndsAt
+          processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = newStats
+        
+        pure ProcessFreeTrialResult with
+          ..
+
+    choice ActivePaymentStream_ProcessPayment : ProcessPaymentResult ActivePaymentStream
+      with
+        processingPeriod : RelTime
+        paymentContext : PaymentContext
+        skipProcessorPayment : Bool
+        activityMarkerFeaturedAppRightCid : Optional (ContractId Amulet.FeaturedAppRight)
+      controller processorContext.processor
+      do
+        assertMsg "Processing period must be greater than zero" (processingPeriod > days 0)
+        Amulet.validateAppRewardBeneficiaries paymentStream.appRewardBeneficiaries
+        assertNotInFreeTrial paymentStream.freeTrialExpiration
+        
+        newProcessedAndPaidUntil <- calculateAndValidateNewProcessedAndPaidUntil paymentStream processedAndPaidUntil processingPeriod
+        
+        (amuletPrice, openMiningRound) <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid processorContext.processor
+        let recipientAmount = calculateAmountForPeriod paymentStream.recipientPaymentPerDay processingPeriod amuletPrice
+        let processorFee = calculateProcessorFee paymentStream.processorPaymentPerDay processingPeriod amuletPrice
+        let shouldPayProcessor = (not skipProcessorPayment) && processorFee > 0.0
+        
+        lockedAmulet <- fetch lockedAmuletCid
+        
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        unlockedAmulet <- fetch unlockResult.amuletSum.amulet
+        -- Calculate actual balance accounting for holding fees since creation
+        let beforeBalance = actualAmount openMiningRound.round unlockedAmulet.amount
+        
+        let totalPaymentAmount = recipientAmount + (if shouldPayProcessor then processorFee else 0.0)
+        let remainingForLock = beforeBalance - totalPaymentAmount
+        assertMsg "Insufficient locked balance for payment" (remainingForLock > 0.0)
+        
+        lock <- createPaymentStreamLock paymentStream.recipient processorContext.processor
+        let paymentOutputs = 
+              [ TransferOutput with
+                  receiver = paymentStream.recipient
+                  receiverFeeRatio = 1.0
+                  amount = recipientAmount
+                  lock = None
+              ] ++
+              (if shouldPayProcessor
+               then [ TransferOutput with
+                        receiver = processorContext.processor
+                        receiverFeeRatio = 1.0
+                        amount = processorFee
+                        lock = None
+                    ]
+               else []) ++
+              [ TransferOutput with
+                  receiver = paymentStream.payer
+                  receiverFeeRatio = 1.0
+                  amount = remainingForLock
+                  lock = Some lock
+              ]
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = paymentStream.payer
+            provider = paymentStream.provider
+            inputs = [InputAmulet unlockResult.amuletSum.amulet]
+            outputs = paymentOutputs
+            beneficiaries = Some paymentStream.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = paymentContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        assertMsg "No outputs in transfer result" (not (null transferResult.createdAmulets))
+        newLockedAmuletCid <- case last transferResult.createdAmulets of
+          TransferResultLockedAmulet cid -> pure cid
+          _ -> abort "Expected locked amulet as last output"
+        
+        newLockedAmulet <- fetch newLockedAmuletCid
+        -- New locked amulet was just created in current round, use initialAmount
+        let afterBalance = newLockedAmulet.amulet.amount.initialAmount
+        let payerCC = beforeBalance - afterBalance
+        
+        newStats <- updateStatsWithPayment 
+              payerCC
+              paymentStream.recipient
+              processorContext.processor
+              transferResult.summary
+              transferResult.createdAmulets
+              stats
+        
+        -- Create activity marker if featured app right provided
+        activityMarkerCid <- case activityMarkerFeaturedAppRightCid of
+          Some farCid -> do
+            let farApiCid : ContractId FeaturedAppRightApi.FeaturedAppRight = coerceContractId farCid
+            createActivityMarker paymentStream.appRewardBeneficiaries farApiCid
+          None -> pure None
+        
+        paymentStreamCid <- create this with 
+          processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = newStats
+          lockedAmuletCid = newLockedAmuletCid
+        
+        pure ProcessPaymentResult with
+          paymentStreamCid
+          transferResult
+          activityMarkerCid
+
+    nonconsuming choice ActivePaymentStream_ProposeChanges : ContractId PaymentStreamChangeProposal
+      with
+        actor : Party
+        paymentStreamChanges : PaymentStreamChanges
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToActivePaymentStream actor paymentStream processorContext
+        assertChangeValuesValidAndNonEmpty paymentStreamChanges
+        assertValidOptionalText description
+        
+        let impactedParties = getImpactedPartiesForPaymentStream paymentStreamChanges paymentStream processorContext
+        let approvals = createInitialApprovalsFromImpactedParties actor paymentStream processorContext impactedParties
+        
+        create PaymentStreamChangeProposal with
+          ..
+
+    choice ActivePaymentStream_Cancel : (Optional (ContractId ActivePaymentStream), Optional (ContractId Amulet.Amulet))
+      with
+        actor : Party
+        disregardAvailablePaidPeriod : Bool
+        description : Optional Text
+        openMiningRoundCid : Optional (ContractId Round.OpenMiningRound)
+      controller actor
+      do
+        assertIsPartyToPaymentStream actor paymentStream processorContext
+        assertOnlyPayerCanDisregardPaidPeriod disregardAvailablePaidPeriod actor paymentStream.payer
+        assertValidOptionalText description
+        
+        now <- getTime
+        -- If payer wants immediate cancellation or no prepaid time remains, unlock immediately
+        if disregardAvailablePaidPeriod || processedAndPaidUntil <= now
+        then do
+          let roundCid = fromSomeNote "openMiningRoundCid required when unlocking funds" openMiningRoundCid
+          unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+            openRoundCid = roundCid
+          pure (None, Some unlockResult.amuletSum.amulet)
+        else do
+          -- Preserve prepaid time by setting paymentsEndAt to now (or trial end if later)
+          assertPaymentsNotEnded paymentStream.paymentsEndAt
+          
+          let effectivePaymentsEndAt = case paymentStream.freeTrialExpiration of
+                Some trialEnd -> max trialEnd now  -- Can't end before trial ends
+                None -> now
+          
+          canceledCid <- create this with paymentStream.paymentsEndAt = Some effectivePaymentsEndAt
+          pure (Some canceledCid, None)
+
+    choice ActivePaymentStream_Refund : (TransferResult, ContractId Amulet.Amulet)
+      with
+        paymentContext : PaymentContext
+        recipientAmuletInputs : [ContractId Amulet.Amulet]
+        recipientFeaturedAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+      controller paymentStream.recipient
+      do
+        assertPaymentsHaveEnded paymentStream.paymentsEndAt
+        assertHasPrepaidTimeRemaining processedAndPaidUntil
+        assertMsg "Recipient must provide amulets for refund" (not (null recipientAmuletInputs))
+        
+        (amuletPrice, _) <- fetchAndValidateAmuletPrice paymentContext.openMiningRoundCid paymentStream.recipient
+        refundAmount <- calculateRefundForPrepaidPeriod processedAndPaidUntil paymentStream.recipientPaymentPerDay paymentStream.processorPaymentPerDay amuletPrice
+        
+        let (transfer, context) = createTransferAndContext 
+              paymentStream.recipient 
+              paymentStream.payer 
+              paymentStream.provider
+              (Some paymentStream.appRewardBeneficiaries)
+              refundAmount 
+              paymentContext 
+              recipientAmuletInputs 
+              recipientFeaturedAppRight
+        
+        refundResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = transfer
+          expectedDso = Some processorContext.dso
+          ..
+        
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        pure (refundResult, unlockResult.amuletSum.amulet)
+
+    choice ActivePaymentStream_AddFunds : (ContractId ActivePaymentStream, Optional (ContractId Amulet.Amulet))
+      with
+        actor : Party
+        lockFundsInput : LockFundsInput
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToPaymentStream actor paymentStream processorContext
+        assertValidOptionalText description
+        assertMsg "Must provide at least one amulet to add" (not (null lockFundsInput.amuletInputs))
+        assertMsg "Amount to lock must be positive" (lockFundsInput.amountToLock > 0.0)
+        
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = lockFundsInput.paymentContext.openMiningRoundCid
+        
+        lock <- createPaymentStreamLock paymentStream.recipient processorContext.processor
+        let allAmulets = unlockResult.amuletSum.amulet :: lockFundsInput.amuletInputs
+        
+        transferResult <- exercise lockFundsInput.paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = actor
+            provider = paymentStream.provider
+            inputs = map InputAmulet allAmulets
+            outputs = [TransferOutput with
+              receiver = paymentStream.payer
+              receiverFeeRatio = 1.0
+              amount = lockFundsInput.amountToLock
+              lock = Some lock]
+            beneficiaries = Some paymentStream.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = lockFundsInput.paymentContext.openMiningRoundCid
+            featuredAppRight = lockFundsInput.paymentContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        newLockedAmuletCid <- case transferResult.createdAmulets of
+          [TransferResultLockedAmulet cid] -> pure cid
+          _ -> abort "Expected exactly one locked amulet output"
+        
+        paymentStreamCid <- create this with lockedAmuletCid = newLockedAmuletCid
+        pure (paymentStreamCid, transferResult.senderChangeAmulet)
+
+    choice ActivePaymentStream_WithdrawFunds : (ContractId ActivePaymentStream, ContractId Amulet.Amulet)
+      with
+        amountToKeepLocked : Decimal
+        paymentContext : PaymentContext
+      controller paymentStream.payer
+      do
+        assertMsg "Amount to keep locked must be positive" (amountToKeepLocked > 0.0)
+        
+        openMiningRound <- exercise paymentContext.openMiningRoundCid (Round.OpenMiningRound_Fetch with p = paymentStream.payer)
+        lockedAmulet <- fetch lockedAmuletCid
+        let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
+        let changeAmount = currentBalance - amountToKeepLocked
+        assertMsg "Insufficient balance to withdraw funds" (changeAmount > 0.0)
+        
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        lock <- createPaymentStreamLock paymentStream.recipient processorContext.processor
+        transferResult <- exercise paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = paymentStream.payer
+            provider = paymentStream.provider
+            inputs = [InputAmulet unlockResult.amuletSum.amulet]
+            outputs = 
+              [ TransferOutput with
+                  receiver = paymentStream.payer
+                  receiverFeeRatio = 1.0
+                  amount = amountToKeepLocked
+                  lock = Some lock
+              , TransferOutput with
+                  receiver = paymentStream.payer
+                  receiverFeeRatio = 1.0
+                  amount = changeAmount
+                  lock = None
+              ]
+            beneficiaries = Some paymentStream.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = paymentContext.openMiningRoundCid
+            featuredAppRight = paymentContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        (newLockedCid, changeAmuletCid) <- case transferResult.createdAmulets of
+          [TransferResultLockedAmulet locked, TransferResultAmulet change] -> 
+            pure (locked, change)
+          _ -> abort "Expected one locked and one regular amulet output"
+        
+        paymentStreamCid <- create this with lockedAmuletCid = newLockedCid
+        pure (paymentStreamCid, changeAmuletCid)
+
+    choice ActivePaymentStream_ArchiveInactivePaymentStream : ContractId Amulet.Amulet
+      with
+        actor : Party
+        paymentContext : PaymentContext
+      controller actor
+      do
+        assertIsPartyToPaymentStream actor paymentStream processorContext
+        assertPaymentsEndedAndPaidPeriodPassed paymentStream.paymentsEndAt processedAndPaidUntil
+        
+        unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+          openRoundCid = paymentContext.openMiningRoundCid
+        
+        pure unlockResult.amuletSum.amulet
+
+    -- Called via PartyMigrationProposal to migrate party identities
+    choice ActivePaymentStream_ChangeParty : ContractId ActivePaymentStream
+      with
+        partyType : PartyRole
+        oldParty : Party
+        newParty : Party
+        changePartyPaymentContext : PaymentContext
+      controller [oldParty, newParty]
+      do
+        assertMsg "Old and new party must be different" (oldParty /= newParty)
+        
+        case partyType of
+          Payer -> do
+            assertMsg "Old party must be the current payer" (oldParty == paymentStream.payer)
+            assertMsg "New party cannot be the current recipient" (newParty /= paymentStream.recipient)
+            -- Payer change doesn't affect lock holders, no need to relock
+            create this with paymentStream.payer = newParty
+          Recipient -> do
+            assertMsg "Old party must be the current recipient" (oldParty == paymentStream.recipient)
+            assertMsg "New party cannot be the current payer" (newParty /= paymentStream.payer)
+            -- Recipient is a lock holder, must unlock and relock with new party
+            openMiningRound <- exercise changePartyPaymentContext.openMiningRoundCid (OpenMiningRound_Fetch with p = oldParty)
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createPaymentStreamLock newParty processorContext.processor
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = paymentStream.payer
+                provider = paymentStream.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = paymentStream.payer
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some paymentStream.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              paymentStream.recipient = newParty
+              lockedAmuletCid = newLockedAmuletCid
+          Processor -> do
+            assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
+            -- Processor is a lock holder, must unlock and relock with new party
+            openMiningRound <- exercise changePartyPaymentContext.openMiningRoundCid (OpenMiningRound_Fetch with p = oldParty)
+            lockedAmulet <- fetch lockedAmuletCid
+            let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
+            
+            unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = changePartyPaymentContext.openMiningRoundCid
+            
+            newLock <- createPaymentStreamLock paymentStream.recipient newParty
+            transferResult <- exercise changePartyPaymentContext.amuletRulesCid AmuletRules_Transfer with
+              transfer = Transfer with
+                sender = paymentStream.payer
+                provider = paymentStream.provider
+                inputs = [InputAmulet unlockResult.amuletSum.amulet]
+                outputs = [TransferOutput with
+                  receiver = paymentStream.payer
+                  receiverFeeRatio = 1.0
+                  amount = currentBalance
+                  lock = Some newLock]
+                beneficiaries = Some paymentStream.appRewardBeneficiaries
+              context = TransferContext with
+                openMiningRound = changePartyPaymentContext.openMiningRoundCid
+                featuredAppRight = changePartyPaymentContext.featuredAppRight
+                issuingMiningRounds = Map.empty
+                validatorRights = Map.empty
+              expectedDso = Some processorContext.dso
+            
+            newLockedAmuletCid <- case transferResult.createdAmulets of
+              [TransferResultLockedAmulet cid] -> pure cid
+              _ -> abort "Expected exactly one locked amulet output"
+            
+            create this with 
+              processorContext.processor = newParty
+              lockedAmuletCid = newLockedAmuletCid
+
+template PaymentStreamChangeProposal
+  with
+    paymentStream : PaymentStream
+    processorContext : ProcessorContext
+    paymentStreamChanges : PaymentStreamChanges
+    approvals : Approvals
+  where
+    signatory [paymentStream.payer, paymentStream.recipient, processorContext.processor]
+    observer paymentStream.observers ++ 
+             [paymentStream.provider] ++ 
+             map (\beneficiary -> beneficiary.beneficiary) paymentStream.appRewardBeneficiaries
+    
+    ensure validateChangeValues paymentStreamChanges
+
+    choice PaymentStreamChangeProposal_Approve : ContractId PaymentStreamChangeProposal
+      with
+        actor : Party
+      controller actor
+      do
+        assertIsPartyToActivePaymentStream actor paymentStream processorContext
+        newApprovals <- addApprovalForActivePaymentStreamAndAssertChanged approvals actor paymentStream processorContext
+        create this with approvals = newApprovals
+
+    choice PaymentStreamChangeProposal_Apply : ContractId ActivePaymentStream
+      with
+        actor : Party
+        activePaymentStreamCid : ContractId ActivePaymentStream
+      controller actor
+      do
+        assertIsPartyToActivePaymentStream actor paymentStream processorContext
+        assertMsg "All parties must approve before applying changes" (areAllApproved approvals)
+        
+        activePaymentStream <- fetch activePaymentStreamCid
+        assertMsg "PaymentStream has changed - proposal is stale" 
+          (activePaymentStream.paymentStream == paymentStream && activePaymentStream.processorContext == processorContext)
+        
+        (updatedPaymentStream, updatedProcessorContext, newProcessedAndPaidUntil) <- 
+          applyChangesToPaymentStream paymentStreamChanges ActivePaymentStreamData with
+            paymentStream = activePaymentStream.paymentStream
+            processorContext = activePaymentStream.processorContext
+            processedAndPaidUntil = activePaymentStream.processedAndPaidUntil
+            stats = activePaymentStream.stats
+        
+        Amulet.validateAppRewardBeneficiaries updatedPaymentStream.appRewardBeneficiaries
+        
+        archive activePaymentStreamCid
+        create activePaymentStream with 
+          paymentStream = updatedPaymentStream
+          processorContext = updatedProcessorContext
+          processedAndPaidUntil = newProcessedAndPaidUntil
+          stats = activePaymentStream.stats
+
+    choice PaymentStreamChangeProposal_Reject : ()
+      with
+        actor : Party
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToActivePaymentStream actor paymentStream processorContext
+        assertValidOptionalText description
+        pure ()

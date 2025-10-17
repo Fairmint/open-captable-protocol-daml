@@ -1,0 +1,98 @@
+module CantonPayments.PaymentStream.Types.PaymentStreamProposal where
+
+import DA.Time (RelTime, convertRelTimeToMicroseconds)
+import DA.TextMap (TextMap)
+import CantonPayments.PaymentStream.Types.PaymentStreamAmount (PaymentStreamAmount(..), validatePaymentStreamAmount)
+import CantonPayments.PaymentStream.Types.PaymentStreamTime (PaymentStreamExpiration(..), resolveAndAssertOptionalTimeInFuture, resolveAndAssertTimeInFuture)
+import CantonPayments.PaymentStream.Types.PaymentStream (PaymentStream(..))
+import Fairmint.Shared.TypeHelpers (validateOptionalText, validateOptionalMetadata)
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary)
+
+-- | Payment stream proposal with flexible time fields (relative or absolute)
+-- Allows proposals to specify expiration times relative to activation rather than creation
+data PaymentStreamProposal = PaymentStreamProposal
+  with
+    payer : Party
+    recipient : Party
+    recipientPaymentPerDay : PaymentStreamAmount
+    processorPaymentPerDay : Optional PaymentStreamAmount
+    freeTrialExpiration : Optional PaymentStreamExpiration
+      -- ^ Can be relative (from activation) or absolute time
+    prepayWindow : RelTime
+    paymentsEndAt : Optional PaymentStreamExpiration
+      -- ^ Can be relative (from activation) or absolute time
+    provider : Party
+    appRewardBeneficiaries : [AppRewardBeneficiary]
+    description : Optional Text
+    metadata : Optional (TextMap Text)
+    observers : [Party]
+  deriving (Eq, Show)
+
+-- | Validates that trial ends before or at payments end for proposals
+-- This is more complex for proposals because times may be relative or absolute
+validateProposalTrialEndsBeforePaymentsEnd : PaymentStreamProposal -> Bool
+validateProposalTrialEndsBeforePaymentsEnd proposal =
+  case (proposal.freeTrialExpiration, proposal.paymentsEndAt) of
+    -- Both precise times: can compare directly
+    (Some (PreciseTime trial), Some (PreciseTime end)) -> trial <= end
+    -- Any other combination: validation will happen at conversion time
+    -- (relative times can't be compared until resolved)
+    _ -> True
+
+-- | Validation for PaymentStreamProposal
+validatePaymentStreamProposal : PaymentStreamProposal -> Bool
+validatePaymentStreamProposal input =
+  input.payer /= input.recipient &&
+  validateOptionalText input.description &&
+  validatePaymentStreamAmount input.recipientPaymentPerDay False &&
+  (case input.processorPaymentPerDay of
+    None -> True
+    Some amt -> validatePaymentStreamAmount amt True) &&
+  convertRelTimeToMicroseconds input.prepayWindow >= 0 &&
+  (case input.freeTrialExpiration of
+    None -> True
+    Some (RelativeTime duration) -> convertRelTimeToMicroseconds duration > 0
+    Some (PreciseTime _) -> True) &&
+  (case input.paymentsEndAt of
+    None -> True
+    Some (RelativeTime duration) -> convertRelTimeToMicroseconds duration > 0
+    Some (PreciseTime _) -> True) &&
+  validateOptionalMetadata input.metadata &&
+  validateProposalTrialEndsBeforePaymentsEnd input
+
+-- | Convert a PaymentStreamProposal to a PaymentStream by resolving and asserting time fields
+-- Asserts that all time fields (paymentsEndAt, freeTrialExpiration) are in the future
+-- and that freeTrialExpiration <= paymentsEndAt when both are set
+assertAndConvertProposalToPaymentStream : PaymentStreamProposal -> Update PaymentStream
+assertAndConvertProposalToPaymentStream proposal = do
+  -- Resolve and validate times
+  resolvedPaymentsEndAt <- resolveAndAssertOptionalTimeInFuture proposal.paymentsEndAt
+  
+  -- Resolve free trial expiration if present
+  freeTrialExpiration <- case proposal.freeTrialExpiration of
+    Some freeTrialExpirationSpec -> do
+      resolved <- resolveAndAssertTimeInFuture freeTrialExpirationSpec
+      pure (Some resolved)
+    None -> pure None
+  
+  -- Assert that trial ends before or at payments end
+  case freeTrialExpiration of
+    Some trial -> case resolvedPaymentsEndAt of
+      Some end -> assertMsg "Free trial must end before or at payments end time" (trial <= end)
+      None -> pure ()
+    None -> pure ()
+  
+  -- Build the PaymentStream
+  pure PaymentStream with
+    payer = proposal.payer
+    recipient = proposal.recipient
+    recipientPaymentPerDay = proposal.recipientPaymentPerDay
+    provider = proposal.provider
+    appRewardBeneficiaries = proposal.appRewardBeneficiaries
+    processorPaymentPerDay = proposal.processorPaymentPerDay
+    prepayWindow = proposal.prepayWindow
+    paymentsEndAt = resolvedPaymentsEndAt
+    freeTrialExpiration = freeTrialExpiration
+    description = proposal.description
+    metadata = proposal.metadata
+    observers = proposal.observers

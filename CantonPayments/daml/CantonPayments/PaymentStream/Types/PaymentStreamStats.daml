@@ -1,0 +1,85 @@
+module CantonPayments.PaymentStream.Types.PaymentStreamStats where
+
+import Splice.AmuletRules (TransferSummary(..), CreatedAmulet(..))
+
+-- | Statistics tracking for paymentStream lifecycle
+-- totalPaidByPayer = difference between locked amulet before and after payment (total cost with fees)
+-- totalReceivedByRecipient = recipient's positive balance change
+-- totalReceivedByProcessor = processor's positive balance change
+-- Relationship: totalPaidByPayer = totalReceivedByRecipient + totalReceivedByProcessor + fees
+data PaymentStreamStats = PaymentStreamStats
+  with
+    roundsProcessed : Int
+    totalPaidByPayerCC : Decimal
+    totalPaidByPayerUSD : Decimal
+    totalReceivedByRecipientCC : Decimal
+    totalReceivedByRecipientUSD : Decimal
+    totalReceivedByProcessorCC : Decimal
+    totalReceivedByProcessorUSD : Decimal
+  deriving (Eq, Show)
+
+-- | Create initial empty stats
+emptyStats : PaymentStreamStats
+emptyStats = PaymentStreamStats with
+  roundsProcessed = 0
+  totalPaidByPayerCC = 0.0
+  totalPaidByPayerUSD = 0.0
+  totalReceivedByRecipientCC = 0.0
+  totalReceivedByRecipientUSD = 0.0
+  totalReceivedByProcessorCC = 0.0
+  totalReceivedByProcessorUSD = 0.0
+
+-- | Increment rounds processed (for free trial processing)
+incrementRounds : PaymentStreamStats -> PaymentStreamStats
+incrementRounds stats = stats with roundsProcessed = stats.roundsProcessed + 1
+
+-- | Update stats after a payment transfer
+-- payerCC is calculated as (beforeBalance - afterBalance) from the locked amulet unlock/lock cycle
+-- The recipient's and processor's amounts come from the created Amulets
+updateStatsWithPayment : 
+  Decimal ->
+  Party -> 
+  Party ->
+  TransferSummary -> 
+  [CreatedAmulet] ->
+  PaymentStreamStats -> 
+  Update PaymentStreamStats
+updateStatsWithPayment payerCC recipient processor transferSummary createdAmulets stats = do
+  -- Get amounts from the created amulets for recipient and processor
+  -- The order of created amulets matches the transfer outputs:
+  -- 1. Recipient (unlocked)
+  -- 2. Processor (unlocked, if payment was made)
+  -- 3. Payer (locked, for remaining escrow)
+  
+  recipientCC <- case createdAmulets of
+    (TransferResultAmulet cid :: _) -> do
+      amulet <- fetch cid
+      if amulet.owner == recipient
+        -- Newly created amulets have no holding fees yet, use initialAmount
+        then pure amulet.amount.initialAmount
+        else pure 0.0
+    _ -> pure 0.0
+  
+  processorCC <- case createdAmulets of
+    (_ :: TransferResultAmulet cid :: _) -> do
+      amulet <- fetch cid
+      if amulet.owner == processor
+        -- Newly created amulets have no holding fees yet, use initialAmount
+        then pure amulet.amount.initialAmount
+        else pure 0.0
+    _ -> pure 0.0
+  
+  -- Calculate USD values at time of transfer (amuletPrice is in the summary)
+  let payerUSD = payerCC * transferSummary.amuletPrice
+  let recipientUSD = recipientCC * transferSummary.amuletPrice
+  let processorUSD = processorCC * transferSummary.amuletPrice
+  
+  pure $ PaymentStreamStats with
+    roundsProcessed = stats.roundsProcessed + 1
+    totalPaidByPayerCC = stats.totalPaidByPayerCC + payerCC
+    totalPaidByPayerUSD = stats.totalPaidByPayerUSD + payerUSD
+    totalReceivedByRecipientCC = stats.totalReceivedByRecipientCC + recipientCC
+    totalReceivedByRecipientUSD = stats.totalReceivedByRecipientUSD + recipientUSD
+    totalReceivedByProcessorCC = stats.totalReceivedByProcessorCC + processorCC
+    totalReceivedByProcessorUSD = stats.totalReceivedByProcessorUSD + processorUSD
+
