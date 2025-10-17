@@ -5,6 +5,7 @@ import DA.Time (addRelTime)
 import qualified DA.Map as Map
 import Splice.Amulet qualified as Amulet
 import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..), CreatedAmulet(..))
+import Fairmint.Shared.Splice.SpliceAmuletHelpers (actualAmount)
 import Fairmint.Subscriptions.Types.Subscription (Subscription(..), validateSubscription, calculateAndValidateNewProcessedAndPaidUntil, assertInFreeTrial, assertNotInFreeTrial, assertIsPartyToSubscription, assertOnlySubscriberCanDisregardPaidPeriod, assertPaymentsNotEnded, assertPaymentsEndedAndPaidPeriodPassed, assertPaymentsHaveEnded, assertHasPrepaidTimeRemaining, clearTrialIfEnded)
 import Fairmint.Subscriptions.Types.SubscriptionAmount (calculateAmountForPeriod, calculateProcessorFee, calculateRefundForPrepaidPeriod)
 import Fairmint.Subscriptions.Types.PaymentContext (PaymentContext(..), createTransferAndContext, fetchAndValidateAmuletPrice)
@@ -95,17 +96,18 @@ template ActiveSubscription
         let shouldPayProcessor = (not skipProcessorPayment) && processorFee > 0.0
         
         lockedAmulet <- fetch lockedAmuletCid
-        let currentBalance = lockedAmulet.amulet.amount.initialAmount
-        let totalPaymentAmount = recipientAmount + (if shouldPayProcessor then processorFee else 0.0)
-        let remainingForLock = currentBalance - totalPaymentAmount
-        assertMsg "Insufficient locked balance for payment" (remainingForLock > 0.0)
         
         unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
           openRoundCid = paymentContext.openMiningRoundCid
         
+        openMiningRound <- fetch paymentContext.openMiningRoundCid
         unlockedAmulet <- fetch unlockResult.amuletSum.amulet
-        let beforeBalance = unlockedAmulet.amount.initialAmount
+        let beforeBalance = actualAmount openMiningRound.round unlockedAmulet.amount
         
+        let totalPaymentAmount = recipientAmount + (if shouldPayProcessor then processorFee else 0.0)
+        let remainingForLock = beforeBalance - totalPaymentAmount
+        assertMsg "Insufficient locked balance for payment" (remainingForLock > 0.0)
+
         lock <- createSubscriptionLock subscription.recipient processorContext.processor
         let paymentOutputs = 
               [ TransferOutput with
@@ -147,13 +149,14 @@ template ActiveSubscription
           _ -> abort "Expected locked amulet as last output"
         
         newLockedAmulet <- fetch newLockedAmuletCid
-        let afterBalance = newLockedAmulet.amulet.amount.initialAmount
+        let afterBalance = actualAmount openMiningRound.round newLockedAmulet.amulet.amount
         let subscriberCC = beforeBalance - afterBalance
         
         newStats <- updateStatsWithPayment 
               subscriberCC
               subscription.recipient
               processorContext.processor
+              transferResult.round
               transferResult.summary
               transferResult.createdAmulets
               stats
@@ -299,8 +302,9 @@ template ActiveSubscription
       do
         assertMsg "Amount to keep locked must be positive" (amountToKeepLocked > 0.0)
         
+        openMiningRound <- fetch paymentContext.openMiningRoundCid
         lockedAmulet <- fetch lockedAmuletCid
-        let currentBalance = lockedAmulet.amulet.amount.initialAmount
+        let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
         let changeAmount = currentBalance - amountToKeepLocked
         assertMsg "Insufficient balance to withdraw funds" (changeAmount > 0.0)
         
@@ -376,8 +380,9 @@ template ActiveSubscription
             assertMsg "Old party must be the current recipient" (oldParty == subscription.recipient)
             assertMsg "New party cannot be the current subscriber" (newParty /= subscription.subscriber)
             -- Recipient is a lock holder, must unlock and relock with new party
+            openMiningRound <- fetch changePartyPaymentContext.openMiningRoundCid
             lockedAmulet <- fetch lockedAmuletCid
-            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
             
             unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
               openRoundCid = changePartyPaymentContext.openMiningRoundCid
@@ -411,8 +416,9 @@ template ActiveSubscription
           Processor -> do
             assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
             -- Processor is a lock holder, must unlock and relock with new party
+            openMiningRound <- fetch changePartyPaymentContext.openMiningRoundCid
             lockedAmulet <- fetch lockedAmuletCid
-            let currentBalance = lockedAmulet.amulet.amount.initialAmount
+            let currentBalance = actualAmount openMiningRound.round lockedAmulet.amulet.amount
             
             unlockResult <- exercise lockedAmuletCid Amulet.LockedAmulet_Unlock with
               openRoundCid = changePartyPaymentContext.openMiningRoundCid
