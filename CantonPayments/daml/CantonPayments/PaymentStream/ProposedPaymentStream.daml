@@ -1,0 +1,141 @@
+module CantonPayments.PaymentStream.ProposedPaymentStream where
+
+import qualified DA.Map as Map
+import CantonPayments.PaymentStream.ActivePaymentStream (ActivePaymentStream(..))
+import CantonPayments.PaymentStream.Types.PaymentStreamProposalChanges (PaymentStreamProposalChanges(..), applyChangesAndAssertChanged, getImpactedPartiesForProposal)
+import CantonPayments.PaymentStream.Types.LockHelpers (createPaymentStreamLock)
+import Fairmint.Shared.TypeHelpers (assertValidOptionalText)
+import CantonPayments.PaymentStream.Types.PaymentStreamProposal (PaymentStreamProposal(..), validatePaymentStreamProposal, assertAndConvertProposalToPaymentStream)
+import CantonPayments.PaymentStream.Types.ProcessorContext (ProcessorContext(..))
+import CantonPayments.PaymentStream.Types.Approvals (Approvals(..), validateAtLeastOneApproved, areAllApproved, addApprovalForProposalAndAssertChanged, updateApprovalsAfterImpact, assertIsPartyToPaymentStreamProposal, getApprovedUsers, getUnapprovedUsers)
+import CantonPayments.PaymentStream.Types.PartyRole (PartyRole(..))
+import CantonPayments.PaymentStream.Types.PaymentStreamStats (emptyStats)
+import CantonPayments.PaymentStream.Types.LockFundsInput (LockFundsInput(..))
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), CreatedAmulet(..))
+
+template ProposedPaymentStream
+  with
+    paymentStreamProposal : PaymentStreamProposal
+    processorContext : ProcessorContext
+    approvals : Approvals
+  where
+    signatory getApprovedUsers paymentStreamProposal approvals ++ [processorContext.processor]
+    observer getUnapprovedUsers paymentStreamProposal approvals ++ 
+             paymentStreamProposal.observers ++ 
+             [paymentStreamProposal.provider] ++ 
+             map (\beneficiary -> beneficiary.beneficiary) paymentStreamProposal.appRewardBeneficiaries
+    
+    ensure validatePaymentStreamProposal paymentStreamProposal && validateAtLeastOneApproved approvals
+
+    choice ProposedPaymentStream_Approve : ContractId ProposedPaymentStream
+      with
+        actor : Party
+      controller actor
+      do
+        assertMsg "Payer cannot use Approve; use StartPaymentStream instead" (actor /= paymentStreamProposal.payer)
+        assertIsPartyToPaymentStreamProposal actor paymentStreamProposal processorContext
+        
+        newApprovals <- addApprovalForProposalAndAssertChanged approvals actor paymentStreamProposal processorContext
+        
+        create this with approvals = newApprovals
+
+    choice ProposedPaymentStream_StartPaymentStream : (ContractId ActivePaymentStream, Optional (ContractId Amulet.Amulet))
+      with
+        lockFundsInput : LockFundsInput
+      controller paymentStreamProposal.payer
+      do
+        assertMsg "Must provide at least one amulet" (not (null lockFundsInput.amuletInputs))
+        assertMsg "Amount to lock must be positive" (lockFundsInput.amountToLock > 0.0)
+        
+        -- Add payer's approval
+        newApprovals <- addApprovalForProposalAndAssertChanged approvals paymentStreamProposal.payer paymentStreamProposal processorContext
+        
+        -- Assert all parties have now approved
+        assertMsg "All parties must approve before starting paymentStream" (areAllApproved newApprovals)
+        
+        now <- getTime
+        paymentStream <- assertAndConvertProposalToPaymentStream paymentStreamProposal
+        Amulet.validateAppRewardBeneficiaries paymentStream.appRewardBeneficiaries
+        
+        lock <- createPaymentStreamLock paymentStream.recipient processorContext.processor
+        transferResult <- exercise lockFundsInput.paymentContext.amuletRulesCid AmuletRules_Transfer with
+          transfer = Transfer with
+            sender = paymentStream.payer
+            provider = paymentStream.provider
+            inputs = map InputAmulet lockFundsInput.amuletInputs
+            outputs = [TransferOutput with
+              receiver = paymentStream.payer
+              receiverFeeRatio = 1.0
+              amount = lockFundsInput.amountToLock
+              lock = Some lock]
+            beneficiaries = Some paymentStream.appRewardBeneficiaries
+          context = TransferContext with
+            openMiningRound = lockFundsInput.paymentContext.openMiningRoundCid
+            featuredAppRight = lockFundsInput.paymentContext.featuredAppRight
+            issuingMiningRounds = Map.empty
+            validatorRights = Map.empty
+          expectedDso = Some processorContext.dso
+        
+        lockedAmuletCid <- case transferResult.createdAmulets of
+          [TransferResultLockedAmulet cid] -> pure cid
+          _ -> abort "Expected exactly one locked amulet output"
+        
+        activePaymentStreamCid <- create ActivePaymentStream with
+          paymentStream
+          processorContext
+          lockedAmuletCid
+          processedAndPaidUntil = now
+          stats = emptyStats
+        
+        pure (activePaymentStreamCid, transferResult.senderChangeAmulet)
+
+    choice ProposedPaymentStream_EditPaymentStreamProposal : ContractId ProposedPaymentStream
+      with
+        actor : Party
+        changes : PaymentStreamProposalChanges
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToPaymentStreamProposal actor paymentStreamProposal processorContext
+        assertValidOptionalText description
+        
+        let impactedParties = getImpactedPartiesForProposal changes paymentStreamProposal processorContext
+        updatedProposal <- applyChangesAndAssertChanged changes paymentStreamProposal processorContext
+        
+        create this with
+          paymentStreamProposal = updatedProposal
+          approvals = updateApprovalsAfterImpact approvals actor impactedParties paymentStreamProposal processorContext
+
+    choice ProposedPaymentStream_Withdraw : ()
+      with
+        actor : Party
+        description : Optional Text
+      controller actor
+      do
+        assertIsPartyToPaymentStreamProposal actor paymentStreamProposal processorContext
+        assertValidOptionalText description
+        pure ()
+
+    -- Called via PartyMigrationProposal to migrate party identities
+    choice ProposedPaymentStream_ChangeParty : ContractId ProposedPaymentStream
+      with
+        partyType : PartyRole
+        oldParty : Party
+        newParty : Party
+      controller [oldParty, newParty]
+      do
+        assertMsg "Old and new party must be different" (oldParty /= newParty)
+        
+        case partyType of
+          Payer -> do
+            assertMsg "Old party must be the current payer" (oldParty == paymentStreamProposal.payer)
+            assertMsg "New party cannot be the current recipient" (newParty /= paymentStreamProposal.recipient)
+            create this with paymentStreamProposal.payer = newParty
+          Recipient -> do
+            assertMsg "Old party must be the current recipient" (oldParty == paymentStreamProposal.recipient)
+            assertMsg "New party cannot be the current payer" (newParty /= paymentStreamProposal.payer)
+            create this with paymentStreamProposal.recipient = newParty
+          Processor -> do
+            assertMsg "Old party must be the current processor" (oldParty == processorContext.processor)
+            create this with processorContext.processor = newParty

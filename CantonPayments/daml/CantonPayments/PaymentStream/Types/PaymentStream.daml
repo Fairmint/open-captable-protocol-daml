@@ -1,0 +1,145 @@
+module CantonPayments.PaymentStream.Types.PaymentStream where
+
+import DA.Time (RelTime, convertRelTimeToMicroseconds, addRelTime)
+import DA.TextMap (TextMap)
+import Fairmint.Shared.TypeHelpers (validateOptionalText, validateOptionalMetadata)
+import CantonPayments.PaymentStream.Types.PaymentStreamAmount (PaymentStreamAmount(..), validatePaymentStreamAmount)
+import CantonPayments.PaymentStream.Types.ProcessorContext (ProcessorContext(..))
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary)
+
+-- | Core payment stream configuration shared between active payment streams and proposals
+data PaymentStream = PaymentStream
+  with
+    payer : Party
+    recipient : Party
+    recipientPaymentPerDay : PaymentStreamAmount
+    processorPaymentPerDay : Optional PaymentStreamAmount
+    freeTrialExpiration : Optional Time
+      -- ^ None if no trial or trial ended; Some if trial is active/future
+    prepayWindow : RelTime
+      -- ^ Maximum time beyond current time that can be prepaid
+    paymentsEndAt : Optional Time
+      -- ^ Payment stream becomes inactive after this time (None = perpetual)
+    provider : Party
+    appRewardBeneficiaries : [AppRewardBeneficiary]
+    description : Optional Text
+    metadata : Optional (TextMap Text)
+    observers : [Party]
+  deriving (Eq, Show)
+
+-- | Validation for PaymentStream
+validatePaymentStream : PaymentStream -> Bool
+validatePaymentStream config =
+  config.payer /= config.recipient &&
+  validateOptionalText config.description &&
+  validatePaymentStreamAmount config.recipientPaymentPerDay False &&
+  (case config.processorPaymentPerDay of
+    None -> True
+    Some amt -> validatePaymentStreamAmount amt False) &&
+  convertRelTimeToMicroseconds config.prepayWindow >= 0 &&
+  validateOptionalMetadata config.metadata &&
+  (case config.freeTrialExpiration of
+    Some trial -> case config.paymentsEndAt of
+      Some end -> trial <= end
+      None -> True
+    None -> True)
+
+-- | Checks if payment stream is currently in free trial state
+isInFreeTrial : Optional Time -> Time -> Bool
+isInFreeTrial freeTrialExpiration now =
+  case freeTrialExpiration of
+    Some trial -> trial >= now
+    None -> False
+
+-- | Calculate the new freeTrialExpiration after processing (clears if trial ended in real time)
+clearTrialIfEnded : Time -> Time -> Optional Time -> Optional Time
+clearTrialIfEnded now trialEnd currentTrialEndsAt =
+  if now >= trialEnd then None else currentTrialEndsAt
+
+-- | Calculate and validate new processedAndPaidUntil for payment processing
+-- Accounts for trial periods (starts from max of trial end and current processedAndPaidUntil)
+-- Validates constraints: not beyond expiration date, not beyond prepay window
+calculateAndValidateNewProcessedAndPaidUntil : PaymentStream -> Time -> RelTime -> Update Time
+calculateAndValidateNewProcessedAndPaidUntil paymentStream processedAndPaidUntil processingPeriod = do
+  -- Calculate effective start time accounting for free trial
+  let effectiveStartTime = case paymentStream.freeTrialExpiration of
+        Some trialEnd -> max trialEnd processedAndPaidUntil
+        None -> processedAndPaidUntil
+  let newProcessedAndPaidUntil = addRelTime effectiveStartTime processingPeriod
+  
+  -- Assert not beyond expiration date
+  case paymentStream.paymentsEndAt of
+    Some expiresAt -> assertMsg "Cannot process beyond expiration date" (newProcessedAndPaidUntil <= expiresAt)
+    None -> pure ()
+  
+  -- Assert not beyond prepay window
+  now <- getTime
+  let maxAllowedProcessedAndPaidUntil = addRelTime now paymentStream.prepayWindow
+  assertMsg "Cannot process beyond prepay window" (newProcessedAndPaidUntil <= maxAllowedProcessedAndPaidUntil)
+  
+  pure newProcessedAndPaidUntil
+
+-- | Assert that payment stream is in free trial (trial end is inclusive)
+-- Returns the trial end time for further use
+assertInFreeTrial : Optional Time -> Update Time
+assertInFreeTrial freeTrialExpiration = do
+  now <- getTime
+  assertMsg "Can only process free trial when paymentStream.freeTrialExpiration is Some and >= now" 
+    (isInFreeTrial freeTrialExpiration now)
+  let Some trialEnd = freeTrialExpiration
+  pure trialEnd
+
+-- | Assert that payment stream is NOT in free trial state
+assertNotInFreeTrial : Optional Time -> Update ()
+assertNotInFreeTrial freeTrialExpiration = do
+  now <- getTime
+  assertMsg "Cannot process payment while in free trial (paymentStream.freeTrialExpiration is Some and >= now)" 
+    (not (isInFreeTrial freeTrialExpiration now))
+
+-- | Asserts that payments haven't ended
+assertPaymentsNotEnded : Optional Time -> Update ()
+assertPaymentsNotEnded paymentsEndAt = do
+  now <- getTime
+  case paymentsEndAt of
+    Some end -> assertMsg "Cannot process after payments end" (now <= end)
+    None -> pure ()
+
+-- | Assert that payments have ended (payment stream is canceled/expired)
+assertPaymentsHaveEnded : Optional Time -> Update ()
+assertPaymentsHaveEnded paymentsEndAt = do
+  now <- getTime
+  case paymentsEndAt of
+    Some end -> assertMsg "Can only refund when payments have ended (paymentsEndAt <= now)" (end <= now)
+    None -> abort "Cannot refund: payment stream has no payments end date"
+
+-- | Assert that payment stream payments have ended and paid period has passed
+-- Ensures payment stream is fully processed before archiving
+assertPaymentsEndedAndPaidPeriodPassed : Optional Time -> Time -> Update ()
+assertPaymentsEndedAndPaidPeriodPassed paymentsEndAt processedAndPaidUntil = do
+  now <- getTime
+  case paymentsEndAt of
+    Some end -> do
+      assertMsg "Payments must have ended (paymentsEndAt <= now)" (end <= now)
+      -- Prevent archiving if there's an outstanding final payment to process
+      assertMsg "Cannot archive while past due - must process through paymentsEndAt first (processedAndPaidUntil >= paymentsEndAt)" 
+        (processedAndPaidUntil >= end)
+    None -> abort "Payment stream has no payments end date"
+  assertMsg "Paid period must have passed (now > processedAndPaidUntil)" (processedAndPaidUntil < now)
+
+-- | Assert that there is prepaid time remaining to refund
+assertHasPrepaidTimeRemaining : Time -> Update ()
+assertHasPrepaidTimeRemaining processedAndPaidUntil = do
+  now <- getTime
+  assertMsg "No prepaid time remaining - use Archive instead" (processedAndPaidUntil > now)
+
+-- | Assert that party is authorized for payment stream actions
+assertIsPartyToPaymentStream : Party -> PaymentStream -> ProcessorContext -> Update ()
+assertIsPartyToPaymentStream party paymentStream context =
+  assertMsg "Only payer, recipient, or processor can perform this action" 
+    (party == paymentStream.payer || party == paymentStream.recipient || party == context.processor)
+
+-- | Assert that only payer can disregard available paid period
+assertOnlyPayerCanDisregardPaidPeriod : Bool -> Party -> Party -> Update ()
+assertOnlyPayerCanDisregardPaidPeriod disregard actor payer =
+  assertMsg "Only payer can set disregardAvailablePaidPeriod to true"
+    (not disregard || actor == payer)
