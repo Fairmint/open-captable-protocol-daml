@@ -19,7 +19,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 ## What Gets Changed
 
 ### Major Upgrade
-- ✅ Folder renamed (e.g., `Subscriptions-v09/` → `Subscriptions-v09/`)
+- ✅ Folder renamed (e.g., `CantonPayments/` → `CantonPayments/`)
 - ✅ Package name updated in `daml.yaml`
 - ✅ Version reset to `0.0.1` in `daml.yaml`
 - ✅ All file references updated across the repository
@@ -32,7 +32,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 ## Available Packages
 
 Current packages that can be upgraded:
-- `Subscriptions` (currently at `Subscriptions-v09`)
+- `Subscriptions` (currently at `CantonPayments`)
 - `OpenCapTable` (currently at `OpenCapTable-v25`)
 - `OpenCapTableReports` (currently at `OpenCapTableReports-v01`)
 - `OpenCapTableProofOfOwnership` (currently at `OpenCapTableProofOfOwnership-v01`)
@@ -70,29 +70,29 @@ Current packages that can be upgraded:
 ### Example 1: Major Upgrade
 
 ```bash
-# Before: Subscriptions-v09 (version 0.2.3)
+# Before: CantonPayments (version 0.2.3)
 npm run upgrade-package -- --package Subscriptions --type major
-# After: Subscriptions-v09 (version 0.0.1)
+# After: CantonPayments (version 0.0.1)
 ```
 
 Files changed:
-- `Subscriptions-v09/` → `Subscriptions-v09/`
-- `Subscriptions-v09/daml.yaml` (name and version fields)
+- `CantonPayments/` → `CantonPayments/`
+- `CantonPayments/daml.yaml` (name and version fields)
 - `multi-package.yaml`
-- All scripts referencing `Subscriptions-v09`
+- All scripts referencing `CantonPayments`
 - README files
 - Test files
 
 ### Example 2: Minor Upgrade
 
 ```bash
-# Before: Subscriptions-v09 (version 0.2.3)
+# Before: CantonPayments (version 0.2.3)
 npm run upgrade-package -- --package Subscriptions --type minor
-# After: Subscriptions-v09 (version 0.2.4)
+# After: CantonPayments (version 0.2.4)
 ```
 
 Files changed:
-- `Subscriptions-v09/daml.yaml` (version field only)
+- `CantonPayments/daml.yaml` (version field only)
 - Any files with hardcoded version strings
 
 ## Script Details

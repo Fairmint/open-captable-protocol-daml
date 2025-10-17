@@ -23,7 +23,7 @@ function getNetworkFromArgs(): string {
 
 async function main() {
   const network = getNetworkFromArgs();
-  console.log(`Uploading Subscriptions DAR file to ${network}...`);
+  console.log(`Uploading CantonPayments DAR file to ${network}...`);
 
   const providers = ['intellect', '5n'];
 
@@ -32,12 +32,12 @@ async function main() {
 
     const client = createLedgerJsonApiClient(network, provider);
 
-    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'Subscriptions-v09', '.daml', 'dist', 'Subscriptions-v09-0.0.7.dar') });
+    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'CantonPayments', '.daml', 'dist', 'CantonPayments-0.0.7.dar') });
 
-    console.log(`✅ Subscriptions DAR file uploaded successfully to ${provider} on ${network}`);
+    console.log(`✅ CantonPayments DAR file uploaded successfully to ${provider} on ${network}`);
   }
 
-  console.log(`🎉 Subscriptions DAR upload process completed for ${network}`);
+  console.log(`🎉 CantonPayments DAR upload process completed for ${network}`);
 }
 
 main();

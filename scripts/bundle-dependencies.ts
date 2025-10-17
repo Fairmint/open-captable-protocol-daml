@@ -7,7 +7,7 @@ import path from 'path';
 const PACKAGE_DIRS = [
 	path.join(__dirname, '../generated/js/OpenCapTable-v25-0.0.1'),
 	path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
-	path.join(__dirname, '../generated/js/Subscriptions-v09-0.0.7'),
+	path.join(__dirname, '../generated/js/CantonPayments-0.0.7'),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
@@ -732,7 +732,7 @@ function main(): void {
 			createBundledFiles(targetDir);
 			createBundledSpliceFiles(targetDir);
 			// Only bundle splice-amulet and additional dependencies for Subscriptions package
-			if (targetDir.includes('Subscriptions-v09')) {
+			if (targetDir.includes('CantonPayments')) {
 				createBundledSpliceAmuletFiles(targetDir);
 				createBundledDATimeTypesFiles(targetDir);
 				createBundledDATypesFiles(targetDir);

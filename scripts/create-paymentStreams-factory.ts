@@ -7,12 +7,12 @@ import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clie
 
 interface ContractIdData {
   mainnet?: {
-    subscriptionsFactoryContractId: string;
+    paymentStreamsFactoryContractId: string;
     templateId: string;
     disclosedContract: DisclosedContract;
   };
   devnet?: {
-    subscriptionsFactoryContractId: string;
+    paymentStreamsFactoryContractId: string;
     templateId: string;
     disclosedContract: DisclosedContract;
   };
@@ -34,7 +34,7 @@ function getNetworkFromArgs(): string {
 }
 
 function getOutputPath(): string {
-  return path.join(__dirname, '..', 'generated', 'subscriptions-factory-contract-id.json');
+  return path.join(__dirname, '..', 'generated', 'paymentStreams-factory-contract-id.json');
 }
 
 function loadExistingContractIds(outputPath: string): ContractIdData {
@@ -44,25 +44,25 @@ function loadExistingContractIds(outputPath: string): ContractIdData {
       return JSON.parse(content) as ContractIdData;
     }
   } catch (err) {
-    console.warn('⚠️  Failed to read existing subscriptions factory contract id file. Proceeding to create a new one.');
+    console.warn('⚠️  Failed to read existing paymentStreams factory contract id file. Proceeding to create a new one.');
   }
   return {};
 }
 
 async function main() {
   const network = getNetworkFromArgs();
-  console.log(`Creating SubscriptionFactory contract for ${network}...`);
+  console.log(`Creating PaymentStreamFactory contract for ${network}...`);
 
   // Import from the combined lib built by scripts/create-root-index.ts
-  const { Fairmint } = await import('../lib');
+  const { CantonPayments } = await import('../lib');
 
   const client = createLedgerJsonApiClient(network, '5n');
 
-  if (!Fairmint?.Subscriptions?.SubscriptionFactory?.SubscriptionFactory) {
-    throw new Error('Generated DAML types not found for Subscriptions package. Please run "npm run codegen" first.');
+  if (!CantonPayments?.PaymentStream?.PaymentStreamFactory?.PaymentStreamFactory) {
+    throw new Error('Generated DAML types not found for CantonPayments package. Please run "npm run codegen" first.');
   }
 
-  console.log(`Template ID: ${Fairmint.Subscriptions.SubscriptionFactory.SubscriptionFactory.templateId}`);
+  console.log(`Template ID: ${CantonPayments.PaymentStream.PaymentStreamFactory.PaymentStreamFactory.templateId}`);
 
   const validatorClient = createValidatorApiClient(network, '5n');
   const clientPartyId = client.getPartyId();
@@ -76,7 +76,7 @@ async function main() {
   const dsoPartyId = dsoResponse.dso_party_id;
   console.log(`✅ DSO Party: ${dsoPartyId}`);
 
-  const subscriptionFactoryData = {
+  const paymentStreamFactoryData = {
     processorContext: {
       processor: network === 'devnet' ? 'test-subscription-processor::1220ea70ea2cbfe6be431f34c7323e249c624a02fb2209d2b73fabd7eea1fe84df34' : "SubscriptionProcessor::12204a039322c01e9f714b56259c3e68b69058bf5dfe1debbe956c698f905ceba9d7", // TODO; Move to env vars and make network dependent
       dso: dsoPartyId,
@@ -84,18 +84,18 @@ async function main() {
   };
 
   const createCommand = {
-    templateId: Fairmint.Subscriptions.SubscriptionFactory.SubscriptionFactory.templateId,
-    createArguments: subscriptionFactoryData,
+    templateId: CantonPayments.PaymentStream.PaymentStreamFactory.PaymentStreamFactory.templateId,
+    createArguments: paymentStreamFactoryData,
   };
 
   try {
-    console.log('Submitting SubscriptionFactory contract creation transaction...');
+    console.log('Submitting PaymentStreamFactory contract creation transaction...');
 
     const response = await client.submitAndWaitForTransactionTree({
       commands: [{
         CreateCommand: createCommand,
       }],
-      actAs: [subscriptionFactoryData.processorContext.processor],
+      actAs: [paymentStreamFactoryData.processorContext.processor],
     });
 
     const eventsById = response.transactionTree?.eventsById;
@@ -114,7 +114,7 @@ async function main() {
       throw new Error('Contract ID not found in CreatedTreeEvent');
     }
 
-    console.log(`✅ SubscriptionFactory contract created with ID: ${contractId}`);
+    console.log(`✅ PaymentStreamFactory contract created with ID: ${contractId}`);
 
     // Fetch the disclosed contract data
     // Note: We need to fetch the contract again because CreatedTreeEvent doesn't include
@@ -122,7 +122,7 @@ async function main() {
     console.log('Fetching disclosed contract data...');
     const factoryEventsResponse = await client.getEventsByContractId({
       contractId,
-      readAs: [subscriptionFactoryData.processorContext.processor],
+      readAs: [paymentStreamFactoryData.processorContext.processor],
     });
 
     const createdEvent = factoryEventsResponse.created?.createdEvent;
@@ -142,14 +142,14 @@ async function main() {
     const outputPath = getOutputPath();
     const data = loadExistingContractIds(outputPath);
     data[network as 'mainnet' | 'devnet'] = {
-      subscriptionsFactoryContractId: contractId,
+      paymentStreamsFactoryContractId: contractId,
       templateId: createdTreeEvent.value.templateId,
       disclosedContract,
     } as any;
     fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
     console.log(`📝 Saved contract ID and disclosed contract to ${outputPath}`);
   } catch (error) {
-    console.error('❌ Failed to create SubscriptionFactory contract:', error);
+    console.error('❌ Failed to create PaymentStreamFactory contract:', error);
     process.exit(1);
   }
 }

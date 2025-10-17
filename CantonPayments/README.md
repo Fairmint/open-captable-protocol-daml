@@ -5,7 +5,7 @@ A general-purpose DAML package for recurring payment streams using Splice Amulet
 ## Overview
 
 Three-party payment stream system with flexible payment processing:
-- **Subscriber**: Pays for the payment stream (funds are automatically withdrawn each period)
+- **Payer**: Pays for the payment stream (funds are automatically withdrawn each period)
 - **Recipient**: Receives payment stream payments
 - **Processor**: Executes transfers each period, optionally for a fee
 
@@ -17,56 +17,56 @@ Three-party payment stream system with flexible payment processing:
 
 ## Payment Stream Terms
 
-When a subscriber and recipient agree to a payment stream, they commit to a set of terms defined in the `PaymentStream` data type:
+When a payer and recipient agree to a payment stream, they commit to a set of terms defined in the `PaymentStream` data type:
 
 **Payment Terms:**
-- **`recipientPaymentPerDay`**: The daily rate the subscriber pays to the recipient (in Amulet or USD)
-  - Can be increased by the subscriber and decreased by the recipient
-- **`processorPaymentPerDay`**: The daily rate the subscriber pays to the processor for handling payments (in Amulet or USD)
-  - Can be increased by the subscriber and decreased by the processor
+- **`recipientPaymentPerDay`**: The daily rate the payer pays to the recipient (in Amulet or USD)
+  - Can be increased by the payer and decreased by the recipient
+- **`processorPaymentPerDay`**: The daily rate the payer pays to the processor for handling payments (in Amulet or USD)
+  - Can be increased by the payer and decreased by the processor
 
-Pro-rated billing ensures subscribers only pay for the exact time period used
+Pro-rated billing ensures payers only pay for the exact time period used
 
 **Service Continuity:**
 - **`prepayWindow`**: How far ahead payments can advance beyond the current time (e.g., 7 days)
-  - Provides a buffer period for subscribers to top up their balance before service interruption
+  - Provides a buffer period for payers to top up their balance before service interruption
   - Larger windows provide more service stability; smaller windows reduce capital requirements
   - Zero prepay window means payments only advance up to recent history instead of prepaying for future usage, so services must honor a grace period before terminating
     - Similarly, small prepay windows (less than or equal to the processor's period) will result in `paidUntil` often being in the recent past rather than the future
-  - Can be increased by the subscriber and decreased by the recipient
+  - Can be increased by the payer and decreased by the recipient
 
 **Duration:**
 - **`paymentsEndAt`**: When payments end (can be far in the future for ongoing payment streams)
-  - Can only be changed by the subscriber (to any time)
+  - Can only be changed by the payer (to any time)
 - **Free trial**: Optional trial period (specified at proposal creation) where no payment is required
   - Specified using `PaymentStreamExpiration` which can be either:
     - **`AbsoluteExpiration Time`**: Expires at a specific timestamp
     - **`RelativeExpiration RelTime`**: Expires at a duration from payment stream creation time (e.g., 30 days from when accepted)
   - Relative expirations allow proposals to remain outstanding without eating into the trial duration
   - Managed by `FreeTrialPaymentStream` template with `trialEndsAt` field (always resolved to absolute time)
-  - Can be extended by the recipient or reduced by the subscriber
+  - Can be extended by the recipient or reduced by the payer
   - Recipients can convert a paid payment stream back to a free trial anytime
   - Automatically converts to `PaidPaymentStream` when trial ends
 
 **Other:**
 - **`description`**: Optional human-readable description of the payment stream purpose (e.g., "Premium membership", "Premium tier - app_id:123")
-  - Changes require both subscriber and recipient approval via description update proposal contracts
+  - Changes require both payer and recipient approval via description update proposal contracts
 - **`metadata`**: Structured key-value pairs for additional payment stream information
   - Stored as `TextMap Text` for type-safe, queryable metadata
-  - Changes require processor approval first, then acceptance by the other party (subscriber or recipient)
+  - Changes require processor approval first, then acceptance by the other party (payer or recipient)
   - Common use: Reference RewardShare contract IDs for off-chain reward distribution
 
 **Key Principles:**
 - Terms are agreed upon during the proposal/acceptance flow
 - Any party can cancel at any time
-- Terms can only be changed by the party negatively impacted (e.g., subscriber increases payments, recipient decreases their payment)
+- Terms can only be changed by the party negatively impacted (e.g., payer increases payments, recipient decreases their payment)
 - On-chain proposals exist for changes requiring both parties' approval (e.g., reason updates)
 
 ## Architecture
 
-**Three-Party Flow:** Can be initiated by subscriber, recipient, or processor:
-- **Subscriber-initiated:** Subscriber proposes terms → Processor approves → Recipient accepts
-- **Recipient-initiated:** Recipient proposes terms → Processor approves → Subscriber accepts
+**Three-Party Flow:** Can be initiated by payer, recipient, or processor:
+- **Payer-initiated:** Payer proposes terms → Processor approves → Recipient accepts
+- **Recipient-initiated:** Recipient proposes terms → Processor approves → Payer accepts
 - **Processor-initiated:** Processor proposes terms → Either party accepts first → Other party accepts
 
 **Billing Model:** Configured as a rate per day but charged pro-rated for any processing period used:
@@ -74,7 +74,7 @@ Pro-rated billing ensures subscribers only pay for the exact time period used
 amountForPeriod = (amountPerDay × periodDuration) / 1 day
 ```
 
-It's pay-as-you-go where transfer fees are paid by the recipient and processor, not the subscriber. This means consistent and predictable costs for end-users regardless of the processing period used.
+It's pay-as-you-go where transfer fees are paid by the recipient and processor, not the payer. This means consistent and predictable costs for end-users regardless of the processing period used.
 
 **Processor Payments:**
 The processor can use any period length, so long as it does not exceed the prepay window (when the window is 0, payments may only advance up until `now`).
@@ -93,21 +93,21 @@ The processor can use any period length, so long as it does not exceed the prepa
 Payment Streams use a **LockedAmulet** for payment escrow:
 
 **At PaymentStream Creation:**
-- When the final approval creates an `ActivePaymentStream`, the subscriber provides:
+- When the final approval creates an `ActivePaymentStream`, the payer provides:
   - Amulet inputs
   - Amount to lock in escrow
 - These are combined into a single `LockedAmulet` with:
   - **Lock holders:** recipient and processor
   - **Lock expiry:** 365 days (to discourage expiry - this is a recovery mechanism only)
   - **Context:** "PaymentStream escrow"
-  - **Fee model:** `receiverFeeRatio = 1.0` - subscriber pays fees from inputs (predictable costs)
-- Any remaining balance from inputs is returned as change to the subscriber
+  - **Fee model:** `receiverFeeRatio = 1.0` - payer pays fees from inputs (predictable costs)
+- Any remaining balance from inputs is returned as change to the payer
 
 **Cost Predictability:**
 All escrow operations use `receiverFeeRatio = 1.0`, meaning:
-- Transfer fees are paid from the subscriber's input amulets
-- The locked amount is exactly what the subscriber specified
-- The subscriber knows upfront the total cost (amount + fees)
+- Transfer fees are paid from the payer's input amulets
+- The locked amount is exactly what the payer specified
+- The payer knows upfront the total cost (amount + fees)
 - No surprises from fees being deducted from the locked balance
 
 **During Payment Processing:**
@@ -115,21 +115,21 @@ All escrow operations use `receiverFeeRatio = 1.0`, meaning:
 - This ensures the recipient and processor maintain control over the escrowed funds
 
 **Fund Management:**
-- **Add funds:** `ActivePaymentStream_AddFunds` - Anyone can add amulets to gift/top-up a payment stream (requires all party approvals to unlock/relock); excess returned as change to funder. Note: subscriber can withdraw these funds at any time.
-- **Withdraw funds:** `ActivePaymentStream_WithdrawFunds` - Subscriber can withdraw excess funds while keeping a specified amount locked; remainder returned as change
+- **Add funds:** `ActivePaymentStream_AddFunds` - Anyone can add amulets to gift/top-up a payment stream (requires all party approvals to unlock/relock); excess returned as change to funder. Note: payer can withdraw these funds at any time.
+- **Withdraw funds:** `ActivePaymentStream_WithdrawFunds` - Payer can withdraw excess funds while keeping a specified amount locked; remainder returned as change
 - **Replace lock:** `ActivePaymentStream_ReplaceLockedAmulet` - Recovery mechanism if lock expires; specify amount to lock
 
 **At PaymentStream Termination:**
-- **Refund:** Recipient provides their own amulets for the refund; the locked balance is returned to subscriber
-- **Cancel (immediate):** Locked amulet is unlocked and returned to subscriber
+- **Refund:** Recipient provides their own amulets for the refund; the locked balance is returned to payer
+- **Cancel (immediate):** Locked amulet is unlocked and returned to payer
 - **Cancel (with prepaid period):** Locked amulet stays for remaining payments, then returned when archived
-- **Archive:** Locked amulet is unlocked and returned to subscriber
+- **Archive:** Locked amulet is unlocked and returned to payer
 
 This architecture ensures:
-1. Payments can be processed without subscriber interaction
+1. Payments can be processed without payer interaction
 2. Recipient and processor maintain control as lock holders
-3. Subscriber retains ownership and can manage the locked balance
-4. Subscriber has predictable costs (fees paid from inputs, not from locked amount)
+3. Payer retains ownership and can manage the locked balance
+4. Payer has predictable costs (fees paid from inputs, not from locked amount)
 5. Funds are returned when the payment stream ends
 
 ## Contract Templates
@@ -138,11 +138,11 @@ The payment stream system uses separate templates for each lifecycle state:
 
 **Proposal Flow:**
 - `PaymentStreamFactory` - Creates proposals with processor/DSO context
-- `SubscriberPaymentStreamProposal` - Subscriber initiates, awaits processor approval
+- `PayerPaymentStreamProposal` - Payer initiates, awaits processor approval
 - `RecipientPaymentStreamProposal` - Recipient initiates, awaits processor approval
 - `ProcessorPaymentStreamProposal` - Processor initiates, awaits acceptance from both parties
-- `ProcessorApprovedPaymentStreamProposal` - Awaits recipient acceptance (after processor approval of subscriber proposal)
-- `ProcessorApprovedRecipientInitiatedPaymentStreamProposal` - Awaits subscriber acceptance (after processor approval of recipient proposal)
+- `ProcessorApprovedPaymentStreamProposal` - Awaits recipient acceptance (after processor approval of payer proposal)
+- `ProcessorApprovedRecipientInitiatedPaymentStreamProposal` - Awaits payer acceptance (after processor approval of recipient proposal)
 - `OnePartyApprovedProcessorPaymentStreamProposal` - Awaits second party acceptance (after one party accepted processor proposal)
 
 **Active Payment Streams:**
@@ -166,14 +166,14 @@ The payment stream system uses separate templates for each lifecycle state:
 
 **Lifecycle Overview:**
 
-1. **Proposal:** Subscriber, recipient, or processor proposes terms via `PaymentStreamFactory`
+1. **Proposal:** Payer, recipient, or processor proposes terms via `PaymentStreamFactory`
 2. **Approval/Acceptance:**
-   - **Subscriber/Recipient-initiated:** Processor validates and approves, then the other party accepts
+   - **Payer/Recipient-initiated:** Processor validates and approves, then the other party accepts
    - **Processor-initiated:** Either party accepts first, then the other party accepts
 3. **Active PaymentStream:** Creates `ActivePaymentStream` with `trialEndsAt` set if free trial, None otherwise
 4. **Processing:**
    - Free trial: Processor advances `processedUntil` and creates activity markers (no payments)
-   - Paid: Processor executes transfers from subscriber to recipient and processor (with app rewards)
+   - Paid: Processor executes transfers from payer to recipient and processor (with app rewards)
 5. **Lifecycle:** Continues until expiration or cancellation by any party
 6. **Transitions:** 
    - Trial converts to paid when `trialEndsAt` reached
@@ -184,11 +184,11 @@ The payment stream system uses separate templates for each lifecycle state:
 
 ## Contract Lifecycle Diagrams
 
-### Subscriber-Initiated Flow
+### Payer-Initiated Flow
 
 ```mermaid
 flowchart LR
-    Start(( )) --> |"propose (subscriber)"|SP["Proposal<br>(via factory)"]
+    Start(( )) --> |"propose (payer)"|SP["Proposal<br>(via factory)"]
     SP -->|"approve (processor)"| PA[Processor Approved]
     SP -->|"reject (any)"| End(( ))
     PA -->|"accept (recipient)"| AS["ActivePaymentStream<br>(FreeTrial or Paid state)"]
@@ -207,7 +207,7 @@ flowchart LR
     Start(( )) --> |"propose (recipient)"| RP["Proposal<br>(via factory)"]
     RP -->|"approve (processor)"| PA[Processor Approved]
     RP -->|"reject (any)"| End(( ))
-    PA -->|"accept (subscriber)"| AS["ActivePaymentStream<br>(FreeTrial or Paid state)"]
+    PA -->|"accept (payer)"| AS["ActivePaymentStream<br>(FreeTrial or Paid state)"]
     PA -->|"reject (any)"| End
     
     classDef proposal fill:#fff9e6,stroke:#666
@@ -221,7 +221,7 @@ flowchart LR
 ```mermaid
 flowchart LR
     Start(( )) --> |"propose (processor)"| PP["Processor Proposal<br>(via factory)"]
-    PP -->|"accept (subscriber or recipient)"| OneApproved[One Party Approved]
+    PP -->|"accept (payer or recipient)"| OneApproved[One Party Approved]
     PP -->|"reject (any)"| End(( ))
     PP -->|"withdraw (processor)"| End
     OneApproved -->|"accept (other party)"| AS["ActivePaymentStream<br>(FreeTrial or Paid state)"]
@@ -274,11 +274,11 @@ flowchart LR
 ## Usage Example
 
 ```haskell
--- 1. Create proposal (subscriber initiates)
-proposalCid <- submit subscriber do
-  exerciseCmd factoryCid PaymentStreamFactory_CreateSubscriberProposal with
+-- 1. Create proposal (payer initiates)
+proposalCid <- submit payer do
+  exerciseCmd factoryCid PaymentStreamFactory_CreatePayerProposal with
     config = PaymentStream with
-      subscriber, recipient
+      payer, recipient
       recipientPaymentPerDay = AmuletAmount 10.0
     processorPaymentPerDay = AmuletAmount 1.0
     prepayWindow = days 7
@@ -291,7 +291,7 @@ proposalCid <- submit subscriber do
 
 -- 2. Processor approves
 approvedCid <- submit processor do
-  exerciseCmd proposalCid SubscriberPaymentStreamProposal_ProcessorApprove
+  exerciseCmd proposalCid PayerPaymentStreamProposal_ProcessorApprove
 
 -- 3. Recipient accepts (providing their provider)
 acceptResult <- submit recipient do
@@ -328,7 +328,7 @@ paymentResult <- submit processor do
 -- Recipient creates a metadata change proposal
 metadataProposalCid <- submit recipient do
   createCmd MetadataChangeProposal with
-    subscriber, recipient, processor
+    payer, recipient, processor
     proposer = recipient
     newMetadata = TM.fromList
       [ ("recipient_reward_agreement_cid", recipientRewardAgreementCid)
@@ -340,11 +340,11 @@ metadataProposalCid <- submit recipient do
 approvedMetadataProposalCid <- submit processor do
   exerciseCmd metadataProposalCid MetadataChangeProposal_ProcessorApprove
 
--- Subscriber accepts the metadata change (requires both processor and subscriber authority)
-updatedActivePaymentStreamCid <- submit processor, subscriber do
+-- Payer accepts the metadata change (requires both processor and payer authority)
+updatedActivePaymentStreamCid <- submit processor, payer do
   exerciseCmd approvedMetadataProposalCid ProcessorApprovedMetadataChangeProposal_Accept with
     activePaymentStreamCid
-    accepter = subscriber
+    accepter = payer
 
 ```
 
@@ -354,12 +354,12 @@ updatedActivePaymentStreamCid <- submit processor, subscriber do
 
 When any party cancels an `ActivePaymentStream` with `processedUntil > now`, they can either:
 - **Honor prepaid period**: Sets `paymentsEndAt` to now (by passing `disregardAvailablePaidPeriod = False`), transitioning to PrepaidCanceled state
-- **Immediately archive** (subscriber only): Subscriber can pass `disregardAvailablePaidPeriod = True` to forgo the prepaid period and archive immediately
+- **Immediately archive** (payer only): Payer can pass `disregardAvailablePaidPeriod = True` to forgo the prepaid period and archive immediately
 
 If the payment stream transitions to PrepaidCanceled state, the recipient has several options:
 
 **Option 1: Honor Prepaid Period**
-- Subscriber retains access until `processedUntil`
+- Payer retains access until `processedUntil`
 - Any party archives once `processedUntil` passes using `ActivePaymentStream_ArchiveInactivePaymentStream`
 - Common for content services (e.g., streaming platforms)
 
@@ -378,7 +378,7 @@ The choice depends on the recipient's business model and customer relationship.
 
 ### Tradeoff: LockedAmulets
 
-**Decision:** This implementation uses **pay-as-you-go with optional prepayment**—funds are pulled from the subscriber's account during each payment processing cycle, with the `prepayWindow` parameter controlling how far ahead payments can advance.
+**Decision:** This implementation uses **pay-as-you-go with optional prepayment**—funds are pulled from the payer's account during each payment processing cycle, with the `prepayWindow` parameter controlling how far ahead payments can advance.
 
 **The prepayWindow provides security without LockedAmulets:**
 
@@ -393,8 +393,8 @@ We don't need full `LockedAmulet` security because that would only guarantee pay
 
 **Pros:**
 - Easy to start—no large upfront deposit or locked funds required
-- Flexible security—`prepayWindow` can be adjusted by subscriber (increase) or recipient (decrease)
-- Simple for subscribers—just maintain account balance
+- Flexible security—`prepayWindow` can be adjusted by payer (increase) or recipient (decrease)
+- Simple for payers—just maintain account balance
 - Recipients get configurable revenue certainty via prepayWindow
 - Natural expiration—payment streams lapse if funds run out
 - No complex refund guarantees to manage
@@ -402,47 +402,47 @@ We don't need full `LockedAmulet` security because that would only guarantee pay
 **Cons:**
 - Payments can still fail if insufficient funds
 - Refunds after cancellation are discretionary, not automatic
-- Subscribers might unintentionally let payment streams lapse
+- Payers might unintentionally let payment streams lapse
 
-**Recommendation:** Use a reasonable `prepayWindow` (e.g., 7 days, 12 hours) to balance subscriber capital requirements with recipient revenue certainty. Recipients should notify subscribers when payments fail and design systems to handle payment failures gracefully.
+**Recommendation:** Use a reasonable `prepayWindow` (e.g., 7 days, 12 hours) to balance payer capital requirements with recipient revenue certainty. Recipients should notify payers when payments fail and design systems to handle payment failures gracefully.
 
 #### Canton Network Polling Alignment
 
 **Benefit:** This pay-as-you-go approach is particularly well-suited for Canton Network's frequent polling mechanism.
 
 With each process transaction, we're securing additional funds and advancing the `processedUntil` timestamp. This transactional approach makes sense because:
-- **Incremental fund capture**: Each polling cycle can capture newly available funds from the subscriber's account, minimizing their initial obligation.
+- **Incremental fund capture**: Each polling cycle can capture newly available funds from the payer's account, minimizing their initial obligation.
 
 The transactional approach trades some efficiency for better UX and works naturally with Canton's polling-based processing model.
 
 #### Open Question: Should Prepaid Window Use LockedAmulets?
 
-**Context:** Currently, the prepaid window amount is paid from the subscriber's regular account balance during each processing cycle. This provides flexibility but no guarantees.
+**Context:** Currently, the prepaid window amount is paid from the payer's regular account balance during each processing cycle. This provides flexibility but no guarantees.
 
 **Alternative Approach:** Lock the prepaid window amount (e.g., `prepayWindow × (recipientPaymentPerDay + processorPaymentPerDay)`) in a `LockedAmulet` at payment stream start or when the prepaid buffer needs replenishment.
 
 **Potential Benefits:**
 
 1. **Guaranteed Refunds on Cancellation:**
-   - Locked funds could be automatically returned to the subscriber after cancellation
+   - Locked funds could be automatically returned to the payer after cancellation
    - Provides stronger consumer protection
    - Could be an opt-in feature in payment stream terms
    - Removes recipient discretion from refund decisions
 
 2. **Guaranteed Service Payment on Delinquency:**
-   - If subscriber runs out of regular funds, service continues for the prepaid period
+   - If payer runs out of regular funds, service continues for the prepaid period
    - After non-payment threshold (e.g., 2 weeks), payment stream auto-closes and locked funds transfer to recipient
    - Provides revenue certainty for recipients
    - Creates clear delinquency handling
 
 **Tradeoffs:**
 
-- **Pro:** Stronger guarantees for both parties (refunds for subscribers, payment for recipients)
+- **Pro:** Stronger guarantees for both parties (refunds for payers, payment for recipients)
 - **Pro:** Could reduce disputes and simplify cancellation logic
 - **Pro:** Aligns prepaid window concept with actual pre-locked funds
-- **Con:** Requires larger upfront deposit from subscribers
+- **Con:** Requires larger upfront deposit from payers
 - **Con:** Adds complexity to payment stream initialization and replenishment
-- **Con:** May reduce subscriber conversion rates due to higher barrier to entry
+- **Con:** May reduce payer conversion rates due to higher barrier to entry
 - **Con:** LockedAmulet contracts add overhead to the system
 
 **Questions to Resolve:**
@@ -467,7 +467,7 @@ The payment stream system uses a unified change system that intelligently determ
 #### Example: Recipient Increases Payment
 
 ```daml
--- Recipient proposes payment increase (impacts subscriber who pays more)
+-- Recipient proposes payment increase (impacts payer who pays more)
 result <- submit recipient do
   exerciseCmd activePaymentStreamCid ActivePaymentStream_ProposeChanges with
     proposer = recipient
@@ -482,26 +482,26 @@ result <- submit recipient do
       description = None
       metadata = None
 
--- Result is Right proposalCid (subscriber approval needed)
+-- Result is Right proposalCid (payer approval needed)
 let Right proposalCid = result
 
--- Subscriber approves
-proposalCid <- submit subscriber do
-  exerciseCmd proposalCid PaymentStreamChangeProposal_Approve with actor = subscriber
+-- Payer approves
+proposalCid <- submit payer do
+  exerciseCmd proposalCid PaymentStreamChangeProposal_Approve with actor = payer
 
 -- Apply changes (both parties are controllers since both approved)
-updatedPaymentStreamCid <- submit subscriber, recipient do
+updatedPaymentStreamCid <- submit payer, recipient do
   exerciseCmd proposalCid PaymentStreamChangeProposal_Apply with
     activePaymentStreamCid
 ```
 
-#### Example: Subscriber Increases Prepay Window
+#### Example: Payer Increases Prepay Window
 
 ```daml
--- Subscriber increases prepay window (only impacts themselves)
-result <- submit subscriber do
+-- Payer increases prepay window (only impacts themselves)
+result <- submit payer do
   exerciseCmd activePaymentStreamCid ActivePaymentStream_ProposeChanges with
-    proposer = subscriber
+    proposer = payer
     payment streamChanges = PaymentStreamChanges with
       prepayWindow = Some (days 30)
       recipientProvider = None
@@ -512,7 +512,7 @@ result <- submit subscriber do
       description = None
       metadata = None
 
--- Result is Left updatedCid (applied immediately, only subscriber impacted)
+-- Result is Left updatedCid (applied immediately, only payer impacted)
 let Left updatedActivePaymentStreamCid = result
 ```
 
@@ -521,12 +521,12 @@ let Left updatedActivePaymentStreamCid = result
 The system determines impacted parties using these rules:
 
 **Recipient Provider**: Recipient only  
-**Recipient Payment**: Subscriber (increase) or Recipient (decrease)  
-**Processor Payment**: Subscriber (increase) or Processor (decrease)  
-**Payments End**: Subscriber (commitment change)  
-**Prepay Window**: Subscriber (increase) or Recipient (decrease)  
-**Trial**: Both Subscriber and Recipient  
-**Description**: Both Subscriber and Recipient  
+**Recipient Payment**: Payer (increase) or Recipient (decrease)  
+**Processor Payment**: Payer (increase) or Processor (decrease)  
+**Payments End**: Payer (commitment change)  
+**Prepay Window**: Payer (increase) or Recipient (decrease)  
+**Trial**: Both Payer and Recipient  
+**Description**: Both Payer and Recipient  
 **Metadata**: All three parties
 
 #### Benefits
@@ -559,10 +559,10 @@ The payment stream system supports flexible free trial expiration through the `P
 
 **Example scenario:**
 - Day 0: Recipient proposes payment stream with `RelativeExpiration (days 30)`
-- Day 7: Subscriber accepts → trial ends at Day 37 (full 30-day trial preserved)
+- Day 7: Payer accepts → trial ends at Day 37 (full 30-day trial preserved)
 - vs. `AbsoluteExpiration (now + 30 days)` → trial would end at Day 30 (only 23 days remain)
 
-This ensures subscribers always receive the full trial period, improving fairness and user experience.
+This ensures payers always receive the full trial period, improving fairness and user experience.
 
 ### Metadata Field: RewardShare References
 
