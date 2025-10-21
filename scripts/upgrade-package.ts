@@ -226,7 +226,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   // Step 3: Search and replace version strings
   console.log('Updating references across the repository...\n');
 
-  // Replace full version strings (e.g., "CantonPayments-0.2.3" → "CantonPayments-0.0.7")
+  // Replace full version strings (e.g., "CantonPayments-0.2.3" → "CantonPayments-0.0.8")
   const oldFullVersionString = `${info.currentFolder}-${info.currentFullVersion}`;
   const newFullVersionString = `${info.newFolder}-${info.newFullVersion}`;
   console.log(`Replacing: ${oldFullVersionString} → ${newFullVersionString}`);
