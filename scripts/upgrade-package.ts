@@ -2,10 +2,10 @@
 /**
  * Script to upgrade DAML package versions.
  * Supports both major and minor version upgrades.
- * 
+ *
  * Usage:
  *   npm run upgrade-package -- --package <name> --type <major|minor>
- *   
+ *
  * Example:
  *   npm run upgrade-package -- --package Subscriptions --type major
  *   npm run upgrade-package -- --package Subscriptions --type minor
@@ -66,12 +66,16 @@ function parseArgs(): UpgradeOptions {
  */
 function findPackageFolder(packageName: string): string {
   const entries = fs.readdirSync(ROOT_DIR, { withFileTypes: true });
-  
+
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "CantonPayments", "OpenCapTable-v25", etc.
+      // Match patterns like "OpenCapTable-v25", "Subscriptions-v05", etc.
       const match = entry.name.match(new RegExp(`^${packageName}-(v\\d+)$`, 'i'));
       if (match) {
+        return entry.name;
+      }
+      // Also match exact name without version suffix (e.g., "CantonPayments")
+      if (entry.name === packageName) {
         return entry.name;
       }
     }
@@ -87,7 +91,7 @@ function readDamlYaml(folderPath: string): { name: string; version: string } {
   const yamlPath = path.join(ROOT_DIR, folderPath, 'daml.yaml');
   const content = fs.readFileSync(yamlPath, 'utf8');
   const parsed = yaml.parse(content);
-  
+
   return {
     name: parsed.name,
     version: parsed.version,
@@ -100,9 +104,31 @@ function readDamlYaml(folderPath: string): { name: string; version: string } {
 function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): PackageInfo {
   const currentFolder = findPackageFolder(packageName);
   const match = currentFolder.match(/^(.+)-(v(\d+))$/);
-  
-  if (!match) {
-    throw new Error(`Invalid package folder format: ${currentFolder}`);
+
+  // Check if package has version suffix
+  const hasVersionSuffix = match !== null;
+
+  if (!hasVersionSuffix) {
+    // Package doesn't have version suffix (e.g., "CantonPayments")
+    if (upgradeType === 'major') {
+      throw new Error(`Package ${currentFolder} does not have a version suffix and does not support major upgrades. Only minor upgrades are supported.`);
+    }
+
+    const { version: currentFullVersion } = readDamlYaml(currentFolder);
+
+    // Minor upgrade - increment patch version
+    const versionParts = currentFullVersion.split('.');
+    if (versionParts.length !== 3) {
+      throw new Error(`Invalid version format: ${currentFullVersion}`);
+    }
+    versionParts[2] = (parseInt(versionParts[2], 10) + 1).toString();
+
+    return {
+      currentFolder,
+      currentMajorVersion: '', // No major version for packages without suffix
+      currentFullVersion,
+      newFullVersion: versionParts.join('.'),
+    };
   }
 
   const baseName = match[1];
@@ -143,12 +169,12 @@ function updateDamlYaml(folderPath: string, newVersion: string, newName?: string
   const yamlPath = path.join(ROOT_DIR, folderPath, 'daml.yaml');
   const content = fs.readFileSync(yamlPath, 'utf8');
   const parsed = yaml.parse(content);
-  
+
   parsed.version = newVersion;
   if (newName) {
     parsed.name = newName;
   }
-  
+
   fs.writeFileSync(yamlPath, yaml.stringify(parsed), 'utf8');
   console.log(`✓ Updated ${yamlPath}`);
 }
@@ -210,7 +236,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   // Step 1: Rename folder
   const oldPath = path.join(ROOT_DIR, info.currentFolder);
   const newPath = path.join(ROOT_DIR, info.newFolder!);
-  
+
   if (fs.existsSync(newPath)) {
     throw new Error(`Target folder already exists: ${info.newFolder}`);
   }
@@ -226,7 +252,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   // Step 3: Search and replace version strings
   console.log('Updating references across the repository...\n');
 
-  // Replace full version strings (e.g., "CantonPayments-0.2.3" → "CantonPayments-0.0.9")
+  // Replace full version strings (e.g., "CantonPayments-0.2.3" → "CantonPayments-0.0.11")
   const oldFullVersionString = `${info.currentFolder}-${info.currentFullVersion}`;
   const newFullVersionString = `${info.newFolder}-${info.newFullVersion}`;
   console.log(`Replacing: ${oldFullVersionString} → ${newFullVersionString}`);
@@ -303,4 +329,3 @@ function main(): void {
 }
 
 main();
-

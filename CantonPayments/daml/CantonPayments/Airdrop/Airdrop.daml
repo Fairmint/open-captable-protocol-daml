@@ -34,8 +34,8 @@ template Airdrop
   where
     signatory config.sender :: joinedParties
     observer observers
-    
-    ensure 
+
+    ensure
       all (\o -> o /= config.sender) observers &&
       all (`notElem` joinedParties) observers
 
@@ -60,7 +60,7 @@ template Airdrop
       do
         let allObservers = dedup (sort (observers ++ newObservers))
         assertMsg "No new observers added" (length allObservers > length observers)
-        
+
         create this with observers = allObservers
         pure ()
 
@@ -70,11 +70,11 @@ template Airdrop
       controller actor
       do
         assertMsg "Party has already joined" (notElem actor joinedParties)
-        
+
         let newJoinedParties = dedup (sort (actor :: joinedParties))
         let newObservers = filter (/= actor) observers
-        
-        create this with 
+
+        create this with
           joinedParties = newJoinedParties
           observers = newObservers
         pure ()
@@ -85,28 +85,34 @@ template Airdrop
         initialAmuletInputs : [ContractId Amulet.Amulet]
         openMiningRoundCid : ContractId OpenMiningRound
         amountPerTransfer : Decimal
+        amuletRules : Optional (ContractId AmuletRules)
       controller config.sender
       do
         assertMsg "Must provide at least one transfer spec" (not (null transferSpecs))
         assertMsg "Amount per transfer must be positive" (amountPerTransfer > 0.0)
         assertMsg "All numberOfTransfers must be positive" (all (\spec -> spec.numberOfTransfers > 0) transferSpecs)
-        assertMsg "Reward beneficiaries should not include sender" 
+        assertMsg "Reward beneficiaries should not include sender"
           (all (\spec -> all (\b -> b.beneficiary /= config.sender) spec.appRewardBeneficiaries) transferSpecs)
-        assertMsg "Total reward weight must be <= 1.0 for each spec" 
+        assertMsg "Total reward weight must be <= 1.0 for each spec"
           (all (\spec -> sum (map (.weight) spec.appRewardBeneficiaries) <= 1.0) transferSpecs)
-        
+
+        -- Use provided amuletRules if available, otherwise use config.amuletRulesCid
+        let amuletRulesCid = case amuletRules of
+              Some cid -> cid
+              None -> config.amuletRulesCid
+
         -- Validate and augment beneficiaries: add sender with remaining weight
         let augmentBeneficiaries : [AppRewardBeneficiary] -> [AppRewardBeneficiary]
-            augmentBeneficiaries beneficiaries = 
+            augmentBeneficiaries beneficiaries =
               let totalProvidedWeight = sum (map (.weight) beneficiaries)
                   senderWeight = 1.0 - totalProvidedWeight
               in (AppRewardBeneficiary with beneficiary = config.sender; weight = senderWeight) :: beneficiaries
-        
+
         -- Helper to execute a single transfer
         let executeTransfer : [ContractId Amulet.Amulet] -> Party -> [AppRewardBeneficiary] -> Update (ContractId Amulet.Amulet)
             executeTransfer amuletInputs recipient beneficiaries = do
               let allBeneficiaries = augmentBeneficiaries beneficiaries
-              transferResult <- exercise config.amuletRulesCid AmuletRules_Transfer with
+              transferResult <- exercise amuletRulesCid AmuletRules_Transfer with
                 transfer = Transfer with
                   sender = config.sender
                   provider = config.sender
@@ -123,25 +129,25 @@ template Airdrop
                   issuingMiningRounds = Map.empty
                   validatorRights = Map.empty
                 expectedDso = Some config.dso
-              
+
               case transferResult.senderChangeAmulet of
                 Some changeAmulet -> pure changeAmulet
                 None -> abort "Expected change amulet from transfer"
-        
+
         -- Process all specs, chaining the amulet inputs
         let processSpec : [ContractId Amulet.Amulet] -> RecipientTransferSpec -> Update [ContractId Amulet.Amulet]
             processSpec currentInputs spec = do
               -- For each spec, execute numberOfTransfers transfers in sequence
               -- First transfer uses currentInputs (all initial amulets on first spec, then single change amulet)
               -- Each subsequent transfer uses only the change amulet from the previous transfer
-              foldlA 
+              foldlA
                 (\inputs _ -> do
                   changeAmulet <- executeTransfer inputs spec.recipient spec.appRewardBeneficiaries
                   pure [changeAmulet]  -- Wrap change as array for next iteration
                 )
                 currentInputs  -- Initial value: all amulets first time, then [changeAmulet] after
                 [1..spec.numberOfTransfers]  -- Execute this many transfers for this recipient
-        
+
         -- Chain all recipient specs together: output of spec N becomes input of spec N+1
         foldlA processSpec initialAmuletInputs transferSpecs
         pure ()
