@@ -4,6 +4,8 @@ import CantonPayments.Airdrop.PersonalAirdrop
 import qualified Splice.Amulet as Amulet
 import Splice.AmuletRules
 import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
+import Splice.Round
+import DA.Action (foldlA)
 
 -- | Factory contract that allows recipients to join and create their own PersonalAirdrop contracts
 template AirdropFactory
@@ -27,3 +29,51 @@ template AirdropFactory
 
         create PersonalAirdrop with
           ..
+
+    -- | Execute transfers on multiple PersonalAirdrop contracts, chaining amulets
+    -- The output amulet from one transfer becomes the input for the next
+    nonconsuming choice Factory_ExecuteBatchTransfers : TransferResult
+      with
+        personalAirdropCids : [ContractId PersonalAirdrop]
+        amuletInputs : [ContractId Amulet.Amulet]
+        openMiningRoundCid : ContractId OpenMiningRound
+        amount : Decimal
+        numberOfTransfers : Int
+      controller sender
+      do
+        assertMsg "Must provide at least one PersonalAirdrop contract" (not $ null personalAirdropCids)
+        assertMsg "Must provide at least one amulet input" (not $ null amuletInputs)
+        assertMsg "Amount must be positive" (amount > 0.0)
+        assertMsg "Number of transfers must be positive" (numberOfTransfers > 0)
+
+        -- Chain transfers: output of one becomes input for the next
+        -- Helper to process one contract and return (changeAmulet, transferResult)
+        let processContract : [ContractId Amulet.Amulet] -> ContractId PersonalAirdrop -> Update ([ContractId Amulet.Amulet], TransferResult)
+            processContract currentInputs personalAirdropCid = do
+              transferResult <- exercise personalAirdropCid PersonalAirdrop_ExecuteTransfer with
+                amuletInputs = currentInputs
+                openMiningRoundCid
+                amount
+                numberOfTransfers
+              case transferResult.senderChangeAmulet of
+                Some changeAmulet -> pure ([changeAmulet], transferResult)
+                None -> abort "Expected change amulet from transfer"
+
+        -- Process first contract to get initial result
+        case personalAirdropCids of
+          [] -> abort "Empty personalAirdropCids list"
+          firstCid :: restCids -> do
+            -- Process first contract
+            (nextInputs, firstResult) <- processContract amuletInputs firstCid
+
+            -- Process remaining contracts, chaining amulets
+            finalResult <- foldlA
+              (\acc personalAirdropCid -> do
+                let (currentInputs, _) = acc
+                processContract currentInputs personalAirdropCid
+              )
+              (nextInputs, firstResult)
+              restCids
+
+            case finalResult of
+              (_, result) -> pure result
