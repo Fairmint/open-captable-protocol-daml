@@ -1,0 +1,130 @@
+module CantonPayments.Airdrop.PersonalAirdrop where
+
+import qualified Splice.Amulet as Amulet
+import Splice.AmuletRules
+import Splice.Round
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
+import DA.Foldable (forA_)
+import DA.Action (foldlA)
+import qualified DA.Map as Map
+
+-- | Personal airdrop contract for a single recipient
+-- Both sender and recipient are signatories, enabling featured app rewards
+template PersonalAirdrop
+  with
+    dso : Party
+    sender : Party
+    provider : Party  -- Featured app provider party
+    featuredAppRight : ContractId Amulet.FeaturedAppRight
+    amuletRulesCid : ContractId AmuletRules
+    appRewardBeneficiaries : [AppRewardBeneficiary]
+    recipient : Party
+  where
+    signatory sender, recipient
+
+    ensure
+      sender /= recipient
+      && sum (map (.weight) appRewardBeneficiaries) == 1.0
+
+    -- | Execute multiple transfers from sender to recipient
+    choice PersonalAirdrop_ExecuteTransfer : TransferResult
+      with
+        amuletInputs : [ContractId Amulet.Amulet]
+        openMiningRoundCid : ContractId OpenMiningRound
+        amount : Decimal
+        numberOfTransfers : Int
+      controller sender
+      do
+        assertMsg "Amount must be positive" (amount > 0.0)
+        assertMsg "Must provide at least one amulet input" (not $ null amuletInputs)
+        assertMsg "Number of transfers must be positive" (numberOfTransfers > 0)
+
+        -- Helper to execute a single transfer
+        let executeTransfer : [ContractId Amulet.Amulet] -> Update (ContractId Amulet.Amulet)
+            executeTransfer inputs = do
+              transferResult <- exercise amuletRulesCid AmuletRules_Transfer with
+                transfer = Transfer with
+                  sender
+                  provider
+                  inputs = map InputAmulet inputs
+                  outputs =
+                    [ TransferOutput with
+                        receiver = recipient
+                        receiverFeeRatio = 0.0
+                        amount
+                        lock = None
+                    ]
+                  beneficiaries = Some appRewardBeneficiaries
+                context = TransferContext with
+                  openMiningRound = openMiningRoundCid
+                  featuredAppRight = Some featuredAppRight
+                  issuingMiningRounds = Map.empty
+                  validatorRights = Map.empty
+                expectedDso = Some dso
+
+              case transferResult.senderChangeAmulet of
+                Some changeAmulet -> pure changeAmulet
+                None -> abort "Expected change amulet from transfer"
+
+        -- Execute transfers in sequence, chaining the change amulet
+        finalResult <- foldlA
+          (\currentInputs _ -> do
+            changeAmulet <- executeTransfer currentInputs
+            pure [changeAmulet]  -- Use change as input for next transfer
+          )
+          amuletInputs  -- Initial inputs
+          [1..numberOfTransfers]  -- Execute this many times
+
+        -- Return the final transfer result (we need to execute one more time to get the full result)
+        -- Actually, we should return the last result, so let's modify the approach
+        let executeTransferWithResult : [ContractId Amulet.Amulet] -> Update TransferResult
+            executeTransferWithResult inputs = do
+              exercise amuletRulesCid AmuletRules_Transfer with
+                transfer = Transfer with
+                  sender
+                  provider
+                  inputs = map InputAmulet inputs
+                  outputs =
+                    [ TransferOutput with
+                        receiver = recipient
+                        receiverFeeRatio = 0.0
+                        amount
+                        lock = None
+                    ]
+                  beneficiaries = Some appRewardBeneficiaries
+                context = TransferContext with
+                  openMiningRound = openMiningRoundCid
+                  featuredAppRight = Some featuredAppRight
+                  issuingMiningRounds = Map.empty
+                  validatorRights = Map.empty
+                expectedDso = Some dso
+
+        -- Execute all transfers except the last, getting change amulets
+        finalInputs <- if numberOfTransfers > 1
+          then foldlA
+            (\currentInputs _ -> do
+              changeAmulet <- executeTransfer currentInputs
+              pure [changeAmulet]
+            )
+            amuletInputs
+            [1..(numberOfTransfers - 1)]
+          else pure amuletInputs
+
+        -- Execute final transfer and return its result
+        executeTransferWithResult finalInputs
+
+    -- | Archive the personal airdrop (either party can archive)
+    choice PersonalAirdrop_Archive : ()
+      with
+        actor : Party
+      controller actor
+      do
+        assertMsg "Only sender or recipient can archive"
+          (actor == sender || actor == recipient)
+        return ()
+
+-- | Helper function to validate personal airdrop parameters
+validatePersonalAirdrop : PersonalAirdrop -> Bool
+validatePersonalAirdrop airdrop =
+  airdrop.sender /= airdrop.recipient
+  && sum (map (.weight) airdrop.appRewardBeneficiaries) == 1.0
