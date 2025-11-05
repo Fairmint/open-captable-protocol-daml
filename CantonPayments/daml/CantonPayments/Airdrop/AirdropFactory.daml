@@ -5,7 +5,10 @@ import qualified Splice.Amulet as Amulet
 import Splice.AmuletRules
 import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import Splice.Round
+import Splice.Expiry (TimeLock(..))
+import Fairmint.Shared.Splice.SpliceAmuletHelpers (actualAmount)
 import DA.Action (foldlA)
+import qualified DA.Map as Map
 
 -- | Factory contract that allows recipients to join and create their own PersonalAirdrop contracts
 template AirdropFactory
@@ -32,6 +35,7 @@ template AirdropFactory
 
     -- | Execute transfers on multiple PersonalAirdrop contracts, chaining amulets
     -- The output amulet from one transfer becomes the input for the next
+    -- Supports optional LockedAmulet: if provided, unlocks it, uses it, and re-locks with preserved details
     nonconsuming choice Factory_ExecuteBatchTransfers : TransferResult
       with
         personalAirdropCids : [ContractId PersonalAirdrop]
@@ -39,12 +43,31 @@ template AirdropFactory
         openMiningRoundCid : ContractId OpenMiningRound
         amount : Decimal
         numberOfTransfers : Int
+        lockedAmuletCid : Optional (ContractId Amulet.LockedAmulet)
       controller sender
       do
         assertMsg "Must provide at least one PersonalAirdrop contract" (not $ null personalAirdropCids)
-        assertMsg "Must provide at least one amulet input" (not $ null amuletInputs)
         assertMsg "Amount must be positive" (amount > 0.0)
         assertMsg "Number of transfers must be positive" (numberOfTransfers > 0)
+
+        -- Validation: if LockedAmulet provided, amuletInputs must be empty (safety mechanism)
+        case lockedAmuletCid of
+          Some _ -> assertMsg "When using LockedAmulet, amuletInputs must be empty" (null amuletInputs)
+          None -> assertMsg "Must provide at least one amulet input when not using LockedAmulet" (not $ null amuletInputs)
+
+        -- Get initial amulet inputs and preserve lock details if using LockedAmulet
+        (initialInputs, lockDetails) <- case lockedAmuletCid of
+          Some lockedCid -> do
+            -- Fetch lock details before unlocking
+            lockedAmulet <- fetch lockedCid
+            let lockDetails = Some (lockedAmulet.lock.holders, lockedAmulet.lock.expiresAt, lockedAmulet.lock.optContext)
+
+            -- Unlock the LockedAmulet
+            unlockResult <- exercise lockedCid Amulet.LockedAmulet_Unlock with
+              openRoundCid = openMiningRoundCid
+
+            pure ([unlockResult.amuletSum.amulet], lockDetails)
+          None -> pure (amuletInputs, None)
 
         -- Chain transfers: output of one becomes input for the next
         -- Helper to process one contract and return (changeAmulet, transferResult)
@@ -59,15 +82,15 @@ template AirdropFactory
                 Some changeAmulet -> pure ([changeAmulet], transferResult)
                 None -> abort "Expected change amulet from transfer"
 
-        -- Process first contract to get initial result
+        -- Process all contracts with chaining
         case personalAirdropCids of
           [] -> abort "Empty personalAirdropCids list"
           firstCid :: restCids -> do
             -- Process first contract
-            (nextInputs, firstResult) <- processContract amuletInputs firstCid
+            (nextInputs, firstResult) <- processContract initialInputs firstCid
 
             -- Process remaining contracts, chaining amulets
-            finalResult <- foldlA
+            result <- foldlA
               (\acc personalAirdropCid -> do
                 let (currentInputs, _) = acc
                 processContract currentInputs personalAirdropCid
@@ -75,5 +98,44 @@ template AirdropFactory
               (nextInputs, firstResult)
               restCids
 
-            case finalResult of
-              (_, result) -> pure result
+            case result of
+              (finalInputs, finalTransferResult) -> do
+                -- If we used a LockedAmulet, re-lock the final change amulet
+                case lockDetails of
+                  Some (holders, expiresAt, optContext) -> do
+                    case finalInputs of
+                      [changeAmulet] -> do
+                        -- Fetch open mining round to calculate actual balance
+                        openMiningRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
+                        changeAmuletContract <- fetch changeAmulet
+                        let currentBalance = actualAmount openMiningRound.round changeAmuletContract.amount
+
+                        -- Create lock with preserved details
+                        let preservedLock = TimeLock with
+                              holders
+                              expiresAt
+                              optContext
+
+                        -- Re-lock the change amulet
+                        relockResult <- exercise amuletRulesCid AmuletRules_Transfer with
+                          transfer = Transfer with
+                            sender
+                            provider
+                            inputs = [InputAmulet changeAmulet]
+                            outputs = [TransferOutput with
+                              receiver = sender
+                              receiverFeeRatio = 1.0
+                              amount = currentBalance
+                              lock = Some preservedLock]
+                            beneficiaries = Some appRewardBeneficiaries
+                          context = TransferContext with
+                            openMiningRound = openMiningRoundCid
+                            featuredAppRight = Some featuredAppRight
+                            issuingMiningRounds = Map.empty
+                            validatorRights = Map.empty
+                          expectedDso = Some dso
+
+                        -- Return result with no change amulet (it's now locked)
+                        pure finalTransferResult with senderChangeAmulet = None
+                      _ -> abort "Expected exactly one change amulet for re-locking"
+                  None -> pure finalTransferResult
