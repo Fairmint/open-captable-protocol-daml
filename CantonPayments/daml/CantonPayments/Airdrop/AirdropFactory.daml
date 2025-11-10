@@ -7,7 +7,9 @@ import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import Splice.Round
 import Splice.Expiry (TimeLock(..))
 import Fairmint.Shared.Splice.SpliceAmuletHelpers (actualAmount)
-import DA.Action (foldlA)
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
+import DA.Action (foldlA, void)
+import qualified DA.List as List
 import qualified DA.Map as Map
 
 -- | Factory contract that allows recipients to join and create their own PersonalAirdrop contracts
@@ -44,6 +46,8 @@ template AirdropFactory
         amount : Decimal
         numberOfTransfers : Int
         lockedAmuletCid : Optional (ContractId Amulet.LockedAmulet)
+        optMergeAmuletInputs : Optional [[ContractId Amulet.Amulet]]
+        optCreateFeaturedMarker : Optional Bool
       controller sender
       do
         assertMsg "Must provide at least one PersonalAirdrop contract" (not $ null personalAirdropCids)
@@ -54,6 +58,43 @@ template AirdropFactory
         case lockedAmuletCid of
           Some _ -> assertMsg "When using LockedAmulet, amuletInputs must be empty" (null amuletInputs)
           None -> assertMsg "Must provide at least one amulet input when not using LockedAmulet" (not $ null amuletInputs)
+
+        let expectedContracts = length personalAirdropCids
+
+        mergeInputsPerAirdrop <- case optMergeAmuletInputs of
+          Some groups -> do
+            assertMsg "Mismatch between merge inputs and PersonalAirdrop contracts" (length groups == expectedContracts)
+            pure groups
+          None -> pure (List.replicate expectedContracts [])
+
+        let hasMergeInputs = any (not . null) mergeInputsPerAirdrop
+        if hasMergeInputs
+          then assertMsg "UTXO merge inputs require numberOfTransfers == 1" (numberOfTransfers == 1)
+          else pure ()
+        let needsOpenMiningRound = hasMergeInputs || case lockedAmuletCid of
+              Some _ -> True
+              None -> False
+
+        openMiningRoundOpt <- if needsOpenMiningRound
+          then Some <$> exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
+          else pure None
+
+        mergeAmountsPerAirdrop <- forA mergeInputsPerAirdrop $ \extraInputs -> case extraInputs of
+          [] -> pure 0.0
+          _ -> do
+            openMiningRound <- case openMiningRoundOpt of
+              Some omr -> pure omr
+              None -> abort "Merge inputs require an open mining round"
+            amounts <- forA extraInputs $ \amuletCid -> do
+              amulet <- fetch amuletCid
+              pure (actualAmount openMiningRound.round amulet.amount)
+            pure (sum amounts)
+
+        let contractsWithMergeData =
+              zipWith
+                (\cid (extraInputs, extraAmount) -> (cid, extraInputs, extraAmount))
+                personalAirdropCids
+                (zip mergeInputsPerAirdrop mergeAmountsPerAirdrop)
 
         -- Get initial amulet inputs and preserve lock details if using LockedAmulet
         (initialInputs, lockDetails) <- case lockedAmuletCid of
@@ -71,32 +112,35 @@ template AirdropFactory
 
         -- Chain transfers: output of one becomes input for the next
         -- Helper to process one contract and return (changeAmulet, transferResult)
-        let processContract : [ContractId Amulet.Amulet] -> ContractId PersonalAirdrop -> Update ([ContractId Amulet.Amulet], TransferResult)
-            processContract currentInputs personalAirdropCid = do
+        let processContract : [ContractId Amulet.Amulet] -> (ContractId PersonalAirdrop, [ContractId Amulet.Amulet], Decimal) -> Update ([ContractId Amulet.Amulet], TransferResult)
+            processContract currentInputs (personalAirdropCid, extraInputs, mergeAmount) = do
+              let allInputs = currentInputs ++ extraInputs
+              assertMsg "Must provide at least one amulet input" (not $ null allInputs)
+              let transferAmount = amount + mergeAmount
               transferResult <- exercise personalAirdropCid PersonalAirdrop_ExecuteTransfer with
-                amuletInputs = currentInputs
+                amuletInputs = allInputs
                 openMiningRoundCid
-                amount
+                amount = transferAmount
                 numberOfTransfers
               case transferResult.senderChangeAmulet of
                 Some changeAmulet -> pure ([changeAmulet], transferResult)
                 None -> abort "Expected change amulet from transfer"
 
         -- Process all contracts with chaining
-        case personalAirdropCids of
+        case contractsWithMergeData of
           [] -> abort "Empty personalAirdropCids list"
-          firstCid :: restCids -> do
+          firstContract :: restContracts -> do
             -- Process first contract
-            (nextInputs, firstResult) <- processContract initialInputs firstCid
+            (nextInputs, firstResult) <- processContract initialInputs firstContract
 
             -- Process remaining contracts, chaining amulets
             result <- foldlA
-              (\acc personalAirdropCid -> do
+              (\acc contractData -> do
                 let (currentInputs, _) = acc
-                processContract currentInputs personalAirdropCid
+                processContract currentInputs contractData
               )
               (nextInputs, firstResult)
-              restCids
+              restContracts
 
             case result of
               (finalInputs, finalTransferResult) -> do
@@ -106,7 +150,9 @@ template AirdropFactory
                     case finalInputs of
                       [changeAmulet] -> do
                         -- Fetch open mining round to calculate actual balance
-                        openMiningRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
+                        openMiningRound <- case openMiningRoundOpt of
+                          Some omr -> pure omr
+                          None -> exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
                         changeAmuletContract <- fetch changeAmulet
                         let currentBalance = actualAmount openMiningRound.round changeAmuletContract.amount
 
@@ -136,6 +182,15 @@ template AirdropFactory
                           expectedDso = Some dso
 
                         -- Return result with no change amulet (it's now locked)
-                        pure finalTransferResult with senderChangeAmulet = None
+                        let relockedResult = finalTransferResult with senderChangeAmulet = None
+                        case optCreateFeaturedMarker of
+                          Some True -> do
+                            void $ createActivityMarker appRewardBeneficiaries (toInterfaceContractId featuredAppRight)
+                            pure relockedResult
+                          _ -> pure relockedResult
                       _ -> abort "Expected exactly one change amulet for re-locking"
-                  None -> pure finalTransferResult
+                  None -> do
+                    case optCreateFeaturedMarker of
+                      Some True -> void $ createActivityMarker appRewardBeneficiaries (toInterfaceContractId featuredAppRight)
+                      _ -> pure ()
+                    pure finalTransferResult

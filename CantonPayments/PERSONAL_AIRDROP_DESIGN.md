@@ -134,7 +134,7 @@ const result = await exerciseChoice(
 1. **Generate TypeScript bindings** for the new contracts
 2. **Create factory creation script** (`createAirdropFactory.ts`)
 3. **Create join script** for recipients (`joinAirdrop.ts`)
-4. **Create execution script** (`executePersonalAirdrop.ts`)
+4. **Create execution script** (`payAllPersonalAirdrops.ts` manual mode with `--recipients`)
 5. **Add to ocp-canton-sdk** for easy access
 6. **Test on devnet** with a small group
 7. **Deploy to mainnet** after validation
@@ -156,8 +156,9 @@ npm run airdrop:join -- \
 # Step 3: Sender executes transfers
 npm run airdrop:execute-personal -- \
   --network mainnet \
-  --recipients "recipient1:10,recipient2:5" \
-  --amount-per-transfer 1.0
+  --amount-per-transfer 1.0 \
+  --batch-size 200 \
+  --max-recipients-per-round 150
 ```
 
 ## Notes
@@ -167,8 +168,3 @@ npm run airdrop:execute-personal -- \
 - Featured app rewards work seamlessly with dual-signatory design
 - No PreApproval contract complexity
 - Better for compliance and auditability (explicit opt-in)
-
-
-
-
-
