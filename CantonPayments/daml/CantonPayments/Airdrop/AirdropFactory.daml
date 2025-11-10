@@ -59,42 +59,15 @@ template AirdropFactory
           Some _ -> assertMsg "When using LockedAmulet, amuletInputs must be empty" (null amuletInputs)
           None -> assertMsg "Must provide at least one amulet input when not using LockedAmulet" (not $ null amuletInputs)
 
+        -- Prepare merge inputs per airdrop
         let expectedContracts = length personalAirdropCids
-
         mergeInputsPerAirdrop <- case optMergeAmuletInputs of
           Some groups -> do
             assertMsg "Mismatch between merge inputs and PersonalAirdrop contracts" (length groups == expectedContracts)
-            pure groups
-          None -> pure (List.replicate expectedContracts [])
+            pure (map Some groups)
+          None -> pure (List.replicate expectedContracts None)
 
-        let hasMergeInputs = any (not . null) mergeInputsPerAirdrop
-        if hasMergeInputs
-          then assertMsg "UTXO merge inputs require numberOfTransfers == 1" (numberOfTransfers == 1)
-          else pure ()
-        let needsOpenMiningRound = hasMergeInputs || case lockedAmuletCid of
-              Some _ -> True
-              None -> False
-
-        openMiningRoundOpt <- if needsOpenMiningRound
-          then Some <$> exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
-          else pure None
-
-        mergeAmountsPerAirdrop <- forA mergeInputsPerAirdrop $ \extraInputs -> case extraInputs of
-          [] -> pure 0.0
-          _ -> do
-            openMiningRound <- case openMiningRoundOpt of
-              Some omr -> pure omr
-              None -> abort "Merge inputs require an open mining round"
-            amounts <- forA extraInputs $ \amuletCid -> do
-              amulet <- fetch amuletCid
-              pure (actualAmount openMiningRound.round amulet.amount)
-            pure (sum amounts)
-
-        let contractsWithMergeData =
-              zipWith
-                (\cid (extraInputs, extraAmount) -> (cid, extraInputs, extraAmount))
-                personalAirdropCids
-                (zip mergeInputsPerAirdrop mergeAmountsPerAirdrop)
+        let contractsWithMergeInputs = zip personalAirdropCids mergeInputsPerAirdrop
 
         -- Get initial amulet inputs and preserve lock details if using LockedAmulet
         (initialInputs, lockDetails) <- case lockedAmuletCid of
@@ -112,22 +85,20 @@ template AirdropFactory
 
         -- Chain transfers: output of one becomes input for the next
         -- Helper to process one contract and return (changeAmulet, transferResult)
-        let processContract : [ContractId Amulet.Amulet] -> (ContractId PersonalAirdrop, [ContractId Amulet.Amulet], Decimal) -> Update ([ContractId Amulet.Amulet], TransferResult)
-            processContract currentInputs (personalAirdropCid, extraInputs, mergeAmount) = do
-              let allInputs = currentInputs ++ extraInputs
-              assertMsg "Must provide at least one amulet input" (not $ null allInputs)
-              let transferAmount = amount + mergeAmount
+        let processContract : [ContractId Amulet.Amulet] -> (ContractId PersonalAirdrop, Optional [ContractId Amulet.Amulet]) -> Update ([ContractId Amulet.Amulet], TransferResult)
+            processContract currentInputs (personalAirdropCid, optMergeInputs) = do
               transferResult <- exercise personalAirdropCid PersonalAirdrop_ExecuteTransfer with
-                amuletInputs = allInputs
+                amuletInputs = currentInputs
                 openMiningRoundCid
-                amount = transferAmount
+                amount
                 numberOfTransfers
+                optMergeAmuletInputs = optMergeInputs
               case transferResult.senderChangeAmulet of
                 Some changeAmulet -> pure ([changeAmulet], transferResult)
                 None -> abort "Expected change amulet from transfer"
 
         -- Process all contracts with chaining
-        case contractsWithMergeData of
+        case contractsWithMergeInputs of
           [] -> abort "Empty personalAirdropCids list"
           firstContract :: restContracts -> do
             -- Process first contract
@@ -150,9 +121,7 @@ template AirdropFactory
                     case finalInputs of
                       [changeAmulet] -> do
                         -- Fetch open mining round to calculate actual balance
-                        openMiningRound <- case openMiningRoundOpt of
-                          Some omr -> pure omr
-                          None -> exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
+                        openMiningRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = sender)
                         changeAmuletContract <- fetch changeAmulet
                         let currentBalance = actualAmount openMiningRound.round changeAmuletContract.amount
 
