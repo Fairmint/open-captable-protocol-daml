@@ -4,7 +4,7 @@ import path from 'path';
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTable-v25-0.0.1');
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTableReports-v01-0.0.2');
-const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'CantonPayments-0.0.21');
+const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'CantonPayments-0.0.22');
 const OCP_LIB = path.join(OCP_DIR, 'lib');
 const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
 const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
