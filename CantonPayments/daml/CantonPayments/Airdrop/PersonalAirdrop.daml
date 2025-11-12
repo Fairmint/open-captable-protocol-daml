@@ -6,7 +6,6 @@ import Splice.Round
 import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 import DA.Action (foldlA)
 import qualified DA.Map as Map
-import Fairmint.Shared.Splice.SpliceAmuletHelpers (actualAmount)
 
 -- | Personal airdrop contract for a single recipient
 -- Both sender and recipient are signatories, enabling featured app rewards
@@ -40,16 +39,13 @@ template PersonalAirdrop
         assertMsg "Must provide at least one amulet input" (not $ null amuletInputs)
         assertMsg "Number of transfers must be positive" (numberOfTransfers > 0)
 
-        -- Validate merge inputs if provided and calculate total merge amount
-        (mergeInputCids, mergeAmount) <- case optMergeAmuletInputs of
-          None -> pure ([], 0.0)
-          Some mergeInputs -> do
-            openMiningRound <- exercise openMiningRoundCid (OpenMiningRound_Fetch with p = recipient)
-            amounts <- forA mergeInputs $ \amuletCid -> do
-              amulet <- fetch amuletCid
-              assertMsg "Merge amulet must be owned by recipient" (amulet.owner == recipient)
-              pure (actualAmount openMiningRound.round amulet.amount)
-            pure (mergeInputs, sum amounts)
+        -- Get merge inputs if provided
+        -- Note: We don't validate or calculate merge amount here because fetching recipient's
+        -- amulets requires recipient's authority, which isn't available in this choice.
+        -- The AmuletRules contract will validate inputs during the merge.
+        let mergeInputCids = case optMergeAmuletInputs of
+              None -> []
+              Some inputs -> inputs
 
         let executeTransferWithResult : [ContractId Amulet.Amulet] -> Update TransferResult
             executeTransferWithResult inputs = do
@@ -73,26 +69,33 @@ template PersonalAirdrop
                   validatorRights = Map.empty
                 expectedDso = Some dso
 
-        -- Execute all transfers, collecting created amulets for merge
-        (_, lastResult, allRecipientAmulets) <- foldlA
-          (\(prevChangeAmulet, _, collectedAmulets) _ -> do
-            -- Use change amulet from previous transfer, or initial inputs for first transfer
-            let currentInputs = case prevChangeAmulet of
-                  None -> amuletInputs
-                  Some cid -> [cid]
-            result <- executeTransferWithResult currentInputs
-            -- Extract the created amulet for recipient
-            recipientAmulet <- case result.createdAmulets of
-              [TransferResultAmulet amuletCid] -> pure amuletCid
-              _ -> abort "Expected exactly one created amulet for recipient"
-            -- Extract change amulet for next iteration
-            changeAmulet <- case result.senderChangeAmulet of
-              Some cid -> pure cid
-              None -> abort "Expected change amulet from transfer"
-            pure (Some changeAmulet, result, collectedAmulets ++ [recipientAmulet])
-          )
-          (None, error "No transfers executed", [])
-          [1..numberOfTransfers]
+        -- Execute first transfer
+        firstResult <- executeTransferWithResult amuletInputs
+        firstRecipientAmulet <- case firstResult.createdAmulets of
+          [TransferResultAmulet amuletCid] -> pure amuletCid
+          _ -> abort "Expected exactly one created amulet for recipient"
+        firstChangeAmulet <- case firstResult.senderChangeAmulet of
+          Some cid -> pure cid
+          None -> abort "Expected change amulet from transfer"
+
+        -- Execute remaining transfers if any, collecting created amulets for merge
+        (_, lastResult, allRecipientAmulets) <- if numberOfTransfers > 1
+          then foldlA
+            (\(prevChangeAmulet, _, collectedAmulets) _ -> do
+              result <- executeTransferWithResult [prevChangeAmulet]
+              -- Extract the created amulet for recipient
+              recipientAmulet <- case result.createdAmulets of
+                [TransferResultAmulet amuletCid] -> pure amuletCid
+                _ -> abort "Expected exactly one created amulet for recipient"
+              -- Extract change amulet for next iteration
+              changeAmulet <- case result.senderChangeAmulet of
+                Some cid -> pure cid
+                None -> abort "Expected change amulet from transfer"
+              pure (changeAmulet, result, collectedAmulets ++ [recipientAmulet])
+            )
+            (firstChangeAmulet, firstResult, [firstRecipientAmulet])
+            [2..numberOfTransfers]
+          else pure (firstChangeAmulet, firstResult, [firstRecipientAmulet])
 
         -- If merge inputs provided, perform merge transfer
         if null mergeInputCids
@@ -100,21 +103,14 @@ template PersonalAirdrop
           else do
             -- Combine all recipient amulets with merge inputs for consolidation
             let allRecipientInputs = allRecipientAmulets ++ mergeInputCids
-            -- Calculate total amount: (airdrop amount * number of transfers) + merge amount
-            let totalMergeAmount = (amount * intToDecimal numberOfTransfers) + mergeAmount
-            -- Perform merge transfer (recipient to recipient, consolidating UTXOs)
+            -- Perform merge transfer (recipient to recipient, consolidating UTXOs). We rely on
+            -- the sender change amulet to contain the consolidated value so no output is required.
             mergeResult <- exercise amuletRulesCid AmuletRules_Transfer with
               transfer = Transfer with
                 sender = recipient
                 provider
                 inputs = map InputAmulet allRecipientInputs
-                outputs =
-                  [ TransferOutput with
-                      receiver = recipient
-                      receiverFeeRatio = 0.0
-                      amount = totalMergeAmount  -- Transfer total value back to recipient
-                      lock = None
-                  ]
+                outputs = []
                 beneficiaries = Some appRewardBeneficiaries
               context = TransferContext with
                 openMiningRound = openMiningRoundCid
@@ -122,8 +118,14 @@ template PersonalAirdrop
                 issuingMiningRounds = Map.empty
                 validatorRights = Map.empty
               expectedDso = Some dso
-            -- Return the merge result (which has the consolidated amulet)
-            pure mergeResult
+            case mergeResult.senderChangeAmulet of
+              Some consolidatedAmulet ->
+                -- Present the consolidated amulet as the created output for downstream consumers.
+                pure (mergeResult with
+                  createdAmulets = [TransferResultAmulet consolidatedAmulet]
+                  senderChangeAmulet = None
+                )
+              None -> abort "Expected consolidated change amulet from merge"
 
     -- | Archive the personal airdrop (either party can archive)
     choice PersonalAirdrop_Archive : ()
