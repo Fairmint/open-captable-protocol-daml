@@ -32,7 +32,7 @@ async function main() {
 
     const client = createLedgerJsonApiClient(network, provider);
 
-    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'CantonPayments', '.daml', 'dist', 'CantonPayments-0.0.22.dar') });
+    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'CantonPayments', '.daml', 'dist', 'CantonPayments-0.0.17.dar') });
 
     console.log(`✅ CantonPayments DAR file uploaded successfully to ${provider} on ${network}`);
   }
