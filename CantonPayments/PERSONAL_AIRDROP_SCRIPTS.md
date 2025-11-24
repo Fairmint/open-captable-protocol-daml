@@ -91,49 +91,48 @@ npm run airdrop:join-factory -- \
 
 ---
 
-### 3. Execute Personal Airdrop (`executePersonalAirdrop.ts`)
+### 3. Execute Personal Airdrop (`payAllPersonalAirdrops.ts`)
 
 **Purpose**: Execute transfers for multiple recipients using their `PersonalAirdrop` contracts.
 
-**Location**: `canton/scripts/src/scripts/app/airdrop/executePersonalAirdrop.ts`
+**Location**: `canton/scripts/src/scripts/app/airdrop/payAllPersonalAirdrops.ts`
 
 **Usage**:
 ```bash
-# Execute transfers for multiple recipients once
 npm run airdrop:execute-personal -- \
-  --recipients "party1::1220...:5,party2::1220...:3" \
-  --amount-per-transfer 0.5 \
   --network mainnet \
-  --provider intellect
-
-# Execute indefinitely every 10 minutes
-npm run airdrop:execute-personal -- \
-  --recipients "party1::1220...:1,party2::1220...:2" \
-  --amount-per-transfer 0.5 \
-  --network devnet \
   --provider intellect \
-  --execution-interval 600
+  --amount-per-transfer 0.5 \
+  --batch-size 200 \
+  --threads 2 \
+  --max-recipients-per-round 120 \
+  --merge-utxos \
+  --merge-utxo-per-recipient 3 \
+  --create-featured-marker
 ```
 
 **Options**:
 - `--network` (required): `mainnet` or `devnet`
 - `--provider` (required): `intellect` or `5n`
-- `--recipients` (required): Comma-separated `partyId:transferCount` pairs
-  - Each recipient will receive the specified number of transfers
 - `--amount-per-transfer` (required): Amount in CC per transfer
-- `--executions` (optional): Number of execution runs (default: unlimited)
-- `--execution-interval` (optional): Seconds between execution runs (default: 600)
+- `--batch-size` (optional, default 200): Number of PersonalAirdrop contracts per batch
+- `--threads` (optional, default 1): Number of parallel workers
+- `--max-recipients-per-round` (optional): Upper bound of PersonalAirdrop contracts processed each round; if omitted all eligible contracts are considered
+- `--merge-utxos` (optional): Enable merging of extra unlocked amulets (dust consolidation)
+- `--merge-utxo-per-recipient` (optional): Cap on the number of merged amulets assigned to a single recipient when merging is enabled
+- `--create-featured-marker` (optional): Emit a featured app activity marker alongside each batch execution
 
 **Output**: Transaction results with update IDs and success counts
 
 **Features**:
-- Automatically queries for `PersonalAirdrop` contracts by recipient
-- Fetches current mining round before each execution
-- Queries and uses top 100 largest amulets
-- Supports multiple transfers per recipient in a single transaction
+- Automatically discovers active `PersonalAirdrop` contracts and selects a randomized subset each round
+- Fetches the current mining round before every execution
+- Chooses the largest available amulets (plus optional dust merges) to fund the batch
+- Optional UTXO merging with per-recipient caps
+- Optional featured app marker creation when desired
 - Sends Slack notifications on success/failure
-- Can run indefinitely with interval
-- Graceful error handling per recipient
+- Runs indefinitely on a 10-minute cadence
+- Graceful error handling per recipient/batch
 
 ---
 
@@ -180,16 +179,19 @@ npm run airdrop:join-factory -- \
 
 ```bash
 npm run airdrop:execute-personal -- \
-  --recipients "recipient1::1220...:5,recipient2::1220...:3" \
   --amount-per-transfer 1.0 \
   --network devnet \
   --provider intellect \
-  --executions 1
+  --batch-size 200 \
+  --threads 2 \
+  --max-recipients-per-round 150 \
+  --merge-utxos \
+  --merge-utxo-per-recipient 2
 
 # Output:
-# ✅ Successful: 2/2 recipients
-# 📊 Total transfers: 8 (5 + 3)
-# 💰 Total amount: 8.00 CC
+# ✅ Successful: 145/145 recipients
+# 📊 Total transfers: 145
+# 💰 Total amount: 145.00 CC
 ```
 
 ---
@@ -284,7 +286,7 @@ DEVNET_5N_JWT_TOKEN=...
 {
   "airdrop:create-factory": "ts-node src/scripts/app/airdrop/createAirdropFactory.ts",
   "airdrop:join-factory": "ts-node src/scripts/app/airdrop/joinAirdropFactory.ts",
-  "airdrop:execute-personal": "ts-node src/scripts/app/airdrop/executePersonalAirdrop.ts"
+  "airdrop:execute-personal": "ts-node src/scripts/app/airdrop/payAllPersonalAirdrops.ts"
 }
 ```
 
@@ -308,7 +310,7 @@ DEVNET_5N_JWT_TOKEN=...
 - **TypeScript Scripts**:
   - `canton/scripts/src/scripts/app/airdrop/createAirdropFactory.ts`
   - `canton/scripts/src/scripts/app/airdrop/joinAirdropFactory.ts`
-  - `canton/scripts/src/scripts/app/airdrop/executePersonalAirdrop.ts`
+  - `canton/scripts/src/scripts/app/airdrop/payAllPersonalAirdrops.ts`
 
 - **Utilities**:
   - `canton/scripts/src/scripts/app/airdrop/airdropUtils.ts`

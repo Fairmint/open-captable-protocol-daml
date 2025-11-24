@@ -92,7 +92,7 @@ async function main() {
     ? featuredAppRight.featured_app_right
     : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
 
-  console.log(`✅ Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
+  console.log(`🔍 Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
 
   // Now create the OcpFactory with the featured_app_right field
   const ocpFactoryData: Fairmint.OpenCapTable.OcpFactory.OcpFactory = {
