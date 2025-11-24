@@ -73,7 +73,7 @@ async function main() {
     ? featuredAppRight.featured_app_right
     : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
 
-  console.log(`🔍 Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
+  console.log(`✅ Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
 
   const reportsFactoryData: any = {
     system_operator: intellectPartyId,
