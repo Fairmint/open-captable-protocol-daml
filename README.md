@@ -3,7 +3,7 @@
 ## AI context
 
 - **Start here**: `llms.txt`
-- **Agent config**: `CLAUDE.md`, `AGENTS.md`, `GEMINI.md`
+- **Docs folder**: `docs/README.md` (optional; keep minimal)
 
 This repository contains multiple DAML packages (e.g., `OpenCapTable-v25`, `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `Shared`, `CantonPayments`). This document defines coding guidelines that apply to all packages.
 
