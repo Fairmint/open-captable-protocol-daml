@@ -1,5 +1,10 @@
 ## Shared Coding Guidelines for OCP DAML Packages
 
+## AI context
+
+- **Start here**: `llms.txt`
+- **Docs folder**: `docs/README.md` (optional; keep minimal)
+
 This repository contains multiple DAML packages (e.g., `OpenCapTable-v25`, `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `Shared`, `CantonPayments`). This document defines coding guidelines that apply to all packages.
 
 For package-specific details about each implementation, see the README.md file in the respective package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v25/README.md`).
