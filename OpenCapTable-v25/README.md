@@ -8,7 +8,7 @@ For shared coding guidelines that apply to all OCP DAML packages, see `open-capt
 
 #### Source of truth: schema (@schema)
 
-**The single source of truth for all data structures is the JSON Schema under `Open-Cap-Format-OCF/schema/` (`@schema`).**
+**The single source of truth for all data structures is the JSON Schema under `libs/Open-Cap-Format-OCF/schema/` (`@schema`).**
 
 - **Strict adherence**: All models, types, events, and files must strictly match the schema definitions (required fields, `const` values, enums, oneOf/anyOf/allOf constraints, formats, and `additionalProperties` rules).
 - **No drift**: Do not introduce fields, values, or shapes that are not defined in the schema. If a need arises, propose a schema change first and only then update code.
@@ -24,7 +24,7 @@ For shared coding guidelines that apply to all OCP DAML packages, see `open-capt
     - `-- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/enums/ConversionTriggerType.schema.json`
   - Place the link immediately above each corresponding DAML type/enum/record definition.
   - Ensure links reference the canonical repository (`Open-Cap-Table-Coalition/Open-Cap-Format-OCF`) and not versioned site URLs.
-  - To find the correct schema quickly, grep the `@schema/` folder (i.e., `Open-Cap-Format-OCF/schema/`) for the type or object/type/enum name and copy its `$id` value.
+  - To find the correct schema quickly, grep the `@schema/` folder (i.e., `libs/Open-Cap-Format-OCF/schema/`) for the type or object/type/enum name and copy its `$id` value.
   - For each type/object definition, include comments in this order directly above the DAML definition:
     1) schema `title`
     2) schema `description`
@@ -38,7 +38,7 @@ For shared coding guidelines that apply to all OCP DAML packages, see `open-capt
     - When our code enforces a stronger constraint than the schema (e.g., non-empty arrays), note it explicitly in a comment (e.g., `-- minItems: 1`).
   - Follow `allOf` references to find inherited field comments:
     - Look at the `allOf` array in the object schema (e.g., WarrantIssuance) to identify referenced primitive/object schemas (e.g., Issuance).
-    - Open those referenced schemas locally under `Open-Cap-Format-OCF/schema/...` and copy the `title`/`description`/`$comment` for inherited fields (e.g., `board_approval_date`, `stockholder_approval_date`, `consideration_text`).
+    - Open those referenced schemas locally under `libs/Open-Cap-Format-OCF/schema/...` and copy the `title`/`description`/`$comment` for inherited fields (e.g., `board_approval_date`, `stockholder_approval_date`, `consideration_text`).
     - Use the referenced schema's comments where the field originates; avoid inventing summaries.
   - Keep comments simple and high-signal; avoid provenance annotations like "From primitives ...".
 
