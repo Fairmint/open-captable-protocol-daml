@@ -1,13 +1,11 @@
 # Docs
 
-This folder contains supplementary documentation for the Open Cap Table Protocol DAML implementation.
+## Contents
 
-## Documents
+- [OCF_IMPLEMENTATION_STATUS.md](./OCF_IMPLEMENTATION_STATUS.md) - Implementation coverage checklist (33% complete)
 
-- **[OCF_IMPLEMENTATION_STATUS.md](./OCF_IMPLEMENTATION_STATUS.md)** - Comprehensive checklist of OCF object types and their DAML implementation status. Use this to track remaining work and plan implementation priorities.
+## Related
 
-## Guidelines
-
-- Add any repository notes here as needed.
-- Keep `llms.txt` updated with the most important information for AI-assisted work.
-- Keep `OCF_IMPLEMENTATION_STATUS.md` updated as new OCF types are implemented.
+- Tasks: [../tasks/README.md](../tasks/README.md)
+- Architecture decisions: [canton/docs/developer/adr/](https://github.com/fairmint/canton/tree/main/docs/developer/adr)
+- AI context: [../llms.txt](../llms.txt)
