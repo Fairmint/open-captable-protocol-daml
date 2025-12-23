@@ -1,0 +1,123 @@
+module OpenCapTable.TestEquityCompensationCancellation where
+import Fairmint.OpenCapTable.EquityCompensationIssuance
+import Fairmint.OpenCapTable.EquityCompensationCancellation
+import qualified Fairmint.OpenCapTable.EquityCompensationCancellation as ECC
+import Fairmint.OpenCapTable.Types (OcfMonetary(..), OcfCompensationType(..))
+import qualified Fairmint.OpenCapTable.Issuer as Iss
+import OpenCapTable.Setup
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+mkIssuer issuer system_operator ctx =
+  submitMulti [system_operator, issuer] [] do
+    createCmd Iss.Issuer with
+      context = ctx
+      issuer_data = Iss.OcfIssuerData with
+        id = "ISSUER_1"
+        legal_name = "TestIssuer Inc."
+        formation_date = DT.time (DA.date 2020 Jan 15) 12 0 0
+        country_of_formation = "US"
+        dba = None
+        country_subdivision_of_formation = None
+        country_subdivision_name_of_formation = None
+        tax_ids = []
+        email = None
+        phone = None
+        address = None
+        initial_shares_authorized = Some (Iss.OcfInitialSharesNumeric 1000.0)
+        comments = []
+
+-- Create an equity compensation issuance to cancel (follows real workflow)
+createEquityCompensationIssuance issuer issuerCid securityId quantity =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateEquityCompensationIssuance with
+      issuance_data = OcfEquityCompensationIssuanceTxData with
+        id = "TX_EC_ISS_1"
+        date = DT.time (DA.date 2020 Jan 15) 0 0 0
+        security_id = securityId
+        custom_id = "GRANT-001"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        stock_plan_id = Some "PLAN-2020"
+        stock_class_id = Some "COMMON"
+        compensation_type = OcfCompensationTypeOptionNSO
+        quantity = quantity
+        exercise_price = Some (OcfMonetary with amount = 0.10, currency = "USD")
+        base_price = None
+        early_exercisable = Some False
+        vesting_terms_id = None
+        vestings = []
+        expiration_date = None
+        termination_exercise_windows = []
+        comments = []
+
+-- Create cancellation based on production data pattern
+-- From production: id=a97d8f4a-..., quantity=214200.00, reason="Cancel all unexercised options after two exercises."
+createEquityCompensationCancellation issuer issuerCid securityId quantity =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateEquityCompensationCancellation with
+      cancellation_data = OcfEquityCompensationCancellationTxData with
+        id = "a97d8f4a-0100-41ed-b4bf-91dcccfadbf0"
+        date = DT.time (DA.date 2021 Dec 01) 0 0 0
+        security_id = securityId
+        quantity = quantity
+        reason_text = "Cancel all unexercised options after two exercises."
+        balance_security_id = None
+        comments = ["Original grant 250,000; exercised 35,800; remaining 214,200 cancelled."]
+
+-- Basic create and archive by issuer (single signer) - using production data
+testEquityCompensationCancellation_CreateAndArchiveByIssuer = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "db5a26d6-3912-4400-87b0-bda74de361af"
+  _ <- createEquityCompensationIssuance issuer issuerCid securityId 250000.0
+  cid <- createEquityCompensationCancellation issuer issuerCid securityId 214200.0
+  submit issuer do
+    exerciseCmd cid ECC.ArchiveByIssuer
+  pure ()
+
+-- Archive with built-in choice (requires both signatories)
+testEquityCompensationCancellation_CreateAndArchiveBuiltIn = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "SEC-EC-002"
+  _ <- createEquityCompensationIssuance issuer issuerCid securityId 100000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateEquityCompensationCancellation with
+      cancellation_data = OcfEquityCompensationCancellationTxData with
+        id = "TX_EC_CANCEL_2"
+        date = DT.time (DA.date 2024 Mar 15) 0 0 0
+        security_id = securityId
+        quantity = 100000.0
+        reason_text = "Employee termination - unvested options forfeited"
+        balance_security_id = None
+        comments = []
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
+
+-- Partial cancellation with optional fields populated
+testEquityCompensationCancellation_PartialWithOptionals = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "SEC-EC-PARTIAL"
+  _ <- createEquityCompensationIssuance issuer issuerCid securityId 500000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateEquityCompensationCancellation with
+      cancellation_data = OcfEquityCompensationCancellationTxData with
+        id = "TX_EC_CANCEL_PARTIAL"
+        date = DT.time (DA.date 2024 Jun 30) 0 0 0
+        security_id = securityId
+        quantity = 150000.0
+        reason_text = "Partial forfeiture due to early departure"
+        balance_security_id = Some "SEC-EC-PARTIAL-BAL"
+        comments = ["Partial cancellation per separation agreement", "Remaining vested options: 350,000"]
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
+
