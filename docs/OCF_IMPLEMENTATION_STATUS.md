@@ -270,4 +270,3 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 |------|--------|
 | 2025-12-23 | Added TX_CONVERTIBLE_CANCELLATION (18/52, 35%) |
 | 2024-12-15 | Initial status document created |
-
