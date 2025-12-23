@@ -10,7 +10,7 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 |----------|-------------|-------|----------|
 | **Objects (Core)** | 8 | 9 | 89% |
 | **Transactions - Issuance** | 4 | 4 | 100% |
-| **Transactions - Cancellation** | 1 | 4 | 25% |
+| **Transactions - Cancellation** | 2 | 4 | 50% |
 | **Transactions - Transfer** | 0 | 4 | 0% |
 | **Transactions - Acceptance** | 0 | 4 | 0% |
 | **Transactions - Exercise** | 1 | 2 | 50% |
@@ -20,7 +20,7 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Transactions - Other** | 0 | 8 | 0% |
 | **Transactions - Vesting** | 0 | 3 | 0% |
 | **Change Events** | 0 | 2 | 0% |
-| **TOTAL** | 17 | 52 | 33% |
+| **TOTAL** | 18 | 52 | 35% |
 
 ---
 
@@ -62,7 +62,7 @@ Transactions that cancel securities.
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
 | **TX_STOCK_CANCELLATION** | ✅ Implemented | `StockCancellation.daml` | ✅ | Supports partial cancellations with `balance_security_id` |
-| **TX_CONVERTIBLE_CANCELLATION** | ❌ Not Started | — | — | Cancel convertible instruments |
+| **TX_CONVERTIBLE_CANCELLATION** | ✅ Implemented | `ConvertibleCancellation.daml` | ✅ | Cancel convertible instruments; uses `amount` (monetary) instead of `quantity` |
 | **TX_WARRANT_CANCELLATION** | ❌ Not Started | — | — | Cancel warrant instruments |
 | **TX_EQUITY_COMPENSATION_CANCELLATION** | ❌ Not Started | — | — | Cancel equity compensation grants |
 
@@ -268,5 +268,6 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 
 | Date | Update |
 |------|--------|
+| 2025-12-23 | Added TX_CONVERTIBLE_CANCELLATION (18/52, 35%) |
 | 2024-12-15 | Initial status document created |
 
