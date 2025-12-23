@@ -62,7 +62,7 @@ Transactions that cancel securities.
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
 | **TX_STOCK_CANCELLATION** | ✅ Implemented | `StockCancellation.daml` | ✅ | Supports partial cancellations with `balance_security_id` |
-| **TX_CONVERTIBLE_CANCELLATION** | ✅ Implemented | `ConvertibleCancellation.daml` | ✅ | Cancel convertible instruments; uses `amount` (monetary) instead of `quantity` |
+| **TX_CONVERTIBLE_CANCELLATION** | ✅ Implemented | `ConvertibleCancellation.daml` | ✅ | Cancel convertible instruments |
 | **TX_WARRANT_CANCELLATION** | ❌ Not Started | — | — | Cancel warrant instruments |
 | **TX_EQUITY_COMPENSATION_CANCELLATION** | ❌ Not Started | — | — | Cancel equity compensation grants |
 
