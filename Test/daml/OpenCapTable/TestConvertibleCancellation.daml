@@ -1,0 +1,107 @@
+module OpenCapTable.TestConvertibleCancellation where
+import Fairmint.OpenCapTable.ConvertibleIssuance
+import Fairmint.OpenCapTable.ConvertibleCancellation
+import qualified Fairmint.OpenCapTable.ConvertibleCancellation as CC
+import Fairmint.OpenCapTable.Types (OcfConvertibleType(..), OcfMonetary(..))
+import OpenCapTable.HelpersTriggers (ocfConvTriggerAutomaticOnDate)
+import qualified Fairmint.OpenCapTable.Issuer as Iss
+import OpenCapTable.Setup
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+mkIssuer issuer system_operator ctx =
+  submitMulti [system_operator, issuer] [] do
+    createCmd Iss.Issuer with
+      context = ctx
+      issuer_data = Iss.OcfIssuerData with
+        id = "ISSUER_1"
+        legal_name = "TestIssuer Inc."
+        formation_date = DT.time (DA.date 2020 Jan 15) 12 0 0
+        country_of_formation = "US"
+        dba = None
+        country_subdivision_of_formation = None
+        country_subdivision_name_of_formation = None
+        tax_ids = []
+        email = None
+        phone = None
+        address = None
+        initial_shares_authorized = Some (Iss.OcfInitialSharesNumeric 1000.0)
+        comments = []
+
+-- Create a convertible issuance to cancel (follows real workflow)
+createConvertibleIssuance issuer issuerCid securityId amount =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleIssuance with
+      issuance_data = OcfConvertibleIssuanceTxData with
+        id = "TX_CONV_ISS_1"
+        date = DT.time (DA.date 2022 Jun 01) 0 0 0
+        security_id = securityId
+        custom_id = "SAFE-1"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        investment_amount = OcfMonetary with amount = amount, currency = "USD"
+        convertible_type = OcfConvertibleSafe
+        conversion_triggers = [ (ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Jun 01) 0 0 0)) ]
+        pro_rata = None
+        seniority = 1
+        comments = []
+
+-- Create cancellation based on real production data pattern
+createConvertibleCancellation issuer issuerCid securityId amount =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleCancellation with
+      cancellation_data = OcfConvertibleCancellationTxData with
+        id = "5a2c0b1e-7f36-4f1e-8a1a-4f7c8e2c0a25"
+        date = DT.time (DA.date 2022 Nov 03) 0 0 0
+        security_id = securityId
+        amount = OcfMonetary with amount = amount, currency = "USD"
+        reason_text = "Full cancellation per customer cap table"
+        balance_security_id = None
+        comments = []
+
+-- Basic create and archive by issuer (single signer)
+testConvertibleCancellation_CreateAndArchiveByIssuer = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "84565134-9f2a-403d-8a02-fe40a46589d6"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 25000.0
+  cid <- createConvertibleCancellation issuer issuerCid securityId 25000.0
+  submit issuer do
+    exerciseCmd cid CC.ArchiveByIssuer
+  pure ()
+
+-- Archive with built-in choice (requires both signatories)
+testConvertibleCancellation_CreateAndArchiveBuiltIn = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "2fbe5f5b-cf6b-4c8d-87cd-b278914b333b"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 50000.0
+  cid <- createConvertibleCancellation issuer issuerCid securityId 50000.0
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
+
+-- Partial cancellation with optional fields populated
+testConvertibleCancellation_PartialWithOptionals = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "SEC-CONV-PARTIAL"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 100000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleCancellation with
+      cancellation_data = OcfConvertibleCancellationTxData with
+        id = "TX_CONV_CANCEL_PARTIAL"
+        date = DT.time (DA.date 2024 Jun 15) 0 0 0
+        security_id = securityId
+        amount = OcfMonetary with amount = 25000.0, currency = "USD"
+        reason_text = "Partial cancellation - investor early exit"
+        balance_security_id = Some "SEC-CONV-PARTIAL-BAL"
+        comments = ["Partial cancellation approved by board", "Remaining balance: $75,000"]
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
