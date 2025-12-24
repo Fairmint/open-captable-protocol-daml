@@ -11,7 +11,7 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Objects (Core)** | 8 | 9 | 89% |
 | **Transactions - Issuance** | 4 | 4 | 100% |
 | **Transactions - Cancellation** | 4 | 4 | 100% |
-| **Transactions - Transfer** | 0 | 4 | 0% |
+| **Transactions - Transfer** | 4 | 4 | 100% |
 | **Transactions - Acceptance** | 0 | 4 | 0% |
 | **Transactions - Exercise** | 1 | 2 | 50% |
 | **Transactions - Conversion** | 0 | 2 | 0% |
@@ -20,7 +20,7 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Transactions - Other** | 0 | 8 | 0% |
 | **Transactions - Vesting** | 0 | 3 | 0% |
 | **Change Events** | 0 | 2 | 0% |
-| **TOTAL** | 20 | 52 | 38% |
+| **TOTAL** | 24 | 52 | 46% |
 
 ---
 
@@ -74,10 +74,10 @@ Transactions that transfer securities between stakeholders. Per OCF spec, transf
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_STOCK_TRANSFER** | ❌ Not Started | — | — | Transfer stock to new holder |
-| **TX_CONVERTIBLE_TRANSFER** | ❌ Not Started | — | — | Transfer convertibles |
-| **TX_WARRANT_TRANSFER** | ❌ Not Started | — | — | Transfer warrants |
-| **TX_EQUITY_COMPENSATION_TRANSFER** | ❌ Not Started | — | — | Transfer equity compensation |
+| **TX_STOCK_TRANSFER** | ✅ Implemented | `StockTransfer.daml` | ✅ | Transfer stock to new holder |
+| **TX_CONVERTIBLE_TRANSFER** | ✅ Implemented | `ConvertibleTransfer.daml` | ✅ | Transfer convertibles (uses `amount`) |
+| **TX_WARRANT_TRANSFER** | ✅ Implemented | `WarrantTransfer.daml` | ✅ | Transfer warrants |
+| **TX_EQUITY_COMPENSATION_TRANSFER** | ✅ Implemented | `EquityCompensationTransfer.daml` | ✅ | Transfer equity compensation (rare) |
 
 ---
 
@@ -202,25 +202,23 @@ These are deprecated aliases in OCF v1.x that route to equity compensation equiv
 ## Implementation Priority Recommendations
 
 ### High Priority (Core Cap Table Operations)
-1. **TX_STOCK_TRANSFER** - Required for secondary sales and stakeholder changes
-2. **TX_CONVERTIBLE_CONVERSION** - Required for financing rounds
-3. **TX_WARRANT_EXERCISE** - Complete exercise transaction coverage
-4. **TX_STOCK_REPURCHASE** - Common corporate action
+1. **TX_CONVERTIBLE_CONVERSION** - Required for financing rounds
+2. **TX_WARRANT_EXERCISE** - Complete exercise transaction coverage
+3. **TX_STOCK_REPURCHASE** - Common corporate action
 
 ### Medium Priority (Complete Transaction Coverage)
-5. **TX_CONVERTIBLE_CANCELLATION** - Cancel unconverted instruments
-6. **TX_WARRANT_CANCELLATION** - Cancel unexercised warrants
-7. **TX_EQUITY_COMPENSATION_CANCELLATION** - Handle forfeitures
-8. **TX_EQUITY_COMPENSATION_RELEASE** - RSU settlements
-9. **TX_STOCK_CLASS_SPLIT** - Stock split operations
-10. **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** - Anti-dilution adjustments
+4. **TX_EQUITY_COMPENSATION_RELEASE** - RSU settlements
+5. **TX_STOCK_CLASS_SPLIT** - Stock split operations
+6. **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** - Anti-dilution adjustments
+7. **TX_STOCK_PLAN_RETURN_TO_POOL** - Return cancelled shares to pool
+8. **TX_STOCK_CONVERSION** - Manual stock conversions
 
 ### Lower Priority (Advanced/Edge Cases)
-11. **TX_VESTING_START/EVENT/ACCELERATION** - Vesting lifecycle management
-12. **Acceptance transactions** - Optional metadata
-13. **Retraction transactions** - Error correction
-14. **Change events** - Stakeholder metadata tracking
-15. **Financing object** - Financing round tracking
+9. **TX_VESTING_START/EVENT/ACCELERATION** - Vesting lifecycle management
+10. **Acceptance transactions** - Optional metadata
+11. **Retraction transactions** - Error correction
+12. **Change events** - Stakeholder metadata tracking
+13. **Financing object** - Financing round tracking
 
 ---
 
@@ -268,6 +266,7 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 
 | Date | Update |
 |------|--------|
+| 2025-12-24 | Added all Transfer transactions (24/52, 46%) - Transfer category complete |
 | 2025-12-23 | Added TX_WARRANT_CANCELLATION and TX_EQUITY_COMPENSATION_CANCELLATION (20/52, 38%) - Cancellation category complete |
 | 2025-12-23 | Added TX_CONVERTIBLE_CANCELLATION (18/52, 35%) |
 | 2024-12-15 | Initial status document created |

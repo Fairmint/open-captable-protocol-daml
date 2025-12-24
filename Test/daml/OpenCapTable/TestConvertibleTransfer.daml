@@ -1,0 +1,135 @@
+module OpenCapTable.TestConvertibleTransfer where
+
+import Fairmint.OpenCapTable.ConvertibleIssuance
+import Fairmint.OpenCapTable.ConvertibleTransfer
+import qualified Fairmint.OpenCapTable.ConvertibleTransfer as CT
+import Fairmint.OpenCapTable.Types (OcfMonetary(..), OcfConvertibleType(..))
+import OpenCapTable.HelpersTriggers (ocfConvTriggerAutomaticOnDate)
+import qualified Fairmint.OpenCapTable.Issuer as Iss
+import OpenCapTable.Setup
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+mkIssuer issuer system_operator ctx =
+  submitMulti [system_operator, issuer] [] do
+    createCmd Iss.Issuer with
+      context = ctx
+      issuer_data = Iss.OcfIssuerData with
+        id = "ISSUER_1"
+        legal_name = "TestIssuer Inc."
+        formation_date = DT.time (DA.date 2020 Jan 15) 12 0 0
+        country_of_formation = "US"
+        dba = None
+        country_subdivision_of_formation = None
+        country_subdivision_name_of_formation = None
+        tax_ids = []
+        email = None
+        phone = None
+        address = None
+        initial_shares_authorized = Some (Iss.OcfInitialSharesNumeric 10000000.0)
+        comments = []
+
+-- Create a convertible issuance to transfer (follows real workflow)
+createConvertibleIssuance issuer issuerCid securityId amount =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleIssuance with
+      issuance_data = OcfConvertibleIssuanceTxData with
+        id = "TX_CONVERTIBLE_ISS_1"
+        date = DT.time (DA.date 2024 Mar 01) 0 0 0
+        security_id = securityId
+        custom_id = "SAFE-1"
+        stakeholder_id = "SH-INVESTOR-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = Some "Cash investment"
+        security_law_exemptions = []
+        convertible_type = OcfConvertibleSafe
+        investment_amount = OcfMonetary with amount = amount, currency = "USD"
+        seniority = 1
+        pro_rata = None
+        conversion_triggers = [(ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Dec 31) 0 0 0))]
+        comments = []
+
+-- Test: SAFE assignment between investors
+-- Based on prod: $100,000 SAFE transferred between investors
+testConvertibleTransfer_SAFEAssignment = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "CSEC-SAFE-001"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 100000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleTransfer with
+      transfer_data = OcfConvertibleTransferTxData with
+        id = "TX_CONVERTIBLE_TRANSFER_1"
+        date = DT.time (DA.date 2025 Sep 08) 0 0 0
+        amount = OcfMonetary with amount = 100000.0, currency = "USD"
+        security_id = securityId
+        resulting_security_ids = ["CSEC-SAFE-ASSIGNED-001"]
+        comments = ["Assignor: ABC Holdings Ltd", "Assignee: New Investor LLC", "Company: Example Corp"]
+        balance_security_id = None
+        consideration_text = Some "Assignment Price: USD 100,000 per Assignment Agreement between ABC Holdings Ltd and New Investor LLC."
+  submit issuer do
+    exerciseCmd cid CT.ArchiveByIssuer
+  pure ()
+
+-- Test: Partial SAFE transfer with balance
+testConvertibleTransfer_PartialSAFE = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "CSEC-SAFE-PARTIAL"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 500000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleTransfer with
+      transfer_data = OcfConvertibleTransferTxData with
+        id = "TX_CONVERTIBLE_TRANSFER_PARTIAL"
+        date = DT.time (DA.date 2025 Oct 15) 0 0 0
+        amount = OcfMonetary with amount = 200000.0, currency = "USD"
+        security_id = securityId
+        resulting_security_ids = ["CSEC-SAFE-SPLIT-001"]
+        comments = ["Partial assignment of SAFE investment", "Original investment: $500,000", "Transferred: $200,000", "Retained: $300,000"]
+        balance_security_id = Some "CSEC-SAFE-RETAINED"
+        consideration_text = Some "Partial assignment at face value."
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
+
+-- Test: Convertible note transfer with full assignment
+testConvertibleTransfer_NoteFullAssignment = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "CSEC-NOTE-001"
+  -- Create a convertible note issuance
+  _ <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleIssuance with
+      issuance_data = OcfConvertibleIssuanceTxData with
+        id = "TX_NOTE_ISS_1"
+        date = DT.time (DA.date 2023 Jun 15) 0 0 0
+        security_id = securityId
+        custom_id = "NOTE-1"
+        stakeholder_id = "SH-INVESTOR-2"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = Some "Convertible note investment"
+        security_law_exemptions = []
+        convertible_type = OcfConvertibleNote
+        investment_amount = OcfMonetary with amount = 250000.0, currency = "USD"
+        seniority = 1
+        pro_rata = None
+        conversion_triggers = [(ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Jun 15) 0 0 0))]
+        comments = []
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleTransfer with
+      transfer_data = OcfConvertibleTransferTxData with
+        id = "TX_NOTE_TRANSFER_1"
+        date = DT.time (DA.date 2025 Dec 01) 0 0 0
+        amount = OcfMonetary with amount = 250000.0, currency = "USD"
+        security_id = securityId
+        resulting_security_ids = ["CSEC-NOTE-ASSIGNED"]
+        comments = ["Full assignment of convertible note"]
+        balance_security_id = None
+        consideration_text = Some "Note assigned at principal amount plus accrued interest."
+  submit issuer do
+    exerciseCmd cid CT.ArchiveByIssuer
+  pure ()
