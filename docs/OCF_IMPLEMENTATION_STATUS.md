@@ -12,15 +12,15 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Transactions - Issuance** | 4 | 4 | 100% |
 | **Transactions - Cancellation** | 4 | 4 | 100% |
 | **Transactions - Transfer** | 4 | 4 | 100% |
-| **Transactions - Acceptance** | 0 | 4 | 0% |
+| **Transactions - Acceptance** | 4 | 4 | 100% |
 | **Transactions - Exercise** | 1 | 2 | 50% |
 | **Transactions - Conversion** | 0 | 2 | 0% |
 | **Transactions - Adjustment** | 3 | 6 | 50% |
-| **Transactions - Retraction** | 0 | 4 | 0% |
+| **Transactions - Retraction** | 4 | 4 | 100% |
 | **Transactions - Other** | 0 | 8 | 0% |
 | **Transactions - Vesting** | 0 | 3 | 0% |
 | **Change Events** | 0 | 2 | 0% |
-| **TOTAL** | 24 | 52 | 46% |
+| **TOTAL** | 32 | 52 | 62% |
 
 ---
 
@@ -87,10 +87,10 @@ Optional metadata-only transactions recording stakeholder acceptance of securiti
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_STOCK_ACCEPTANCE** | ❌ Not Started | — | — | Record stock acceptance |
-| **TX_CONVERTIBLE_ACCEPTANCE** | ❌ Not Started | — | — | Record convertible acceptance |
-| **TX_WARRANT_ACCEPTANCE** | ❌ Not Started | — | — | Record warrant acceptance |
-| **TX_EQUITY_COMPENSATION_ACCEPTANCE** | ❌ Not Started | — | — | Record equity comp acceptance |
+| **TX_STOCK_ACCEPTANCE** | ✅ Implemented | `StockAcceptance.daml` | ✅ | Record stock acceptance |
+| **TX_CONVERTIBLE_ACCEPTANCE** | ✅ Implemented | `ConvertibleAcceptance.daml` | ✅ | Record convertible acceptance |
+| **TX_WARRANT_ACCEPTANCE** | ✅ Implemented | `WarrantAcceptance.daml` | ✅ | Record warrant acceptance |
+| **TX_EQUITY_COMPENSATION_ACCEPTANCE** | ✅ Implemented | `EquityCompensationAcceptance.daml` | ✅ | Record equity comp acceptance |
 
 ---
 
@@ -137,10 +137,10 @@ Transactions that invalidate prior issuances (ab initio).
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_STOCK_RETRACTION** | ❌ Not Started | — | — | Retract stock issuance |
-| **TX_CONVERTIBLE_RETRACTION** | ❌ Not Started | — | — | Retract convertible issuance |
-| **TX_WARRANT_RETRACTION** | ❌ Not Started | — | — | Retract warrant issuance |
-| **TX_EQUITY_COMPENSATION_RETRACTION** | ❌ Not Started | — | — | Retract equity comp grant |
+| **TX_STOCK_RETRACTION** | ✅ Implemented | `StockRetraction.daml` | ✅ | Retract stock issuance |
+| **TX_CONVERTIBLE_RETRACTION** | ✅ Implemented | `ConvertibleRetraction.daml` | ✅ | Retract convertible issuance |
+| **TX_WARRANT_RETRACTION** | ✅ Implemented | `WarrantRetraction.daml` | ✅ | Retract warrant issuance |
+| **TX_EQUITY_COMPENSATION_RETRACTION** | ✅ Implemented | `EquityCompensationRetraction.daml` | ✅ | Retract equity comp grant |
 
 ---
 
@@ -215,10 +215,8 @@ These are deprecated aliases in OCF v1.x that route to equity compensation equiv
 
 ### Lower Priority (Advanced/Edge Cases)
 9. **TX_VESTING_START/EVENT/ACCELERATION** - Vesting lifecycle management
-10. **Acceptance transactions** - Optional metadata
-11. **Retraction transactions** - Error correction
-12. **Change events** - Stakeholder metadata tracking
-13. **Financing object** - Financing round tracking
+10. **Change events** - Stakeholder metadata tracking
+11. **Financing object** - Financing round tracking
 
 ---
 
@@ -266,6 +264,7 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 
 | Date | Update |
 |------|--------|
+| 2025-12-24 | Added all Acceptance and Retraction transactions (32/52, 62%) - Both categories complete |
 | 2025-12-24 | Added all Transfer transactions (24/52, 46%) - Transfer category complete |
 | 2025-12-23 | Added TX_WARRANT_CANCELLATION and TX_EQUITY_COMPENSATION_CANCELLATION (20/52, 38%) - Cancellation category complete |
 | 2025-12-23 | Added TX_CONVERTIBLE_CANCELLATION (18/52, 35%) |
