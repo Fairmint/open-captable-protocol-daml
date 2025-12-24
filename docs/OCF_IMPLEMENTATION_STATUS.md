@@ -13,14 +13,14 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Transactions - Cancellation** | 4 | 4 | 100% |
 | **Transactions - Transfer** | 4 | 4 | 100% |
 | **Transactions - Acceptance** | 4 | 4 | 100% |
-| **Transactions - Exercise** | 1 | 2 | 50% |
-| **Transactions - Conversion** | 0 | 2 | 0% |
-| **Transactions - Adjustment** | 3 | 6 | 50% |
+| **Transactions - Exercise** | 2 | 2 | 100% |
+| **Transactions - Conversion** | 2 | 2 | 100% |
+| **Transactions - Adjustment** | 4 | 6 | 67% |
 | **Transactions - Retraction** | 4 | 4 | 100% |
-| **Transactions - Other** | 0 | 8 | 0% |
-| **Transactions - Vesting** | 0 | 3 | 0% |
+| **Transactions - Other** | 3 | 5 | 60% |
+| **Transactions - Vesting** | 3 | 3 | 100% |
 | **Change Events** | 0 | 2 | 0% |
-| **TOTAL** | 32 | 52 | 62% |
+| **TOTAL** | 42 | 52 | 81% |
 
 ---
 
@@ -101,7 +101,7 @@ Transactions that exercise convertible securities into stock.
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
 | **TX_EQUITY_COMPENSATION_EXERCISE** | ✅ Implemented | `EquityCompensationExercise.daml` | ✅ | Exercise options/SARs |
-| **TX_WARRANT_EXERCISE** | ❌ Not Started | — | — | Exercise warrants into stock |
+| **TX_WARRANT_EXERCISE** | ✅ Implemented | `WarrantExercise.daml` | ✅ | Exercise warrants into stock |
 
 ---
 
@@ -111,8 +111,8 @@ Transactions that convert securities.
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_STOCK_CONVERSION** | ❌ Not Started | — | — | Manual stock conversions (e.g., preferred → common) |
-| **TX_CONVERTIBLE_CONVERSION** | ❌ Not Started | — | — | Convert SAFEs/Notes to stock |
+| **TX_STOCK_CONVERSION** | ✅ Implemented | `StockConversion.daml` | ✅ | Manual stock conversions (e.g., preferred → common) |
+| **TX_CONVERTIBLE_CONVERSION** | ✅ Implemented | `ConvertibleConversion.daml` | ✅ | Convert SAFEs/Notes to stock |
 
 ---
 
@@ -126,7 +126,7 @@ Transactions that adjust cap table parameters.
 | **TX_STOCK_CLASS_AUTHORIZED_SHARES_ADJUSTMENT** | ✅ Implemented | `StockClassAuthorizedSharesAdjustment.daml` | ✅ | Adjust stock class authorized shares |
 | **TX_STOCK_PLAN_POOL_ADJUSTMENT** | ✅ Implemented | `StockPlanPoolAdjustment.daml` | ✅ | Adjust stock plan pool size |
 | **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** | ❌ Not Started | — | — | Adjust conversion ratios (anti-dilution) |
-| **TX_STOCK_CLASS_SPLIT** | ❌ Not Started | — | — | Stock splits (forward/reverse) |
+| **TX_STOCK_CLASS_SPLIT** | ✅ Implemented | `StockClassSplit.daml` | ✅ | Stock splits (forward/reverse) |
 | **TX_STOCK_PLAN_RETURN_TO_POOL** | ❌ Not Started | — | — | Return cancelled shares to pool |
 
 ---
@@ -150,9 +150,9 @@ Other security lifecycle transactions.
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_STOCK_REPURCHASE** | ❌ Not Started | — | — | Company repurchase of stock |
-| **TX_STOCK_REISSUANCE** | ❌ Not Started | — | — | Re-paper stock certificates |
-| **TX_STOCK_CONSOLIDATION** | ❌ Not Started | — | — | Merge multiple securities into one |
+| **TX_STOCK_REPURCHASE** | ✅ Implemented | `StockRepurchase.daml` | ✅ | Company repurchase of stock |
+| **TX_STOCK_REISSUANCE** | ✅ Implemented | `StockReissuance.daml` | ✅ | Re-paper stock certificates |
+| **TX_STOCK_CONSOLIDATION** | ✅ Implemented | `StockConsolidation.daml` | ✅ | Merge multiple securities into one |
 | **TX_EQUITY_COMPENSATION_RELEASE** | ❌ Not Started | — | — | RSU/restricted stock release |
 | **TX_EQUITY_COMPENSATION_REPRICING** | ❌ Not Started | — | — | Reprice equity compensation |
 
@@ -164,9 +164,9 @@ Transactions that manage vesting schedules.
 
 | Transaction Type | Status | DAML Module | Tests | Notes |
 |------------------|--------|-------------|-------|-------|
-| **TX_VESTING_START** | ❌ Not Started | — | — | Start vesting clock |
-| **TX_VESTING_EVENT** | ❌ Not Started | — | — | Record explicit vesting event |
-| **TX_VESTING_ACCELERATION** | ❌ Not Started | — | — | Accelerate vesting |
+| **TX_VESTING_START** | ✅ Implemented | `VestingStart.daml` | ✅ | Start vesting clock |
+| **TX_VESTING_EVENT** | ✅ Implemented | `VestingEvent.daml` | ✅ | Record explicit vesting event |
+| **TX_VESTING_ACCELERATION** | ✅ Implemented | `VestingAcceleration.daml` | ✅ | Accelerate vesting |
 
 ---
 
@@ -201,22 +201,18 @@ These are deprecated aliases in OCF v1.x that route to equity compensation equiv
 
 ## Implementation Priority Recommendations
 
-### High Priority (Core Cap Table Operations)
-1. **TX_CONVERTIBLE_CONVERSION** - Required for financing rounds
-2. **TX_WARRANT_EXERCISE** - Complete exercise transaction coverage
-3. **TX_STOCK_REPURCHASE** - Common corporate action
+### High Priority (Remaining)
+1. **TX_EQUITY_COMPENSATION_RELEASE** - RSU settlements
+2. **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** - Anti-dilution adjustments
+3. **TX_STOCK_PLAN_RETURN_TO_POOL** - Return cancelled shares to pool
 
-### Medium Priority (Complete Transaction Coverage)
-4. **TX_EQUITY_COMPENSATION_RELEASE** - RSU settlements
-5. **TX_STOCK_CLASS_SPLIT** - Stock split operations
-6. **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** - Anti-dilution adjustments
-7. **TX_STOCK_PLAN_RETURN_TO_POOL** - Return cancelled shares to pool
-8. **TX_STOCK_CONVERSION** - Manual stock conversions
+### Medium Priority
+4. **TX_EQUITY_COMPENSATION_REPRICING** - Reprice equity compensation
+5. **Financing object** - Financing round tracking
 
-### Lower Priority (Advanced/Edge Cases)
-9. **TX_VESTING_START/EVENT/ACCELERATION** - Vesting lifecycle management
-10. **Change events** - Stakeholder metadata tracking
-11. **Financing object** - Financing round tracking
+### Lower Priority (Optional/Edge Cases)
+6. **TX_STAKEHOLDER_RELATIONSHIP_CHANGE_EVENT** - Track relationship changes
+7. **TX_STAKEHOLDER_STATUS_CHANGE_EVENT** - Track status changes
 
 ---
 
@@ -264,6 +260,7 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 
 | Date | Update |
 |------|--------|
+| 2025-12-24 | Added Exercise, Conversion, Vesting, and Stock Operations (42/52, 81%) - Exercise, Conversion, Vesting categories complete |
 | 2025-12-24 | Added all Acceptance and Retraction transactions (32/52, 62%) - Both categories complete |
 | 2025-12-24 | Added all Transfer transactions (24/52, 46%) - Transfer category complete |
 | 2025-12-23 | Added TX_WARRANT_CANCELLATION and TX_EQUITY_COMPENSATION_CANCELLATION (20/52, 38%) - Cancellation category complete |
