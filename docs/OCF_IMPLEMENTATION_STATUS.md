@@ -1,6 +1,6 @@
 # OCF Object Types Implementation Status
 
-This document tracks the implementation status of [Open Cap Format (OCF)](https://github.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF) object types in this DAML repository. It serves as a checklist for remaining implementation work.
+This document tracks the implementation status of [Open Cap Format (OCF)](https://github.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF) object types in this DAML repository.
 
 > **Authority**: The canonical reference for OCF schema is https://github.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF
 
@@ -8,19 +8,19 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 
 | Category | Implemented | Total | Coverage |
 |----------|-------------|-------|----------|
-| **Objects (Core)** | 8 | 9 | 89% |
+| **Objects (Core)** | 8 | 8 | 100% |
 | **Transactions - Issuance** | 4 | 4 | 100% |
 | **Transactions - Cancellation** | 4 | 4 | 100% |
 | **Transactions - Transfer** | 4 | 4 | 100% |
 | **Transactions - Acceptance** | 4 | 4 | 100% |
 | **Transactions - Exercise** | 2 | 2 | 100% |
 | **Transactions - Conversion** | 2 | 2 | 100% |
-| **Transactions - Adjustment** | 4 | 6 | 67% |
+| **Transactions - Adjustment** | 6 | 6 | 100% |
 | **Transactions - Retraction** | 4 | 4 | 100% |
-| **Transactions - Other** | 3 | 5 | 60% |
+| **Transactions - Other** | 5 | 5 | 100% |
 | **Transactions - Vesting** | 3 | 3 | 100% |
-| **Change Events** | 0 | 2 | 0% |
-| **TOTAL** | 42 | 52 | 81% |
+| **Change Events** | 2 | 2 | 100% |
+| **TOTAL** | 48 | 48 | 100% |
 
 ---
 
@@ -38,7 +38,6 @@ These are the foundational objects that define the structure of a cap table.
 | **VestingTerms** | ✅ Implemented | `VestingTerms.daml` | ✅ | Vesting schedule definitions |
 | **Valuation** | ✅ Implemented | `Valuation.daml` | ✅ | 409A and other valuations |
 | **Document** | ✅ Implemented | `Document.daml` | ✅ | Document references and metadata |
-| **Financing** | ❌ Not Started | — | — | Financing round objects |
 
 ---
 
@@ -124,10 +123,10 @@ Transactions that adjust cap table parameters.
 |------------------|--------|-------------|-------|-------|
 | **TX_ISSUER_AUTHORIZED_SHARES_ADJUSTMENT** | ✅ Implemented | `IssuerAuthorizedSharesAdjustment.daml` | ✅ | Adjust issuer-level authorized shares |
 | **TX_STOCK_CLASS_AUTHORIZED_SHARES_ADJUSTMENT** | ✅ Implemented | `StockClassAuthorizedSharesAdjustment.daml` | ✅ | Adjust stock class authorized shares |
+| **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** | ✅ Implemented | `StockClassConversionRatioAdjustment.daml` | ✅ | Adjust conversion ratios (anti-dilution) |
 | **TX_STOCK_PLAN_POOL_ADJUSTMENT** | ✅ Implemented | `StockPlanPoolAdjustment.daml` | ✅ | Adjust stock plan pool size |
-| **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** | ❌ Not Started | — | — | Adjust conversion ratios (anti-dilution) |
+| **TX_STOCK_PLAN_RETURN_TO_POOL** | ✅ Implemented | `StockPlanReturnToPool.daml` | ✅ | Return cancelled shares to pool |
 | **TX_STOCK_CLASS_SPLIT** | ✅ Implemented | `StockClassSplit.daml` | ✅ | Stock splits (forward/reverse) |
-| **TX_STOCK_PLAN_RETURN_TO_POOL** | ❌ Not Started | — | — | Return cancelled shares to pool |
 
 ---
 
@@ -153,8 +152,8 @@ Other security lifecycle transactions.
 | **TX_STOCK_REPURCHASE** | ✅ Implemented | `StockRepurchase.daml` | ✅ | Company repurchase of stock |
 | **TX_STOCK_REISSUANCE** | ✅ Implemented | `StockReissuance.daml` | ✅ | Re-paper stock certificates |
 | **TX_STOCK_CONSOLIDATION** | ✅ Implemented | `StockConsolidation.daml` | ✅ | Merge multiple securities into one |
-| **TX_EQUITY_COMPENSATION_RELEASE** | ❌ Not Started | — | — | RSU/restricted stock release |
-| **TX_EQUITY_COMPENSATION_REPRICING** | ❌ Not Started | — | — | Reprice equity compensation |
+| **TX_EQUITY_COMPENSATION_RELEASE** | ✅ Implemented | `EquityCompensationRelease.daml` | ✅ | RSU/restricted stock release |
+| **TX_EQUITY_COMPENSATION_REPRICING** | ✅ Implemented | `EquityCompensationRepricing.daml` | ✅ | Reprice equity compensation |
 
 ---
 
@@ -176,8 +175,18 @@ Metadata events for stakeholder changes (optional per OCF spec, no cap table imp
 
 | Event Type | Status | DAML Module | Tests | Notes |
 |------------|--------|-------------|-------|-------|
-| **TX_STAKEHOLDER_RELATIONSHIP_CHANGE_EVENT** | ❌ Not Started | — | — | Track relationship changes |
-| **TX_STAKEHOLDER_STATUS_CHANGE_EVENT** | ❌ Not Started | — | — | Track status changes (termination, etc.) |
+| **CE_STAKEHOLDER_RELATIONSHIP** | ✅ Implemented | `StakeholderRelationshipChangeEvent.daml` | ✅ | Track relationship changes |
+| **CE_STAKEHOLDER_STATUS** | ✅ Implemented | `StakeholderStatusChangeEvent.daml` | ✅ | Track status changes (termination, etc.) |
+
+---
+
+## Excluded OCF Objects
+
+These OCF objects are intentionally excluded from implementation.
+
+| Object Type | Reason |
+|-------------|--------|
+| **Financing** | Organizational metadata only - groups issuances into rounds (e.g., "Series A"). Zero records exist in prod/dev. No cap table calculations depend on it. Not required for correctness. |
 
 ---
 
@@ -195,24 +204,7 @@ These are deprecated aliases in OCF v1.x that route to equity compensation equiv
 | TX_PLAN_SECURITY_TRANSFER | N/A | TX_EQUITY_COMPENSATION_TRANSFER |
 | TX_PLAN_SECURITY_ACCEPTANCE | N/A | TX_EQUITY_COMPENSATION_ACCEPTANCE |
 
-> **Note**: We do not plan to implement deprecated types. Our implementation uses the current naming convention.
-
----
-
-## Implementation Priority Recommendations
-
-### High Priority (Remaining)
-1. **TX_EQUITY_COMPENSATION_RELEASE** - RSU settlements
-2. **TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT** - Anti-dilution adjustments
-3. **TX_STOCK_PLAN_RETURN_TO_POOL** - Return cancelled shares to pool
-
-### Medium Priority
-4. **TX_EQUITY_COMPENSATION_REPRICING** - Reprice equity compensation
-5. **Financing object** - Financing round tracking
-
-### Lower Priority (Optional/Edge Cases)
-6. **TX_STAKEHOLDER_RELATIONSHIP_CHANGE_EVENT** - Track relationship changes
-7. **TX_STAKEHOLDER_STATUS_CHANGE_EVENT** - Track status changes
+> **Note**: We do not implement deprecated types. Our implementation uses the current naming convention.
 
 ---
 
@@ -223,6 +215,7 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 ### Implemented Types
 - `OcfMonetary` - Currency amounts
 - `OcfRatio` - Mathematical ratios
+- `OcfRatioConversionMechanism` - Ratio-based conversion (for anti-dilution adjustments)
 - `OcfAddress` - Addresses with country codes
 - `OcfEmail` / `OcfPhone` - Contact information
 - `OcfTaxID` - Tax identifiers
@@ -240,7 +233,8 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 - `OcfCompensationType` - Option types, RSU, SAR
 - `OcfConvertibleType` - SAFE/Note/Security
 - `OcfStakeholderType` - Individual/Institution
-- `OcfStakeholderRelationshipType` - Employee, Investor, etc.
+- `OcfStakeholderRelationshipType` - Employee, Investor, Advisor, Founder, etc. (13 values)
+- `OcfStakeholderStatusType` - Active, Leave, Termination types (9 values)
 - `OcfValuationType` - 409A
 - `OcfObjectType` - All OCF object type identifiers
 - Various period, trigger, and mechanism enums
@@ -260,6 +254,7 @@ The `Types.daml` module contains shared OCF types and enums. Current implementat
 
 | Date | Update |
 |------|--------|
+| 2025-12-29 | **100% Complete** - Added final 6 types: TX_STOCK_CLASS_CONVERSION_RATIO_ADJUSTMENT, TX_STOCK_PLAN_RETURN_TO_POOL, TX_EQUITY_COMPENSATION_RELEASE, TX_EQUITY_COMPENSATION_REPRICING, CE_STAKEHOLDER_RELATIONSHIP, CE_STAKEHOLDER_STATUS. Excluded Financing object (organizational metadata only). |
 | 2025-12-24 | Added Exercise, Conversion, Vesting, and Stock Operations (42/52, 81%) - Exercise, Conversion, Vesting categories complete |
 | 2025-12-24 | Added all Acceptance and Retraction transactions (32/52, 62%) - Both categories complete |
 | 2025-12-24 | Added all Transfer transactions (24/52, 46%) - Transfer category complete |
