@@ -1,0 +1,144 @@
+module OpenCapTable.TestConvertibleConversion where
+
+import Fairmint.OpenCapTable.ConvertibleIssuance (OcfConvertibleIssuanceTxData(..), OcfConvertibleConversionTrigger(..))
+import Fairmint.OpenCapTable.ConvertibleConversion
+import qualified Fairmint.OpenCapTable.ConvertibleConversion as CC
+import Fairmint.OpenCapTable.Types (OcfMonetary(..), OcfConversionTriggerType(..), OcfConvertibleConversionRight(..), OcfConvertibleConversionMechanism(..), OcfSAFEConversionMechanism(..), OcfConvertibleType(..), OcfCapitalizationDefinition(..))
+import qualified Fairmint.OpenCapTable.Issuer as Iss
+import OpenCapTable.Setup
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+mkIssuer issuer system_operator ctx =
+  submitMulti [system_operator, issuer] [] do
+    createCmd Iss.Issuer with
+      context = ctx
+      issuer_data = Iss.OcfIssuerData with
+        id = "ISSUER_1"
+        legal_name = "ExampleCo Inc."
+        formation_date = DT.time (DA.date 2020 Jan 15) 12 0 0
+        country_of_formation = "US"
+        dba = None
+        country_subdivision_of_formation = None
+        country_subdivision_name_of_formation = None
+        tax_ids = []
+        email = None
+        phone = None
+        address = None
+        initial_shares_authorized = Some (Iss.OcfInitialSharesNumeric 10000000.0)
+        comments = []
+
+-- Create a convertible issuance to convert (follows real workflow)
+createConvertibleIssuance issuer issuerCid securityId amount =
+  submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleIssuance with
+      issuance_data = OcfConvertibleIssuanceTxData with
+        id = "TX_CONV_ISS_1"
+        date = DT.time (DA.date 2023 Mar 15) 0 0 0
+        security_id = securityId
+        custom_id = "SAFE-1"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        convertible_type = OcfConvertibleSafe
+        investment_amount = OcfMonetary with amount = amount, currency = "USD"
+        conversion_triggers = [OcfConvertibleConversionTrigger with
+          trigger_id = "equity-financing-trigger"
+          type_ = OcfTriggerTypeTypeAutomaticOnCondition
+          conversion_right = OcfConvertibleConversionRight with
+            type_ = "CONVERTIBLE_CONVERSION_RIGHT"
+            conversion_mechanism = OcfConvMechSAFE (OcfSAFEConversionMechanism with
+              conversion_mfn = False
+              capitalization_definition = None
+              capitalization_definition_rules = None
+              conversion_discount = Some 0.20
+              conversion_timing = None
+              conversion_valuation_cap = Some (OcfMonetary with amount = 16000000.0, currency = "USD")
+              exit_multiple = None)
+            converts_to_future_round = Some True
+            converts_to_stock_class_id = None
+          nickname = Some "Equity Financing"
+          trigger_condition = Some "Qualified equity financing of at least $1,000,000"
+          trigger_date = None
+          trigger_description = Some "Automatic conversion upon qualified equity financing"]
+        pro_rata = None
+        seniority = 1
+        comments = []
+
+-- Test 1: SAFE conversion upon equity financing
+-- Based on prod: SAFE conversion to Series Seed-2 Preferred
+testConvertibleConversion_SAFEConversion = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 100000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleConversion with
+      conversion_data = OcfConvertibleConversionTxData with
+        id = "25d377f8-a8de-4d8d-853c-2d75927e7927"
+        date = DT.time (DA.date 2025 Nov 10) 0 0 0
+        security_id = securityId
+        trigger_id = "equity-financing-trigger"
+        reason_text = "Automatic conversion upon Series Seed-2 equity financing"
+        resulting_security_ids = ["5f4a6b7c-9d0e-2f3a-6b7c-8d9e0f1a2b3c"]
+        comments = ["SAFE conversion to Series Seed-2 Preferred for Investor A"]
+        balance_security_id = None
+        capitalization_definition = None
+        quantity_converted = None
+  submit issuer do
+    exerciseCmd cid CC.ArchiveByIssuer
+  pure ()
+
+-- Test 2: Convertible conversion with capitalization definition
+testConvertibleConversion_WithCapDefinition = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "CONV-SEC-002"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 250000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleConversion with
+      conversion_data = OcfConvertibleConversionTxData with
+        id = "TX_CONV_CONVERSION_2"
+        date = DT.time (DA.date 2025 Dec 01) 0 0 0
+        security_id = securityId
+        trigger_id = "equity-financing-trigger"
+        reason_text = "Conversion based on fully diluted capitalization at $16M valuation cap"
+        resulting_security_ids = ["SSEC-PREFERRED-001"]
+        comments = ["Conversion of $250,000 SAFE at $16M post-money valuation cap"]
+        balance_security_id = None
+        capitalization_definition = Some (OcfCapitalizationDefinition with
+          exclude_security_ids = []
+          include_security_ids = []
+          include_stock_class_ids = ["COMMON", "PREFERRED"]
+          include_stock_plans_ids = ["ESOP-2024"])
+        quantity_converted = Some 15625.0  -- $250K / $16 per share
+  submitMulti [issuer, system_operator] [] do
+    exerciseCmd cid Archive
+  pure ()
+
+-- Test 3: Partial conversion with balance security
+testConvertibleConversion_PartialConversion = script do
+  TestOcp{system_operator, issuer, ctx} <- setupTestOcp
+  issuerCid <- mkIssuer issuer system_operator ctx
+  let securityId = "CONV-SEC-003"
+  _ <- createConvertibleIssuance issuer issuerCid securityId 500000.0
+  cid <- submit issuer do
+    exerciseCmd issuerCid Iss.CreateConvertibleConversion with
+      conversion_data = OcfConvertibleConversionTxData with
+        id = "TX_CONV_CONVERSION_3"
+        date = DT.time (DA.date 2025 Nov 15) 0 0 0
+        security_id = securityId
+        trigger_id = "equity-financing-trigger"
+        reason_text = "Partial conversion - investor electing to convert $300,000 of $500,000 SAFE"
+        resulting_security_ids = ["SSEC-PREFERRED-002"]
+        comments = []
+        balance_security_id = Some "CONV-SEC-003-REMAINDER"
+        capitalization_definition = None
+        quantity_converted = Some 300000.0
+  submit issuer do
+    exerciseCmd cid CC.ArchiveByIssuer
+  pure ()
