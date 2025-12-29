@@ -20,7 +20,9 @@ This document tracks the implementation status of [Open Cap Format (OCF)](https:
 | **Transactions - Other** | 5 | 5 | 100% |
 | **Transactions - Vesting** | 3 | 3 | 100% |
 | **Change Events** | 2 | 2 | 100% |
-| **TOTAL** | 48 | 48 | 100% |
+| **TOTAL** | 48 | 48 | 100%* |
+
+*Excludes Financing object (organizational metadata only) - see Excluded Objects section
 
 ---
 
