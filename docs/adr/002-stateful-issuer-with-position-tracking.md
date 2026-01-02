@@ -1,4 +1,4 @@
-# ADR-002: Stateful Issuer with Embedded OCF Objects
+# ADR-002: Stateful Issuer with OCF Object References
 
 ## Status
 
@@ -13,64 +13,75 @@ The current OpenCapTable implementation on Canton uses an event-sourcing pattern
 3. There's no on-chain tracking of current state—determining "what does Alice own?" requires off-chain event replay
 4. Reference integrity is not enforced—IDs like `stakeholder_id` and `stock_class_id` are just strings with no validation that the referenced objects exist
 5. Contract keys are not available on Canton Network, making lookups by business ID difficult
+6. Each OCF object has its own `ArchiveByIssuer` choice, but there's no central control over the cap table state
 
 This creates several problems:
 
 - **No current state visibility**: To know current ownership, you must query all events and replay them off-chain
 - **No reference integrity**: Can issue stock to a non-existent stakeholder or reference invalid stock classes
 - **Scattered data**: Cap table data spread across many contracts, hard to query holistically
-- **No business rule enforcement**: Can't enforce rules like "issued shares must not exceed authorized shares" on-chain
+- **No central lifecycle control**: Objects can be archived independently, potentially leaving orphaned references
+- **No edit/delete support**: OCF objects are immutable but errors need to be correctable
 
 ## Decision
 
 Redesign the OpenCapTable architecture to use a **Stateful Issuer** pattern where:
 
-1. A single `IssuerState` contract per issuer contains **all OCF objects as arrays**
-2. Objects are stored in their native OCF format (no transformation)
-3. Arrays are sorted by creation date for consistent ordering
-4. Computed values (balances, totals) are derived on-demand by looping through relevant arrays
-5. Aggregates/indexes can be added later when scale requires it
+1. A single `IssuerState` contract per issuer maintains **arrays of ContractIds** pointing to all OCF objects
+2. OCF objects remain as separate contracts (existing templates)
+3. `IssuerState` is the **sole authority** for creating, editing, and deleting OCF objects
+4. Remove `ArchiveByIssuer` from individual templates—all archiving goes through `IssuerState`
+5. Editing an object = archive old contract + create new contract + update ContractId in array
+6. Deleting an object = archive contract + remove ContractId from array
 
 ### Design Principles
 
-1. **Simplicity over optimization**: Loop through arrays rather than maintain derived state
-2. **OCF objects as-is**: Store the standard OCF data structures directly
-3. **No computed aggregates**: Avoid state that could get out of sync
-4. **Scale later**: Add caching/indexes when hitting limits, not before
+1. **Central lifecycle control**: All OCF object lifecycle managed through `IssuerState`
+2. **Reference tracking**: `IssuerState` maintains the source of truth for what exists
+3. **Support corrections**: Edit and delete operations for fixing errors
+4. **Atomic operations**: Multi-step operations happen in single transactions
+5. **OCF compliance**: Individual OCF objects remain in standard format
 
 ### Architecture Overview
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                         IssuerState                              │
-│  (1 contract per issuer - contains all cap table data)          │
+│  (1 contract per issuer - maintains all ContractId references)  │
 ├─────────────────────────────────────────────────────────────────┤
 │  context: Context                                                │
 │  issuer_data: OcfIssuerData                                     │
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │ OBJECTS (arrays, sorted by creation date)                   ││
+│  │ OBJECT REFERENCES (arrays of ContractIds)                   ││
 │  ├─────────────────────────────────────────────────────────────┤│
-│  │ stakeholders: [OcfStakeholderData]                          ││
-│  │ stock_classes: [OcfStockClassData]                          ││
-│  │ stock_plans: [OcfStockPlanData]                             ││
-│  │ stock_legend_templates: [OcfStockLegendTemplateData]        ││
-│  │ vesting_terms: [OcfVestingTermsData]                        ││
-│  │ documents: [OcfDocument]                                    ││
-│  │ valuations: [OcfValuationData]                              ││
+│  │ stakeholders: [ContractId Stakeholder]                      ││
+│  │ stock_classes: [ContractId StockClass]                      ││
+│  │ stock_plans: [ContractId StockPlan]                         ││
+│  │ stock_legend_templates: [ContractId StockLegendTemplate]    ││
+│  │ vesting_terms: [ContractId VestingTerms]                    ││
+│  │ documents: [ContractId Document]                            ││
 │  └─────────────────────────────────────────────────────────────┘│
 │                                                                  │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │ TRANSACTIONS (arrays, sorted by date)                       ││
+│  │ TRANSACTION REFERENCES (arrays of ContractIds)              ││
 │  ├─────────────────────────────────────────────────────────────┤│
-│  │ stock_issuances: [OcfStockIssuanceData]                     ││
-│  │ stock_transfers: [OcfStockTransferData]                     ││
-│  │ stock_cancellations: [OcfStockCancellationData]             ││
-│  │ equity_compensation_issuances: [OcfEquityCompIssuanceData]  ││
-│  │ convertible_issuances: [OcfConvertibleIssuanceData]         ││
-│  │ warrant_issuances: [OcfWarrantIssuanceData]                 ││
+│  │ stock_issuances: [ContractId StockIssuance]                 ││
+│  │ stock_transfers: [ContractId StockTransfer]                 ││
+│  │ stock_cancellations: [ContractId StockCancellation]         ││
 │  │ ... (all other transaction types)                           ││
 │  └─────────────────────────────────────────────────────────────┘│
+│                                                                  │
+│  CHOICES: Add*, Edit*, Delete* for each object type             │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              │ creates/archives
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│              OCF Object Contracts (existing templates)           │
+├─────────────────────────────────────────────────────────────────┤
+│  Stakeholder | StockClass | StockIssuance | StockTransfer | ... │
+│  (No ArchiveByIssuer - lifecycle controlled by IssuerState)     │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -82,266 +93,313 @@ template IssuerState
     context: Context
     issuer_data: OcfIssuerData
     
-    -- Objects (sorted by creation date)
-    stakeholders: [OcfStakeholderData]
-    stock_classes: [OcfStockClassData]
-    stock_plans: [OcfStockPlanData]
-    stock_legend_templates: [OcfStockLegendTemplateData]
-    vesting_terms: [OcfVestingTermsData]
-    documents: [OcfDocument]
+    -- Object references (ContractIds)
+    stakeholders: [ContractId Stakeholder]
+    stock_classes: [ContractId StockClass]
+    stock_plans: [ContractId StockPlan]
+    stock_legend_templates: [ContractId StockLegendTemplate]
+    vesting_terms: [ContractId VestingTerms]
+    documents: [ContractId Document]
     
-    -- Stock transactions
-    stock_issuances: [OcfStockIssuanceData]
-    stock_transfers: [OcfStockTransferData]
-    stock_cancellations: [OcfStockCancellationData]
-    stock_repurchases: [OcfStockRepurchaseData]
-    stock_reissuances: [OcfStockReissuanceData]
-    stock_conversions: [OcfStockConversionData]
-    stock_acceptances: [OcfStockAcceptanceData]
-    stock_retractions: [OcfStockRetractionData]
+    -- Stock transaction references
+    stock_issuances: [ContractId StockIssuance]
+    stock_transfers: [ContractId StockTransfer]
+    stock_cancellations: [ContractId StockCancellation]
+    stock_repurchases: [ContractId StockRepurchase]
+    stock_reissuances: [ContractId StockReissuance]
+    stock_conversions: [ContractId StockConversion]
+    stock_acceptances: [ContractId StockAcceptance]
+    stock_retractions: [ContractId StockRetraction]
+    stock_consolidations: [ContractId StockConsolidation]
     
-    -- Equity compensation transactions
-    equity_comp_issuances: [OcfEquityCompensationIssuanceData]
-    equity_comp_exercises: [OcfEquityCompensationExerciseData]
-    equity_comp_cancellations: [OcfEquityCompensationCancellationData]
-    equity_comp_transfers: [OcfEquityCompensationTransferData]
-    equity_comp_acceptances: [OcfEquityCompensationAcceptanceData]
-    equity_comp_retractions: [OcfEquityCompensationRetractionData]
-    equity_comp_releases: [OcfEquityCompensationReleaseData]
-    equity_comp_repricings: [OcfEquityCompensationRepricingData]
+    -- Equity compensation transaction references
+    equity_comp_issuances: [ContractId EquityCompensationIssuance]
+    equity_comp_exercises: [ContractId EquityCompensationExercise]
+    equity_comp_cancellations: [ContractId EquityCompensationCancellation]
+    equity_comp_transfers: [ContractId EquityCompensationTransfer]
+    equity_comp_acceptances: [ContractId EquityCompensationAcceptance]
+    equity_comp_retractions: [ContractId EquityCompensationRetraction]
+    equity_comp_releases: [ContractId EquityCompensationRelease]
+    equity_comp_repricings: [ContractId EquityCompensationRepricing]
     
-    -- Convertible transactions
-    convertible_issuances: [OcfConvertibleIssuanceData]
-    convertible_transfers: [OcfConvertibleTransferData]
-    convertible_conversions: [OcfConvertibleConversionData]
-    convertible_cancellations: [OcfConvertibleCancellationData]
-    convertible_acceptances: [OcfConvertibleAcceptanceData]
-    convertible_retractions: [OcfConvertibleRetractionData]
+    -- Convertible transaction references
+    convertible_issuances: [ContractId ConvertibleIssuance]
+    convertible_transfers: [ContractId ConvertibleTransfer]
+    convertible_conversions: [ContractId ConvertibleConversion]
+    convertible_cancellations: [ContractId ConvertibleCancellation]
+    convertible_acceptances: [ContractId ConvertibleAcceptance]
+    convertible_retractions: [ContractId ConvertibleRetraction]
     
-    -- Warrant transactions
-    warrant_issuances: [OcfWarrantIssuanceData]
-    warrant_transfers: [OcfWarrantTransferData]
-    warrant_exercises: [OcfWarrantExerciseData]
-    warrant_cancellations: [OcfWarrantCancellationData]
-    warrant_acceptances: [OcfWarrantAcceptanceData]
-    warrant_retractions: [OcfWarrantRetractionData]
+    -- Warrant transaction references
+    warrant_issuances: [ContractId WarrantIssuance]
+    warrant_transfers: [ContractId WarrantTransfer]
+    warrant_exercises: [ContractId WarrantExercise]
+    warrant_cancellations: [ContractId WarrantCancellation]
+    warrant_acceptances: [ContractId WarrantAcceptance]
+    warrant_retractions: [ContractId WarrantRetraction]
     
-    -- Vesting transactions
-    vesting_starts: [OcfVestingStartData]
-    vesting_events: [OcfVestingEventData]
-    vesting_accelerations: [OcfVestingAccelerationData]
+    -- Vesting transaction references
+    vesting_starts: [ContractId VestingStart]
+    vesting_events: [ContractId VestingEvent]
+    vesting_accelerations: [ContractId VestingAcceleration]
     
-    -- Adjustment transactions
-    issuer_authorized_shares_adjustments: [OcfIssuerAuthorizedSharesAdjustmentData]
-    stock_class_authorized_shares_adjustments: [OcfStockClassAuthorizedSharesAdjustmentData]
-    stock_class_conversion_ratio_adjustments: [OcfStockClassConversionRatioAdjustmentData]
-    stock_class_splits: [OcfStockClassSplitData]
-    stock_plan_pool_adjustments: [OcfStockPlanPoolAdjustmentData]
-    stock_plan_returns_to_pool: [OcfStockPlanReturnToPoolData]
+    -- Adjustment transaction references
+    issuer_authorized_shares_adjustments: [ContractId IssuerAuthorizedSharesAdjustment]
+    stock_class_authorized_shares_adjustments: [ContractId StockClassAuthorizedSharesAdjustment]
+    stock_class_conversion_ratio_adjustments: [ContractId StockClassConversionRatioAdjustment]
+    stock_class_splits: [ContractId StockClassSplit]
+    stock_plan_pool_adjustments: [ContractId StockPlanPoolAdjustment]
+    stock_plan_returns_to_pool: [ContractId StockPlanReturnToPool]
     
-    -- Stakeholder events
-    stakeholder_relationship_changes: [OcfStakeholderRelationshipChangeEventData]
-    stakeholder_status_changes: [OcfStakeholderStatusChangeEventData]
+    -- Stakeholder event references
+    stakeholder_relationship_changes: [ContractId StakeholderRelationshipChangeEvent]
+    stakeholder_status_changes: [ContractId StakeholderStatusChangeEvent]
     
   where
     signatory context.issuer, context.system_operator
 ```
 
-### Helper Functions for Queries
+### Lifecycle Operations
+
+#### Add (Create new OCF object)
 
 ```daml
--- Find stakeholder by ID (loops through array)
-findStakeholder : Text -> [OcfStakeholderData] -> Optional OcfStakeholderData
-findStakeholder id stakeholders = 
-  find (\s -> s.id == id) stakeholders
-
--- Check if stakeholder exists
-stakeholderExists : Text -> [OcfStakeholderData] -> Bool
-stakeholderExists id stakeholders = 
-  isSome (findStakeholder id stakeholders)
-
--- Find stock class by ID
-findStockClass : Text -> [OcfStockClassData] -> Optional OcfStockClassData
-findStockClass id classes = 
-  find (\c -> c.id == id) classes
-
--- Get all active securities for a stakeholder
--- (issuances minus cancellations/transfers out)
-getStakeholderSecurities : Text -> IssuerState -> [SecurityInfo]
-getStakeholderSecurities stakeholderId state =
-  let 
-    -- Get all issuances for this stakeholder
-    stockIssuances = filter (\i -> i.stakeholder_id == stakeholderId) state.stock_issuances
-    
-    -- Get security IDs that have been cancelled or transferred
-    cancelledIds = map (.security_id) state.stock_cancellations
-    transferredIds = map (.security_id) state.stock_transfers
-    inactiveIds = cancelledIds ++ transferredIds
-    
-    -- Filter to active securities
-    activeIssuances = filter (\i -> not (i.security_id `elem` inactiveIds)) stockIssuances
-  in
-    map toSecurityInfo activeIssuances
-
--- Calculate shares issued for a stock class
-getSharesIssuedForClass : Text -> IssuerState -> Decimal
-getSharesIssuedForClass classId state =
-  let
-    -- Sum issuances for this class
-    issuances = filter (\i -> i.stock_class_id == classId) state.stock_issuances
-    totalIssued = sum (map (.quantity) issuances)
-    
-    -- Subtract cancellations
-    cancellations = filter (\c -> 
-      any (\i -> i.security_id == c.security_id && i.stock_class_id == classId) 
-          state.stock_issuances
-    ) state.stock_cancellations
-    totalCancelled = sum (map (.quantity) cancellations)
-  in
-    totalIssued - totalCancelled
-```
-
-### Example: Stock Issuance
-
-```daml
-    choice IssueStock : ContractId IssuerState
-      with
-        issuance_data: OcfStockIssuanceData
-      controller context.issuer
-      do
-        -- VALIDATION: Stakeholder must exist
-        assertMsg "Stakeholder not found" 
-          (stakeholderExists issuance_data.stakeholder_id stakeholders)
-        
-        -- VALIDATION: Stock class must exist
-        let maybeClass = findStockClass issuance_data.stock_class_id stock_classes
-        assertMsg "Stock class not found" (isSome maybeClass)
-        let stockClass = fromSome maybeClass
-        
-        -- VALIDATION: Security ID must be unique
-        let existingIds = map (.security_id) stock_issuances
-        assertMsg "Security ID already exists" 
-          (not (issuance_data.security_id `elem` existingIds))
-        
-        -- VALIDATION: Sufficient authorized shares
-        let currentIssued = getSharesIssuedForClass issuance_data.stock_class_id this
-        let newTotal = currentIssued + issuance_data.quantity
-        assertMsg "Exceeds authorized shares" 
-          (newTotal <= stockClass.initial_shares_authorized)
-        
-        -- Create marker for featured app rewards
-        createMarker context
-        
-        -- Append to array (sorted by date)
-        let newIssuances = sortOn (.date) (issuance_data :: stock_issuances)
-        
-        create this with stock_issuances = newIssuances
-```
-
-### Example: Stock Transfer
-
-```daml
-    choice TransferStock : ContractId IssuerState
-      with
-        transfer_data: OcfStockTransferData
-      controller context.issuer
-      do
-        -- VALIDATION: Source security exists
-        let maybeIssuance = find (\i -> i.security_id == transfer_data.security_id) stock_issuances
-        assertMsg "Security not found" (isSome maybeIssuance)
-        let sourceIssuance = fromSome maybeIssuance
-        
-        -- VALIDATION: Security not already cancelled/transferred
-        let cancelledIds = map (.security_id) stock_cancellations
-        let transferredIds = map (.security_id) stock_transfers
-        assertMsg "Security already cancelled" 
-          (not (transfer_data.security_id `elem` cancelledIds))
-        assertMsg "Security already transferred" 
-          (not (transfer_data.security_id `elem` transferredIds))
-        
-        -- VALIDATION: Recipient exists
-        assertMsg "Recipient not found" 
-          (stakeholderExists transfer_data.resulting_security_stakeholder_id stakeholders)
-        
-        -- VALIDATION: Quantity check
-        assertMsg "Transfer quantity exceeds holdings" 
-          (transfer_data.quantity <= sourceIssuance.quantity)
-        
-        createMarker context
-        
-        -- Record transfer
-        let newTransfers = sortOn (.date) (transfer_data :: stock_transfers)
-        
-        -- Create new issuance for recipient
-        let newIssuance = sourceIssuance with
-              id = transfer_data.id <> "_issuance"
-              security_id = transfer_data.resulting_security_id
-              stakeholder_id = transfer_data.resulting_security_stakeholder_id
-              quantity = transfer_data.quantity
-              date = transfer_data.date
-        
-        let newIssuances = sortOn (.date) (newIssuance :: stock_issuances)
-        
-        create this with 
-          stock_transfers = newTransfers
-          stock_issuances = newIssuances
-```
-
-### Example: Add Stakeholder
-
-```daml
+    -- Add a new stakeholder
     choice AddStakeholder : ContractId IssuerState
       with
         stakeholder_data: OcfStakeholderData
       controller context.issuer
       do
-        -- VALIDATION: ID must be unique
+        -- VALIDATION: ID must be unique (fetch all and check)
+        existingData <- mapA (\cid -> do
+          c <- fetch cid
+          pure c.stakeholder_data.id
+        ) stakeholders
         assertMsg "Stakeholder ID already exists" 
-          (not (stakeholderExists stakeholder_data.id stakeholders))
+          (stakeholder_data.id `notElem` existingData)
         
         createMarker context
         
-        -- Append to array
-        let newStakeholders = stakeholder_data :: stakeholders
+        -- Create the OCF object contract
+        newCid <- create Stakeholder with
+          context = context
+          stakeholder_data = stakeholder_data
         
-        create this with stakeholders = newStakeholders
+        -- Add ContractId to array
+        create this with stakeholders = newCid :: stakeholders
+```
+
+#### Edit (Correct an existing OCF object)
+
+```daml
+    -- Edit an existing stakeholder (archive old, create new)
+    choice EditStakeholder : ContractId IssuerState
+      with
+        old_cid: ContractId Stakeholder
+        new_data: OcfStakeholderData
+      controller context.issuer
+      do
+        -- VALIDATION: Contract must be in our list
+        assertMsg "Stakeholder not found in issuer state" 
+          (old_cid `elem` stakeholders)
+        
+        -- Fetch old to verify and get context
+        old <- fetch old_cid
+        
+        -- VALIDATION: ID should match (can't change ID via edit)
+        assertMsg "Cannot change stakeholder ID via edit" 
+          (old.stakeholder_data.id == new_data.id)
+        
+        createMarker context
+        
+        -- Archive old contract
+        archive old_cid
+        
+        -- Create new contract with updated data
+        newCid <- create Stakeholder with
+          context = context
+          stakeholder_data = new_data
+        
+        -- Replace ContractId in array
+        let updatedList = newCid :: filter (/= old_cid) stakeholders
+        create this with stakeholders = updatedList
+```
+
+#### Delete (Remove an OCF object)
+
+```daml
+    -- Delete a stakeholder
+    choice DeleteStakeholder : ContractId IssuerState
+      with
+        cid: ContractId Stakeholder
+      controller context.issuer
+      do
+        -- VALIDATION: Contract must be in our list
+        assertMsg "Stakeholder not found in issuer state" 
+          (cid `elem` stakeholders)
+        
+        -- Optional: Check for dependent objects (securities held by this stakeholder)
+        -- This could be enforced or just warned depending on requirements
+        
+        createMarker context
+        
+        -- Archive the contract
+        archive cid
+        
+        -- Remove ContractId from array
+        create this with stakeholders = filter (/= cid) stakeholders
+```
+
+### Example: Stock Issuance with Validation
+
+```daml
+    choice AddStockIssuance : ContractId IssuerState
+      with
+        issuance_data: OcfStockIssuanceData
+      controller context.issuer
+      do
+        -- VALIDATION: Stakeholder must exist
+        stakeholderIds <- mapA (\cid -> do
+          c <- fetch cid
+          pure c.stakeholder_data.id
+        ) stakeholders
+        assertMsg "Stakeholder not found" 
+          (issuance_data.stakeholder_id `elem` stakeholderIds)
+        
+        -- VALIDATION: Stock class must exist
+        stockClassIds <- mapA (\cid -> do
+          c <- fetch cid
+          pure c.stock_class_data.id
+        ) stock_classes
+        assertMsg "Stock class not found" 
+          (issuance_data.stock_class_id `elem` stockClassIds)
+        
+        -- VALIDATION: Security ID must be unique across all issuances
+        existingSecurityIds <- mapA (\cid -> do
+          c <- fetch cid
+          pure c.issuance_data.security_id
+        ) stock_issuances
+        assertMsg "Security ID already exists" 
+          (issuance_data.security_id `notElem` existingSecurityIds)
+        
+        createMarker context
+        
+        -- Create the issuance contract
+        newCid <- create StockIssuance with
+          context = context
+          issuance_data = issuance_data
+        
+        create this with stock_issuances = newCid :: stock_issuances
+```
+
+### Changes to Existing Templates
+
+#### Remove ArchiveByIssuer
+
+All existing OCF object templates should have `ArchiveByIssuer` removed. The `IssuerState` contract will archive objects directly since it's a signatory.
+
+**Before:**
+```daml
+template Stakeholder
+  with
+    context: Context
+    stakeholder_data: OcfStakeholderData
+  where
+    signatory context.issuer, context.system_operator
+    
+    -- Remove this choice
+    choice ArchiveByIssuer : ()
+      controller context.issuer
+      do pure ()
+```
+
+**After:**
+```daml
+template Stakeholder
+  with
+    context: Context
+    stakeholder_data: OcfStakeholderData
+  where
+    signatory context.issuer, context.system_operator
+    -- No ArchiveByIssuer - lifecycle controlled by IssuerState
+```
+
+#### Archive via IssuerState
+
+Since `IssuerState` has the same signatories (`context.issuer`, `context.system_operator`), it can directly `archive` any OCF object contract without needing a special choice.
+
+### Helper Functions
+
+```daml
+-- Check if a stakeholder ID exists
+stakeholderIdExists : Text -> [ContractId Stakeholder] -> Update Bool
+stakeholderIdExists targetId cids = do
+  ids <- mapA (\cid -> do
+    c <- fetch cid
+    pure c.stakeholder_data.id
+  ) cids
+  pure (targetId `elem` ids)
+
+-- Get stakeholder data by ID
+getStakeholderById : Text -> [ContractId Stakeholder] -> Update (Optional (ContractId Stakeholder, OcfStakeholderData))
+getStakeholderById targetId cids = do
+  results <- mapA (\cid -> do
+    c <- fetch cid
+    pure (cid, c.stakeholder_data)
+  ) cids
+  pure $ find (\(_, d) -> d.id == targetId) results
+
+-- Calculate shares issued for a stock class
+getSharesIssuedForClass : Text -> [ContractId StockIssuance] -> [ContractId StockCancellation] -> Update Decimal
+getSharesIssuedForClass classId issuanceCids cancellationCids = do
+  -- Get all issuances for this class
+  issuances <- mapA fetch issuanceCids
+  let classIssuances = filter (\i -> i.issuance_data.stock_class_id == classId) issuances
+  let totalIssued = sum (map (\i -> i.issuance_data.quantity) classIssuances)
+  
+  -- Get cancellations for securities in this class
+  cancellations <- mapA fetch cancellationCids
+  let cancelledQuantity = sum $ map (\c -> 
+        let secId = c.cancellation_data.security_id
+            maybeIssuance = find (\i -> i.issuance_data.security_id == secId) classIssuances
+        in case maybeIssuance of
+             Some i -> c.cancellation_data.quantity
+             None -> 0.0
+      ) cancellations
+  
+  pure (totalIssued - cancelledQuantity)
 ```
 
 ## Implementation Plan
 
 ### Phase 1: Create IssuerState Template
 
-1. Create `IssuerState.daml` with all arrays and basic choices
-2. Add helper functions for common queries (find by ID, etc.)
-3. Implement `Add*` choices for objects (stakeholders, stock classes, etc.)
-4. Implement core transaction choices (issuances, transfers, cancellations)
-5. Write tests for all choices
+1. Create `IssuerState.daml` with all ContractId arrays
+2. Implement `Add*` choices for all object types with validation
+3. Implement `Edit*` choices for correcting errors
+4. Implement `Delete*` choices for removing objects
+5. Write comprehensive tests
 
-### Phase 2: Migration Support
+### Phase 2: Update Existing Templates
+
+1. Remove `ArchiveByIssuer` from all OCF object templates
+2. Update `OcpFactory` to create `IssuerState` instead of `Issuer`
+3. Keep old `Issuer` template for backward compatibility (deprecated)
+4. Update SDK to use new `IssuerState` contract
+
+### Phase 3: Migration Support
 
 1. Create migration script to consolidate existing contracts into `IssuerState`
-2. Keep existing templates available for backward compatibility
-3. Add `OcpFactory` choice to create `IssuerState` directly
-4. Update SDK to work with new contract structure
+2. Script collects all existing OCF contracts for an issuer
+3. Creates new `IssuerState` with ContractIds
+4. Archives old `Issuer` contract
 
-### Phase 3: Deprecate Old Templates (Optional)
+### Future Enhancements
 
-1. Mark old individual templates as deprecated
-2. Provide tooling to export `IssuerState` as OCF JSON
-3. Add convenience choices for common operations (batch operations, etc.)
-
-### Future: Add Indexes When Needed
-
-When scale requires it, add optional computed indexes:
-
-```daml
--- Optional: Add when needed for performance
-data IssuerIndexes = IssuerIndexes
-  with
-    securities_by_stakeholder: Map Text [Text]  -- stakeholder_id -> [security_id]
-    shares_by_class: Map Text Decimal           -- class_id -> total_shares
-  deriving (Eq, Show)
-```
+When scale requires optimization:
+- Add ID-based indexes: `Map Text (ContractId Stakeholder)`
+- Cache computed values (shares issued per class)
+- Implement batch operations
 
 ## Consequences
 
@@ -349,48 +407,47 @@ data IssuerIndexes = IssuerIndexes
 
 | Benefit | Description |
 |---------|-------------|
-| **Simplicity** | No derived state to maintain, just arrays of OCF objects |
-| **OCF Compliance** | Objects stored in native OCF format |
-| **Single Source of Truth** | All cap table data in one contract |
+| **Central Lifecycle Control** | All create/edit/delete through `IssuerState` |
 | **Reference Integrity** | Validate IDs exist before operations |
-| **Atomicity** | All changes happen in single transaction |
-| **Easy Export** | Arrays can be directly serialized to OCF JSON |
-| **Debuggability** | Easy to inspect current state |
+| **Error Correction** | Edit and delete support for fixing mistakes |
+| **Atomic Operations** | Multi-step operations in single transaction |
+| **OCF Compliance** | Objects remain in standard OCF format |
+| **Queryable State** | ContractId arrays show what exists |
+| **Existing Templates** | Reuse existing OCF object templates |
 
 ### Negative
 
 | Concern | Mitigation |
 |---------|------------|
-| **Query Performance** | O(n) loops; fine for most companies (<1000 securities) |
-| **Contract Size** | May hit limits for very large cap tables |
-| **Breaking Change** | Migration required from current design |
-| **Serialization** | All writes go through one contract |
+| **Validation Cost** | Fetching contracts to validate; cache if needed |
+| **Array Operations** | O(n) lookups; add indexes when scale requires |
+| **Breaking Change** | Remove ArchiveByIssuer; provide migration |
+| **Single Point of Control** | Intentional - central authority for cap table |
 
-### Scale Limits
+### Scale Considerations
 
-For a typical startup cap table:
-- ~50 stakeholders
-- ~100-500 securities
-- ~1000 total transactions
+For typical startup cap tables (~50 stakeholders, ~500 securities):
+- Array operations are fast
+- Validation fetches are acceptable
 
-Array operations will be fast. If hitting limits:
-1. Add computed indexes
-2. Archive historical transactions to separate contract
-3. Shard by security type
+If hitting limits:
+1. Add `Map Text (ContractId X)` indexes for O(1) lookup
+2. Batch validation (fetch once, check many)
+3. Shard by object type into separate state contracts
 
 ## Alternatives Considered
 
-### Alternative 1: Keep Current Event-Sourcing Design
+### Alternative 1: Keep Current Design
 
-**Rejected because**: Requires off-chain infrastructure to compute current state, no reference integrity, scattered data across many contracts.
+**Rejected because**: No central state tracking, no reference integrity, no edit/delete support, scattered lifecycle control.
 
-### Alternative 2: Computed Aggregates (Maps, Running Totals)
+### Alternative 2: Embed OCF Data in Arrays (Previous Version)
 
-**Rejected because**: More complex, risk of aggregate state getting out of sync with source data, harder to debug.
+**Rejected because**: Duplicates data (both in array and in contracts), harder to query individual objects, larger contract size.
 
-### Alternative 3: Per-Security Position Contracts
+### Alternative 3: Maps Instead of Arrays
 
-**Rejected because**: Still scatters data across contracts, doesn't provide holistic view.
+**Deferred**: Maps provide O(1) lookup but add complexity. Arrays are simpler to implement and sufficient for most cap tables. Can add Map indexes later.
 
 ## References
 

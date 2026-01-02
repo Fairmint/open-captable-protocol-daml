@@ -8,7 +8,7 @@
 
 | ADR | Title | Status |
 |-----|-------|--------|
-| [ADR-002](./adr/002-stateful-issuer-with-position-tracking.md) | Stateful Issuer with Embedded OCF Objects | Proposed |
+| [ADR-002](./adr/002-stateful-issuer-with-position-tracking.md) | Stateful Issuer with OCF Object References | Proposed |
 
 ## Related
 
