@@ -1,4 +1,4 @@
-# ADR-002: Stateful Issuer with OCF Object References
+# ADR-002: Stateful Cap Table with OCF Object References
 
 ## Status
 
@@ -8,10 +8,10 @@
 
 ## TL;DR
 
-Replace the current event-sourcing pattern with a **Stateful Issuer** that:
-- Maintains arrays of ContractIds pointing to all OCF objects
+Introduce a new **CapTable** contract that:
+- Maintains arrays of ContractIds pointing to all OCF objects (including Issuer)
 - Acts as the sole authority for create/edit/delete operations
-- Enables reference integrity validation at transaction time
+- Validates that referenced objects exist before creating transactions (e.g., can't issue stock to a non-existent stakeholder)
 
 ---
 
@@ -24,21 +24,19 @@ The existing implementation uses an event-sourcing pattern where the `Issuer` co
 | Problem | Impact |
 |---------|--------|
 | **No current state visibility** | Must replay all events off-chain to determine ownership |
-| **No reference integrity** | Can issue stock to non-existent stakeholders |
-| **Scattered data** | Cap table spread across many contracts |
-| **No central lifecycle control** | Objects archived independently → orphaned references |
-| **No edit/delete support** | OCF objects are immutable, but errors need correction |
+| **No reference validation** | Can issue stock to non-existent stakeholders or invalid stock classes |
+| **Scattered data** | Cap table spread across many independent contracts |
 
 ---
 
 ## Decision
 
-Implement a **Stateful Issuer** pattern:
+Introduce a new **CapTable** contract (separate from the OCF `Issuer` object):
 
-1. Single `IssuerState` contract per issuer maintains **arrays of ContractIds**
-2. OCF objects remain as separate contracts (existing templates)
-3. `IssuerState` is the **sole authority** for creating, editing, and deleting
-4. Remove `ArchiveByIssuer` from individual templates
+1. Single `CapTable` contract per cap table maintains **arrays of ContractIds** to all OCF objects
+2. The `Issuer` remains a simple OCF object (just data, no factory methods)
+3. All create/edit/delete operations go through `CapTable`
+4. `CapTable` validates references exist before allowing transactions
 5. Edit = archive old + create new + update ContractId in array
 6. Delete = archive contract + remove ContractId from array
 
@@ -48,11 +46,12 @@ Implement a **Stateful Issuer** pattern:
 
 ```mermaid
 graph TB
-    subgraph IssuerState["IssuerState Contract"]
+    subgraph CapTable["CapTable Contract (new)"]
         direction TB
-        Meta["context, issuer_data"]
+        Meta["context"]
 
         subgraph Objects["Object References"]
+            O0["issuer: ContractId Issuer"]
             O1["stakeholders: ContractId[]"]
             O2["stock_classes: ContractId[]"]
             O3["stock_plans: ContractId[]"]
@@ -64,16 +63,16 @@ graph TB
             T1["stock_issuances: ContractId[]"]
             T2["stock_transfers: ContractId[]"]
             T3["stock_cancellations: ContractId[]"]
-            T4["equity_comp_*: ContractId[]"]
-            T5["..."]
+            T4["..."]
         end
 
         Choices["Choices: Add*, Edit*, Delete*"]
     end
 
-    IssuerState -->|creates/archives| OCF["OCF Object Contracts"]
+    CapTable -->|creates/archives| OCF["OCF Object Contracts"]
 
-    subgraph OCF["OCF Contracts"]
+    subgraph OCF["OCF Contracts (unchanged)"]
+        C0[Issuer]
         C1[Stakeholder]
         C2[StockClass]
         C3[StockIssuance]
@@ -83,9 +82,10 @@ graph TB
 
 ### Key Points
 
-- **One IssuerState per issuer** — single source of truth
-- **OCF contracts unchanged** — just remove `ArchiveByIssuer` choice
-- **Same signatories** — IssuerState can directly archive OCF contracts
+- **CapTable is a new custom contract** — not an OCF object
+- **Issuer is now just data** — simple OCF object, no factory methods
+- **All OCF contracts remain unchanged** — just remove `ArchiveByIssuer` choice
+- **Same signatories** — CapTable can directly archive OCF contracts
 
 ---
 
@@ -145,7 +145,7 @@ choice DeleteStakeholder(cid):
 
 ## Validation Example: Stock Issuance
 
-Shows how reference integrity is enforced:
+Shows how references are validated before creating transactions:
 
 ```
 choice AddStockIssuance(data):
@@ -170,7 +170,27 @@ choice AddStockIssuance(data):
 
 ## Template Changes
 
-### Remove ArchiveByIssuer
+### Issuer: Remove Factory Methods
+
+**Before:**
+```
+template Issuer:
+    signatory: issuer, system_operator
+
+    // ~40+ factory choices
+    choice CreateStakeholder(data): ...
+    choice CreateStockIssuance(data): ...
+    // etc.
+```
+
+**After:**
+```
+template Issuer:
+    signatory: issuer, system_operator
+    // Just data — no factory methods
+```
+
+### OCF Objects: Remove ArchiveByIssuer
 
 **Before:**
 ```
@@ -186,31 +206,31 @@ template Stakeholder:
 ```
 template Stakeholder:
     signatory: issuer, system_operator
-    // No ArchiveByIssuer — lifecycle controlled by IssuerState
+    // No ArchiveByIssuer — lifecycle controlled by CapTable
 ```
 
-Since `IssuerState` shares the same signatories, it can directly `archive` any OCF contract.
+Since `CapTable` shares the same signatories, it can directly `archive` any OCF contract.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1: Create IssuerState
-- Create `IssuerState.daml` with all ContractId arrays
+### Phase 1: Create CapTable
+- Create `CapTable.daml` with all ContractId arrays
 - Implement `Add*`, `Edit*`, `Delete*` choices with validation
 - Write comprehensive tests
 
 ### Phase 2: Update Templates
+- Remove factory methods from `Issuer`
 - Remove `ArchiveByIssuer` from all OCF templates
-- Update `OcpFactory` to create `IssuerState` instead of `Issuer`
-- Keep old `Issuer` template (deprecated) for backward compatibility
+- Update `OcpFactory` to create `CapTable` (which creates the `Issuer`)
 - Update SDK to use new contract
 
 ### Phase 3: Migration
 - Create migration script to consolidate existing contracts
 - Collect all existing OCF contracts for an issuer
-- Create new `IssuerState` with ContractIds
-- Archive old `Issuer` contract
+- Create new `CapTable` with ContractIds
+- Archive old `Issuer` contract (with factory methods)
 
 ---
 
@@ -220,12 +240,11 @@ Since `IssuerState` shares the same signatories, it can directly `archive` any O
 
 | Benefit | Description |
 |---------|-------------|
-| Central lifecycle control | All create/edit/delete through `IssuerState` |
-| Reference integrity | Validate IDs exist before operations |
-| Error correction | Edit and delete support for mistakes |
-| Atomic operations | Multi-step operations in single transaction |
-| OCF compliance | Objects remain in standard format |
+| Reference validation | Validate that IDs exist before operations |
+| Clean separation | CapTable is our custom logic; OCF objects stay standard |
 | Queryable state | ContractId arrays show what exists |
+| Atomic operations | Multi-step operations in single transaction |
+| OCF compliance | Issuer and all objects remain in standard OCF format |
 
 ### Negative
 
@@ -252,9 +271,10 @@ Since `IssuerState` shares the same signatories, it can directly `archive` any O
 
 | Alternative | Decision |
 |-------------|----------|
-| **Keep current design** | Rejected — no state tracking, no reference integrity, no edit/delete |
-| **Embed OCF data in arrays** | Rejected — duplicates data, harder to query individual objects |
-| **Maps instead of arrays** | Deferred — adds complexity, can add later when needed |
+| **Keep current design** | Rejected — no state tracking, no reference validation |
+| **Modify Issuer directly** | Rejected — Issuer is an OCF object, should stay simple |
+| **Embed OCF data in arrays** | Rejected — duplicates data, harder to query |
+| **Maps instead of arrays** | Deferred — adds complexity, can add later |
 
 ---
 
