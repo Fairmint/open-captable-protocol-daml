@@ -2,9 +2,9 @@
  * CapTable Code Generator
  *
  * Generates CapTable.daml by:
- * 1. Discovering types from DAML files in OpenCapTable-v25/
+ * 1. Discovering types from DAML files in OpenCapTable-v25/OCF/
  * 2. Deriving module, data_type, data_param, map_field programmatically
- * 3. Using config only for: excluded files, object vs transaction, validations
+ * 3. Using config only for: object vs transaction classification, validations
  *
  * Usage: tsx codegen/generate-captable.ts
  */
@@ -14,7 +14,6 @@ import * as path from "path";
 import * as yaml from "yaml";
 
 interface Config {
-  exclude: string[];
   objects: string[];
   validations: Record<string, Record<string, string>>;
 }
@@ -29,11 +28,12 @@ interface TypeDef {
 }
 
 const CODEGEN_DIR = path.dirname(new URL(import.meta.url).pathname);
-const DAML_DIR = path.join(
+const OPENCAPTABLE_DIR = path.join(
   CODEGEN_DIR,
   "../OpenCapTable-v25/daml/Fairmint/OpenCapTable"
 );
-const OUTPUT_PATH = path.join(DAML_DIR, "CapTable.daml");
+const OCF_DIR = path.join(OPENCAPTABLE_DIR, "OCF");
+const OUTPUT_PATH = path.join(OPENCAPTABLE_DIR, "CapTable.daml");
 
 function loadConfig(): Config {
   const configPath = path.join(CODEGEN_DIR, "captable-config.yaml");
@@ -96,22 +96,20 @@ function parseTypeInfo(filePath: string, typeName: string): { dataType: string; 
 }
 
 /**
- * Discover all types from DAML files
+ * Discover all types from DAML files in OCF/ subdirectory
  */
 function discoverTypes(config: Config): { objects: TypeDef[]; transactions: TypeDef[] } {
-  const excludeSet = new Set(config.exclude);
   const objectSet = new Set(config.objects);
 
-  const files = fs.readdirSync(DAML_DIR)
+  const files = fs.readdirSync(OCF_DIR)
     .filter((f) => f.endsWith(".daml"))
-    .filter((f) => !excludeSet.has(f.replace(".daml", "")))
     .map((f) => f.replace(".daml", ""));
 
   const objects: TypeDef[] = [];
   const transactions: TypeDef[] = [];
 
   for (const name of files) {
-    const filePath = path.join(DAML_DIR, `${name}.daml`);
+    const filePath = path.join(OCF_DIR, `${name}.daml`);
     const typeInfo = parseTypeInfo(filePath, name);
 
     if (!typeInfo) {
@@ -124,7 +122,7 @@ function discoverTypes(config: Config): { objects: TypeDef[]; transactions: Type
 
     const typeDef: TypeDef = {
       name,
-      module: `Fairmint.OpenCapTable.${name}`,
+      module: `Fairmint.OpenCapTable.OCF.${name}`,
       data_type: typeInfo.dataType,
       data_param: typeInfo.fieldName,
       map_field: pluralize(snakeName),
