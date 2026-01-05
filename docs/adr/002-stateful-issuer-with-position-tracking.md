@@ -9,7 +9,7 @@
 ## TL;DR
 
 Introduce a new **CapTable** contract that:
-- Maintains `Map<id, ContractId>` for all OCF objects (O(1) lookup by business ID)
+- Maintains `Map Text ContractId` for all OCF objects (O(1) lookup by business ID)
 - Acts as the sole authority for create/edit/delete operations
 - Validates that referenced objects exist before creating transactions (e.g., can't issue stock to a non-existent stakeholder)
 
@@ -52,17 +52,17 @@ graph TB
 
         subgraph Objects["Object References (Map id → ContractId)"]
             O0["issuer: ContractId Issuer"]
-            O1["stakeholders: Map Text ContractId"]
-            O2["stock_classes: Map Text ContractId"]
-            O3["stock_plans: Map Text ContractId"]
-            O4["vesting_terms: Map Text ContractId"]
+            O1["stakeholders: Map Text (ContractId Stakeholder)"]
+            O2["stock_classes: Map Text (ContractId StockClass)"]
+            O3["stock_plans: Map Text (ContractId StockPlan)"]
+            O4["vesting_terms: Map Text (ContractId VestingTerms)"]
             O5["..."]
         end
 
         subgraph Transactions["Transaction References (Map id → ContractId)"]
-            T1["stock_issuances: Map Text ContractId"]
-            T2["stock_transfers: Map Text ContractId"]
-            T3["stock_cancellations: Map Text ContractId"]
+            T1["stock_issuances: Map Text (ContractId StockIssuance)"]
+            T2["stock_transfers: Map Text (ContractId StockTransfer)"]
+            T3["stock_cancellations: Map Text (ContractId StockCancellation)"]
             T4["..."]
         end
 
@@ -100,10 +100,10 @@ choice AddStakeholder(data):
     assert data.id not in stakeholders
 
     -- Create OCF contract
-    new_cid = create Stakeholder(context, data)
+    new_cid <- create Stakeholder(context, data)
 
-    -- Update state
-    return create this with { stakeholders: insert(data.id, new_cid, stakeholders) }
+    -- Update state (archive old CapTable, create new with updated map)
+    create this with { stakeholders = Map.insert data.id new_cid stakeholders }
 ```
 
 ### Edit (Correct)
@@ -111,31 +111,38 @@ choice AddStakeholder(data):
 ```haskell
 choice EditStakeholder(id, new_data):
     -- Lookup by ID (O(1))
-    old_cid = stakeholders[id]
-    assert old_cid exists
+    old_cid <- lookup id stakeholders
+    assert (isSome old_cid)
     assert id == new_data.id  -- Can't change ID via edit
 
     -- Replace contract
-    archive old_cid
-    new_cid = create Stakeholder(context, new_data)
+    archive (fromSome old_cid)
+    new_cid <- create Stakeholder(context, new_data)
 
-    -- Update state
-    return create this with { stakeholders: insert(id, new_cid, stakeholders) }
+    -- Update state (archive old CapTable, create new with updated map)
+    create this with { stakeholders = Map.insert id new_cid stakeholders }
 ```
 
 ### Delete (Archive + Remove)
 
-> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. We validate references on Add, but validating on Delete would require fetching a potentially large number of contracts to check for references.
+> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. 
+> 
+> **Operational policy**: Deletions should be restricted to admin workflows that first verify or migrate dependent contracts. Most risky operations include:
+> - Deleting stakeholders (may be referenced by issuances, transfers)
+> - Deleting stock classes (may be referenced by issuances, plans)
+> - Deleting stock plans (may be referenced by equity compensation)
+> 
+> We validate references on Add, but comprehensive validation on Delete would require fetching potentially hundreds of contracts to check for reverse references.
 
 ```haskell
 choice DeleteStakeholder(id):
     -- Lookup by ID (O(1))
-    cid = stakeholders[id]
-    assert cid exists
+    cid <- lookup id stakeholders
+    assert (isSome cid)
 
-    -- Archive and remove
-    archive cid
-    return create this with { stakeholders: delete(id, stakeholders) }
+    -- Archive and remove from map
+    archive (fromSome cid)
+    create this with { stakeholders = Map.delete id stakeholders }
 ```
 
 ### Future: Recovery Operations
@@ -151,18 +158,20 @@ Shows how references are validated before creating transactions:
 ```haskell
 choice AddStockIssuance(data):
     -- Validate stakeholder exists (O(1) map lookup)
-    assert data.stakeholder_id in stakeholders
+    assert (isSome $ Map.lookup data.stakeholder_id stakeholders)
 
     -- Validate stock class exists (O(1))
-    assert data.stock_class_id in stock_classes
+    assert (isSome $ Map.lookup data.stock_class_id stock_classes)
 
     -- Validate security ID unique (O(1))
-    assert data.security_id not in stock_issuances
+    assert (isNone $ Map.lookup data.security_id stock_issuances)
 
-    -- Create
-    new_cid = create StockIssuance(context, data)
-    return create this with {
-        stock_issuances: insert(data.security_id, new_cid, stock_issuances)
+    -- Create OCF contract
+    new_cid <- create StockIssuance(context, data)
+    
+    -- Update state
+    create this with {
+        stock_issuances = Map.insert data.security_id new_cid stock_issuances
     }
 ```
 
@@ -247,7 +256,9 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 | Concern | Mitigation |
 |---------|------------|
-| Stale references | Delete can leave broken refs; validating would require fetching too many contracts |
+| Stale references | **Accepted trade-off for now.** Operational policy forbids deleting objects that are known to be referenced by other OCF objects; deletions are restricted to admin workflows that first migrate or archive dependents. Full graph validation on every delete is deferred because it would require fetching too many contracts at current scale. |
+
+**Future work / acceptance criteria:** When (a) a stale-reference incident is detected in production **or** (b) typical cap tables exceed an agreed threshold (e.g., >10k OCF contracts per issuer), we will introduce stronger guarantees (e.g., a reverse-reference index, periodic batch validator, or off-chain integrity checker) and update this ADR accordingly.
 
 ---
 
