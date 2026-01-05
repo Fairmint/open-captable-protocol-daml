@@ -66,7 +66,7 @@ graph TB
             T4["..."]
         end
 
-        Choices["Choices: Add*, Edit*, Delete*, Remove*"]
+        Choices["Choices: Add*, Edit*, Delete*"]
     end
 
     CapTable -->|creates/archives| OCF["OCF Object Contracts"]
@@ -138,16 +138,9 @@ choice DeleteStakeholder(id):
     return create this with { stakeholders: delete(id, stakeholders) }
 ```
 
-### Remove (Cleanup without Archive)
+### Future: Recovery Operations
 
-Use when a contract was archived externally and needs to be removed from the map.
-
-```haskell
-choice RemoveStakeholder(id):
-    -- Just remove from map (don't try to archive)
-    assert id in stakeholders
-    return create this with { stakeholders: delete(id, stakeholders) }
-```
+> 💡 **Note**: If contracts are ever archived outside of CapTable (e.g., via direct ledger operations), we may need to add `Remove*` choices that delete entries from the map without attempting to archive the contract. Not implementing this initially—will add if needed.
 
 ---
 
@@ -221,7 +214,7 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 ### Phase 1: Create CapTable
 - Create `CapTable.daml` with all `Map Text ContractId` fields
-- Implement `Add*`, `Edit*`, `Delete*`, `Remove*` choices with validation
+- Implement `Add*`, `Edit*`, `Delete*` choices with validation
 - Write comprehensive tests
 
 ### Phase 2: Update Templates
@@ -249,7 +242,6 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 | Queryable state | Maps show what exists by ID |
 | Atomic operations | Multi-step operations in single transaction |
 | OCF compliance | Issuer and all objects remain in standard OCF format |
-| Recovery path | Remove* choices handle externally-archived contracts |
 
 ### Negative
 
