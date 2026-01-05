@@ -94,32 +94,32 @@ graph TB
 
 ### Add (Create)
 
-```
+```haskell
 choice AddStakeholder(data):
-    // Validate ID uniqueness (O(1) map lookup)
+    -- Validate ID uniqueness (O(1) map lookup)
     assert data.id not in stakeholders
 
-    // Create OCF contract
+    -- Create OCF contract
     new_cid = create Stakeholder(context, data)
 
-    // Update state
+    -- Update state
     return create this with { stakeholders: insert(data.id, new_cid, stakeholders) }
 ```
 
 ### Edit (Correct)
 
-```
+```haskell
 choice EditStakeholder(id, new_data):
-    // Lookup by ID (O(1))
+    -- Lookup by ID (O(1))
     old_cid = stakeholders[id]
     assert old_cid exists
-    assert id == new_data.id  // Can't change ID via edit
+    assert id == new_data.id  -- Can't change ID via edit
 
-    // Replace contract
+    -- Replace contract
     archive old_cid
     new_cid = create Stakeholder(context, new_data)
 
-    // Update state
+    -- Update state
     return create this with { stakeholders: insert(id, new_cid, stakeholders) }
 ```
 
@@ -127,13 +127,13 @@ choice EditStakeholder(id, new_data):
 
 > ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. We validate references on Add, but cannot prevent references from becoming stale after deletion.
 
-```
+```haskell
 choice DeleteStakeholder(id):
-    // Lookup by ID (O(1))
+    -- Lookup by ID (O(1))
     cid = stakeholders[id]
     assert cid exists
 
-    // Archive and remove
+    -- Archive and remove
     archive cid
     return create this with { stakeholders: delete(id, stakeholders) }
 ```
@@ -142,9 +142,9 @@ choice DeleteStakeholder(id):
 
 Use when a contract was archived externally and needs to be removed from the map.
 
-```
+```haskell
 choice RemoveStakeholder(id):
-    // Just remove from map — don't try to archive
+    -- Just remove from map (don't try to archive)
     assert id in stakeholders
     return create this with { stakeholders: delete(id, stakeholders) }
 ```
@@ -155,18 +155,18 @@ choice RemoveStakeholder(id):
 
 Shows how references are validated before creating transactions:
 
-```
+```haskell
 choice AddStockIssuance(data):
-    // Validate stakeholder exists (O(1) map lookup)
+    -- Validate stakeholder exists (O(1) map lookup)
     assert data.stakeholder_id in stakeholders
 
-    // Validate stock class exists (O(1))
+    -- Validate stock class exists (O(1))
     assert data.stock_class_id in stock_classes
 
-    // Validate security ID unique (O(1))
+    -- Validate security ID unique (O(1))
     assert data.security_id not in stock_issuances
 
-    // Create
+    -- Create
     new_cid = create StockIssuance(context, data)
     return create this with {
         stock_issuances: insert(data.security_id, new_cid, stock_issuances)
@@ -180,18 +180,17 @@ choice AddStockIssuance(data):
 ### Issuer: Remove Factory Methods
 
 **Before:**
-```
+```haskell
 template Issuer:
     signatory: issuer, system_operator
 
-    // ~40+ factory choices
+    -- ~40+ factory choices
     choice CreateStakeholder(data): ...
     choice CreateStockIssuance(data): ...
-    // etc.
 ```
 
 **After:**
-```
+```haskell
 template Issuer:
     signatory: issuer, system_operator
 ```
@@ -199,7 +198,7 @@ template Issuer:
 ### OCF Objects: Remove ArchiveByIssuer
 
 **Before:**
-```
+```haskell
 template Stakeholder:
     signatory: issuer, system_operator
 
@@ -209,7 +208,7 @@ template Stakeholder:
 ```
 
 **After:**
-```
+```haskell
 template Stakeholder:
     signatory: issuer, system_operator
 ```
