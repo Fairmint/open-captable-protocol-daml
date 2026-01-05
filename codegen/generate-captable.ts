@@ -98,10 +98,11 @@ function parseTypeInfo(filePath: string, typeName: string): { dataType: string; 
 
 /**
  * Discover all types from DAML files in OCF/ subdirectory
+ * Issuer is excluded because it's handled specially (only EditIssuer, no Add/Delete)
  */
 function discoverTypes(config: Config): TypeDef[] {
   const files = fs.readdirSync(OCF_DIR)
-    .filter((f) => f.endsWith(".daml"))
+    .filter((f) => f.endsWith(".daml") && f !== "Issuer.daml")
     .map((f) => f.replace(".daml", ""));
 
   const types: TypeDef[] = [];
@@ -270,7 +271,7 @@ import qualified DA.Map as Map
 
 import Fairmint.OpenCapTable.Types (Context)
 import Fairmint.OpenCapTable.Helpers (createMarker)
-import Fairmint.OpenCapTable.Issuer (Issuer(..), IssuerOcfData)
+import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 
 -- OCF Types
 ${imports}
