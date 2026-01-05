@@ -9,7 +9,7 @@
 ## TL;DR
 
 Introduce a new **CapTable** contract that:
-- Maintains arrays of ContractIds pointing to all OCF objects (including Issuer)
+- Maintains `Map<id, ContractId>` for all OCF objects (O(1) lookup by business ID)
 - Acts as the sole authority for create/edit/delete operations
 - Validates that referenced objects exist before creating transactions (e.g., can't issue stock to a non-existent stakeholder)
 
@@ -33,12 +33,12 @@ The existing implementation uses an event-sourcing pattern where the `Issuer` co
 
 Introduce a new **CapTable** contract (separate from the OCF `Issuer` object):
 
-1. Single `CapTable` contract per cap table maintains **arrays of ContractIds** to all OCF objects
+1. Single `CapTable` contract per cap table maintains **Maps of id → ContractId** for all OCF objects
 2. The `Issuer` remains a simple OCF object (just data, no factory methods)
 3. All create/edit/delete operations go through `CapTable`
-4. `CapTable` validates references exist before allowing transactions
-5. Edit = archive old + create new + update ContractId in array
-6. Delete = archive contract + remove ContractId from array
+4. `CapTable` validates references exist before allowing transactions (O(1) map lookup)
+5. Edit = archive old + create new + update ContractId in map
+6. Delete = archive contract + remove from map
 
 ---
 
@@ -49,28 +49,28 @@ graph TB
     subgraph CapTable["CapTable Contract (new)"]
         direction TB
         Meta["context"]
-
-        subgraph Objects["Object References"]
+        
+        subgraph Objects["Object References (Map id → ContractId)"]
             O0["issuer: ContractId Issuer"]
-            O1["stakeholders: ContractId[]"]
-            O2["stock_classes: ContractId[]"]
-            O3["stock_plans: ContractId[]"]
-            O4["vesting_terms: ContractId[]"]
+            O1["stakeholders: Map Text ContractId"]
+            O2["stock_classes: Map Text ContractId"]
+            O3["stock_plans: Map Text ContractId"]
+            O4["vesting_terms: Map Text ContractId"]
             O5["..."]
         end
-
-        subgraph Transactions["Transaction References"]
-            T1["stock_issuances: ContractId[]"]
-            T2["stock_transfers: ContractId[]"]
-            T3["stock_cancellations: ContractId[]"]
+        
+        subgraph Transactions["Transaction References (Map id → ContractId)"]
+            T1["stock_issuances: Map Text ContractId"]
+            T2["stock_transfers: Map Text ContractId"]
+            T3["stock_cancellations: Map Text ContractId"]
             T4["..."]
         end
-
-        Choices["Choices: Add*, Edit*, Delete*"]
+        
+        Choices["Choices: Add*, Edit*, Delete*, Remove*"]
     end
-
+    
     CapTable -->|creates/archives| OCF["OCF Object Contracts"]
-
+    
     subgraph OCF["OCF Contracts (unchanged)"]
         C0[Issuer]
         C1[Stakeholder]
@@ -86,6 +86,7 @@ graph TB
 - **Issuer is now just data** — simple OCF object, no factory methods
 - **All OCF contracts remain unchanged** — just remove `ArchiveByIssuer` choice
 - **Same signatories** — CapTable can directly archive OCF contracts
+- **Maps for O(1) lookup** — instant validation by business ID
 
 ---
 
@@ -95,50 +96,57 @@ graph TB
 
 ```
 choice AddStakeholder(data):
-    // Validate ID uniqueness
-    existing_ids = fetch_all(stakeholders).map(s => s.id)
-    assert data.id not in existing_ids
-
+    // Validate ID uniqueness (O(1) map lookup)
+    assert data.id not in stakeholders
+    
     // Create OCF contract
     new_cid = create Stakeholder(context, data)
-
+    
     // Update state
-    return create this with { stakeholders: [new_cid, ...stakeholders] }
+    return create this with { stakeholders: insert(data.id, new_cid, stakeholders) }
 ```
 
 ### Edit (Correct)
 
 ```
-choice EditStakeholder(old_cid, new_data):
-    // Validate exists in our list
-    assert old_cid in stakeholders
-
-    // Fetch and validate ID unchanged
-    old = fetch(old_cid)
-    assert old.id == new_data.id  // Can't change ID via edit
-
+choice EditStakeholder(id, new_data):
+    // Lookup by ID (O(1))
+    old_cid = stakeholders[id]
+    assert old_cid exists
+    assert id == new_data.id  // Can't change ID via edit
+    
     // Replace contract
     archive old_cid
     new_cid = create Stakeholder(context, new_data)
-
+    
     // Update state
-    return create this with {
-        stakeholders: [new_cid, ...stakeholders.filter(c => c != old_cid)]
-    }
+    return create this with { stakeholders: insert(id, new_cid, stakeholders) }
 ```
 
-### Delete (Remove)
+### Delete (Archive + Remove)
+
+> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. We validate references on Add, but cannot prevent references from becoming stale after deletion.
 
 ```
-choice DeleteStakeholder(cid):
-    // Validate exists
-    assert cid in stakeholders
-
-    // Optional: check no dependent objects
-
-    // Remove
+choice DeleteStakeholder(id):
+    // Lookup by ID (O(1))
+    cid = stakeholders[id]
+    assert cid exists
+    
+    // Archive and remove
     archive cid
-    return create this with { stakeholders: stakeholders.filter(c => c != cid) }
+    return create this with { stakeholders: delete(id, stakeholders) }
+```
+
+### Remove (Cleanup without Archive)
+
+Use when a contract was archived externally and needs to be removed from the map.
+
+```
+choice RemoveStakeholder(id):
+    // Just remove from map — don't try to archive
+    assert id in stakeholders
+    return create this with { stakeholders: delete(id, stakeholders) }
 ```
 
 ---
@@ -149,21 +157,20 @@ Shows how references are validated before creating transactions:
 
 ```
 choice AddStockIssuance(data):
-    // Validate stakeholder exists
-    stakeholder_ids = fetch_all(stakeholders).map(s => s.id)
-    assert data.stakeholder_id in stakeholder_ids
-
-    // Validate stock class exists
-    class_ids = fetch_all(stock_classes).map(c => c.id)
-    assert data.stock_class_id in class_ids
-
-    // Validate security ID unique
-    existing_security_ids = fetch_all(stock_issuances).map(i => i.security_id)
-    assert data.security_id not in existing_security_ids
-
+    // Validate stakeholder exists (O(1) map lookup)
+    assert data.stakeholder_id in stakeholders
+    
+    // Validate stock class exists (O(1))
+    assert data.stock_class_id in stock_classes
+    
+    // Validate security ID unique (O(1))
+    assert data.security_id not in stock_issuances
+    
     // Create
     new_cid = create StockIssuance(context, data)
-    return create this with { stock_issuances: [new_cid, ...stock_issuances] }
+    return create this with { 
+        stock_issuances: insert(data.security_id, new_cid, stock_issuances) 
+    }
 ```
 
 ---
@@ -176,7 +183,7 @@ choice AddStockIssuance(data):
 ```
 template Issuer:
     signatory: issuer, system_operator
-
+    
     // ~40+ factory choices
     choice CreateStakeholder(data): ...
     choice CreateStockIssuance(data): ...
@@ -187,7 +194,6 @@ template Issuer:
 ```
 template Issuer:
     signatory: issuer, system_operator
-    // Just data — no factory methods
 ```
 
 ### OCF Objects: Remove ArchiveByIssuer
@@ -196,8 +202,8 @@ template Issuer:
 ```
 template Stakeholder:
     signatory: issuer, system_operator
-
-    choice ArchiveByIssuer:  // ← Remove this
+    
+    choice ArchiveByIssuer:
         controller: issuer
         return ()
 ```
@@ -206,7 +212,6 @@ template Stakeholder:
 ```
 template Stakeholder:
     signatory: issuer, system_operator
-    // No ArchiveByIssuer — lifecycle controlled by CapTable
 ```
 
 Since `CapTable` shares the same signatories, it can directly `archive` any OCF contract.
@@ -216,8 +221,8 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 ## Implementation Plan
 
 ### Phase 1: Create CapTable
-- Create `CapTable.daml` with all ContractId arrays
-- Implement `Add*`, `Edit*`, `Delete*` choices with validation
+- Create `CapTable.daml` with all `Map Text ContractId` fields
+- Implement `Add*`, `Edit*`, `Delete*`, `Remove*` choices with validation
 - Write comprehensive tests
 
 ### Phase 2: Update Templates
@@ -229,7 +234,7 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 ### Phase 3: Migration
 - Create migration script to consolidate existing contracts
 - Collect all existing OCF contracts for an issuer
-- Create new `CapTable` with ContractIds
+- Create new `CapTable` with Maps
 - Archive old `Issuer` contract (with factory methods)
 
 ---
@@ -240,30 +245,19 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 | Benefit | Description |
 |---------|-------------|
-| Reference validation | Validate that IDs exist before operations |
+| Reference validation | Validate that IDs exist before operations (O(1)) |
 | Clean separation | CapTable is our custom logic; OCF objects stay standard |
-| Queryable state | ContractId arrays show what exists |
+| Queryable state | Maps show what exists by ID |
 | Atomic operations | Multi-step operations in single transaction |
 | OCF compliance | Issuer and all objects remain in standard OCF format |
+| Recovery path | Remove* choices handle externally-archived contracts |
 
 ### Negative
 
 | Concern | Mitigation |
 |---------|------------|
-| Validation cost | Fetching contracts to validate; cache if needed |
-| Array operations O(n) | Add indexes when scale requires |
+| Stale references | Delete can leave broken refs; validate on Add only |
 | Breaking change | Provide migration path |
-
----
-
-## Scale Considerations
-
-**Typical startup** (~50 stakeholders, ~500 securities): Arrays are fast enough.
-
-**If hitting limits:**
-1. Add `Map<id, ContractId>` indexes for O(1) lookup
-2. Batch validation (fetch once, check many)
-3. Shard by object type into separate state contracts
 
 ---
 
@@ -273,8 +267,8 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 |-------------|----------|
 | **Keep current design** | Rejected — no state tracking, no reference validation |
 | **Modify Issuer directly** | Rejected — Issuer is an OCF object, should stay simple |
-| **Embed OCF data in arrays** | Rejected — duplicates data, harder to query |
-| **Maps instead of arrays** | Deferred — adds complexity, can add later |
+| **Embed OCF data in maps** | Rejected — duplicates data, harder to query |
+| **Arrays instead of maps** | Rejected — O(n) lookup not acceptable for validation |
 
 ---
 
