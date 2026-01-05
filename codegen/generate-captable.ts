@@ -4,7 +4,7 @@
  * Generates CapTable.daml by:
  * 1. Discovering types from DAML files in OpenCapTable-v25/OCF/
  * 2. Deriving module, data_type, data_param, map_field programmatically
- * 3. Using config only for: object vs transaction classification, validations
+ * 3. Using config only for reference validations
  *
  * Usage: tsx codegen/generate-captable.ts
  */
@@ -14,8 +14,7 @@ import * as path from "path";
 import * as yaml from "yaml";
 
 interface Config {
-  objects: string[];
-  validations: Record<string, Record<string, string>>;
+  validations: Record<string, string[]>;
 }
 
 interface TypeDef {
@@ -43,19 +42,26 @@ function loadConfig(): Config {
 
 /**
  * Convert PascalCase to snake_case
- * StockClass -> stock_class
- * EquityCompensationIssuance -> equity_compensation_issuance
  */
 function toSnakeCase(str: string): string {
+  return str.replace(/([a-z])([A-Z])/g, "$1_$2").toLowerCase();
+}
+
+/**
+ * Convert snake_case to Title Case
+ * stakeholder_id -> Stakeholder
+ * stock_class_id -> Stock class
+ */
+function toTitleCase(str: string): string {
   return str
-    .replace(/([a-z])([A-Z])/g, "$1_$2")
-    .toLowerCase();
+    .replace(/_id$/, "")
+    .split("_")
+    .map((word, i) => (i === 0 ? word.charAt(0).toUpperCase() + word.slice(1) : word))
+    .join(" ");
 }
 
 /**
  * Pluralize a snake_case string
- * stakeholder -> stakeholders
- * stock_class -> stock_classes
  */
 function pluralize(str: string): string {
   if (str.endsWith("s")) return str + "es";
@@ -65,17 +71,13 @@ function pluralize(str: string): string {
 
 /**
  * Parse a DAML file to find its main data type and field name
- * Returns { dataType, fieldName } or null
  */
 function parseTypeInfo(filePath: string, typeName: string): { dataType: string; fieldName: string } | null {
   const content = fs.readFileSync(filePath, "utf-8");
 
-  // Look for: data <Name>OcfData = <Name>OcfData
   const dataMatch = content.match(/^data (\w+OcfData) = \1/m);
   if (!dataMatch) return null;
 
-  // Look for field name in template definition
-  // template TypeName with context: Context <fieldName>: <DataType>
   const templateRegex = new RegExp(
     `template ${typeName}\\s+with\\s+context:\\s*Context\\s+(\\w+):\\s*(\\w+OcfData)`,
     "m"
@@ -83,7 +85,6 @@ function parseTypeInfo(filePath: string, typeName: string): { dataType: string; 
   const templateMatch = content.match(templateRegex);
 
   if (!templateMatch) {
-    // Fallback: try to find any field with the OcfData type
     const fieldRegex = new RegExp(`(\\w+):\\s*${dataMatch[1]}`, "m");
     const fieldMatch = content.match(fieldRegex);
     if (fieldMatch) {
@@ -98,15 +99,12 @@ function parseTypeInfo(filePath: string, typeName: string): { dataType: string; 
 /**
  * Discover all types from DAML files in OCF/ subdirectory
  */
-function discoverTypes(config: Config): { objects: TypeDef[]; transactions: TypeDef[] } {
-  const objectSet = new Set(config.objects);
-
+function discoverTypes(config: Config): TypeDef[] {
   const files = fs.readdirSync(OCF_DIR)
     .filter((f) => f.endsWith(".daml"))
     .map((f) => f.replace(".daml", ""));
 
-  const objects: TypeDef[] = [];
-  const transactions: TypeDef[] = [];
+  const types: TypeDef[] = [];
 
   for (const name of files) {
     const filePath = path.join(OCF_DIR, `${name}.daml`);
@@ -118,7 +116,7 @@ function discoverTypes(config: Config): { objects: TypeDef[]; transactions: Type
     }
 
     const snakeName = toSnakeCase(name);
-    const validationConfig = config.validations[name] || {};
+    const validationFields = config.validations[name] || [];
 
     const typeDef: TypeDef = {
       name,
@@ -126,25 +124,17 @@ function discoverTypes(config: Config): { objects: TypeDef[]; transactions: Type
       data_type: typeInfo.dataType,
       data_param: typeInfo.fieldName,
       map_field: pluralize(snakeName),
-      validations: Object.entries(validationConfig).map(([field, error]) => ({
+      validations: validationFields.map((field) => ({
         field,
         map: pluralize(toSnakeCase(field.replace("_id", ""))),
-        error,
+        error: `${toTitleCase(field)} not found`,
       })),
     };
 
-    if (objectSet.has(name)) {
-      objects.push(typeDef);
-    } else {
-      transactions.push(typeDef);
-    }
+    types.push(typeDef);
   }
 
-  // Sort alphabetically for consistent output
-  objects.sort((a, b) => a.name.localeCompare(b.name));
-  transactions.sort((a, b) => a.name.localeCompare(b.name));
-
-  return { objects, transactions };
+  return types.sort((a, b) => a.name.localeCompare(b.name));
 }
 
 function generateImports(types: TypeDef[]): string {
@@ -255,26 +245,13 @@ function generate(): void {
   const config = loadConfig();
 
   console.log("Discovering types from DAML files...");
-  const { objects, transactions } = discoverTypes(config);
-  const allTypes = [...objects, ...transactions];
+  const types = discoverTypes(config);
 
-  console.log(`  Found ${objects.length} objects, ${transactions.length} transactions`);
+  console.log(`  Found ${types.length} types`);
 
-  // Generate imports
-  const imports = generateImports(allTypes);
-
-  // Generate map fields
-  const objectMapFields = objects.map(generateMapField).join("\n");
-  const transactionMapFields = transactions.map(generateMapField).join("\n");
-
-  // Generate choices
-  const objectChoices = objects
-    .map((t) => generateChoicesForType(t))
-    .join("\n\n");
-
-  const transactionChoices = transactions
-    .map((t) => generateChoicesForType(t))
-    .join("\n\n");
+  const imports = generateImports(types);
+  const mapFields = types.map(generateMapField).join("\n");
+  const choices = types.map((t) => generateChoicesForType(t)).join("\n\n");
 
   const output = `module Fairmint.OpenCapTable.CapTable where
 
@@ -295,7 +272,7 @@ import Fairmint.OpenCapTable.Types (Context)
 import Fairmint.OpenCapTable.Helpers (createMarker)
 import Fairmint.OpenCapTable.Issuer (Issuer(..), IssuerOcfData)
 
--- OCF Objects and Transactions
+-- OCF Types
 ${imports}
 
 
@@ -306,11 +283,8 @@ template CapTable
     -- Issuer (exactly 1, edit only - no add/delete)
     issuer: ContractId Issuer
 
-    -- Objects
-${objectMapFields}
-
-    -- Transactions
-${transactionMapFields}
+    -- OCF object/transaction maps
+${mapFields}
 
   where
     signatory context.issuer, context.system_operator
@@ -324,13 +298,11 @@ ${transactionMapFields}
         new_issuer_data: IssuerOcfData
       controller context.issuer
       do
-        -- Fetch current issuer to validate ID hasn't changed
         old_issuer <- fetch issuer
         assertMsg "Cannot change issuer ID" (old_issuer.issuer_data.id == new_issuer_data.id)
 
         _ <- createMarker context
 
-        -- Archive old and create new
         archive issuer
         new_issuer_cid <- create Issuer with
           context = context
@@ -338,16 +310,12 @@ ${transactionMapFields}
 
         create this with issuer = new_issuer_cid
 
-${objectChoices}
-
-${transactionChoices}
+${choices}
 `;
 
   fs.writeFileSync(OUTPUT_PATH, output);
   console.log(`\nGenerated ${OUTPUT_PATH}`);
-  console.log(`  - ${objects.length} object types (${objects.length * 3} choices)`);
-  console.log(`  - ${transactions.length} transaction types (${transactions.length * 3} choices)`);
-  console.log(`  - Total: ${allTypes.length} types, ${allTypes.length * 3 + 1} choices`);
+  console.log(`  - ${types.length} types, ${types.length * 3 + 1} choices`);
 }
 
 generate();
