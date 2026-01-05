@@ -157,7 +157,7 @@ function generateValidations(
   return validations
     .map(
       (v) =>
-        `${prefix}assertMsg "${v.error}" (Map.lookup ${dataParam}.${v.field} ${v.map} /= None)`
+        `${prefix}assertMsg ("${v.error}: " <> ${dataParam}.${v.field}) (Map.lookup ${dataParam}.${v.field} ${v.map} /= None)`
     )
     .join("\n");
 }
