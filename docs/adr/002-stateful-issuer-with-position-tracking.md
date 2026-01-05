@@ -248,7 +248,6 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 | Concern | Mitigation |
 |---------|------------|
 | Stale references | Delete can leave broken refs; validating would require fetching too many contracts |
-| Breaking change | Provide migration path |
 
 ---
 
