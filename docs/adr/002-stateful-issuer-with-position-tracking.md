@@ -49,7 +49,7 @@ graph TB
     subgraph CapTable["CapTable Contract (new)"]
         direction TB
         Meta["context"]
-        
+
         subgraph Objects["Object References (Map id → ContractId)"]
             O0["issuer: ContractId Issuer"]
             O1["stakeholders: Map Text ContractId"]
@@ -58,19 +58,19 @@ graph TB
             O4["vesting_terms: Map Text ContractId"]
             O5["..."]
         end
-        
+
         subgraph Transactions["Transaction References (Map id → ContractId)"]
             T1["stock_issuances: Map Text ContractId"]
             T2["stock_transfers: Map Text ContractId"]
             T3["stock_cancellations: Map Text ContractId"]
             T4["..."]
         end
-        
+
         Choices["Choices: Add*, Edit*, Delete*, Remove*"]
     end
-    
+
     CapTable -->|creates/archives| OCF["OCF Object Contracts"]
-    
+
     subgraph OCF["OCF Contracts (unchanged)"]
         C0[Issuer]
         C1[Stakeholder]
@@ -98,10 +98,10 @@ graph TB
 choice AddStakeholder(data):
     // Validate ID uniqueness (O(1) map lookup)
     assert data.id not in stakeholders
-    
+
     // Create OCF contract
     new_cid = create Stakeholder(context, data)
-    
+
     // Update state
     return create this with { stakeholders: insert(data.id, new_cid, stakeholders) }
 ```
@@ -114,11 +114,11 @@ choice EditStakeholder(id, new_data):
     old_cid = stakeholders[id]
     assert old_cid exists
     assert id == new_data.id  // Can't change ID via edit
-    
+
     // Replace contract
     archive old_cid
     new_cid = create Stakeholder(context, new_data)
-    
+
     // Update state
     return create this with { stakeholders: insert(id, new_cid, stakeholders) }
 ```
@@ -132,7 +132,7 @@ choice DeleteStakeholder(id):
     // Lookup by ID (O(1))
     cid = stakeholders[id]
     assert cid exists
-    
+
     // Archive and remove
     archive cid
     return create this with { stakeholders: delete(id, stakeholders) }
@@ -159,17 +159,17 @@ Shows how references are validated before creating transactions:
 choice AddStockIssuance(data):
     // Validate stakeholder exists (O(1) map lookup)
     assert data.stakeholder_id in stakeholders
-    
+
     // Validate stock class exists (O(1))
     assert data.stock_class_id in stock_classes
-    
+
     // Validate security ID unique (O(1))
     assert data.security_id not in stock_issuances
-    
+
     // Create
     new_cid = create StockIssuance(context, data)
-    return create this with { 
-        stock_issuances: insert(data.security_id, new_cid, stock_issuances) 
+    return create this with {
+        stock_issuances: insert(data.security_id, new_cid, stock_issuances)
     }
 ```
 
@@ -183,7 +183,7 @@ choice AddStockIssuance(data):
 ```
 template Issuer:
     signatory: issuer, system_operator
-    
+
     // ~40+ factory choices
     choice CreateStakeholder(data): ...
     choice CreateStockIssuance(data): ...
@@ -202,7 +202,7 @@ template Issuer:
 ```
 template Stakeholder:
     signatory: issuer, system_operator
-    
+
     choice ArchiveByIssuer:
         controller: issuer
         return ()
@@ -258,17 +258,6 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 |---------|------------|
 | Stale references | Delete can leave broken refs; validate on Add only |
 | Breaking change | Provide migration path |
-
----
-
-## Alternatives Considered
-
-| Alternative | Decision |
-|-------------|----------|
-| **Keep current design** | Rejected — no state tracking, no reference validation |
-| **Modify Issuer directly** | Rejected — Issuer is an OCF object, should stay simple |
-| **Embed OCF data in maps** | Rejected — duplicates data, harder to query |
-| **Arrays instead of maps** | Rejected — O(n) lookup not acceptable for validation |
 
 ---
 
