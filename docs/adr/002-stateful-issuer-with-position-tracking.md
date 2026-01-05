@@ -125,7 +125,7 @@ choice EditStakeholder(id, new_data):
 
 ### Delete (Archive + Remove)
 
-> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. We validate references on Add, but cannot prevent references from becoming stale after deletion.
+> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. We validate references on Add, but validating on Delete would require fetching a potentially large number of contracts to check for references.
 
 ```haskell
 choice DeleteStakeholder(id):
@@ -255,7 +255,7 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 | Concern | Mitigation |
 |---------|------------|
-| Stale references | Delete can leave broken refs; validate on Add only |
+| Stale references | Delete can leave broken refs; validating would require fetching too many contracts |
 | Breaking change | Provide migration path |
 
 ---
