@@ -47,46 +47,27 @@ Introduce a new **CapTable** contract (separate from the OCF `Issuer` object):
 ## Architecture
 
 ```mermaid
-graph TB
-    subgraph CapTable["CapTable Contract (new)"]
+graph LR
+    subgraph CapTable["CapTable Contract"]
         direction TB
-        Meta["context"]
 
-        subgraph Objects["Object References (Map id → ContractId)"]
-            O0["issuer: ContractId Issuer"]
-            O1["stakeholders: Map Text (ContractId Stakeholder)"]
-            O2["stock_classes: Map Text (ContractId StockClass)"]
-            O3["stock_plans: Map Text (ContractId StockPlan)"]
-            O4["vesting_terms: Map Text (ContractId VestingTerms)"]
-            O5["..."]
+        subgraph " "
+            direction LR
+            Objects["Object Refs<br/>Map id → ContractId<br/><i>stakeholders, stock_classes, ...</i>"]
+            Transactions["Transaction Refs<br/>Map id → ContractId<br/><i>issuances, transfers, ...</i>"]
+            ReverseRefs["Reverse Refs<br/>Map id → Set id<br/><i>stakeholder_refs, security_refs, ...</i>"]
         end
-
-        subgraph Transactions["Transaction References (Map id → ContractId)"]
-            T1["stock_issuances: Map Text (ContractId StockIssuance)"]
-            T2["stock_transfers: Map Text (ContractId StockTransfer)"]
-            T3["stock_cancellations: Map Text (ContractId StockCancellation)"]
-            T4["..."]
-        end
-
-        subgraph ReverseRefs["Reverse Reference Indexes (Map id → Set id)"]
-            R1["stakeholder_refs: Map Text (Set Text)"]
-            R2["stock_class_refs: Map Text (Set Text)"]
-            R3["stock_plan_refs: Map Text (Set Text)"]
-            R4["security_refs: Map Text (Set Text)"]
-            R5["..."]
-        end
-
-        Choices["Choices: Add*, Edit*, Delete*"]
     end
 
-    CapTable -->|creates/archives| OCF["OCF Object Contracts"]
+    CapTable -->|"Add/Edit/Delete"| OCF
 
-    subgraph OCF["OCF Contracts (unchanged)"]
-        C0[Issuer]
-        C1[Stakeholder]
-        C2[StockClass]
-        C3[StockIssuance]
-        C4[...]
+    subgraph OCF["OCF Contracts"]
+        direction LR
+        C1[Issuer]
+        C2[Stakeholder]
+        C3[StockClass]
+        C4[StockIssuance]
+        C5[...]
     end
 ```
 
