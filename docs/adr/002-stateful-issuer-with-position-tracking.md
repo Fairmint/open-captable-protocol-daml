@@ -11,7 +11,7 @@
 Introduce a new **CapTable** contract that:
 - Maintains `Map Text ContractId` for all OCF objects (O(1) lookup by business ID)
 - Acts as the sole authority for create/edit/delete operations
-- Validates that referenced objects exist before creating transactions (e.g., can't issue stock to a non-existent stakeholder)
+- Validates references on **create** (can't issue stock to non-existent stakeholder)
 
 ---
 
@@ -44,46 +44,64 @@ Introduce a new **CapTable** contract (separate from the OCF `Issuer` object):
 
 ## Architecture
 
+### Factory Creates CapTable
+
+The `OcpFactory` creates a `CapTable` contract given Issuer data. The Issuer is required to initialize a cap table and cannot be added or removed—only edited.
+
+```haskell
+choice CreateCapTable(issuer_data):
+    -- Create the Issuer OCF contract
+    issuer_cid <- create Issuer(context, issuer_data)
+
+    -- Create CapTable with Issuer reference and empty maps
+    create CapTable with {
+        issuer = issuer_cid,
+        issuer_id = issuer_data.id,
+        -- All other maps start empty
+        stakeholders = Map.empty,
+        stock_classes = Map.empty,
+        ...
+    }
+```
+
+### CapTable Structure
+
+The CapTable maintains maps organized by OCF schema categories:
+
 ```mermaid
-graph TB
-    subgraph CapTable["CapTable Contract (new)"]
+graph LR
+    subgraph CapTable["CapTable Contract"]
         direction TB
-        Meta["context"]
-
-        subgraph Objects["Object References (Map id → ContractId)"]
-            O0["issuer: ContractId Issuer"]
-            O1["stakeholders: Map Text (ContractId Stakeholder)"]
-            O2["stock_classes: Map Text (ContractId StockClass)"]
-            O3["stock_plans: Map Text (ContractId StockPlan)"]
-            O4["vesting_terms: Map Text (ContractId VestingTerms)"]
-            O5["..."]
+        subgraph " "
+            direction LR
+            Issuer["Issuer<br/><i>exactly 1, edit only</i>"]
+            Objects["Objects<br/><i>stakeholders, stock_classes,<br/>stock_plans, vesting_terms, ...</i>"]
+            Transactions["Transactions<br/><i>issuances, transfers,<br/>cancellations, exercises, ...</i>"]
         end
-
-        subgraph Transactions["Transaction References (Map id → ContractId)"]
-            T1["stock_issuances: Map Text (ContractId StockIssuance)"]
-            T2["stock_transfers: Map Text (ContractId StockTransfer)"]
-            T3["stock_cancellations: Map Text (ContractId StockCancellation)"]
-            T4["..."]
-        end
-
-        Choices["Choices: Add*, Edit*, Delete*"]
     end
 
-    CapTable -->|creates/archives| OCF["OCF Object Contracts"]
+    CapTable -->|"Add/Edit/Delete"| OCF
 
-    subgraph OCF["OCF Contracts (unchanged)"]
-        C0[Issuer]
-        C1[Stakeholder]
-        C2[StockClass]
-        C3[StockIssuance]
-        C4[...]
+    subgraph OCF["OCF Contracts"]
+        direction LR
+        C1[Issuer]
+        C2[Stakeholder]
+        C3[StockClass]
+        C4[StockIssuance]
+        C5[...]
     end
 ```
+
+| Category | Maps | Notes |
+|----------|------|-------|
+| **Issuer** | `issuer: ContractId Issuer` | Exactly 1. No Add/Delete, only Edit. |
+| **Objects** | `stakeholders`, `stock_classes`, `stock_plans`, `stock_legend_templates`, `vesting_terms`, `valuations`, `financings`, `documents` | Add/Edit/Delete |
+| **Transactions** | `stock_issuances`, `stock_transfers`, `stock_cancellations`, `equity_compensation_issuances`, `convertible_issuances`, `warrant_issuances`, ... | Add/Edit/Delete |
 
 ### Key Points
 
 - **CapTable is a new custom contract** — not an OCF object
-- **Issuer is now just data** — simple OCF object, no factory methods
+- **Issuer is exactly 1** — created with CapTable, can only be edited
 - **All OCF contracts remain unchanged** — just remove `ArchiveByIssuer` choice
 - **Same signatories** — CapTable can directly archive OCF contracts
 - **Maps for O(1) lookup** — instant validation by business ID
@@ -92,8 +110,25 @@ graph TB
 
 ## Lifecycle Operations
 
-### Add (Create)
+### Issuer (Edit Only)
 
+The Issuer is created with the CapTable and cannot be added or deleted—only edited:
+
+```haskell
+choice EditIssuer(new_data):
+    assert issuer_id == new_data.id  -- Can't change ID
+
+    -- Replace contract
+    archive issuer
+    new_cid <- create Issuer(context, new_data)
+
+    -- Update state
+    create this with { issuer = new_cid }
+```
+
+### Objects: Add / Edit / Delete
+
+**Add:**
 ```haskell
 choice AddStakeholder(data):
     -- Validate ID uniqueness (O(1) map lookup)
@@ -102,78 +137,70 @@ choice AddStakeholder(data):
     -- Create OCF contract
     new_cid <- create Stakeholder(context, data)
 
-    -- Update state (archive old CapTable, create new with updated map)
+    -- Update state
     create this with { stakeholders = Map.insert data.id new_cid stakeholders }
 ```
 
-### Edit (Correct)
-
+**Edit:**
 ```haskell
 choice EditStakeholder(id, new_data):
     -- Lookup by ID (O(1))
     old_cid <- lookup id stakeholders
-    assert (isSome old_cid)
+    assert (isSome old_cid) "Stakeholder not found"
     assert id == new_data.id  -- Can't change ID via edit
 
     -- Replace contract
     archive (fromSome old_cid)
     new_cid <- create Stakeholder(context, new_data)
 
-    -- Update state (archive old CapTable, create new with updated map)
+    -- Update state
     create this with { stakeholders = Map.insert id new_cid stakeholders }
 ```
 
-### Delete (Archive + Remove)
-
-> ⚠️ **Warning**: Deleting an object may leave broken references. For example, deleting a stakeholder won't automatically clean up stock issuances that reference it. 
-> 
-> **Operational policy**: Deletions should be restricted to admin workflows that first verify or migrate dependent contracts. Most risky operations include:
-> - Deleting stakeholders (may be referenced by issuances, transfers)
-> - Deleting stock classes (may be referenced by issuances, plans)
-> - Deleting stock plans (may be referenced by equity compensation)
-> 
-> We validate references on Add, but comprehensive validation on Delete would require fetching potentially hundreds of contracts to check for reverse references.
-
+**Delete:**
 ```haskell
 choice DeleteStakeholder(id):
     -- Lookup by ID (O(1))
     cid <- lookup id stakeholders
-    assert (isSome cid)
+    assert (isSome cid) "Stakeholder not found"
 
     -- Archive and remove from map
     archive (fromSome cid)
     create this with { stakeholders = Map.delete id stakeholders }
 ```
 
-### Future: Recovery Operations
-
-> 💡 **Note**: If contracts are ever archived outside of CapTable (e.g., via direct ledger operations), we may need to add `Remove*` choices that delete entries from the map without attempting to archive the contract. Not implementing this initially—will add if needed.
+> ⚠️ **Note**: Delete does not validate reverse references. Deleting an object that is referenced by transactions will leave dangling references. Operational policy should ensure dependents are cleaned up first.
 
 ---
 
-## Validation Example: Stock Issuance
+### Transactions: Add with Reference Validation
 
-Shows how references are validated before creating transactions:
+Transactions reference objects (stakeholders, stock classes, etc.). We validate these references exist before creating:
 
 ```haskell
 choice AddStockIssuance(data):
     -- Validate stakeholder exists (O(1) map lookup)
     assert (isSome $ Map.lookup data.stakeholder_id stakeholders)
+        "Stakeholder not found"
 
     -- Validate stock class exists (O(1))
     assert (isSome $ Map.lookup data.stock_class_id stock_classes)
+        "Stock class not found"
 
     -- Validate security ID unique (O(1))
     assert (isNone $ Map.lookup data.security_id stock_issuances)
+        "Security ID already exists"
 
     -- Create OCF contract
     new_cid <- create StockIssuance(context, data)
-    
+
     -- Update state
     create this with {
         stock_issuances = Map.insert data.security_id new_cid stock_issuances
     }
 ```
+
+Edit and Delete follow the same pattern as Objects above.
 
 ---
 
@@ -219,46 +246,19 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 ---
 
-## Implementation Plan
+## Consequences
 
-### Phase 1: Create CapTable
-- Create `CapTable.daml` with all `Map Text ContractId` fields
-- Implement `Add*`, `Edit*`, `Delete*` choices with validation
-- Write comprehensive tests
-
-### Phase 2: Update Templates
-- Remove factory methods from `Issuer`
-- Remove `ArchiveByIssuer` from all OCF templates
-- Update `OcpFactory` to create `CapTable` (which creates the `Issuer`)
-- Update SDK to use new contract
-
-### Phase 3: Migration
-- Create migration script to consolidate existing contracts
-- Collect all existing OCF contracts for an issuer
-- Create new `CapTable` with Maps
-- Archive old `Issuer` contract (with factory methods)
+- **Reference validation on create** — O(1) validation that referenced objects exist
+- **Clean separation** — CapTable is custom logic; OCF objects stay standard
+- **Queryable state** — Maps show what exists by ID
+- **Atomic operations** — Multi-step operations in single transaction
+- **OCF compliance** — Issuer and all objects remain in standard OCF format
 
 ---
 
-## Consequences
+## Future Considerations
 
-### Positive
-
-| Benefit | Description |
-|---------|-------------|
-| Reference validation | Validate that IDs exist before operations (O(1)) |
-| Clean separation | CapTable is our custom logic; OCF objects stay standard |
-| Queryable state | Maps show what exists by ID |
-| Atomic operations | Multi-step operations in single transaction |
-| OCF compliance | Issuer and all objects remain in standard OCF format |
-
-### Negative
-
-| Concern | Mitigation |
-|---------|------------|
-| Stale references | **Accepted trade-off for now.** Operational policy forbids deleting objects that are known to be referenced by other OCF objects; deletions are restricted to admin workflows that first migrate or archive dependents. Full graph validation on every delete is deferred because it would require fetching too many contracts at current scale. |
-
-**Future work / acceptance criteria:** When (a) a stale-reference incident is detected in production **or** (b) typical cap tables exceed an agreed threshold (e.g., >10k OCF contracts per issuer), we will introduce stronger guarantees (e.g., a reverse-reference index, periodic batch validator, or off-chain integrity checker) and update this ADR accordingly.
+**Delete validation via reverse-reference indexes**: To prevent deleting objects that are still referenced, we could maintain `Map Text (Set Text)` indexes that track what references each object. This would enable O(1) delete validation but adds complexity—every add/edit/delete must maintain the reverse indexes, creating risk of inconsistency. Not planned for initial implementation.
 
 ---
 
