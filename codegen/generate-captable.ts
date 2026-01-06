@@ -67,7 +67,7 @@ function pluralize(str: string): string {
   // Words already plural (e.g., vesting_terms)
   if (str.endsWith("_terms")) return str;
   // Words ending in s, x, z, ch, sh get "es"
-  if (str.endsWith("ss") || str.endsWith("x") || str.endsWith("z") || 
+  if (str.endsWith("ss") || str.endsWith("x") || str.endsWith("z") ||
       str.endsWith("ch") || str.endsWith("sh")) return str + "es";
   // Words ending in consonant + y get "ies"
   if (str.endsWith("y") && !/[aeiou]y$/.test(str)) return str.slice(0, -1) + "ies";
@@ -169,11 +169,11 @@ function generateValidations(
     .join("\n");
 }
 
-function generateAddChoice(t: TypeDef): string {
+function generateCreateChoice(t: TypeDef): string {
   const validations = generateValidations(t.validations, t.data_param, "        ");
   const validationBlock = validations ? `\n${validations}\n` : "";
 
-  return `    choice Add${t.name} : ContractId CapTable
+  return `    choice Create${t.name} : ContractId CapTable
       with
         ${t.data_param}: ${t.data_type}
       controller context.issuer
@@ -236,12 +236,12 @@ function generateDeleteChoice(t: TypeDef): string {
 
 function generateChoicesForType(t: TypeDef): string {
   const separator = `    -- ==========================================================================
-    -- ${t.name.toUpperCase()} (Add/Edit/Delete)
+    -- ${t.name.toUpperCase()} (Create/Edit/Delete)
     -- ==========================================================================`;
 
   return `${separator}
 
-${generateAddChoice(t)}
+${generateCreateChoice(t)}
 
 ${generateEditChoice(t)}
 
@@ -288,7 +288,7 @@ template CapTable
   with
     context: Context
 
-    -- Issuer (exactly 1, edit only - no add/delete)
+    -- Issuer (exactly 1, edit only - no create/delete)
     issuer: ContractId Issuer
 
     -- OCF object/transaction maps
@@ -298,7 +298,7 @@ ${mapFields}
     signatory context.issuer, context.system_operator
 
     -- ==========================================================================
-    -- ISSUER (Edit only - no Add/Delete)
+    -- ISSUER (Edit only - no Create/Delete)
     -- ==========================================================================
 
     choice EditIssuer : ContractId CapTable

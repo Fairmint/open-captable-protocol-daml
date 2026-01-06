@@ -126,11 +126,11 @@ choice EditIssuer(new_data):
     create this with { issuer = new_cid }
 ```
 
-### Objects: Add / Edit / Delete
+### Objects: Create / Edit / Delete
 
-**Add:**
+**Create:**
 ```haskell
-choice AddStakeholder(data):
+choice CreateStakeholder(data):
     -- Validate ID uniqueness (O(1) map lookup)
     assert data.id not in stakeholders
 
@@ -173,12 +173,12 @@ choice DeleteStakeholder(id):
 
 ---
 
-### Transactions: Add with Reference Validation
+### Transactions: Create with Reference Validation
 
 Transactions reference objects (stakeholders, stock classes, etc.). We validate these references exist before creating:
 
 ```haskell
-choice AddStockIssuance(data):
+choice CreateStockIssuance(data):
     -- Validate stakeholder exists (O(1) map lookup)
     assert (isSome $ Map.lookup data.stakeholder_id stakeholders)
         "Stakeholder not found"
