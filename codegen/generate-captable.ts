@@ -64,8 +64,15 @@ function toTitleCase(str: string): string {
  * Pluralize a snake_case string
  */
 function pluralize(str: string): string {
+  // Words already plural (e.g., vesting_terms)
+  if (str.endsWith("_terms")) return str;
+  // Words ending in s, x, z, ch, sh get "es"
+  if (str.endsWith("ss") || str.endsWith("x") || str.endsWith("z") || 
+      str.endsWith("ch") || str.endsWith("sh")) return str + "es";
+  // Words ending in consonant + y get "ies"
+  if (str.endsWith("y") && !/[aeiou]y$/.test(str)) return str.slice(0, -1) + "ies";
+  // Words ending in s (like stock_class) get "es"
   if (str.endsWith("s")) return str + "es";
-  if (str.endsWith("y")) return str.slice(0, -1) + "ies";
   return str + "s";
 }
 
