@@ -26,10 +26,11 @@ interface TypeDef {
   validations: Array<{ field: string; map: string; error: string }>;
 }
 
-const CODEGEN_DIR = path.dirname(new URL(import.meta.url).pathname);
+const REPO_ROOT = process.cwd();
+const CODEGEN_DIR = path.join(REPO_ROOT, "scripts/codegen");
 const OPENCAPTABLE_DIR = path.join(
-  CODEGEN_DIR,
-  "../../OpenCapTable-v25/daml/Fairmint/OpenCapTable"
+  REPO_ROOT,
+  "OpenCapTable-v25/daml/Fairmint/OpenCapTable"
 );
 const OCF_DIR = path.join(OPENCAPTABLE_DIR, "OCF");
 const OUTPUT_PATH = path.join(OPENCAPTABLE_DIR, "CapTable.daml");
