@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** | 2026-01-02
+**Implemented** | 2026-01-05
 
 ---
 
