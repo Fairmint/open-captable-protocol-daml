@@ -1,4 +1,5 @@
 import path from 'path';
+import { getErrorMessage } from './types';
 
 try {
 	const rootPkg = require(path.join('..'));
@@ -17,7 +18,7 @@ try {
 	if (!reports?.mainnet?.reportsFactoryContractId) throw new Error('Reports Factory JSON missing expected fields');
 
 	console.log('OK: Root package exports Fairmint aggregator and both JSON subpaths are accessible');
-} catch (e: any) {
-	console.error('Import test failed:', e?.message || e);
+} catch (e) {
+	console.error('Import test failed:', getErrorMessage(e));
 	process.exit(1);
 }
