@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 
-import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as path from 'path';
 import { createLedgerJsonApiClient } from './utils';
+import { isContractNetwork, type ContractNetwork } from './types';
 
-function getNetworkFromArgs(): string {
+function getNetworkFromArgs(): ContractNetwork {
   const args = process.argv.slice(2);
   const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
 
@@ -14,7 +14,7 @@ function getNetworkFromArgs(): string {
   }
 
   const network = args[networkIndex + 1].toLowerCase();
-  if (network !== 'mainnet' && network !== 'devnet') {
+  if (!isContractNetwork(network)) {
     console.error('❌ Network must be either "mainnet" or "devnet"');
     process.exit(1);
   }

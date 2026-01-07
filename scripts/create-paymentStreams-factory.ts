@@ -4,21 +4,20 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clients/ledger-json-api/schemas/api/commands';
+import { isContractNetwork, type ContractNetwork } from './types';
 
-interface ContractIdData {
-  mainnet?: {
-    paymentStreamsFactoryContractId: string;
-    templateId: string;
-    disclosedContract: DisclosedContract;
-  };
-  devnet?: {
-    paymentStreamsFactoryContractId: string;
-    templateId: string;
-    disclosedContract: DisclosedContract;
-  };
+interface PaymentStreamsFactoryContractData {
+  paymentStreamsFactoryContractId: string;
+  templateId: string;
+  disclosedContract: DisclosedContract;
 }
 
-function getNetworkFromArgs(): string {
+interface ContractIdData {
+  mainnet?: PaymentStreamsFactoryContractData;
+  devnet?: PaymentStreamsFactoryContractData;
+}
+
+function getNetworkFromArgs(): ContractNetwork {
   const args = process.argv.slice(2);
   const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
   if (networkIndex === -1 || networkIndex === args.length - 1) {
@@ -26,7 +25,7 @@ function getNetworkFromArgs(): string {
     process.exit(1);
   }
   const network = args[networkIndex + 1].toLowerCase();
-  if (network !== 'mainnet' && network !== 'devnet') {
+  if (!isContractNetwork(network)) {
     console.error('❌ Network must be either "mainnet" or "devnet"');
     process.exit(1);
   }
@@ -141,11 +140,11 @@ async function main() {
 
     const outputPath = getOutputPath();
     const data = loadExistingContractIds(outputPath);
-    data[network as 'mainnet' | 'devnet'] = {
+    data[network] = {
       paymentStreamsFactoryContractId: contractId,
       templateId: createdTreeEvent.value.templateId,
       disclosedContract,
-    } as any;
+    };
     fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
     console.log(`📝 Saved contract ID and disclosed contract to ${outputPath}`);
   } catch (error) {

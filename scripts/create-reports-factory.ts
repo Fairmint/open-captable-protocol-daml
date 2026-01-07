@@ -3,19 +3,25 @@
 import * as path from 'path';
 import * as fs from 'fs';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
+import { isContractNetwork, type ContractNetwork } from './types';
 
-interface ContractIdData {
-  mainnet?: {
-    reportsFactoryContractId: string;
-    templateId: string;
-  };
-  devnet?: {
-    reportsFactoryContractId: string;
-    templateId: string;
-  };
+interface ReportsFactoryContractData {
+  reportsFactoryContractId: string;
+  templateId: string;
 }
 
-function getNetworkFromArgs(): string {
+interface ContractIdData {
+  mainnet?: ReportsFactoryContractData;
+  devnet?: ReportsFactoryContractData;
+}
+
+interface ReportsFactoryCreateArgs {
+  system_operator: string;
+  featured_app_right: string;
+  [key: string]: string;
+}
+
+function getNetworkFromArgs(): ContractNetwork {
   const args = process.argv.slice(2);
   const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
   if (networkIndex === -1 || networkIndex === args.length - 1) {
@@ -23,7 +29,7 @@ function getNetworkFromArgs(): string {
     process.exit(1);
   }
   const network = args[networkIndex + 1].toLowerCase();
-  if (network !== 'mainnet' && network !== 'devnet') {
+  if (!isContractNetwork(network)) {
     console.error('❌ Network must be either "mainnet" or "devnet"');
     process.exit(1);
   }
@@ -75,7 +81,7 @@ async function main() {
 
   console.log(`🔍 Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
 
-  const reportsFactoryData: any = {
+  const reportsFactoryData: ReportsFactoryCreateArgs = {
     system_operator: intellectPartyId,
     featured_app_right: featuredAppRightContractId,
   };
@@ -114,10 +120,10 @@ async function main() {
 
     const outputPath = getOutputPath();
     const data = loadExistingContractIds(outputPath);
-    data[network as 'mainnet' | 'devnet'] = {
+    data[network] = {
       reportsFactoryContractId: contractId,
       templateId: createdTreeEvent.value.templateId,
-    } as any;
+    };
     fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
     console.log(`📝 Saved contract ID to ${outputPath}`);
   } catch (error) {

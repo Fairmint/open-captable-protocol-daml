@@ -1,13 +1,10 @@
 import fs from 'fs';
 import path from 'path';
+import type { PackageJson } from './types';
 
 // Read the root package.json
 const rootPackagePath = path.join(__dirname, '..', 'package.json');
-const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as {
-	name: string;
-	version: string;
-	peerDependencies?: Record<string, string>;
-};
+const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
 
 const packages = [
   { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v25-0.0.1'), name: rootPackage.name },
@@ -17,7 +14,7 @@ const packages = [
 for (const { dir, name } of packages) {
   const packageJsonPath = path.join(dir, 'package.json');
   if (!fs.existsSync(packageJsonPath)) continue;
-  const generatedPackage = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as any;
+  const generatedPackage = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
 
   // Update the version and name
   generatedPackage.version = rootPackage.version;

@@ -1,25 +1,24 @@
 #!/usr/bin/env node
 
-import { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 // Import from the combined lib built by scripts/create-root-index.ts
 import { Fairmint } from '../lib';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
+import { isContractNetwork, type ContractNetwork } from './types';
 
 // Define the contract ID file structure
-interface ContractIdData {
-  mainnet?: {
-    ocpFactoryContractId: string;
-    templateId: string;
-  };
-  devnet?: {
-    ocpFactoryContractId: string;
-    templateId: string;
-  };
+interface OcpFactoryContractData {
+  ocpFactoryContractId: string;
+  templateId: string;
 }
 
-function getNetworkFromArgs(): string {
+interface ContractIdData {
+  mainnet?: OcpFactoryContractData;
+  devnet?: OcpFactoryContractData;
+}
+
+function getNetworkFromArgs(): ContractNetwork {
   const args = process.argv.slice(2);
   const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
 
@@ -29,7 +28,7 @@ function getNetworkFromArgs(): string {
   }
 
   const network = args[networkIndex + 1].toLowerCase();
-  if (network !== 'mainnet' && network !== 'devnet') {
+  if (!isContractNetwork(network)) {
     console.error('❌ Network must be either "mainnet" or "devnet"');
     process.exit(1);
   }

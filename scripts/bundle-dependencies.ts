@@ -2,6 +2,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { getErrorMessage, type PackageJson } from './types';
 
 // Paths
 const PACKAGE_DIRS = [
@@ -690,7 +691,7 @@ function replaceDependencyReferences(targetDir: string): void {
 function removeLocalDependency(targetDir: string): void {
 	console.log('🗑️  Removing local dependencies from package.json...');
 	const packageJsonPath = path.join(targetDir, 'package.json');
-	const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as any;
+	const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
 	const localDependencies = [
 		'@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
 		'@daml.js/splice-api-featured-app-v1-1.0.0',
@@ -745,8 +746,8 @@ function main(): void {
 		}
 		console.log('✅ Dependency bundling completed successfully (TS)!');
 		console.log('📦 Package is now ready for publishing to npm');
-	} catch (error: any) {
-		console.error('❌ Error during dependency bundling:', error?.message || error);
+	} catch (error) {
+		console.error('❌ Error during dependency bundling:', getErrorMessage(error));
 		process.exit(1);
 	}
 }
