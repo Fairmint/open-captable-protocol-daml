@@ -4,7 +4,7 @@
  * Generates CapTable.daml with a single UpdateCapTable batch choice that:
  * 1. Accepts lists of creates, edits, and deletes
  * 2. Processes creates in tier order (for intra-batch dependencies)
- * 3. Returns AnyContractId lists for created/edited objects
+ * 3. Returns Text lists (OCF object IDs) for created/edited objects
  *
  * Usage: tsx scripts/codegen/generate-captable.ts
  */
