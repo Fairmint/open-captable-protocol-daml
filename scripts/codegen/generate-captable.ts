@@ -217,33 +217,18 @@ ${restConstructors}
 }
 
 /**
- * Generate wrapper record types for each edit type and the OcfEditData sum type
- * DAML requires each constructor to have exactly one argument when using sum types with data
+ * Generate the OcfEditData sum type
+ * Uses the OCF data type directly since it contains the ID field
  */
 function generateOcfEditData(types: TypeDef[]): string {
-  // Generate wrapper record types for each edit
-  const wrapperRecords = types
-    .map((t) => {
-      const snake = toSnakeCase(t.name);
-      return `data Edit${t.name}Data = Edit${t.name}Data with
-    edit_${snake}_id: Text
-    edit_${snake}_data: ${t.data_type}
-  deriving (Eq, Show)`;
-    })
-    .join("\n\n");
-
-  // Generate the sum type referencing the wrapper records
   const first = types[0];
   const rest = types.slice(1);
-  const firstConstructor = `  = OcfEdit${first.name} Edit${first.name}Data`;
+  const firstConstructor = `  = OcfEdit${first.name} ${first.data_type}`;
   const restConstructors = rest
-    .map((t) => `  | OcfEdit${t.name} Edit${t.name}Data`)
+    .map((t) => `  | OcfEdit${t.name} ${t.data_type}`)
     .join("\n");
 
-  return `-- | Wrapper records for edit data (DAML requires single-argument constructors)
-${wrapperRecords}
-
--- | Sum type for edits
+  return `-- | Sum type for edits (uses OCF data directly - ID is in the data record)
 data OcfEditData
 ${firstConstructor}
 ${restConstructors}
@@ -251,18 +236,18 @@ ${restConstructors}
 }
 
 /**
- * Generate the OcfDeleteRef sum type
+ * Generate the OcfObjectId sum type (for delete operations)
  */
-function generateOcfDeleteRef(types: TypeDef[]): string {
+function generateOcfObjectId(types: TypeDef[]): string {
   const first = types[0];
   const rest = types.slice(1);
-  const firstConstructor = `  = OcfDelete${first.name} Text`;
+  const firstConstructor = `  = Ocf${first.name}Id Text`;
   const restConstructors = rest
-    .map((t) => `  | OcfDelete${t.name} Text`)
+    .map((t) => `  | Ocf${t.name}Id Text`)
     .join("\n");
 
-  return `-- | Sum type for delete references (tagged with type)
-data OcfDeleteRef
+  return `-- | Sum type for object identifiers (tagged with type for delete operations)
+data OcfObjectId
 ${firstConstructor}
 ${restConstructors}
   deriving (Eq, Show)`;
@@ -303,28 +288,24 @@ function generateCreateCase(t: TypeDef): string {
  * Generate an edit case for a single type in processEdit
  */
 function generateEditCase(t: TypeDef): string {
-  const snake = toSnakeCase(t.name);
-  const idField = `edit_${snake}_id`;
-  const dataField = `edit_${snake}_data`;
-  const validations = generateValidationCode(t, dataField, "maps.");
+  const validations = generateValidationCode(t, "d", "maps.");
   const validationBlock = validations ? `\n${validations}` : "";
 
-  return `      OcfEdit${t.name} Edit${t.name}Data{..} -> do
-        let oldCidOpt = Map.lookup ${idField} maps.${t.map_field}
+  return `      OcfEdit${t.name} d -> do
+        let oldCidOpt = Map.lookup d.id maps.${t.map_field}
         assertMsg "${t.name} not found" (oldCidOpt /= None)
-        let Some oldCid = oldCidOpt
-        assertMsg "Cannot change ${t.name} ID" (${idField} == ${dataField}.id)${validationBlock}
+        let Some oldCid = oldCidOpt${validationBlock}
         archive oldCid
-        newCid <- create ${t.name} with context = ctx, ${t.data_param} = ${dataField}
-        let newMaps = maps with ${t.map_field} = Map.insert ${idField} newCid maps.${t.map_field}
-        pure (newMaps, ${idField})`;
+        newCid <- create ${t.name} with context = ctx, ${t.data_param} = d
+        let newMaps = maps with ${t.map_field} = Map.insert d.id newCid maps.${t.map_field}
+        pure (newMaps, d.id)`;
 }
 
 /**
  * Generate a delete case for a single type in processDelete
  */
 function generateDeleteCase(t: TypeDef): string {
-  return `      OcfDelete${t.name} delId -> do
+  return `      Ocf${t.name}Id delId -> do
         let oldCidOpt = Map.lookup delId maps.${t.map_field}
         assertMsg "${t.name} not found" (oldCidOpt /= None)
         let Some oldCid = oldCidOpt
@@ -409,8 +390,8 @@ function generateProcessDelete(types: TypeDef[]): string {
   const cases = sortedTypes.map((t) => generateDeleteCase(t)).join("\n");
 
   return `-- | Process a single delete operation, returning updated maps
-processDelete : CapTableMaps -> OcfDeleteRef -> Update CapTableMaps
-processDelete maps deleteRef = case deleteRef of
+processDelete : CapTableMaps -> OcfObjectId -> Update CapTableMaps
+processDelete maps objId = case objId of
 ${cases}`;
 }
 
@@ -528,7 +509,7 @@ function generateUpdateCapTableChoice(types: TypeDef[]): string {
       with
         creates: [OcfCreateData]
         edits: [OcfEditData]
-        deletes: [OcfDeleteRef]
+        deletes: [OcfObjectId]
       controller context.issuer
       do
         -- Create marker for this update
@@ -600,7 +581,7 @@ function generate(): void {
     .join("\n");
   const ocfCreateData = generateOcfCreateData(types);
   const ocfEditData = generateOcfEditData(types);
-  const ocfDeleteRef = generateOcfDeleteRef(types);
+  const ocfObjectId = generateOcfObjectId(types);
   const capTableMapsRecord = generateCapTableMapsRecord(types);
   const toMaps = generateToMaps(types);
   const getCreateTier = generateGetCreateTier(types);
@@ -650,7 +631,7 @@ ${ocfCreateData}
 
 ${ocfEditData}
 
-${ocfDeleteRef}
+${ocfObjectId}
 
 -- | Result of batch UpdateCapTable operation
 -- Returns OCF object IDs (Text) for created/edited objects - caller can look up ContractIds in the new CapTable maps
