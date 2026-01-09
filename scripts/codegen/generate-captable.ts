@@ -181,8 +181,6 @@ function generateCreateChoice(t: TypeDef): string {
       do
         assertMsg "${t.name} ID already exists" (Map.lookup ${t.data_param}.id ${t.map_field} == None)
 ${validationBlock}
-        _ <- createMarker context
-
         new_cid <- create ${t.name} with
           context = context
           ..
@@ -209,8 +207,6 @@ function generateEditChoice(t: TypeDef): string {
         let Some old_cid = old_cid_opt
         assertMsg "Cannot change ${t.name} ID" (id == new_${t.data_param}.id)
 ${validationBlock}
-        _ <- createMarker context
-
         archive old_cid
         new_cid <- create ${t.name} with
           context = context
@@ -228,8 +224,6 @@ function generateDeleteChoice(t: TypeDef): string {
         let old_cid_opt = Map.lookup id ${t.map_field}
         assertMsg "${t.name} not found" (old_cid_opt /= None)
         let Some old_cid = old_cid_opt
-
-        _ <- createMarker context
 
         archive old_cid
         create this with ${t.map_field} = Map.delete id ${t.map_field}`;
@@ -274,15 +268,25 @@ function generate(): void {
 -- Config: scripts/codegen/captable-config.yaml
 -- =============================================================================
 
+import DA.Foldable (forA_)
 import DA.Map (Map)
 import qualified DA.Map as Map
 
 import Fairmint.OpenCapTable.Types (Context)
-import Fairmint.OpenCapTable.Helpers (createMarker)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
+import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight, AppRewardBeneficiary(..))
 
 -- OCF Types
 ${imports}
+
+
+-- | App reward configuration for batch operations
+-- When provided to UpdateCapTable, creates activity markers for app rewards
+data AppRewardsConfig = AppRewardsConfig with
+    couponCount: Int
+    featuredAppRight: ContractId FeaturedAppRight
+  deriving (Eq, Show)
 
 
 template CapTable
@@ -310,14 +314,32 @@ ${mapFields}
         old_issuer <- fetch issuer
         assertMsg "Cannot change issuer ID" (old_issuer.issuer_data.id == new_issuer_data.id)
 
-        _ <- createMarker context
-
         archive issuer
         new_issuer_cid <- create Issuer with
           context = context
           issuer_data = new_issuer_data
 
         create this with issuer = new_issuer_cid
+
+    -- ==========================================================================
+    -- BATCH UPDATE (with optional app rewards)
+    -- ==========================================================================
+
+    -- | Batch update choice - the ONLY place where activity markers are created
+    -- Markers are created when appRewards is provided with couponCount > 0
+    nonconsuming choice UpdateCapTable : ()
+      with
+        appRewards: Optional AppRewardsConfig
+      controller context.issuer
+      do
+        case appRewards of
+          Some config -> do
+            let beneficiaries = [AppRewardBeneficiary with beneficiary = context.system_operator, weight = 1.0]
+            -- Create couponCount activity markers
+            forA_ [1..config.couponCount] $ \\_ -> do
+              createActivityMarker beneficiaries config.featuredAppRight
+          None -> pure ()
+        pure ()
 
 ${choices}
 `;
