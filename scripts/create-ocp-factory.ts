@@ -4,7 +4,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 // Import from the combined lib built by scripts/create-root-index.ts
 import { Fairmint } from '../lib';
-import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
+import { createLedgerJsonApiClient } from './utils';
 import { isContractNetwork, type ContractNetwork } from './types';
 
 // Define the contract ID file structure
@@ -75,28 +75,11 @@ async function main() {
 
   console.log(`Template ID: ${Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId}`);
 
-  // Create validator client to lookup featured app right
-  const validatorClient = createValidatorApiClient(network, 'intellect');
   const intellectPartyId = client.getPartyId();
 
-  // Lookup featured app right for intellect party
-  console.log('Looking up existing FeaturedAppRight contract...');
-  const featuredAppRight = await validatorClient.lookupFeaturedAppRight({ partyId: intellectPartyId });
-  if (!featuredAppRight || !featuredAppRight.featured_app_right) {
-    throw new Error(`No featured app right found for party ${intellectPartyId}`);
-  }
-
-  // Extract the contract ID - it might be nested in the response
-  const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string'
-    ? featuredAppRight.featured_app_right
-    : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
-
-  console.log(`🔍 Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
-
-  // Now create the OcpFactory with the featured_app_right field
+  // Create the OcpFactory (featured_app_right is now passed per-call to UpdateCapTable)
   const ocpFactoryData: Fairmint.OpenCapTable.OcpFactory.OcpFactory = {
-    system_operator: intellectPartyId,
-    featured_app_right: featuredAppRightContractId
+    system_operator: intellectPartyId
   };
 
   const createCommand = {
