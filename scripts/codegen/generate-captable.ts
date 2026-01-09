@@ -268,6 +268,7 @@ function generate(): void {
 -- Config: scripts/codegen/captable-config.yaml
 -- =============================================================================
 
+import DA.Action (when)
 import DA.Foldable (forA_)
 import DA.Map (Map)
 import qualified DA.Map as Map
@@ -335,9 +336,10 @@ ${mapFields}
         case appRewards of
           Some config -> do
             let beneficiaries = [AppRewardBeneficiary with beneficiary = context.system_operator, weight = 1.0]
-            -- Create couponCount activity markers
-            forA_ [1..config.couponCount] $ \\_ -> do
-              createActivityMarker beneficiaries config.featuredAppRight
+            -- Create couponCount activity markers (skip if couponCount <= 0)
+            when (config.couponCount > 0) $ do
+              forA_ [1..config.couponCount] $ \\_ -> do
+                createActivityMarker beneficiaries config.featuredAppRight
           None -> pure ()
         pure ()
 
