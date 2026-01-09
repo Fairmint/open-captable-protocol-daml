@@ -2,6 +2,7 @@
 
 ## Contents
 
+- [OCP_CONTRACT_DIAGRAM.md](./OCP_CONTRACT_DIAGRAM.md) - **OCP contract architecture diagrams** (Mermaid)
 - [OCF_IMPLEMENTATION_STATUS.md](./OCF_IMPLEMENTATION_STATUS.md) - Implementation coverage checklist (33% complete)
 
 ## Architecture Decision Records
