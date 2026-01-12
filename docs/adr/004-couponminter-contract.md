@@ -60,8 +60,8 @@ template CouponMinter
       with
         featuredAppRight: ContractId FeaturedAppRight
         count: Int
-        metadata: Text
         beneficiaries: [AppRewardBeneficiary]
+        metadata: Optional Text
       controller operator
 ```
 
@@ -71,8 +71,8 @@ template CouponMinter
 |-----------|------|-------------|
 | `featuredAppRight` | `ContractId FeaturedAppRight` | The FeaturedAppRight contract to use |
 | `count` | `Int` | Number of markers to create (must be ≥ 1) |
-| `metadata` | `Text` | OCF object ContractId for audit trail |
 | `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients (empty array allowed—Splice API handles default) |
+| `metadata` | `Optional Text` | OCF object ContractId for audit trail (optional) |
 
 ### Result Type
 
@@ -109,10 +109,11 @@ The `CouponMinter` contract holds no state—it's purely a capability/authorizat
 
 ### Metadata for Audit Trail
 
-The `metadata` field provides traceability from markers back to source OCF objects. The value should be the **ContractId** of the OCF object that triggered the minting.
+The optional `metadata` field provides traceability from markers back to source OCF objects. When provided, the value should be the **ContractId** of the OCF object that triggered the minting.
 
 Example:
-- `"00a1b2c3d4e5..."` — ContractId of a StockIssuance contract
+- `Some "00a1b2c3d4e5..."` — ContractId of a StockIssuance contract
+- `None` — No metadata (e.g., for manual/promotional minting)
 
 This preserves privacy—the underlying transaction details (type, value) remain confidential. Only the ContractId is recorded, which can be looked up by authorized parties if needed.
 
