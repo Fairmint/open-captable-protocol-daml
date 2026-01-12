@@ -490,7 +490,7 @@ ${generateLegacyDeleteChoice(t)}`;
 }
 
 /**
- * Generate the UpdateCapTable choice with app rewards support
+ * Generate the UpdateCapTable choice
  */
 function generateUpdateCapTableChoice(types: TypeDef[]): string {
   const mapWithFields = types
@@ -499,37 +499,24 @@ function generateUpdateCapTableChoice(types: TypeDef[]): string {
     .join("\n");
 
   return `    -- ==========================================================================
-    -- BATCH UPDATE (Create/Edit/Delete + optional app rewards)
+    -- BATCH UPDATE (Create/Edit/Delete)
     -- ==========================================================================
 
     -- | Batch update choice for efficient bulk operations.
-    -- This is the primary choice for cap table mutations and the ONLY place where
-    -- app reward activity markers are created. Legacy individual choices exist for
-    -- backward compatibility but do NOT create activity markers.
+    -- This is the primary choice for cap table mutations. Legacy individual choices
+    -- exist for backward compatibility.
     --
     -- Parameters:
     -- - creates: List of OCF objects to create (processed in tier order for dependencies)
     -- - edits: List of OCF objects to edit (ID is in the data record)
     -- - deletes: List of OCF object IDs to delete
-    -- - appRewards: Optional app reward configuration for activity marker creation
     choice UpdateCapTable : UpdateCapTableResult
       with
         creates: [OcfCreateData]
         edits: [OcfEditData]
         deletes: [OcfObjectId]
-        appRewards: Optional AppRewardsConfig
       controller context.issuer
       do
-        -- Create activity markers if app rewards config is provided
-        case appRewards of
-          Some config -> do
-            assertMsg "couponCount must be non-negative" (config.couponCount >= 0)
-            let beneficiaries = [AppRewardBeneficiary with beneficiary = context.system_operator, weight = 1.0]
-            when (config.couponCount > 0) $ do
-              forA_ [1..config.couponCount] $ \\_ -> do
-                createActivityMarker beneficiaries config.featuredAppRight
-          None -> pure ()
-
         -- Start with current maps
         let initialMaps = toMaps this
 
@@ -625,8 +612,6 @@ ${generateLegacyChoices(t)}`)
 -- Config: scripts/codegen/captable-config.yaml
 -- =============================================================================
 
-import DA.Action (when)
-import DA.Foldable (forA_)
 import DA.Map (Map)
 import qualified DA.Map as Map
 import DA.List (sortOn)
@@ -634,8 +619,6 @@ import DA.Action (foldlA)
 
 import Fairmint.OpenCapTable.Types (Context)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
-import Fairmint.Shared.Splice.SpliceFeaturedHelpers (createActivityMarker)
-import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight, AppRewardBeneficiary(..))
 
 -- OCF Types
 ${imports}
@@ -650,14 +633,6 @@ ${ocfCreateData}
 ${ocfEditData}
 
 ${ocfObjectId}
-
--- | App reward configuration for batch operations.
--- When provided to UpdateCapTable, creates activity markers for app rewards.
--- This is the ONLY mechanism for creating app reward activity markers.
-data AppRewardsConfig = AppRewardsConfig with
-    couponCount: Int                          -- Number of activity markers to create (must be >= 0)
-    featuredAppRight: ContractId FeaturedAppRight
-  deriving (Eq, Show)
 
 -- | Result of batch UpdateCapTable operation
 -- Returns OCF object IDs (Text) for created/edited objects - caller can look up ContractIds in the new CapTable maps
