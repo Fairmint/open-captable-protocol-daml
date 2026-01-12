@@ -8,7 +8,7 @@
 
 ## TL;DR
 
-Featured app reward coupons (Canton Network app rewards) are created for **financial transactions** based on **transaction value**. Each $100 of value (rounded up) creates 1 coupon. A separate **CouponMinter** contract handles rate-limited coupon creation to avoid transaction limits on large issuances.
+Featured app reward coupons (Canton Network app rewards) are created for **financial transactions** based on **transaction value**. Each $100 of value creates 1 coupon, with rounding applied **per individual issuance or transfer** (not aggregated). A backend **CouponMinter** service handles rate-limited coupon creation to manage throughput on large issuances or transfers.
 
 ---
 
@@ -16,15 +16,17 @@ Featured app reward coupons (Canton Network app rewards) are created for **finan
 
 ### Canton Network Featured App Rewards
 
-The Canton Network provides a mechanism for rewarding apps that drive network activity through "Featured App Markers." When an app creates activity markers, it earns rewards proportional to the activity it generates.
+The Canton Network provides a mechanism for rewarding apps that drive network activity through "Featured App Markers." Each marker earns a reward with a value that varies based on the total number of markers created network-wide in a given round. Since each marker has variable value, we create **multiple markers per transaction** to weight rewards proportionally to the transaction's economic significance.
 
-### Value-Based Rewards
+Rather than creating a flat 1 marker per transaction regardless of size, we want rewards to be proportional to the economic value. This ensures that large transactions (e.g., $1M stock issuance) generate appropriately more rewards than small ones (e.g., $100 stock issuance).
 
-Rather than creating a flat 1 coupon per transaction regardless of size, we want rewards to be proportional to the economic value of the transaction. This ensures that large transactions (e.g., $1M stock issuance) generate appropriately more rewards than small ones (e.g., $100 stock issuance).
+### Rate Limiting Rationale
 
-### TPS Constraints
+Canton Network has transaction throughput limits. A single large transaction (e.g., $1M issuance = 10,000 coupons) cannot mint all coupons atomically.
 
-Canton Network has transaction throughput limits. A single large transaction (e.g., $1M issuance = 10,000 coupons) cannot mint all coupons atomically. We need a rate-limited mechanism to spread coupon creation over time.
+Additionally, the value per coupon depends on total coupons issued network-wide in a round. Slowly dripping out coupons prevents us from flooding the network with markers—which would crash the value per coupon, negatively impacting us and other network participants.
+
+The TPS limit will be set and modified over time to stay in line with guidance from Canton Network committees.
 
 ---
 
@@ -32,7 +34,7 @@ Canton Network has transaction throughput limits. A single large transaction (e.
 
 ### 1. Value-Based Coupon Calculation
 
-**Create 1 coupon per $100 of transaction value, rounded up.**
+**Create 1 coupon per $100 of transaction value, rounded up per individual transaction.**
 
 | Transaction Value | Coupons Created |
 |-------------------|-----------------|
@@ -45,64 +47,25 @@ Canton Network has transaction throughput limits. A single large transaction (e.
 
 **Formula:** `coupons = ceiling(transactionValue / 100)`
 
-### 2. Separate CouponMinter Contract
+**Important:** Rounding is applied per individual issuance or transfer. For example, a single batch containing 3 separate $150 transfers produces **6 coupons** (2 each), not 5 coupons based on the $450 total.
 
-Coupon minting is decoupled from the main OCP system contracts into a dedicated **CouponMinter** contract. This provides:
+### 2. Separate CouponMinter Service
 
-- **Rate limiting**: Configurable TPS limit (e.g., 1 TPS) to avoid overwhelming the network
+Coupon minting is decoupled from the main OCP system contracts into a dedicated backend **CouponMinter** service. This provides:
+
+- **Rate limiting**: Configurable TPS limit to avoid overwhelming the network and to maintain healthy coupon value
 - **Audit trail**: Contract ID attribution for each coupon batch, linking rewards to specific transactions
-- **Flexibility**: Can adjust minting parameters without modifying core OCP contracts
+- **Flexibility**: Can adjust minting parameters based on Canton Network committee guidance without modifying core OCP contracts
 
-### 3. CouponMinter Contract Design
+### 3. Configuration Parameters
 
-```daml
-template CouponMinter
-  with
-    operator : Party
-    featuredAppRightCid : ContractId FeaturedAppRight
-    -- Rate limiting
-    tpsLimit : Decimal              -- Max coupons per second (e.g., 1.0)
-    lastMintTime : Time             -- Last coupon mint timestamp
-    -- Pending work
-    pendingCoupons : Int            -- Coupons remaining to mint
-    sourceContractId : Text         -- Contract ID that justifies these coupons
-    sourceTransactionType : Text    -- e.g., "StockIssuance", "ConvertibleIssuance"
-    sourceTransactionValue : Decimal -- Original transaction value in USD
-```
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `COUPON_VALUE_UNIT` | $100 | USD value per coupon |
+| `TPS_LIMIT` | 1.0 | Coupons per second (adjustable per Canton guidance) |
+| `MIN_COUPONS` | 1 | Minimum coupons per transaction |
 
-**Key Choices:**
-
-| Choice | Description |
-|--------|-------------|
-| `QueueCoupons` | Queue coupons for a transaction (called by OCP contracts) |
-| `MintNextBatch` | Mint the next batch of coupons (respects TPS limit) |
-| `UpdateTpsLimit` | Adjust the TPS limit |
-
-### 4. Minting Flow
-
-```
-┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  OCP Contract   │     │   CouponMinter   │     │ Canton Network  │
-│ (StockIssuance) │     │                  │     │ (FeaturedApp)   │
-└────────┬────────┘     └────────┬─────────┘     └────────┬────────┘
-         │                       │                        │
-         │ QueueCoupons(10000)   │                        │
-         │──────────────────────>│                        │
-         │                       │                        │
-         │                       │ MintNextBatch (1 TPS)  │
-         │                       │───────────────────────>│
-         │                       │       (repeat)         │
-         │                       │───────────────────────>│
-         │                       │         ...            │
-         │                       │  (~2.8 hrs for 10k)    │
-         └───────────────────────┴────────────────────────┘
-```
-
-**Example:** A $1,000,000 stock issuance:
-1. OCP `UpdateCapTable` processes the issuance
-2. Calls `CouponMinter.QueueCoupons` with 10,000 coupons and source contract ID
-3. Background process calls `MintNextBatch` at 1 TPS
-4. All 10,000 coupons minted over ~2.8 hours
+These can be adjusted over time based on network conditions and reward economics.
 
 ---
 
@@ -130,99 +93,26 @@ Only **financial transactions** (issuances and transfers) create coupons.
 
 | Transaction Type | Value Field | Notes |
 |------------------|-------------|-------|
-| **StockIssuance** | `quantity × pricePerShare.amount` | Uses share price at issuance |
-| **ConvertibleIssuance** | `investmentAmount.amount` | Principal investment amount |
-| **EquityCompensationIssuance** | `quantity × exercisePrice.amount` | Strike price × shares |
-| **WarrantIssuance** | `quantity × purchasePrice.amount` | Purchase price × warrants |
-| **StockTransfer** | `quantity × pricePerShare.amount` | Transfer price if available, else FMV |
-| **ConvertibleTransfer** | `investmentAmount.amount` | Transferred principal |
-| **EquityCompensationTransfer** | `quantity × exercisePrice.amount` | Strike price × shares transferred |
-| **WarrantTransfer** | `quantity × purchasePrice.amount` | Purchase price × warrants transferred |
+| **StockIssuance** | `quantity × share_price.amount` | Uses share price at issuance |
+| **ConvertibleIssuance** | `investment_amount.amount` | Principal investment amount |
+| **EquityCompensationIssuance** | `quantity × exercise_price.amount` | Strike price × shares |
+| **WarrantIssuance** | `quantity × purchase_price.amount` | Purchase price × warrants |
+| **StockTransfer** | `quantity × FMV` | See fallback logic below |
+| **ConvertibleTransfer** | From original issuance | Transferred principal |
+| **EquityCompensationTransfer** | `quantity × exercise_price` | Strike price × shares transferred |
+| **WarrantTransfer** | `quantity × purchase_price` | Purchase price × warrants transferred |
 
-**Note:** If price data is unavailable (e.g., gift transfers), use fair market value from most recent Valuation, or default to 1 coupon minimum.
+### Price Fallback for StockTransfer
 
----
+The [StockTransfer OCF schema](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/transactions/transfer/StockTransfer.schema.json) does not include a price field—it only has an optional `consideration_text` field for unstructured text descriptions. See the [DAML implementation](../../../OpenCapTable-v25/daml/Fairmint/OpenCapTable/OCF/StockTransfer.daml).
 
-## CouponMinter Contract Specification
+When price is not available (e.g., gift transfers, estate transfers), we look up the fair market value from the most recent [Valuation](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/Valuation.schema.json) object for the relevant stock class. The Valuation object contains `price_per_share` and `stock_class_id`. See the [Valuation DAML implementation](../../../OpenCapTable-v25/daml/Fairmint/OpenCapTable/OCF/Valuation.daml).
 
-### Template Fields
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `operator` | `Party` | Fairmint operator party |
-| `featuredAppRightCid` | `ContractId FeaturedAppRight` | Canton Network featured app right |
-| `tpsLimit` | `Decimal` | Maximum coupons per second (default: 1.0) |
-| `lastMintTime` | `Time` | Timestamp of last mint operation |
-| `pendingCoupons` | `Int` | Number of coupons remaining to mint |
-| `sourceContractId` | `Text` | Contract ID of the transaction that justified these coupons |
-| `sourceTransactionType` | `Text` | OCF transaction type (e.g., "StockIssuance") |
-| `sourceTransactionValue` | `Decimal` | Original USD value of the transaction |
-
-### Choices
-
-#### `QueueCoupons`
-
-Queue coupons for minting based on a transaction.
-
-```daml
-choice QueueCoupons : ContractId CouponMinter
-  with
-    actor : Party
-    transactionValue : Decimal      -- USD value of transaction
-    transactionContractId : Text    -- Contract ID for attribution
-    transactionType : Text          -- OCF type name
-  controller actor
-  do
-    assertMsg "Only operator can queue coupons" (actor == operator)
-    assertMsg "Transaction value must be positive" (transactionValue > 0.0)
-    let couponsToCreate = ceiling (transactionValue / 100.0)
-    create this with
-      pendingCoupons = pendingCoupons + couponsToCreate
-      sourceContractId = transactionContractId
-      sourceTransactionType = transactionType
-      sourceTransactionValue = transactionValue
-```
-
-#### `MintNextBatch`
-
-Mint the next batch of coupons, respecting TPS limit.
-
-```daml
-choice MintNextBatch : ContractId CouponMinter
-  with
-    actor : Party
-    currentTime : Time
-  controller actor
-  do
-    assertMsg "Only operator can mint" (actor == operator)
-    assertMsg "No pending coupons" (pendingCoupons > 0)
-    
-    -- Calculate how many coupons we can mint based on elapsed time
-    let elapsedSeconds = convertMicrosecondsToSeconds (currentTime - lastMintTime)
-    let maxCoupons = floor (elapsedSeconds * tpsLimit)
-    let couponsToMint = min maxCoupons pendingCoupons
-    
-    -- Mint coupons (create activity markers)
-    forA_ [1..couponsToMint] $ \_ -> do
-      exercise featuredAppRightCid FeaturedAppRight_CreateActivityMarker with
-        beneficiaries = []
-    
-    create this with
-      pendingCoupons = pendingCoupons - couponsToMint
-      lastMintTime = currentTime
-```
-
----
-
-## Configuration Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `COUPON_VALUE_UNIT` | $100 | USD value per coupon |
-| `TPS_LIMIT` | 1.0 | Coupons per second |
-| `MIN_COUPONS` | 1 | Minimum coupons per transaction |
-
-These can be adjusted over time based on network conditions and reward economics.
+**Fallback logic:**
+1. Look up the `stock_class_id` from the original `StockIssuance` (via `security_id`)
+2. Find the most recent `Valuation` where `valuation.stock_class_id` matches and `valuation.effective_date <= transfer.date`
+3. Use `valuation.price_per_share.amount × transfer.quantity`
+4. If no Valuation exists, default to 1 coupon minimum
 
 ---
 
@@ -232,19 +122,22 @@ These can be adjusted over time based on network conditions and reward economics
 
 - **Transaction:** 1,000 shares at $5/share = $5,000
 - **Coupons:** ceiling($5,000 / $100) = **50 coupons**
-- **Mint time:** 50 seconds at 1 TPS
 
 ### Example 2: Large Convertible Issuance
 
 - **Transaction:** $1,000,000 SAFE investment
 - **Coupons:** ceiling($1,000,000 / $100) = **10,000 coupons**
-- **Mint time:** ~2.78 hours at 1 TPS
 
 ### Example 3: Option Grant
 
 - **Transaction:** 10,000 options at $2 strike = $20,000
 - **Coupons:** ceiling($20,000 / $100) = **200 coupons**
-- **Mint time:** ~3.3 minutes at 1 TPS
+
+### Example 4: Batch with Multiple Transfers
+
+- **Transaction batch:** 3 separate stock transfers of $150 each
+- **Coupons:** 3 × ceiling($150 / $100) = 3 × 2 = **6 coupons**
+- **Note:** Not ceiling($450 / $100) = 5 coupons
 
 ---
 
@@ -285,10 +178,10 @@ These represent new securities being issued to stakeholders. Each issuance creat
 
 | OCF Object | Coupons | Value Source |
 |------------|---------|--------------|
-| **StockIssuance** | ✅ | quantity × pricePerShare |
-| **ConvertibleIssuance** | ✅ | investmentAmount |
-| **EquityCompensationIssuance** | ✅ | quantity × exercisePrice |
-| **WarrantIssuance** | ✅ | quantity × purchasePrice |
+| **StockIssuance** | ✅ | quantity × share_price |
+| **ConvertibleIssuance** | ✅ | investment_amount |
+| **EquityCompensationIssuance** | ✅ | quantity × exercise_price |
+| **WarrantIssuance** | ✅ | quantity × purchase_price |
 
 ### Transfer Transactions (Securities Change Hands)
 
@@ -296,10 +189,10 @@ These represent securities moving from one stakeholder to another. Each transfer
 
 | OCF Object | Coupons | Value Source |
 |------------|---------|--------------|
-| **StockTransfer** | ✅ | quantity × pricePerShare |
-| **ConvertibleTransfer** | ✅ | investmentAmount |
-| **EquityCompensationTransfer** | ✅ | quantity × exercisePrice |
-| **WarrantTransfer** | ✅ | quantity × purchasePrice |
+| **StockTransfer** | ✅ | quantity × FMV (from Valuation) |
+| **ConvertibleTransfer** | ✅ | investment_amount (from original issuance) |
+| **EquityCompensationTransfer** | ✅ | quantity × exercise_price |
+| **WarrantTransfer** | ✅ | quantity × purchase_price |
 
 ### Acceptance Transactions (Securities Formally Accepted)
 
@@ -379,7 +272,7 @@ These represent company-wide structural changes that affect all securities of a 
 
 | Date | Change | PR |
 |------|--------|-----|
-| 2026-01-12 | Changed to value-based coupons, added CouponMinter contract | — |
+| 2026-01-12 | Changed to value-based coupons, added CouponMinter service | — |
 | 2026-01-09 | Created proposal | — |
 
 ---
