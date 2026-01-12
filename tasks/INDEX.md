@@ -6,6 +6,7 @@
 
 | Task | Date | Summary |
 |------|------|---------|
+| [Canton 3.4 Upgrade](./2026/01/2026.01.12-canton-3.4-upgrade.md) | 2026-01-12 | Upgrade DAML SDK from 3.3 to Canton 3.4.10 |
 | [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md) | 2026-01-12 | Replace string building with template files for reviewable codegen |
 | [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md) | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable` |
 | [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md) | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks |
