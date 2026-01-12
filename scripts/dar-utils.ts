@@ -53,7 +53,26 @@ export function loadDarsLock(): DarsLock {
   }
 
   const content = fs.readFileSync(lockPath, 'utf-8');
-  return JSON.parse(content);
+  
+  try {
+    const parsed = JSON.parse(content);
+
+    // Validate basic structure
+    if (
+      typeof parsed !== 'object' ||
+      parsed === null ||
+      typeof parsed.version !== 'number' ||
+      typeof parsed.packages !== 'object' ||
+      parsed.packages === null
+    ) {
+      throw new Error(`Invalid dars.lock format at ${lockPath}`);
+    }
+
+    return parsed as DarsLock;
+  } catch (err: any) {
+    console.error(`❌ Failed to parse dars.lock at ${lockPath}: ${err?.message ?? String(err)}`);
+    throw new Error(`Corrupted dars.lock file. Please restore from backup or delete to reset.`);
+  }
 }
 
 /**
@@ -61,7 +80,28 @@ export function loadDarsLock(): DarsLock {
  */
 export function saveDarsLock(lock: DarsLock): void {
   const lockPath = path.join(getDarsDir(), 'dars.lock');
-  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
+  const lockDir = path.dirname(lockPath);
+  const tempPath = path.join(
+    lockDir,
+    `dars.lock.tmp-${process.pid}-${Date.now()}`
+  );
+  const data = JSON.stringify(lock, null, 2) + '\n';
+
+  try {
+    // Write to a temporary file first to avoid partial writes to the lock file
+    fs.writeFileSync(tempPath, data);
+    // Atomically replace the lock file with the temporary file
+    fs.renameSync(tempPath, lockPath);
+  } finally {
+    // Best-effort cleanup if something went wrong before rename
+    if (fs.existsSync(tempPath)) {
+      try {
+        fs.unlinkSync(tempPath);
+      } catch {
+        // Ignore cleanup errors
+      }
+    }
+  }
 }
 
 /**
@@ -76,9 +116,11 @@ export function computeSha256(filePath: string): string {
 
 /**
  * Get the lock key for a DAR file.
+ * Always uses forward slashes for consistency across platforms.
  */
 export function getDarLockKey(packageName: string, version: string, darName: string): string {
-  return `${packageName}/${version}/${darName}.dar`;
+  const key = path.join(packageName, version, `${darName}.dar`);
+  return key.replace(/\\/g, '/');
 }
 
 /**
@@ -158,6 +200,42 @@ export function warnIfBuildingFresh(packageName: string, version: string): void 
 }
 
 /**
+ * Get the path to a DAR file, preferring backed-up version over fresh build.
+ * Returns the backed-up DAR path if available and verified, otherwise falls back to fresh build.
+ */
+export function getDarPath(packageName: string, version: string, darName: string): string {
+  const rootDir = path.join(__dirname, '..');
+
+  // First, check if we have a backed-up DAR (throws DarIntegrityError if tampered)
+  try {
+    const backedUpPath = getBackedUpDarPath(packageName, version, darName);
+    if (backedUpPath) {
+      console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
+      return backedUpPath;
+    }
+  } catch (error) {
+    if (error instanceof DarIntegrityError) {
+      console.error(`❌ ${error.message}`);
+      console.error('   This is a security concern. Please investigate before proceeding.');
+      process.exit(1);
+    }
+    throw error;
+  }
+
+  // Fall back to freshly built DAR
+  const freshPath = path.join(rootDir, packageName, '.daml', 'dist', `${darName}-${version}.dar`);
+  warnIfBuildingFresh(packageName, version);
+
+  if (!fs.existsSync(freshPath)) {
+    console.error(`❌ DAR file not found: ${freshPath}`);
+    console.error('Run "npm run build" first to build the DAR.');
+    process.exit(1);
+  }
+
+  return freshPath;
+}
+
+/**
  * Record that a DAR was uploaded to a specific network.
  * Updates the networks array in dars.lock.
  */
@@ -172,6 +250,7 @@ export function recordNetworkUpload(
 
   // Only update if entry exists
   if (!lock.packages[lockKey]) {
+    console.log(`ℹ️ DAR not backed up yet, skipping network record for ${lockKey} (${network})`);
     return;
   }
 

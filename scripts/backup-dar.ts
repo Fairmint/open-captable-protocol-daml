@@ -85,8 +85,19 @@ function getSdkVersion(damlYamlPath: string): string {
   }
 
   const content = fs.readFileSync(fullPath, 'utf-8');
-  const parsed = yaml.parse(content);
-  return parsed['sdk-version'] || 'unknown';
+  
+  try {
+    const parsed = yaml.parse(content);
+    if (parsed && typeof parsed === 'object') {
+      return (parsed as any)['sdk-version'] || 'unknown';
+    }
+    console.error(`⚠️ daml.yaml at ${fullPath} did not contain a valid object, using "unknown" for SDK version`);
+    return 'unknown';
+  } catch (err: any) {
+    console.error(`❌ Failed to parse daml.yaml at ${fullPath}: ${err?.message ?? String(err)}`);
+    console.error('Using "unknown" for SDK version');
+    return 'unknown';
+  }
 }
 
 async function main() {

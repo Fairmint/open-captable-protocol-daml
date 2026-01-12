@@ -105,7 +105,7 @@ function verifyDars(update: boolean): VerificationResult {
   // Check for DAR files not in dars.lock
   for (const darPath of darFiles) {
     if (!checkedPaths.has(darPath)) {
-      const relativePath = path.relative(darsDir, darPath);
+      const relativePath = path.relative(darsDir, darPath).replace(/\\/g, '/');
       console.error(`❌ Untracked DAR: ${relativePath}`);
       result.errors.push(
         `Untracked DAR file: ${relativePath}\n` +
@@ -129,7 +129,7 @@ function verifyDars(update: boolean): VerificationResult {
     }
   }
 
-  // Save updates if requested
+  // Save updates if requested and any changes were made
   if (update && (result.mismatch > 0 || result.sizeMismatch > 0 || result.untracked > 0)) {
     // Sort packages alphabetically
     const sortedPackages: Record<string, DarsLockEntry> = {};

@@ -5,10 +5,8 @@ import * as fs from 'fs';
 import { createLedgerJsonApiClient } from './utils';
 import { isContractNetwork, type ContractNetwork } from './types';
 import {
-  getBackedUpDarPath,
-  warnIfBuildingFresh,
+  getDarPath,
   recordNetworkUpload,
-  DarIntegrityError,
 } from './dar-utils';
 
 const PACKAGE_NAME = 'OpenCapTable-v25';
@@ -33,43 +31,15 @@ function getNetworkFromArgs(): ContractNetwork {
   return network;
 }
 
-function getDarPath(): string {
-  const rootDir = path.join(__dirname, '..');
-
-  // First, check if we have a backed-up DAR (throws DarIntegrityError if tampered)
-  try {
-    const backedUpPath = getBackedUpDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
-    if (backedUpPath) {
-      console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
-      return backedUpPath;
-    }
-  } catch (error) {
-    if (error instanceof DarIntegrityError) {
-      console.error(`❌ ${error.message}`);
-      console.error('   This is a security concern. Please investigate before proceeding.');
-      process.exit(1);
-    }
-    throw error;
-  }
-
-  // Fall back to freshly built DAR
-  const freshPath = path.join(rootDir, PACKAGE_NAME, '.daml', 'dist', `${DAR_NAME}-${DAR_VERSION}.dar`);
-  warnIfBuildingFresh(PACKAGE_NAME, DAR_VERSION);
-
-  if (!fs.existsSync(freshPath)) {
-    console.error(`❌ DAR file not found: ${freshPath}`);
-    console.error('Run "npm run build" first to build the DAR.');
-    process.exit(1);
-  }
-
-  return freshPath;
+function getOctDarPath(): string {
+  return getDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
 }
 
 async function main() {
   const network = getNetworkFromArgs();
   console.log(`Uploading DAR file to ${network}...`);
 
-  const darPath = getDarPath();
+  const darPath = getOctDarPath();
   const providers = ['intellect', '5n'];
 
   for (const provider of providers) {
