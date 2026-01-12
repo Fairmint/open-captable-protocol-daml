@@ -13,6 +13,7 @@
 | [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md) | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable` |
 | [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md) | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks |
 | [Review Marker Creation Logic](./2026/01/2026.01.09-review-marker-creation-logic.md) | 2026-01-09 | Remove markers from individual choices; batch only |
+| [CouponMinter Contract Design](./2026/01/2026.01.12-couponminter-contract-design.md) | 2026-01-12 | Simple contract for backend-driven marker minting |
 
 ## Completed Tasks
 
