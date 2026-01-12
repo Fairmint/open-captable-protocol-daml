@@ -193,32 +193,37 @@ function discoverTypes(config: Config): TypeDef[] {
 }
 
 /**
+ * Read a template file with clear error handling
+ */
+function readTemplateFile(relativePath: string): string {
+  const fullPath = path.join(TEMPLATES_DIR, relativePath);
+  try {
+    return fs.readFileSync(fullPath, "utf-8");
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      console.error(`  ERROR: Template file not found: ${fullPath}`);
+      console.error(`  Run from repository root: scripts/codegen/templates/`);
+      process.exit(1);
+    }
+    throw error;
+  }
+}
+
+/**
  * Load and compile the main template, registering partials
  */
 function loadTemplate(): HandlebarsTemplateDelegate {
   // Load loop templates as partials
-  const createCase = fs.readFileSync(
-    path.join(TEMPLATES_DIR, "loops/create-case.daml"),
-    "utf-8"
-  );
-  const editCase = fs.readFileSync(
-    path.join(TEMPLATES_DIR, "loops/edit-case.daml"),
-    "utf-8"
-  );
-  const deleteCase = fs.readFileSync(
-    path.join(TEMPLATES_DIR, "loops/delete-case.daml"),
-    "utf-8"
-  );
+  const createCase = readTemplateFile("loops/create-case.daml");
+  const editCase = readTemplateFile("loops/edit-case.daml");
+  const deleteCase = readTemplateFile("loops/delete-case.daml");
 
   Handlebars.registerPartial("create-case", createCase);
   Handlebars.registerPartial("edit-case", editCase);
   Handlebars.registerPartial("delete-case", deleteCase);
 
   // Load and compile main template
-  const mainTemplate = fs.readFileSync(
-    path.join(TEMPLATES_DIR, "CapTable.daml.template"),
-    "utf-8"
-  );
+  const mainTemplate = readTemplateFile("CapTable.daml.template");
 
   return Handlebars.compile(mainTemplate, { noEscape: true });
 }
