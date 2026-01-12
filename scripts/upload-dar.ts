@@ -1,8 +1,14 @@
 #!/usr/bin/env node
 
 import * as path from 'path';
+import * as fs from 'fs';
 import { createLedgerJsonApiClient } from './utils';
 import { isContractNetwork, type ContractNetwork } from './types';
+import { getBackedUpDarPath, warnIfBuildingFresh, recordNetworkUpload } from './dar-utils';
+
+const PACKAGE_NAME = 'OpenCapTable-v25';
+const DAR_NAME = 'OpenCapTable-v25';
+const DAR_VERSION = '0.0.1';
 
 function getNetworkFromArgs(): ContractNetwork {
   const args = process.argv.slice(2);
@@ -22,10 +28,34 @@ function getNetworkFromArgs(): ContractNetwork {
   return network;
 }
 
+function getDarPath(): string {
+  const rootDir = path.join(__dirname, '..');
+
+  // First, check if we have a backed-up DAR
+  const backedUpPath = getBackedUpDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
+  if (backedUpPath) {
+    console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
+    return backedUpPath;
+  }
+
+  // Fall back to freshly built DAR
+  const freshPath = path.join(rootDir, PACKAGE_NAME, '.daml', 'dist', `${DAR_NAME}-${DAR_VERSION}.dar`);
+  warnIfBuildingFresh(PACKAGE_NAME, DAR_VERSION);
+
+  if (!fs.existsSync(freshPath)) {
+    console.error(`❌ DAR file not found: ${freshPath}`);
+    console.error('Run "npm run build" first to build the DAR.');
+    process.exit(1);
+  }
+
+  return freshPath;
+}
+
 async function main() {
   const network = getNetworkFromArgs();
   console.log(`Uploading DAR file to ${network}...`);
 
+  const darPath = getDarPath();
   const providers = ['intellect', '5n'];
 
   for (const provider of providers) {
@@ -34,10 +64,13 @@ async function main() {
     // Create client using EnvLoader
     const client = createLedgerJsonApiClient(network, provider);
 
-    await client.uploadDarFile({ filePath: path.join(__dirname, '..', 'OpenCapTable-v25', '.daml', 'dist', 'OpenCapTable-v25-0.0.1.dar') });
+    await client.uploadDarFile({ filePath: darPath });
 
     console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
   }
+
+  // Record the network upload in dars.lock if using backed-up DAR
+  recordNetworkUpload(PACKAGE_NAME, DAR_VERSION, DAR_NAME, network);
 
   console.log(`🎉 DAR upload process completed for ${network}`);
 }
