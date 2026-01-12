@@ -10,21 +10,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
 import * as yaml from 'yaml';
-
-interface DarsLockEntry {
-  sha256: string;
-  size: number;
-  sdkVersion: string;
-  uploadedAt: string;
-  networks: string[];
-}
-
-interface DarsLock {
-  version: number;
-  packages: Record<string, DarsLockEntry>;
-}
+import {
+  loadDarsLock,
+  saveDarsLock,
+  computeSha256,
+  getDarsDir,
+  type DarsLockEntry,
+} from './dar-utils';
 
 interface PackageConfig {
   name: string;
@@ -82,13 +75,6 @@ function parseArgs(): { package: string; version: string; network?: string } {
   return { package: packageName, version, network };
 }
 
-function computeSha256(filePath: string): string {
-  const fileBuffer = fs.readFileSync(filePath);
-  const hash = crypto.createHash('sha256');
-  hash.update(fileBuffer);
-  return hash.digest('hex');
-}
-
 function getSdkVersion(damlYamlPath: string): string {
   const rootDir = path.join(__dirname, '..');
   const fullPath = path.join(rootDir, damlYamlPath);
@@ -103,27 +89,10 @@ function getSdkVersion(damlYamlPath: string): string {
   return parsed['sdk-version'] || 'unknown';
 }
 
-function loadDarsLock(): DarsLock {
-  const rootDir = path.join(__dirname, '..');
-  const lockPath = path.join(rootDir, 'dars', 'dars.lock');
-
-  if (!fs.existsSync(lockPath)) {
-    return { version: 1, packages: {} };
-  }
-
-  const content = fs.readFileSync(lockPath, 'utf-8');
-  return JSON.parse(content);
-}
-
-function saveDarsLock(lock: DarsLock): void {
-  const rootDir = path.join(__dirname, '..');
-  const lockPath = path.join(rootDir, 'dars', 'dars.lock');
-  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
-}
-
 async function main() {
   const { package: packageName, version, network } = parseArgs();
   const rootDir = path.join(__dirname, '..');
+  const darsDir = getDarsDir();
 
   // Validate package
   const config = PACKAGE_CONFIGS[packageName];
@@ -144,7 +113,7 @@ async function main() {
     `${config.darName}-${version}.dar`
   );
 
-  const destDir = path.join(rootDir, 'dars', config.name, version);
+  const destDir = path.join(darsDir, config.name, version);
   const destDarPath = path.join(destDir, `${config.darName}.dar`);
   const lockKey = `${config.name}/${version}/${config.darName}.dar`;
 

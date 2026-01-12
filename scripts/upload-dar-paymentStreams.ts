@@ -4,7 +4,12 @@ import * as path from 'path';
 import * as fs from 'fs';
 import { createLedgerJsonApiClient } from './utils';
 import { isContractNetwork, type ContractNetwork } from './types';
-import { getBackedUpDarPath, warnIfBuildingFresh, recordNetworkUpload } from './dar-utils';
+import {
+  getBackedUpDarPath,
+  warnIfBuildingFresh,
+  recordNetworkUpload,
+  DarIntegrityError,
+} from './dar-utils';
 
 const PACKAGE_NAME = 'CantonPayments';
 const DAR_NAME = 'CantonPayments';
@@ -31,11 +36,20 @@ function getNetworkFromArgs(): ContractNetwork {
 function getDarPath(): string {
   const rootDir = path.join(__dirname, '..');
 
-  // First, check if we have a backed-up DAR
-  const backedUpPath = getBackedUpDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
-  if (backedUpPath) {
-    console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
-    return backedUpPath;
+  // First, check if we have a backed-up DAR (throws DarIntegrityError if tampered)
+  try {
+    const backedUpPath = getBackedUpDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
+    if (backedUpPath) {
+      console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
+      return backedUpPath;
+    }
+  } catch (error) {
+    if (error instanceof DarIntegrityError) {
+      console.error(`❌ ${error.message}`);
+      console.error('   This is a security concern. Please investigate before proceeding.');
+      process.exit(1);
+    }
+    throw error;
   }
 
   // Fall back to freshly built DAR

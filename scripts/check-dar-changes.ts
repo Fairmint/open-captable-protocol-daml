@@ -16,60 +16,7 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
-
-interface DarsLockEntry {
-  sha256: string;
-  size: number;
-  sdkVersion: string;
-  uploadedAt: string;
-  networks: string[];
-}
-
-interface DarsLock {
-  version: number;
-  packages: Record<string, DarsLockEntry>;
-}
-
-function computeSha256(filePath: string): string {
-  const fileBuffer = fs.readFileSync(filePath);
-  const hash = crypto.createHash('sha256');
-  hash.update(fileBuffer);
-  return hash.digest('hex');
-}
-
-function loadDarsLock(): DarsLock {
-  const rootDir = path.join(__dirname, '..');
-  const lockPath = path.join(rootDir, 'dars', 'dars.lock');
-
-  if (!fs.existsSync(lockPath)) {
-    return { version: 1, packages: {} };
-  }
-
-  const content = fs.readFileSync(lockPath, 'utf-8');
-  return JSON.parse(content);
-}
-
-function findDarFiles(darsDir: string): string[] {
-  const files: string[] = [];
-
-  function scanDir(dir: string) {
-    if (!fs.existsSync(dir)) return;
-
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        scanDir(fullPath);
-      } else if (entry.name.endsWith('.dar')) {
-        files.push(fullPath);
-      }
-    }
-  }
-
-  scanDir(darsDir);
-  return files;
-}
+import { loadDarsLock, computeSha256, getDarsDir, findDarFiles } from './dar-utils';
 
 interface CheckResult {
   errors: string[];
@@ -77,8 +24,7 @@ interface CheckResult {
 }
 
 function checkDarIntegrity(): CheckResult {
-  const rootDir = path.join(__dirname, '..');
-  const darsDir = path.join(rootDir, 'dars');
+  const darsDir = getDarsDir();
   const errors: string[] = [];
   const warnings: string[] = [];
 
@@ -138,7 +84,6 @@ async function main() {
   }
 
   // Summary
-  const rootDir = path.join(__dirname, '..');
   const lock = loadDarsLock();
   const packageCount = Object.keys(lock.packages).length;
 

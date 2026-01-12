@@ -12,20 +12,14 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
-
-interface DarsLockEntry {
-  sha256: string;
-  size: number;
-  sdkVersion: string;
-  uploadedAt: string;
-  networks: string[];
-}
-
-interface DarsLock {
-  version: number;
-  packages: Record<string, DarsLockEntry>;
-}
+import {
+  loadDarsLock,
+  saveDarsLock,
+  computeSha256,
+  getDarsDir,
+  findDarFiles,
+  type DarsLockEntry,
+} from './dar-utils';
 
 function parseArgs(): { update: boolean } {
   const args = process.argv.slice(2);
@@ -34,56 +28,9 @@ function parseArgs(): { update: boolean } {
   };
 }
 
-function computeSha256(filePath: string): string {
-  const fileBuffer = fs.readFileSync(filePath);
-  const hash = crypto.createHash('sha256');
-  hash.update(fileBuffer);
-  return hash.digest('hex');
-}
-
-function loadDarsLock(): DarsLock {
-  const rootDir = path.join(__dirname, '..');
-  const lockPath = path.join(rootDir, 'dars', 'dars.lock');
-
-  if (!fs.existsSync(lockPath)) {
-    return { version: 1, packages: {} };
-  }
-
-  const content = fs.readFileSync(lockPath, 'utf-8');
-  return JSON.parse(content);
-}
-
-function saveDarsLock(lock: DarsLock): void {
-  const rootDir = path.join(__dirname, '..');
-  const lockPath = path.join(rootDir, 'dars', 'dars.lock');
-  fs.writeFileSync(lockPath, JSON.stringify(lock, null, 2) + '\n');
-}
-
-function findDarFiles(darsDir: string): string[] {
-  const files: string[] = [];
-
-  function scanDir(dir: string) {
-    if (!fs.existsSync(dir)) return;
-
-    const entries = fs.readdirSync(dir, { withFileTypes: true });
-    for (const entry of entries) {
-      const fullPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        scanDir(fullPath);
-      } else if (entry.name.endsWith('.dar')) {
-        files.push(fullPath);
-      }
-    }
-  }
-
-  scanDir(darsDir);
-  return files;
-}
-
 async function main() {
   const { update } = parseArgs();
-  const rootDir = path.join(__dirname, '..');
-  const darsDir = path.join(rootDir, 'dars');
+  const darsDir = getDarsDir();
 
   console.log('🔍 Verifying DAR file integrity...\n');
 
