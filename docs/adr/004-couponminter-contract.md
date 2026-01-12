@@ -53,30 +53,26 @@ A stateless utility contract that mints activity markers on demand.
 template CouponMinter
   with
     operator: Party      -- System operator (Fairmint)
-    provider: Party      -- Provider party for the featured app
   where
     signatory operator
-    observer provider
 
     nonconsuming choice MintCoupons : MintCouponsResult
       with
-        actor: Party
         featuredAppRight: ContractId FeaturedAppRight
         count: Int
         metadata: Text
         beneficiaries: [AppRewardBeneficiary]
-      controller actor
+      controller operator
 ```
 
 ### Choice: MintCoupons
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `actor` | `Party` | Party executing (must be operator or provider) |
 | `featuredAppRight` | `ContractId FeaturedAppRight` | The FeaturedAppRight contract to use |
 | `count` | `Int` | Number of markers to create (must be ≥ 1) |
-| `metadata` | `Text` | Audit trail linking to source transaction |
-| `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients |
+| `metadata` | `Text` | OCF object ContractId for audit trail |
+| `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients (empty array allowed—Splice API handles default) |
 
 ### Result Type
 
@@ -90,7 +86,8 @@ data MintCouponsResult = MintCouponsResult with
 The contract performs minimal validation:
 
 1. `count >= 1` — Must mint at least one marker
-2. `actor == operator || actor == provider` — Only authorized parties can mint
+
+The `operator` is both signatory and controller, so authorization is implicit.
 
 All other validation (value calculation, rate limiting) happens in the backend.
 
@@ -112,16 +109,16 @@ The `CouponMinter` contract holds no state—it's purely a capability/authorizat
 
 ### Metadata for Audit Trail
 
-The `metadata` field provides traceability from markers back to source transactions. Recommended format:
+The `metadata` field provides traceability from markers back to source OCF objects. The value should be the **ContractId** of the OCF object that triggered the minting.
 
-```
-<TransactionType>:<TransactionId>:<Value>
-```
+Example:
+- `"00a1b2c3d4e5..."` — ContractId of a StockIssuance contract
 
-Examples:
-- `"StockIssuance:txn-abc123:$5000"` — Markers for a stock issuance
-- `"ConvertibleIssuance:txn-xyz789:$100000"` — Markers for a SAFE
-- `"BatchUpdate:batch-456:$12500"` — Markers for a batch operation
+This preserves privacy—the underlying transaction details (type, value) remain confidential. Only the ContractId is recorded, which can be looked up by authorized parties if needed.
+
+### Beneficiaries
+
+The `beneficiaries` array specifies reward recipients. An empty array is allowed—the Splice API handles this case with its default behavior. The backend service determines the appropriate beneficiaries based on the app configuration.
 
 ### No Throttling in Contract
 
@@ -141,7 +138,7 @@ Rate limiting is explicitly **not** in the contract:
 │  (StockIssuance, ConvertibleIssuance, etc.)                │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              │ Transaction value
+                              │ Transaction value + ContractId
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                COUPONMINTER BACKEND SERVICE                 │
@@ -152,12 +149,12 @@ Rate limiting is explicitly **not** in the contract:
 │  4. Call MintCoupons choice (possibly in batches)           │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              │ MintCoupons(count, metadata, ...)
+                              │ MintCoupons(count, contractId, ...)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 COUPONMINTER CONTRACT (DAML)                │
 │                                                             │
-│  - Validate inputs                                          │
+│  - Validate count >= 1                                      │
 │  - Exercise FeaturedAppRight_CreateActivityMarker           │
 │  - Return created marker contract IDs                       │
 └─────────────────────────────────────────────────────────────┘
@@ -179,7 +176,7 @@ Rate limiting is explicitly **not** in the contract:
 
 - **Simple contract**: Easy to audit, understand, and maintain
 - **Flexible backend**: Rate limiting and business logic can evolve independently
-- **Clear audit trail**: Metadata links markers to source transactions
+- **Privacy preserved**: Metadata contains only ContractId, not transaction details
 - **Decoupled operations**: Minting doesn't block cap table updates
 
 ### Tradeoffs

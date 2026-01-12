@@ -9,6 +9,8 @@
 | ADR | Title | Status |
 |-----|-------|--------|
 | [ADR-002](./adr/002-stateful-issuer-with-position-tracking.md) | Stateful Cap Table with OCF Object References | Implemented |
+| [ADR-003](./adr/003-featured-app-markers-for-ocp-transactions.md) | Value-Based Coupon Minting for OCP Transactions | Proposed |
+| [ADR-004](./adr/004-couponminter-contract.md) | CouponMinter Contract | Proposed |
 
 ## Related
 
