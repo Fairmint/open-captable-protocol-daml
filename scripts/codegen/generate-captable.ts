@@ -1,11 +1,10 @@
 /**
  * CapTable Code Generator (Batch Design)
  *
- * Generates CapTable.daml with a single UpdateCapTable batch choice that:
+ * Generates CapTable.daml with the UpdateCapTable batch choice that:
  * 1. Accepts lists of creates, edits, and deletes
  * 2. Processes creates in tier order (for intra-batch dependencies)
  * 3. Returns Text lists (OCF object IDs) for created/edited objects
- * 4. Optionally creates app reward activity markers
  *
  * Usage: tsx scripts/codegen/generate-captable.ts
  */
@@ -411,85 +410,6 @@ ${cases}`;
 }
 
 /**
- * Generate backward-compatible individual Create choice for a type
- * NOTE: Legacy choices do NOT create activity markers - markers are only created via UpdateCapTable
- */
-function generateLegacyCreateChoice(t: TypeDef): string {
-  const validations = generateValidationCode(t, t.data_param, "");
-  const validationBlock = validations ? `\n${validations}\n` : "";
-
-  return `    -- | Legacy choice for backward compatibility (does NOT create activity markers)
-    choice Create${t.name} : ContractId CapTable
-      with
-        ${t.data_param}: ${t.data_type}
-      controller context.issuer
-      do
-        assertMsg "${t.name} ID already exists" (Map.lookup ${t.data_param}.id ${t.map_field} == None)
-${validationBlock}
-        new_cid <- create ${t.name} with
-          context = context
-          ..
-
-        create this with ${t.map_field} = Map.insert ${t.data_param}.id new_cid ${t.map_field}`;
-}
-
-/**
- * Generate backward-compatible individual Edit choice for a type
- */
-function generateLegacyEditChoice(t: TypeDef): string {
-  const validations = generateValidationCode(t, `new_${t.data_param}`, "");
-  const validationBlock = validations ? `\n${validations}\n` : "";
-
-  return `    -- | Legacy choice for backward compatibility (does NOT create activity markers)
-    choice Edit${t.name} : ContractId CapTable
-      with
-        id: Text
-        new_${t.data_param}: ${t.data_type}
-      controller context.issuer
-      do
-        let old_cid_opt = Map.lookup id ${t.map_field}
-        assertMsg "${t.name} not found" (old_cid_opt /= None)
-        let Some old_cid = old_cid_opt
-        assertMsg "Cannot change ${t.name} ID" (id == new_${t.data_param}.id)
-${validationBlock}
-        archive old_cid
-        new_cid <- create ${t.name} with
-          context = context
-          ${t.data_param} = new_${t.data_param}
-
-        create this with ${t.map_field} = Map.insert id new_cid ${t.map_field}`;
-}
-
-/**
- * Generate backward-compatible individual Delete choice for a type
- */
-function generateLegacyDeleteChoice(t: TypeDef): string {
-  return `    -- | Legacy choice for backward compatibility (does NOT create activity markers)
-    choice Delete${t.name} : ContractId CapTable
-      with
-        id: Text
-      controller context.issuer
-      do
-        let old_cid_opt = Map.lookup id ${t.map_field}
-        assertMsg "${t.name} not found" (old_cid_opt /= None)
-        let Some old_cid = old_cid_opt
-
-        archive old_cid
-        create this with ${t.map_field} = Map.delete id ${t.map_field}`;
-}
-
-/**
- * Generate all legacy choices for a type
- */
-function generateLegacyChoices(t: TypeDef): string {
-  return `${generateLegacyCreateChoice(t)}
-
-${generateLegacyEditChoice(t)}
-
-${generateLegacyDeleteChoice(t)}`;
-}
-
-/**
  * Generate the UpdateCapTable choice
  */
 function generateUpdateCapTableChoice(types: TypeDef[]): string {
@@ -503,8 +423,7 @@ function generateUpdateCapTableChoice(types: TypeDef[]): string {
     -- ==========================================================================
 
     -- | Batch update choice for efficient bulk operations.
-    -- This is the primary choice for cap table mutations. Legacy individual choices
-    -- exist for backward compatibility.
+    -- This is the primary choice for cap table mutations.
     --
     -- Parameters:
     -- - creates: List of OCF objects to create (processed in tier order for dependencies)
@@ -591,14 +510,6 @@ function generate(): void {
   const processEdit = generateProcessEdit(types);
   const processDelete = generateProcessDelete(types);
   const updateCapTableChoice = generateUpdateCapTableChoice(types);
-  const legacyChoices = types
-    .sort((a, b) => a.name.localeCompare(b.name))
-    .map((t) => `    -- ==========================================================================
-    -- ${t.name.toUpperCase()} (Legacy individual choices for backward compatibility)
-    -- ==========================================================================
-
-${generateLegacyChoices(t)}`)
-    .join("\n\n");
 
   const output = `module Fairmint.OpenCapTable.CapTable where
 
@@ -697,14 +608,12 @@ ${mapFields}
         create this with issuer = new_issuer_cid
 
 ${updateCapTableChoice}
-
-${legacyChoices}
 `;
 
   fs.writeFileSync(OUTPUT_PATH, output);
   console.log(`\nGenerated ${OUTPUT_PATH}`);
   console.log(`  - ${types.length} types`);
-  console.log(`  - ${2 + types.length * 3} choices (EditIssuer, UpdateCapTable + ${types.length * 3} legacy)`);
+  console.log(`  - 2 choices (EditIssuer, UpdateCapTable)`);
   console.log(`  - Batch operations with ${Math.max(...Object.keys(config.tiers).map(Number))} processing tiers`);
 }
 

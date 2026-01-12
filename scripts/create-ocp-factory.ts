@@ -77,7 +77,7 @@ async function main() {
 
   const intellectPartyId = client.getPartyId();
 
-  // Create the OcpFactory (featured_app_right is now passed per-call to UpdateCapTable)
+  // Create the OcpFactory
   const ocpFactoryData: Fairmint.OpenCapTable.OcpFactory.OcpFactory = {
     system_operator: intellectPartyId
   };
