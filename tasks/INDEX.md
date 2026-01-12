@@ -13,6 +13,7 @@
 | [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md) | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable` |
 | [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md) | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks |
 | [Review Marker Creation Logic](./2026/01/2026.01.09-review-marker-creation-logic.md) | 2026-01-09 | Remove markers from individual choices; batch only |
+| [Implement CouponMinter Contract](./2026/01/2026.01.12-couponminter-contract-design.md) | 2026-01-12 | DAML implementation per ADR-004 |
 
 ## Completed Tasks
 
@@ -29,6 +30,7 @@
 | ADR-001 | OCF Cap Table on Canton | Accepted | [canton repo](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md) |
 | ADR-002 | Stateful Cap Table with OCF Object References | Implemented | [docs/adr/002](../docs/adr/002-stateful-issuer-with-position-tracking.md) |
 | ADR-003 | Value-Based Coupon Minting for OCP Transactions | Proposed | [docs/adr/003](../docs/adr/003-featured-app-markers-for-ocp-transactions.md) |
+| ADR-004 | CouponMinter Contract | Proposed | [docs/adr/004](../docs/adr/004-couponminter-contract.md) |
 
 ## Task File Naming
 
