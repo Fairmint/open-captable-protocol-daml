@@ -6,7 +6,7 @@
 flowchart TB
     OcpFactory -->|AuthorizeIssuer| IssuerAuthorization
     IssuerAuthorization -->|CreateCapTable| CapTable
-    CapTable -->|Edit| Issuer
+    CapTable -->|Edit| Issuer["Issuer (OCF object)"]
     CapTable -->|Create/Edit/Delete| OCF["OCF Objects & Transactions"]
 ```
 
@@ -18,6 +18,7 @@ flowchart TB
 sequenceDiagram
     actor SO as System Operator
     actor I as Issuer
+    participant OCF as OCF Contracts
 
     SO->>OcpFactory: Deploy (once)
     SO->>OcpFactory: AuthorizeIssuer(issuer)
@@ -28,6 +29,7 @@ sequenceDiagram
     IssuerAuthorization->>CapTable: create (with Issuer)
 
     I->>CapTable: UpdateCapTable(creates, edits, deletes)
+    CapTable->>OCF: archive/create OCF contracts
 ```
 
 ## Key Design Patterns
