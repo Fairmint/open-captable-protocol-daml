@@ -133,6 +133,26 @@ async function main() {
   if (lock.packages[lockKey]) {
     console.log(`ℹ️ DAR already backed up: ${lockKey}`);
 
+    // Verify the actual DAR file exists before any other operations
+    if (!fs.existsSync(destDarPath)) {
+      console.error(`❌ Lock file references missing DAR: ${destDarPath}`);
+      console.error('This is an inconsistent state. The lock entry exists but the DAR file is missing.');
+      console.error('Please either:');
+      console.error('  1. Restore the missing DAR file from a backup');
+      console.error('  2. Remove the lock entry and re-backup the DAR');
+      process.exit(1);
+    }
+
+    // Verify existing file hash matches
+    const existingHash = computeSha256(destDarPath);
+    if (existingHash !== lock.packages[lockKey].sha256) {
+      console.error(`❌ Hash mismatch! Backed up DAR has been modified.`);
+      console.error(`   Expected: ${lock.packages[lockKey].sha256}`);
+      console.error(`   Found:    ${existingHash}`);
+      process.exit(1);
+    }
+    console.log(`✅ Existing backup verified: ${lockKey}`);
+
     // If network specified, add to networks list if not present
     if (network) {
       const existing = lock.packages[lockKey];
@@ -144,18 +164,6 @@ async function main() {
       } else {
         console.log(`ℹ️ Network "${network}" already recorded for ${lockKey}`);
       }
-    }
-
-    // Verify existing file matches
-    if (fs.existsSync(destDarPath)) {
-      const existingHash = computeSha256(destDarPath);
-      if (existingHash !== lock.packages[lockKey].sha256) {
-        console.error(`❌ Hash mismatch! Backed up DAR has been modified.`);
-        console.error(`   Expected: ${lock.packages[lockKey].sha256}`);
-        console.error(`   Found:    ${existingHash}`);
-        process.exit(1);
-      }
-      console.log(`✅ Existing backup verified: ${lockKey}`);
     }
 
     return;
