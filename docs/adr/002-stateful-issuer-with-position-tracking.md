@@ -340,6 +340,14 @@ Since `CapTable` shares the same signatories, it can directly `archive` any OCF 
 
 ---
 
+## Related Documentation
+
+- **[OCP Contract Diagram](../OCP_CONTRACT_DIAGRAM.md)** - Visual Mermaid diagrams of the contract architecture
+
+> **Maintenance**: When updating this ADR or the contract design, also update the diagram at `docs/OCP_CONTRACT_DIAGRAM.md`.
+
+---
+
 ## References
 
 - [OCF Schema](https://github.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF)

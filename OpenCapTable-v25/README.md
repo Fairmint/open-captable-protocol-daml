@@ -4,6 +4,17 @@ This module contains the Open Cap Table Protocol (OpenCapTable) DAML implementat
 
 For shared coding guidelines that apply to all OCP DAML packages, see `open-captable-protocol-daml/README.md`.
 
+### Contract Architecture
+
+See **[OCP Contract Diagram](../docs/OCP_CONTRACT_DIAGRAM.md)** for visual documentation of the contract hierarchy and relationships.
+
+**Key components:**
+- `OcpFactory` → `IssuerAuthorization` → `CapTable` (factory chain)
+- `CapTable` maintains `Map Text (ContractId T)` for all OCF objects (O(1) lookup)
+- All OCF contracts use dual signatories: `issuer` + `system_operator`
+
+> **Maintenance**: When changing the contract design, update the diagram at `docs/OCP_CONTRACT_DIAGRAM.md`.
+
 ### Schema guidance
 
 #### Source of truth: schema (@schema)

@@ -1,5 +1,9 @@
 # Docs
 
+## Contents
+
+- [OCP_CONTRACT_DIAGRAM.md](./OCP_CONTRACT_DIAGRAM.md) - **OCP contract architecture diagrams** (Mermaid)
+
 ## Architecture Decision Records
 
 | ADR | Title | Status |
