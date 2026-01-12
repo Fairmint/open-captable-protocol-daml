@@ -7,13 +7,8 @@
 | Task | Date | Summary |
 |------|------|---------|
 | [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md) | 2026-01-12 | Replace string building with template files for reviewable codegen |
-| [CI/CD Optimization](./2026/01/2026.01.07-ci-cd-optimization.md) | 2026-01-07 | Add caching, concurrency controls, consistent Node versions |
-| [Code Generation Enhancements](./2026/01/2026.01.07-code-generation-enhancements.md) | 2026-01-07 | Add tests, error handling, validation to CapTable generator |
-| [Documentation Improvements](./2026/01/2026.01.07-documentation-improvements.md) | 2026-01-07 | Complete missing ADRs, SDK docs, contribution guide |
-| [Test Coverage & Quality](./2026/01/2026.01.07-test-coverage-quality.md) | 2026-01-07 | Coverage thresholds, negative tests, TypeScript tests |
 | [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md) | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable` |
 | [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md) | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks |
-| [Review Marker Creation Logic](./2026/01/2026.01.09-review-marker-creation-logic.md) | 2026-01-09 | Remove markers from individual choices; batch only |
 | [Implement CouponMinter Contract](./2026/01/2026.01.12-couponminter-contract-design.md) | 2026-01-12 | DAML implementation per ADR-004 |
 
 ## Completed Tasks
