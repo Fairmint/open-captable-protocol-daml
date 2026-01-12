@@ -6,6 +6,7 @@
 
 | Task | Date | Summary |
 |------|------|---------|
+| [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md) | 2026-01-12 | Replace string building with template files for reviewable codegen |
 | [CI/CD Optimization](./2026/01/2026.01.07-ci-cd-optimization.md) | 2026-01-07 | Add caching, concurrency controls, consistent Node versions |
 | [Code Generation Enhancements](./2026/01/2026.01.07-code-generation-enhancements.md) | 2026-01-07 | Add tests, error handling, validation to CapTable generator |
 | [Documentation Improvements](./2026/01/2026.01.07-documentation-improvements.md) | 2026-01-07 | Complete missing ADRs, SDK docs, contribution guide |
