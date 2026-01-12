@@ -3,6 +3,7 @@
 /**
  * Verify DAR integrity script
  * Checks that all DAR files in dars/ match their recorded hashes in dars.lock.
+ * Used both for manual verification and CI enforcement.
  *
  * Usage: tsx scripts/verify-dars.ts [--update]
  *
@@ -28,30 +29,37 @@ function parseArgs(): { update: boolean } {
   };
 }
 
-async function main() {
-  const { update } = parseArgs();
+interface VerificationResult {
+  verified: number;
+  missing: number;
+  mismatch: number;
+  untracked: number;
+  errors: string[];
+}
+
+function verifyDars(update: boolean): VerificationResult {
   const darsDir = getDarsDir();
-
-  console.log('🔍 Verifying DAR file integrity...\n');
-
   const lock = loadDarsLock();
   const darFiles = findDarFiles(darsDir);
+  const checkedPaths = new Set<string>();
 
-  let hasErrors = false;
-  let checkedCount = 0;
-  let missingCount = 0;
-  let mismatchCount = 0;
-  let unknownCount = 0;
+  const result: VerificationResult = {
+    verified: 0,
+    missing: 0,
+    mismatch: 0,
+    untracked: 0,
+    errors: [],
+  };
 
   // Check each entry in dars.lock
   for (const [lockKey, entry] of Object.entries(lock.packages)) {
     const darPath = path.join(darsDir, lockKey);
+    checkedPaths.add(darPath);
 
     if (!fs.existsSync(darPath)) {
       console.error(`❌ Missing DAR: ${lockKey}`);
-      console.error(`   Expected at: ${darPath}`);
-      missingCount++;
-      hasErrors = true;
+      result.errors.push(`Missing DAR file: ${lockKey} (recorded in dars.lock but file not found)`);
+      result.missing++;
       continue;
     }
 
@@ -62,8 +70,13 @@ async function main() {
       console.error(`❌ Hash mismatch: ${lockKey}`);
       console.error(`   Expected: ${entry.sha256}`);
       console.error(`   Actual:   ${actualHash}`);
-      mismatchCount++;
-      hasErrors = true;
+      result.errors.push(
+        `Hash mismatch for ${lockKey}:\n` +
+          `  Expected (dars.lock): ${entry.sha256}\n` +
+          `  Actual (file):        ${actualHash}\n` +
+          `  This DAR file has been modified without updating dars.lock!`
+      );
+      result.mismatch++;
 
       if (update) {
         console.log(`   📝 Updating hash in dars.lock`);
@@ -78,18 +91,24 @@ async function main() {
       if (update) {
         entry.size = actualStats.size;
       }
+      result.verified++;
     } else {
       console.log(`✅ ${lockKey}`);
-      checkedCount++;
+      result.verified++;
     }
   }
 
   // Check for DAR files not in dars.lock
   for (const darPath of darFiles) {
-    const relativePath = path.relative(darsDir, darPath);
-    if (!lock.packages[relativePath]) {
-      console.warn(`⚠️ Unknown DAR (not in dars.lock): ${relativePath}`);
-      unknownCount++;
+    if (!checkedPaths.has(darPath)) {
+      const relativePath = path.relative(darsDir, darPath);
+      console.error(`❌ Untracked DAR: ${relativePath}`);
+      result.errors.push(
+        `Untracked DAR file: ${relativePath}\n` +
+          `  This file exists in dars/ but is not recorded in dars.lock.\n` +
+          `  Use 'npm run backup-dar' to properly add new DAR files.`
+      );
+      result.untracked++;
 
       if (update) {
         console.log(`   📝 Adding to dars.lock`);
@@ -107,7 +126,7 @@ async function main() {
   }
 
   // Save updates if requested
-  if (update && (mismatchCount > 0 || unknownCount > 0)) {
+  if (update && (result.mismatch > 0 || result.untracked > 0)) {
     // Sort packages alphabetically
     const sortedPackages: Record<string, DarsLockEntry> = {};
     Object.keys(lock.packages)
@@ -121,27 +140,47 @@ async function main() {
     console.log('\n📝 dars.lock has been updated');
   }
 
+  return result;
+}
+
+async function main() {
+  const { update } = parseArgs();
+
+  console.log('🔍 Verifying DAR file integrity...\n');
+
+  const result = verifyDars(update);
+  const hasErrors = result.errors.length > 0;
+  const packageCount = result.verified + result.missing + result.mismatch;
+
   // Summary
   console.log('\n--- Summary ---');
-  console.log(`Verified: ${checkedCount}`);
-  if (missingCount > 0) console.log(`Missing:  ${missingCount}`);
-  if (mismatchCount > 0) console.log(`Mismatch: ${mismatchCount}`);
-  if (unknownCount > 0) console.log(`Unknown:  ${unknownCount}`);
+  console.log(`Verified: ${result.verified}`);
+  if (result.missing > 0) console.log(`Missing:  ${result.missing}`);
+  if (result.mismatch > 0) console.log(`Mismatch: ${result.mismatch}`);
+  if (result.untracked > 0) console.log(`Untracked: ${result.untracked}`);
+
+  if (packageCount === 0 && !hasErrors) {
+    console.log('\nℹ️ No DAR files backed up yet. This is OK for a fresh setup.');
+    return;
+  }
 
   if (hasErrors && !update) {
-    console.error('\n❌ Verification failed!');
-    console.error('Run with --update to fix dars.lock (use with caution)');
+    console.error('\n' + '─'.repeat(60));
+    console.error(`\n❌ Verification failed with ${result.errors.length} error(s)\n`);
+    console.error('To fix these issues:');
+    console.error('  1. If changes were intentional, run: npm run backup-dar -- --package <name> --version <version>');
+    console.error('  2. If changes were accidental, restore the original DAR files');
+    console.error('  3. Never modify backed-up DAR files directly');
+    console.error('  4. Run with --update to fix dars.lock (use with caution)\n');
     process.exit(1);
   }
 
-  if (Object.keys(lock.packages).length === 0) {
-    console.log('\nℹ️ No DAR files backed up yet.');
-  } else if (!hasErrors) {
+  if (!hasErrors) {
     console.log('\n✅ All DAR files verified successfully!');
   }
 }
 
 main().catch(error => {
-  console.error('❌ Error:', error);
+  console.error('❌ Unexpected error:', error);
   process.exit(1);
 });
