@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** | 2026-01-12
+**Implemented** | 2026-01-12
 
 ---
 
@@ -225,6 +225,7 @@ choice UpdateCapTable : UpdateCapTableResult
 | Date | Change | PR |
 |------|--------|-----|
 | 2026-01-12 | Created ADR | — |
+| 2026-01-12 | Implemented (CouponMinter contract + tests) | — |
 
 ---
 
