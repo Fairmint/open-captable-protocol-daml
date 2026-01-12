@@ -71,7 +71,7 @@ template CouponMinter
 |-----------|------|-------------|
 | `featuredAppRight` | `ContractId FeaturedAppRight` | The FeaturedAppRight contract to use |
 | `count` | `Int` | Number of markers to create (must be ≥ 1) |
-| `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients (empty array allowed—Splice API handles default) |
+| `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients (one marker created per beneficiary) |
 | `metadata` | `Optional Text` | OCF object ContractId for audit trail (optional) |
 
 ### Result Type
@@ -119,7 +119,9 @@ This preserves privacy—the underlying transaction details (type, value) remain
 
 ### Beneficiaries
 
-The `beneficiaries` array specifies reward recipients. An empty array is allowed—the Splice API handles this case with its default behavior. The backend service determines the appropriate beneficiaries based on the app configuration.
+The `beneficiaries` array specifies reward recipients. The Splice API creates one `FeaturedAppActivityMarker` per beneficiary per call to `CreateActivityMarker`. Each beneficiary has a `weight` (0.0 to 1.0) that determines their share of the reward.
+
+**Current behavior with empty array:** If an empty beneficiaries array is passed, the Splice API returns an empty list of markers—no markers are created. The backend service should always provide at least one beneficiary (typically the system operator with weight 1.0).
 
 ### No Throttling in Contract
 
@@ -207,12 +209,6 @@ choice UpdateCapTable : UpdateCapTableResult
 - Can't rate-limit within a single transaction
 - Large issuances would create thousands of markers atomically
 - Couples cap table operations to reward logic
-
-### Per-Issuer CouponMinter
-
-Could create separate `CouponMinter` contracts per issuer for isolation.
-
-**Deferred**: Start with a single shared contract. Add per-issuer isolation if needed for access control or attribution.
 
 ---
 
