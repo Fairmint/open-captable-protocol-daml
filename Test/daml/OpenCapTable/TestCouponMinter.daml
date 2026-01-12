@@ -1,11 +1,13 @@
 module OpenCapTable.TestCouponMinter where
 
 import Daml.Script
-import Fairmint.OpenCapTable.CouponMinter
+import Fairmint.CouponMinter
+import Splice.Amulet qualified as Amulet
 import Splice.Api.FeaturedAppRightV1 qualified as Featured
 import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary(..))
 
--- | Test-only FeaturedAppRight template for testing CouponMinter
+-- | Test FeaturedAppRight template that creates real FeaturedAppActivityMarker contracts.
+-- This allows us to verify that MintCoupons produces the correct number of markers.
 template TestFeaturedAppRight
   with
     dso : Party
@@ -15,10 +17,17 @@ template TestFeaturedAppRight
     observer provider
     interface instance Featured.FeaturedAppRight for TestFeaturedAppRight where
       view = Featured.FeaturedAppRightView with ..
-      featuredAppRight_CreateActivityMarkerImpl _ arg = do
-        pure (Featured.FeaturedAppRight_CreateActivityMarkerResult [])
+      featuredAppRight_CreateActivityMarkerImpl _self arg = do
+        -- Create actual FeaturedAppActivityMarker contracts for each beneficiary
+        cids <- forA arg.beneficiaries $ \b ->
+          create Amulet.FeaturedAppActivityMarker with
+            dso = dso
+            provider = provider
+            beneficiary = b.beneficiary
+            weight = b.weight
+        pure (Featured.FeaturedAppRight_CreateActivityMarkerResult $ map toInterfaceContractId cids)
 
--- | Test MintCoupons with valid inputs (count = 1)
+-- | Test MintCoupons with count = 1, verify one marker per beneficiary is created
 testMintCoupons_ValidCount1 = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
@@ -27,7 +36,7 @@ testMintCoupons_ValidCount1 = script do
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
+  -- Create test FeaturedAppRight (DSO creates it since they're signatory)
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
@@ -41,35 +50,40 @@ testMintCoupons_ValidCount1 = script do
       beneficiaries = [AppRewardBeneficiary operator 1.0]
       metadata = Some "test-contract-id-123"
   
-  -- Verify result (test mock returns empty list per implementation)
-  assertMsg "Expected empty marker list from test mock" (result.markerCids == [])
+  -- Verify: count=1 * 1 beneficiary = 1 marker
+  assertMsg "Expected 1 marker for count=1 with 1 beneficiary" (length result.markerCids == 1)
+  
+  -- Verify the marker was actually created on the ledger
+  markers <- query @Amulet.FeaturedAppActivityMarker dso
+  assertMsg "Expected 1 marker contract on ledger" (length markers == 1)
   pure ()
 
--- | Test MintCoupons with count = 5 (multiple iterations)
-testMintCoupons_ValidCount5 = script do
+-- | Test MintCoupons with count = 3, verify correct total markers
+testMintCoupons_ValidCount3 = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   
-  -- Create CouponMinter
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
       provider = operator
   
-  -- Exercise MintCoupons with count = 5
+  -- Exercise MintCoupons with count = 3
   result <- submitMulti [operator] [dso] do
     exerciseCmd couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
-      count = 5
+      count = 3
       beneficiaries = [AppRewardBeneficiary operator 1.0]
       metadata = None
   
-  -- Verify result (test mock returns empty list per implementation)
-  assertMsg "Expected empty marker list from test mock" (result.markerCids == [])
+  -- Verify: count=3 * 1 beneficiary = 3 markers
+  assertMsg "Expected 3 markers for count=3 with 1 beneficiary" (length result.markerCids == 3)
+  
+  markers <- query @Amulet.FeaturedAppActivityMarker dso
+  assertMsg "Expected 3 marker contracts on ledger" (length markers == 3)
   pure ()
 
 -- | Test MintCoupons rejects count = 0
@@ -77,11 +91,9 @@ testMintCoupons_RejectsCount0 = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   
-  -- Create CouponMinter
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
@@ -100,11 +112,9 @@ testMintCoupons_RejectsNegativeCount = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   
-  -- Create CouponMinter
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
@@ -123,18 +133,16 @@ testMintCoupons_Nonconsuming = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   
-  -- Create CouponMinter
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
       provider = operator
   
   -- Exercise MintCoupons twice to verify nonconsuming behavior
-  _ <- submitMulti [operator] [dso] do
+  result1 <- submitMulti [operator] [dso] do
     exerciseCmd couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 1
@@ -142,40 +150,47 @@ testMintCoupons_Nonconsuming = script do
       metadata = Some "first-mint"
   
   -- Second call should succeed (nonconsuming)
-  _ <- submitMulti [operator] [dso] do
+  result2 <- submitMulti [operator] [dso] do
     exerciseCmd couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 2
       beneficiaries = [AppRewardBeneficiary operator 1.0]
       metadata = Some "second-mint"
   
+  -- Total markers: 1 + 2 = 3
+  assertMsg "First call should produce 1 marker" (length result1.markerCids == 1)
+  assertMsg "Second call should produce 2 markers" (length result2.markerCids == 2)
+  
+  markers <- query @Amulet.FeaturedAppActivityMarker dso
+  assertMsg "Expected 3 total marker contracts on ledger" (length markers == 3)
   pure ()
 
--- | Test MintCoupons with multiple beneficiaries
+-- | Test MintCoupons with multiple beneficiaries creates marker per beneficiary per iteration
 testMintCoupons_MultipleBeneficiaries = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   alice <- allocateParty "Alice"
   bob <- allocateParty "Bob"
   
-  -- Create CouponMinter
   couponMinterCid <- submit operator do
     createCmd CouponMinter with operator
   
-  -- Create test FeaturedAppRight
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
       provider = operator
   
-  -- Exercise MintCoupons with multiple beneficiaries
+  -- Exercise MintCoupons with 2 beneficiaries and count = 2
   result <- submitMulti [operator] [dso] do
     exerciseCmd couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
-      count = 1
+      count = 2
       beneficiaries = [AppRewardBeneficiary alice 0.5, AppRewardBeneficiary bob 0.5]
       metadata = None
   
-  -- Verify result (test mock returns empty list per implementation)
-  assertMsg "Expected empty marker list from test mock" (result.markerCids == [])
+  -- Verify: count=2 * 2 beneficiaries = 4 markers
+  assertMsg "Expected 4 markers for count=2 with 2 beneficiaries" (length result.markerCids == 4)
+  
+  markers <- query @Amulet.FeaturedAppActivityMarker dso
+  assertMsg "Expected 4 marker contracts on ledger" (length markers == 4)
   pure ()
