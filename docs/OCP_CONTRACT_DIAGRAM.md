@@ -18,6 +18,10 @@ flowchart TB
 sequenceDiagram
     actor SO as System Operator
     actor I as Issuer
+    participant OcpFactory
+    participant IssuerAuthorization
+    participant Issuer
+    participant CapTable
     participant OCF as OCF Contracts
 
     SO->>OcpFactory: Deploy (once)
