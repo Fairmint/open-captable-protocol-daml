@@ -33,6 +33,7 @@ interface VerificationResult {
   verified: number;
   missing: number;
   mismatch: number;
+  sizeMismatch: number;
   untracked: number;
   errors: string[];
 }
@@ -47,6 +48,7 @@ function verifyDars(update: boolean): VerificationResult {
     verified: 0,
     missing: 0,
     mismatch: 0,
+    sizeMismatch: 0,
     untracked: 0,
     errors: [],
   };
@@ -89,8 +91,10 @@ function verifyDars(update: boolean): VerificationResult {
       console.warn(`   Actual:   ${actualStats.size} bytes`);
 
       if (update) {
+        console.log(`   📝 Updating size in dars.lock`);
         entry.size = actualStats.size;
       }
+      result.sizeMismatch++;
       result.verified++;
     } else {
       console.log(`✅ ${lockKey}`);
@@ -126,7 +130,7 @@ function verifyDars(update: boolean): VerificationResult {
   }
 
   // Save updates if requested
-  if (update && (result.mismatch > 0 || result.untracked > 0)) {
+  if (update && (result.mismatch > 0 || result.sizeMismatch > 0 || result.untracked > 0)) {
     // Sort packages alphabetically
     const sortedPackages: Record<string, DarsLockEntry> = {};
     Object.keys(lock.packages)
@@ -157,6 +161,7 @@ async function main() {
   console.log(`Verified: ${result.verified}`);
   if (result.missing > 0) console.log(`Missing:  ${result.missing}`);
   if (result.mismatch > 0) console.log(`Mismatch: ${result.mismatch}`);
+  if (result.sizeMismatch > 0) console.log(`Size fixed: ${result.sizeMismatch}`);
   if (result.untracked > 0) console.log(`Untracked: ${result.untracked}`);
 
   if (packageCount === 0 && !hasErrors) {
