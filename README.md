@@ -5,12 +5,12 @@
 - **Start here**: `llms.txt`
 - **Docs folder**: `docs/README.md` (optional; keep minimal)
 
-This repository contains multiple DAML packages (e.g., `OpenCapTable-v27`,
+This repository contains multiple DAML packages (e.g., `OpenCapTable-v28`,
 `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `Shared`, `CantonPayments`). This
 document defines coding guidelines that apply to all packages.
 
 For package-specific details about each implementation, see the README.md file in the respective
-package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v27/README.md`).
+package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v28/README.md`).
 
 ### Global exceptions
 
@@ -82,7 +82,7 @@ validateOcfThing t = t.field /= ""
 
 Each package may include additional constraints and domain guidance. Refer to:
 
-- `open-captable-protocol-daml/OpenCapTable-v27/README.md` for Open Cap Table specifics (e.g.,
+- `open-captable-protocol-daml/OpenCapTable-v28/README.md` for Open Cap Table specifics (e.g.,
   Issuer management patterns).
 - Other package READMEs as applicable.
 
@@ -149,7 +149,7 @@ Add your package directory to the `PACKAGE_DIRS` array:
 
 ```typescript
 const PACKAGE_DIRS = [
-  path.join(__dirname, '../generated/js/OpenCapTable-v27-0.0.1'),
+  path.join(__dirname, '../generated/js/OpenCapTable-v28-0.0.1'),
   path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
   path.join(__dirname, '../generated/js/NewPackage-v01-0.0.1'),
 ];
@@ -161,7 +161,7 @@ Add your package directory to the `packageDirs` array:
 
 ```typescript
 const packageDirs = [
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v27-0.0.1'),
+  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v28-0.0.1'),
   path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'),
   path.join(__dirname, '..', 'generated', 'js', 'NewPackage-v01-0.0.1'),
 ];
