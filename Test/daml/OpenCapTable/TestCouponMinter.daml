@@ -1,6 +1,7 @@
 module OpenCapTable.TestCouponMinter where
 
 import Daml.Script
+import DA.Time (seconds)
 import Fairmint.CouponMinter
 import Splice.Amulet qualified as Amulet
 import Splice.Api.FeaturedAppRightV1 qualified as Featured
@@ -34,7 +35,10 @@ testMintCoupons_ValidCount1 = script do
   
   -- Create CouponMinter
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   -- Create test FeaturedAppRight (DSO creates it since they're signatory)
   featuredAppRightCid <- submit dso do
@@ -48,6 +52,7 @@ testMintCoupons_ValidCount1 = script do
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 1
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = Some "test-contract-id-123"
   
   -- Verify: count=1 * 1 beneficiary = 1 marker
@@ -64,7 +69,10 @@ testMintCoupons_ValidCount3 = script do
   dso <- allocateParty "DSO"
   
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
@@ -77,6 +85,7 @@ testMintCoupons_ValidCount3 = script do
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 3
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = None
   
   -- Verify: count=3 * 1 beneficiary = 3 markers
@@ -92,7 +101,10 @@ testMintCoupons_RejectsCount0 = script do
   dso <- allocateParty "DSO"
   
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
@@ -105,6 +117,7 @@ testMintCoupons_RejectsCount0 = script do
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 0
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = None
 
 -- | Test MintCoupons rejects negative count
@@ -113,7 +126,10 @@ testMintCoupons_RejectsNegativeCount = script do
   dso <- allocateParty "DSO"
   
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
@@ -126,35 +142,41 @@ testMintCoupons_RejectsNegativeCount = script do
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = -1
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = None
 
--- | Test CouponMinter is nonconsuming (can be used multiple times)
-testMintCoupons_Nonconsuming = script do
+-- | Test CouponMinter is consuming but returns new contract ID for chaining
+testMintCoupons_ConsumingWithChaining = script do
   operator <- allocateParty "Operator"
   dso <- allocateParty "DSO"
   
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
       dso = dso
       provider = operator
   
-  -- Exercise MintCoupons twice to verify nonconsuming behavior
+  -- First mint - use the new contract ID returned
   result1 <- submitMulti [operator] [dso] do
     exerciseCmd couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 1
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = Some "first-mint"
   
-  -- Second call should succeed (nonconsuming)
+  -- Second mint - use the new contract ID from first result
   result2 <- submitMulti [operator] [dso] do
-    exerciseCmd couponMinterCid MintCoupons with
+    exerciseCmd result1.couponMinterCid MintCoupons with
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 2
       beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None
       metadata = Some "second-mint"
   
   -- Total markers: 1 + 2 = 3
@@ -173,7 +195,10 @@ testMintCoupons_MultipleBeneficiaries = script do
   bob <- allocateParty "Bob"
   
   couponMinterCid <- submit operator do
-    createCmd CouponMinter with operator
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
   
   featuredAppRightCid <- submit dso do
     createCmd TestFeaturedAppRight with
@@ -186,6 +211,7 @@ testMintCoupons_MultipleBeneficiaries = script do
       featuredAppRight = toInterfaceContractId featuredAppRightCid
       count = 2
       beneficiaries = [AppRewardBeneficiary alice 0.5, AppRewardBeneficiary bob 0.5]
+      maxTps = None
       metadata = None
   
   -- Verify: count=2 * 2 beneficiaries = 4 markers
@@ -194,3 +220,197 @@ testMintCoupons_MultipleBeneficiaries = script do
   markers <- query @Amulet.FeaturedAppActivityMarker dso
   assertMsg "Expected 4 marker contracts on ledger" (length markers == 4)
   pure ()
+
+-- | Test TPS enforcement - first call with maxTps should succeed (no previous mint)
+testMintCoupons_TpsFirstCallSucceeds = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- First call with TPS limit should succeed (no previous mint to compare against)
+  result <- submitMulti [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 5.0
+      metadata = None
+  
+  assertMsg "Expected 1 marker" (length result.markerCids == 1)
+  pure ()
+
+-- | Test TPS enforcement - second call too soon should fail
+testMintCoupons_TpsExceededFails = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- First call - mints 10 coupons with 5 TPS limit
+  -- Required wait for next call = 10 / 5 = 2 seconds
+  result1 <- submitMulti [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 10
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 5.0
+      metadata = None
+  
+  -- Second call immediately (same timestamp) - should fail because not enough time passed
+  submitMultiMustFail [operator] [dso] do
+    exerciseCmd result1.couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 5.0
+      metadata = None
+
+-- | Test TPS enforcement - call after sufficient time passes should succeed
+testMintCoupons_TpsAfterWaitSucceeds = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- First call - mints 5 coupons with 5 TPS limit
+  -- Required wait for next call = 5 / 5 = 1 second
+  result1 <- submitMulti [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 5
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 5.0
+      metadata = None
+  
+  -- Advance time by 2 seconds (more than required 1 second)
+  passTime (seconds 2)
+  
+  -- Second call should succeed after waiting
+  result2 <- submitMulti [operator] [dso] do
+    exerciseCmd result1.couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 5.0
+      metadata = None
+  
+  assertMsg "Second call should produce 1 marker" (length result2.markerCids == 1)
+  
+  markers <- query @Amulet.FeaturedAppActivityMarker dso
+  assertMsg "Expected 6 total markers on ledger" (length markers == 6)
+  pure ()
+
+-- | Test TPS enforcement - omitting maxTps bypasses check
+testMintCoupons_TpsOmittedBypassesCheck = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- First call with TPS limit
+  result1 <- submitMulti [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 100
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 1.0  -- Would require 100 seconds to wait
+      metadata = None
+  
+  -- Second call immediately without TPS limit - should succeed
+  result2 <- submitMulti [operator] [dso] do
+    exerciseCmd result1.couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = None  -- No TPS check
+      metadata = None
+  
+  assertMsg "Second call should succeed without TPS check" (length result2.markerCids == 1)
+  pure ()
+
+-- | Test TPS enforcement - zero or negative maxTps should fail
+testMintCoupons_TpsInvalidValueFails = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- Call with maxTps = 0 should fail
+  submitMultiMustFail [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some 0.0
+      metadata = None
+
+-- | Test TPS enforcement - negative maxTps should fail
+testMintCoupons_TpsNegativeValueFails = script do
+  operator <- allocateParty "Operator"
+  dso <- allocateParty "DSO"
+  
+  couponMinterCid <- submit operator do
+    createCmd CouponMinter with
+      operator
+      lastMintTime = None
+      lastMintCount = 0
+  
+  featuredAppRightCid <- submit dso do
+    createCmd TestFeaturedAppRight with
+      dso = dso
+      provider = operator
+  
+  -- Call with negative maxTps should fail
+  submitMultiMustFail [operator] [dso] do
+    exerciseCmd couponMinterCid MintCoupons with
+      featuredAppRight = toInterfaceContractId featuredAppRightCid
+      count = 1
+      beneficiaries = [AppRewardBeneficiary operator 1.0]
+      maxTps = Some (-5.0)
+      metadata = None

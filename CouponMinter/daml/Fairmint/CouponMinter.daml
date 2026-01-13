@@ -1,37 +1,68 @@
 module Fairmint.CouponMinter where
 
 -- Utility contract for minting Featured App Activity Markers on demand
--- Enables a backend service to mint Splice rewards
+-- Enables a backend service to mint Splice rewards with optional on-chain TPS enforcement
 -- See ADR-004: https://github.com/fairmint/open-captable-protocol-daml/docs/adr/004-couponminter-contract.md
 
 import DA.Action (replicateA)
+import DA.Time (RelTime, subTime, convertRelTimeToMicroseconds)
 import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight(..), FeaturedAppRight_CreateActivityMarker(..), AppRewardBeneficiary(..), FeaturedAppActivityMarker)
 
 data MintCouponsResult = MintCouponsResult with
+    couponMinterCid: ContractId CouponMinter
     markerCids: [ContractId FeaturedAppActivityMarker]
   deriving (Eq, Show)
 
 template CouponMinter
   with
     operator: Party
+    lastMintTime: Optional Time
+    lastMintCount: Int
   where
     signatory operator
 
-    nonconsuming choice MintCoupons : MintCouponsResult
+    choice MintCoupons : MintCouponsResult
       with
         featuredAppRight: ContractId FeaturedAppRight
         count: Int
         beneficiaries: [AppRewardBeneficiary]
+        maxTps: Optional Decimal
+          -- ^ Optional TPS limit. If provided, enforces that enough time has passed
+          -- since the last mint operation based on the previous mint count.
+          -- Required interval = lastMintCount / maxTps seconds.
         metadata: Optional Text
           -- ^ Optional metadata for audit trail.
       controller operator
       do
         assertMsg "count must be at least 1" (count >= 1)
-        
+
+        now <- getTime
+
+        -- Enforce TPS limit if provided and there was a previous mint
+        case (maxTps, lastMintTime) of
+          (Some tps, Some lastTime) -> do
+            assertMsg "maxTps must be positive" (tps > 0.0)
+            let minIntervalMicros = intToDecimal lastMintCount * 1000000.0 / tps
+            let elapsed : RelTime = subTime now lastTime
+            let elapsedMicros = intToDecimal (convertRelTimeToMicroseconds elapsed)
+            assertMsg
+              ("TPS limit exceeded: need " <> show minIntervalMicros <> " microseconds between mints, only " <> show elapsedMicros <> " elapsed (max " <> show tps <> " TPS)")
+              (elapsedMicros >= minIntervalMicros)
+          (Some tps, None) ->
+            assertMsg "maxTps must be positive" (tps > 0.0)
+          _ -> pure ()
+
         allMarkerCids <- replicateA count $ do
           result <- exercise featuredAppRight FeaturedAppRight_CreateActivityMarker with
             ..
           pure result.activityMarkerCids
-        
+
+        -- Recreate contract with updated timestamp and count
+        couponMinterCid <- create this with
+          lastMintTime = Some now
+          lastMintCount = count
+
+        let markerCids = concat allMarkerCids
+
         pure MintCouponsResult with
-          markerCids = concat allMarkerCids
+          ..
