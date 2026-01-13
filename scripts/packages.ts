@@ -55,14 +55,17 @@ export type PackageKey = keyof typeof PACKAGES;
 
 /**
  * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v25').
+ * Key lookup is case-insensitive.
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {
   const lowerKey = keyOrName.toLowerCase();
-  if (lowerKey in PACKAGES) {
-    return PACKAGES[lowerKey as PackageKey];
+  // Case-insensitive key lookup
+  const matchingKey = Object.keys(PACKAGES).find(k => k.toLowerCase() === lowerKey);
+  if (matchingKey) {
+    return PACKAGES[matchingKey as PackageKey];
   }
-  // Also support lookup by full name
-  return Object.values(PACKAGES).find(pkg => pkg.name === keyOrName);
+  // Also support lookup by full name (case-insensitive)
+  return Object.values(PACKAGES).find(pkg => pkg.name.toLowerCase() === lowerKey);
 }
 
 /**
