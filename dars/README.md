@@ -17,9 +17,9 @@ we store the exact bytes of published packages here.
 dars/
 ├── README.md                          # This file
 ├── dars.lock                          # Hash manifest for CI verification
-├── OpenCapTable-v26/
+├── OpenCapTable-v27/
 │   └── 0.0.1/
-│       └── OpenCapTable-v26.dar       # Backed-up DAR file
+│       └── OpenCapTable-v27.dar       # Backed-up DAR file
 ├── OpenCapTableReports-v01/
 │   └── 0.0.2/
 │       └── OpenCapTableReports-v01.dar
@@ -35,7 +35,7 @@ dars/
 Back up the DAR file after uploading to mainnet:
 
 ```bash
-npm run backup-dar -- --package OpenCapTable-v26 --version 0.0.1
+npm run backup-dar -- --package OpenCapTable-v27 --version 0.0.1
 ```
 
 This will:
@@ -67,7 +67,7 @@ The `dars.lock` file contains SHA256 hashes and metadata for all backed-up DARs:
 {
   "version": 1,
   "packages": {
-    "OpenCapTable-v26/0.0.1/OpenCapTable-v26.dar": {
+    "OpenCapTable-v27/0.0.1/OpenCapTable-v27.dar": {
       "sha256": "abc123...",
       "size": 12345,
       "sdkVersion": "3.3.0-snapshot.20250603.0",
