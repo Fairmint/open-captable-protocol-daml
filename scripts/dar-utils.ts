@@ -53,7 +53,7 @@ export function loadDarsLock(): DarsLock {
   }
 
   const content = fs.readFileSync(lockPath, 'utf-8');
-  
+
   try {
     const parsed = JSON.parse(content);
 
@@ -190,23 +190,26 @@ export function getBackedUpDarPath(
 }
 
 /**
- * Print a warning when using a freshly built DAR instead of a backed-up one.
+ * Get the path to a freshly built DAR file (from .daml/dist/).
+ * Returns the path if it exists, null otherwise.
  */
-export function warnIfBuildingFresh(packageName: string, version: string): void {
-  console.warn(`⚠️ No backed-up DAR found for ${packageName} v${version}`);
-  console.warn(`   Using freshly built DAR from .daml/dist/`);
-  console.warn(`   After successful upload, run:`);
-  console.warn(`   npm run backup-dar -- --package ${packageName} --version ${version}`);
+export function getFreshDarPath(packageName: string, version: string, darName: string): string | null {
+  const rootDir = path.join(__dirname, '..');
+  const freshPath = path.join(rootDir, packageName, '.daml', 'dist', `${darName}-${version}.dar`);
+  return fs.existsSync(freshPath) ? freshPath : null;
 }
 
 /**
- * Get the path to a DAR file, preferring backed-up version over fresh build.
- * Returns the backed-up DAR path if available and verified, otherwise falls back to fresh build.
+ * Require a backed-up DAR file to exist and be verified.
+ * This is the strict mode - it will NOT fall back to fresh builds.
+ * Use this when you want to ensure the DAR has been properly backed up before proceeding.
+ *
+ * @throws Error if no backup exists
+ * @throws DarIntegrityError if backup exists but hash doesn't match
  */
-export function getDarPath(packageName: string, version: string, darName: string): string {
+export function requireBackedUpDar(packageName: string, version: string, darName: string): string {
   const rootDir = path.join(__dirname, '..');
 
-  // First, check if we have a backed-up DAR (throws DarIntegrityError if tampered)
   try {
     const backedUpPath = getBackedUpDarPath(packageName, version, darName);
     if (backedUpPath) {
@@ -222,9 +225,53 @@ export function getDarPath(packageName: string, version: string, darName: string
     throw error;
   }
 
-  // Fall back to freshly built DAR
+  // No backup found - fail with clear instructions
+  console.error(`❌ DAR not backed up: ${packageName} v${version}`);
+  console.error(`   Backups are required before upload to ensure reproducibility.`);
+  console.error(`   Run first: npm run backup-dar -- --package ${packageName} --version ${version}`);
+  process.exit(1);
+}
+
+/**
+ * Check if a DAR has been backed up.
+ */
+export function isDarBackedUp(packageName: string, version: string, darName: string): boolean {
+  const lockKey = getDarLockKey(packageName, version, darName);
+  const lock = loadDarsLock();
+  if (!lock.packages[lockKey]) return false;
+
+  const darPath = path.join(getDarsDir(), lockKey);
+  return fs.existsSync(darPath);
+}
+
+/**
+ * @deprecated Use requireBackedUpDar instead to ensure backups are mandatory.
+ * Get the path to a DAR file, preferring backed-up version over fresh build.
+ * Returns the backed-up DAR path if available and verified, otherwise falls back to fresh build.
+ */
+export function getDarPath(packageName: string, version: string, darName: string): string {
+  const rootDir = path.join(__dirname, '..');
+
+  try {
+    const backedUpPath = getBackedUpDarPath(packageName, version, darName);
+    if (backedUpPath) {
+      console.log(`📦 Using backed-up DAR: ${path.relative(rootDir, backedUpPath)}`);
+      return backedUpPath;
+    }
+  } catch (error) {
+    if (error instanceof DarIntegrityError) {
+      console.error(`❌ ${error.message}`);
+      console.error('   This is a security concern. Please investigate before proceeding.');
+      process.exit(1);
+    }
+    throw error;
+  }
+
+  // Fall back to freshly built DAR (deprecated behavior)
   const freshPath = path.join(rootDir, packageName, '.daml', 'dist', `${darName}-${version}.dar`);
-  warnIfBuildingFresh(packageName, version);
+  console.warn(`⚠️ No backed-up DAR found for ${packageName} v${version}`);
+  console.warn(`   Using freshly built DAR from .daml/dist/`);
+  console.warn(`   This behavior is deprecated. Please backup first.`);
 
   if (!fs.existsSync(freshPath)) {
     console.error(`❌ DAR file not found: ${freshPath}`);

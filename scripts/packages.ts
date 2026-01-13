@@ -206,3 +206,26 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
   console.error('');
   console.error('Networks: devnet, mainnet');
 }
+
+// =============================================================================
+// Template ID Utilities
+// =============================================================================
+
+/**
+ * Build a DAML template ID dynamically from package config.
+ * Format: #<package-name>:<module>:<template>
+ *
+ * This ensures we always use the correct package version from daml.yaml (single source of truth),
+ * avoiding hardcoded version references that become stale after upgrades.
+ *
+ * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v26')
+ * @param module - Full module path (e.g., 'Fairmint.OpenCapTable.OcpFactory')
+ * @param template - Template name (e.g., 'OcpFactory')
+ */
+export function buildTemplateId(packageKey: string, module: string, template: string): string {
+  const pkg = getPackage(packageKey);
+  if (!pkg) {
+    throw new Error(`Unknown package: ${packageKey}. Valid keys: ${getPackageKeys().join(', ')}`);
+  }
+  return `#${pkg.name}:${module}:${template}`;
+}

@@ -8,9 +8,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { Fairmint } from '../lib';
 import { createLedgerJsonApiClient } from './utils';
-import { requireNetwork } from './packages';
+import { requireNetwork, buildTemplateId } from './packages';
 
 interface ContractIdData {
   mainnet?: { ocpFactoryContractId: string; templateId: string };
@@ -38,22 +37,21 @@ async function main() {
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
-  if (!Fairmint?.OpenCapTable?.OcpFactory?.OcpFactory) {
-    throw new Error('Generated types not found. Run "npm run codegen" first.');
-  }
-
   const client = createLedgerJsonApiClient(network, 'intellect');
   const operatorPartyId = client.getPartyId();
-  const templateId = Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId;
+
+  // Build template ID dynamically from package config (single source of truth)
+  const templateId = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
 
   console.log(`  Template: ${templateId}`);
   console.log(`  Operator: ${operatorPartyId}`);
 
+  // Create arguments matching current OcpFactory DAML (only system_operator required)
   const response = await client.submitAndWaitForTransactionTree({
     commands: [{
       CreateCommand: {
         templateId,
-        createArguments: { system_operator: operatorPartyId } as Fairmint.OpenCapTable.OcpFactory.OcpFactory,
+        createArguments: { system_operator: operatorPartyId },
       },
     }],
   });
