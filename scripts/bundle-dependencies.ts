@@ -568,10 +568,7 @@ function replaceDependencyReferences(targetDir: string): void {
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'))
         .replace(/\\/g, '/');
       if (isDts) {
-        content = content.replace(
-          /from 'daml.js\/splice-api-token-metadata-v1-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
+        content = content.replace(/from 'daml.js\/splice-api-token-metadata-v1-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
           /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,

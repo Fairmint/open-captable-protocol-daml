@@ -2,11 +2,10 @@
 /**
  * Verifies that the npm package has no unresolved external daml.js/ imports.
  *
- * After Canton 3.4, DAML codegen produces imports like:
- *   require('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')
+ * After Canton 3.4, DAML codegen produces imports like: require('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')
  *
- * These must be replaced with relative paths by bundle-dependencies.ts
- * before the package is published, otherwise consumers can't use it.
+ * These must be replaced with relative paths by bundle-dependencies.ts before the package is published, otherwise
+ * consumers can't use it.
  *
  * This script catches the issue in CI before publish.
  */
@@ -34,8 +33,8 @@ function findFiles(dir: string, extension: string): string[] {
   return files;
 }
 
-function checkForUnresolvedImports(): { file: string; matches: string[] }[] {
-  const issues: { file: string; matches: string[] }[] = [];
+function checkForUnresolvedImports(): Array<{ file: string; matches: string[] }> {
+  const issues: Array<{ file: string; matches: string[] }> = [];
 
   // Check both .js and .d.ts files
   const jsFiles = findFiles(LIB_DIR, '.js');
@@ -44,10 +43,7 @@ function checkForUnresolvedImports(): { file: string; matches: string[] }[] {
 
   // Pattern to find unresolved daml.js imports
   // These should have been replaced with relative paths
-  const unresolvedPatterns = [
-    /require\(['"]daml\.js\/[^'"]+['"]\)/g,
-    /from ['"]daml\.js\/[^'"]+['"]/g,
-  ];
+  const unresolvedPatterns = [/require\(['"]daml\.js\/[^'"]+['"]\)/g, /from ['"]daml\.js\/[^'"]+['"]/g];
 
   for (const filePath of allFiles) {
     const content = fs.readFileSync(filePath, 'utf8');
@@ -91,12 +87,8 @@ function main(): void {
         }
         console.error('');
       }
-      console.error(
-        'These imports should have been replaced with relative paths by bundle-dependencies.ts.',
-      );
-      console.error(
-        'Check that the patterns in bundle-dependencies.ts match the generated code format.',
-      );
+      console.error('These imports should have been replaced with relative paths by bundle-dependencies.ts.');
+      console.error('Check that the patterns in bundle-dependencies.ts match the generated code format.');
       process.exit(1);
     }
 
