@@ -1,135 +1,96 @@
 #!/usr/bin/env node
+/**
+ * Create the ReportsFactory contract.
+ * Saves contract ID to generated/reports-factory-contract-id.json.
+ *
+ * Usage: tsx scripts/create-reports-factory.ts --network <devnet|mainnet>
+ */
 
-import * as path from 'path';
 import * as fs from 'fs';
+import * as path from 'path';
 import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
-import { isContractNetwork, type ContractNetwork } from './types';
-
-interface ReportsFactoryContractData {
-  reportsFactoryContractId: string;
-  templateId: string;
-}
+import { requireNetwork } from './packages';
 
 interface ContractIdData {
-  mainnet?: ReportsFactoryContractData;
-  devnet?: ReportsFactoryContractData;
+  mainnet?: { reportsFactoryContractId: string; templateId: string };
+  devnet?: { reportsFactoryContractId: string; templateId: string };
 }
 
-interface ReportsFactoryCreateArgs {
-  system_operator: string;
-  featured_app_right: string;
-  [key: string]: string;
-}
-
-function getNetworkFromArgs(): ContractNetwork {
-  const args = process.argv.slice(2);
-  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
-  if (networkIndex === -1 || networkIndex === args.length - 1) {
-    console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
-    process.exit(1);
-  }
-  const network = args[networkIndex + 1].toLowerCase();
-  if (!isContractNetwork(network)) {
-    console.error('❌ Network must be either "mainnet" or "devnet"');
-    process.exit(1);
-  }
-  return network;
-}
-
-function getOutputPath(): string {
-  return path.join(__dirname, '..', 'generated', 'reports-factory-contract-id.json');
-}
-
-function loadExistingContractIds(outputPath: string): ContractIdData {
+function loadExistingData(filePath: string): ContractIdData {
   try {
-    if (fs.existsSync(outputPath)) {
-      const content = fs.readFileSync(outputPath, 'utf8');
-      return JSON.parse(content) as ContractIdData;
-    }
-  } catch (err) {
-    console.warn('⚠️  Failed to read existing reports factory contract id file. Proceeding to create a new one.');
+    if (fs.existsSync(filePath)) return JSON.parse(fs.readFileSync(filePath, 'utf8'));
+  } catch {
+    console.warn('⚠️  Could not read existing file, starting fresh');
   }
   return {};
 }
 
 async function main() {
-  const network = getNetworkFromArgs();
-  console.log(`Creating ReportsFactory contract for ${network}...`);
+  const network = requireNetwork('create-reports-factory.ts');
 
-  // Import from the combined lib built by scripts/create-root-index.ts
+  console.log(`\n🔨 Creating ReportsFactory on ${network}\n`);
+
   const { Fairmint } = await import('../lib');
 
-  const client = createLedgerJsonApiClient(network, 'intellect');
-
   if (!Fairmint?.OpenCapTableReports?.ReportsFactory?.ReportsFactory) {
-    throw new Error('Generated DAML types not found for Reports package. Please run "npm run codegen" first.');
+    throw new Error('Generated types not found. Run "npm run codegen" first.');
   }
 
-  console.log(`Template ID: ${Fairmint.OpenCapTableReports.ReportsFactory.ReportsFactory.templateId}`);
-
+  const client = createLedgerJsonApiClient(network, 'intellect');
   const validatorClient = createValidatorApiClient(network, 'intellect');
-  const intellectPartyId = client.getPartyId();
+  const operatorPartyId = client.getPartyId();
+  const templateId = Fairmint.OpenCapTableReports.ReportsFactory.ReportsFactory.templateId;
 
-  console.log('Looking up existing FeaturedAppRight contract...');
-  const featuredAppRight = await validatorClient.lookupFeaturedAppRight({ partyId: intellectPartyId });
-  if (!featuredAppRight || !featuredAppRight.featured_app_right) {
-    throw new Error(`No featured app right found for party ${intellectPartyId}`);
+  console.log(`  Template: ${templateId}`);
+  console.log(`  Operator: ${operatorPartyId}`);
+
+  // Lookup FeaturedAppRight
+  console.log('  Looking up FeaturedAppRight...');
+  const featuredAppRight = await validatorClient.lookupFeaturedAppRight({ partyId: operatorPartyId });
+  if (!featuredAppRight?.featured_app_right) {
+    throw new Error(`No FeaturedAppRight found for ${operatorPartyId}`);
   }
   const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string'
     ? featuredAppRight.featured_app_right
     : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
+  console.log(`  FeaturedAppRight: ${featuredAppRightContractId}`);
 
-  console.log(`🔍 Found FeaturedAppRight contract: ${featuredAppRightContractId}`);
+  const response = await client.submitAndWaitForTransactionTree({
+    commands: [{
+      CreateCommand: {
+        templateId,
+        createArguments: {
+          system_operator: operatorPartyId,
+          featured_app_right: featuredAppRightContractId,
+        },
+      },
+    }],
+  });
 
-  const reportsFactoryData: ReportsFactoryCreateArgs = {
-    system_operator: intellectPartyId,
-    featured_app_right: featuredAppRightContractId,
-  };
-
-  const createCommand = {
-    templateId: Fairmint.OpenCapTableReports.ReportsFactory.ReportsFactory.templateId,
-    createArguments: reportsFactoryData,
-  };
-
-  try {
-    console.log('Submitting ReportsFactory contract creation transaction...');
-
-    const response = await client.submitAndWaitForTransactionTree({
-      commands: [{
-        CreateCommand: createCommand,
-      }],
-    });
-
-    const eventsById = response.transactionTree?.eventsById;
-    if (!eventsById || Object.keys(eventsById).length === 0) {
-      throw new Error('No events found in transaction response');
-    }
-
-    const firstEvent = eventsById[Object.keys(eventsById)[0]];
-    if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
-      throw new Error('First event is not a CreatedTreeEvent');
-    }
-    const createdTreeEvent = firstEvent.CreatedTreeEvent;
-
-    const contractId = createdTreeEvent.value.contractId;
-    if (!contractId) {
-      throw new Error('Contract ID not found in CreatedTreeEvent');
-    }
-
-    console.log(`✅ ReportsFactory contract created with ID: ${contractId}`);
-
-    const outputPath = getOutputPath();
-    const data = loadExistingContractIds(outputPath);
-    data[network] = {
-      reportsFactoryContractId: contractId,
-      templateId: createdTreeEvent.value.templateId,
-    };
-    fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
-    console.log(`📝 Saved contract ID to ${outputPath}`);
-  } catch (error) {
-    console.error('❌ Failed to create ReportsFactory contract:', error);
-    process.exit(1);
+  const eventsById = response.transactionTree?.eventsById;
+  if (!eventsById || Object.keys(eventsById).length === 0) {
+    throw new Error('No events in response');
   }
+
+  const firstEvent = eventsById[Object.keys(eventsById)[0]];
+  if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
+    throw new Error('Expected CreatedTreeEvent');
+  }
+
+  const contractId = firstEvent.CreatedTreeEvent.value.contractId;
+  const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
+
+  // Save to file
+  const outputPath = path.join(__dirname, '..', 'generated', 'reports-factory-contract-id.json');
+  const data = loadExistingData(outputPath);
+  data[network] = { reportsFactoryContractId: contractId, templateId: resultTemplateId };
+  fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
+
+  console.log(`\n✅ Created: ${contractId}`);
+  console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}\n`);
 }
 
-main();
+main().catch(err => {
+  console.error('❌ Failed:', err);
+  process.exit(1);
+});

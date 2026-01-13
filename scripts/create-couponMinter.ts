@@ -1,82 +1,61 @@
 #!/usr/bin/env node
+/**
+ * Create the initial CouponMinter contract.
+ * Uses `intellect` as the operator.
+ *
+ * Note: CouponMinter uses consuming choices, so the contract ID changes on every
+ * MintCoupons call. Clients must query for the current contract on demand.
+ *
+ * Usage: tsx scripts/create-couponMinter.ts --network <devnet|mainnet>
+ */
 
 import { createLedgerJsonApiClient } from './utils';
-import { isContractNetwork, type ContractNetwork } from './types';
+import { requireNetwork } from './packages';
 
-// CouponMinter template ID - matches CouponMinter/daml.yaml version 0.0.1
-const COUPON_MINTER_TEMPLATE_ID = 'Fairmint.CouponMinter:CouponMinter';
-
-function getNetworkFromArgs(): ContractNetwork {
-  const args = process.argv.slice(2);
-  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
-
-  if (networkIndex === -1 || networkIndex === args.length - 1) {
-    console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
-    process.exit(1);
-  }
-
-  const network = args[networkIndex + 1].toLowerCase();
-  if (!isContractNetwork(network)) {
-    console.error('❌ Network must be either "mainnet" or "devnet"');
-    process.exit(1);
-  }
-
-  return network;
-}
+const TEMPLATE_ID = 'Fairmint.CouponMinter:CouponMinter';
+const DEFAULT_MAX_TPS = '100.0'; // Default TPS limit for minting coupons
 
 async function main() {
-  const network = getNetworkFromArgs();
-  console.log(`Creating CouponMinter contract for ${network}...`);
+  const network = requireNetwork('create-couponMinter.ts');
 
-  // Use intellect as the provider/operator
+  console.log(`\n🔨 Creating CouponMinter on ${network}\n`);
+
   const client = createLedgerJsonApiClient(network, 'intellect');
-  const intellectPartyId = client.getPartyId();
+  const operatorPartyId = client.getPartyId();
 
-  console.log(`Template ID: ${COUPON_MINTER_TEMPLATE_ID}`);
-  console.log(`Operator (intellect): ${intellectPartyId}`);
+  console.log(`  Template: ${TEMPLATE_ID}`);
+  console.log(`  Operator: ${operatorPartyId}`);
+  console.log(`  Max TPS: ${DEFAULT_MAX_TPS}`);
 
-  // CouponMinter contract payload
-  const couponMinterData = {
-    operator: intellectPartyId,
-    lastMintTime: null, // Optional Time - None
-    lastMintCount: '0', // Int
-  };
+  const response = await client.submitAndWaitForTransactionTree({
+    commands: [{
+      CreateCommand: {
+        templateId: TEMPLATE_ID,
+        createArguments: {
+          operator: operatorPartyId,
+          maxTps: DEFAULT_MAX_TPS,
+          lastMint: null,
+        },
+      },
+    }],
+  });
 
-  const createCommand = {
-    templateId: COUPON_MINTER_TEMPLATE_ID,
-    createArguments: couponMinterData,
-  };
-
-  try {
-    console.log('Submitting CouponMinter contract creation transaction...');
-
-    const response = await client.submitAndWaitForTransactionTree({
-      commands: [{ CreateCommand: createCommand }],
-    });
-
-    const eventsById = response.transactionTree?.eventsById;
-    if (!eventsById || Object.keys(eventsById).length === 0) {
-      throw new Error('No events found in transaction response');
-    }
-
-    const firstEvent = eventsById[Object.keys(eventsById)[0]];
-    if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
-      throw new Error('First event is not a CreatedTreeEvent');
-    }
-    const createdTreeEvent = firstEvent.CreatedTreeEvent;
-
-    const contractId = createdTreeEvent.value.contractId;
-    if (!contractId) {
-      throw new Error('Contract ID not found in CreatedTreeEvent');
-    }
-
-    console.log(`✅ CouponMinter contract created with ID: ${contractId}`);
-    console.log(`   Template ID: ${createdTreeEvent.value.templateId}`);
-    console.log(`\n📝 Note: CouponMinter uses consuming choices, so clients must query for the current contract on demand.`);
-  } catch (error) {
-    console.error('❌ Failed to create CouponMinter contract:', error);
-    process.exit(1);
+  const eventsById = response.transactionTree?.eventsById;
+  if (!eventsById || Object.keys(eventsById).length === 0) {
+    throw new Error('No events in response');
   }
+
+  const firstEvent = eventsById[Object.keys(eventsById)[0]];
+  if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
+    throw new Error('Expected CreatedTreeEvent');
+  }
+
+  const contractId = firstEvent.CreatedTreeEvent.value.contractId;
+  console.log(`\n✅ Created: ${contractId}`);
+  console.log(`\n📝 Clients must query for current contract (ID changes on each MintCoupons call)\n`);
 }
 
-main();
+main().catch(err => {
+  console.error('❌ Failed:', err);
+  process.exit(1);
+});

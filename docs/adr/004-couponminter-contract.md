@@ -2,13 +2,13 @@
 
 ## Status
 
-**Implemented** | 2026-01-12
+**Implemented** | 2026-01-13
 
 ---
 
 ## TL;DR
 
-A `CouponMinter` contract allows the backend service to mint Featured App Activity Markers on demand with **optional on-chain TPS enforcement**. When a TPS limit is provided, the contract guarantees that minting operations cannot exceed the specified rate, enforced at the ledger level.
+A `CouponMinter` contract allows the backend service to mint Featured App Activity Markers on demand with **mandatory on-chain TPS enforcement**. The contract guarantees that minting operations cannot exceed the configured rate, enforced at the ledger level. The operator can adjust the TPS limit at any time via the `SetMaxTps` choice.
 
 ---
 
@@ -28,7 +28,6 @@ The CouponMinter **backend service** (not defined here) handles:
 | **Scheduling** | Queues and schedules minting operations over time |
 | **Batch sizing** | Controls how many markers to mint per contract call |
 | **Retry logic** | Handles failures and retries |
-| **TPS configuration** | Provides the TPS limit to each call (can vary dynamically) |
 
 The on-chain TPS enforcement provides a hard guarantee that limits cannot be exceeded, even if the backend has bugs or is compromised.
 
@@ -47,26 +46,43 @@ Rather than embedding minting logic in `CapTable` or `UpdateCapTable`:
 
 ### Contract: CouponMinter
 
-A stateful contract that mints activity markers on demand with optional TPS enforcement.
+A stateful contract that mints activity markers on demand with mandatory TPS enforcement.
 
 ```daml
+data LastMint = LastMint with
+    time: Time
+    count: Int
+
 template CouponMinter
   with
     operator: Party           -- System operator (Fairmint)
-    lastMintTime: Optional Time  -- Timestamp of last mint (for TPS enforcement)
-    lastMintCount: Int        -- Number of coupons minted in last call
+    maxTps: Decimal           -- TPS limit (must be > 0)
+    lastMint: Optional LastMint  -- Previous mint info (for TPS enforcement)
   where
     signatory operator
+    ensure maxTps > 0.0
+
+    choice SetMaxTps : ContractId CouponMinter
+      with
+        newMaxTps: Decimal
+      controller operator
 
     choice MintCoupons : MintCouponsResult
       with
         featuredAppRight: ContractId FeaturedAppRight
         count: Int
         beneficiaries: [AppRewardBeneficiary]
-        maxTps: Optional Decimal
         metadata: Optional Text
       controller operator
 ```
+
+### Choice: SetMaxTps
+
+Allows the operator to change the TPS limit at any time! The contract is recreated with the new `maxTps` value. The `ensure` clause validates that the new value is > 0.
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `newMaxTps` | `Decimal` | New TPS limit (must be > 0) |
 
 ### Choice: MintCoupons
 
@@ -75,7 +91,6 @@ template CouponMinter
 | `featuredAppRight` | `ContractId FeaturedAppRight` | The FeaturedAppRight contract to use |
 | `count` | `Int` | Number of markers to create (must be ≥ 1) |
 | `beneficiaries` | `[AppRewardBeneficiary]` | Reward recipients (one marker created per beneficiary) |
-| `maxTps` | `Optional Decimal` | Optional TPS limit; if provided, enforces time-based rate limiting |
 | `metadata` | `Optional Text` | OCF object ContractId for audit trail (optional) |
 
 ### Result Type
@@ -90,9 +105,9 @@ data MintCouponsResult = MintCouponsResult with
 
 The contract performs the following validation:
 
-1. `count >= 1` — Must mint at least one marker
-2. `maxTps > 0` — If TPS limit is provided, it must be positive
-3. **TPS enforcement** — If `maxTps` is provided and there was a previous mint, checks that enough time has elapsed
+1. `maxTps > 0` — Enforced by the `ensure` clause on contract creation
+2. `count >= 1` — Must mint at least one marker
+3. **TPS enforcement** — If there was a previous mint, checks that enough time has elapsed
 
 The `operator` is both signatory and controller, so authorization is implicit.
 
@@ -100,43 +115,54 @@ The `operator` is both signatory and controller, so authorization is implicit.
 
 ## Design Decisions
 
-### Consuming Choice with State Tracking
+### Consuming Choices with State Tracking
 
-`MintCoupons` is a **consuming choice** that archives the old contract and creates a new one with updated state. This enables on-chain TPS enforcement by tracking:
+Both `MintCoupons` and `SetMaxTps` are **consuming choices** that archive the old contract and create a new one. This enables:
 
-- `lastMintTime`: When the previous mint occurred
-- `lastMintCount`: How many coupons were minted in the previous call
+- On-chain TPS enforcement by tracking `lastMint` (time and count of previous mint)
+- TPS configuration changes via `SetMaxTps`
 
 The backend must track the new `couponMinterCid` returned in each result for subsequent calls.
 
+### LastMint Record
+
+The `lastMint` field is an `Optional LastMint` record containing:
+
+- `time`: When the previous mint occurred
+- `count`: How many coupons were minted in the previous call
+
+This consolidates the timing information needed for TPS enforcement into a single optional field.
+
 ### On-Chain TPS Enforcement
 
-When `maxTps` is provided, the contract enforces rate limiting at the ledger level:
+The contract **always** enforces rate limiting at the ledger level when there's a previous mint:
 
 ```
-Required interval = lastMintCount / maxTps seconds
+Required interval = lastMint.count / maxTps seconds
 ```
 
 For example:
-- If `maxTps = 5` and `lastMintCount = 10`, must wait at least 2 seconds before the next call
-- If `maxTps = 100` and `lastMintCount = 1`, must wait at least 10 milliseconds
+- If `maxTps = 5` and `lastMint.count = 10`, must wait at least 2 seconds before the next call
+- If `maxTps = 100` and `lastMint.count = 1`, must wait at least 10 milliseconds
 
 **Why enforce on-chain?**
 1. **Guaranteed compliance**: Even if the backend has bugs or is compromised, the ledger rejects excessive minting
 2. **Auditability**: Rate limit violations are visible in transaction rejections
-3. **Flexibility**: TPS limit is passed per-call, allowing dynamic adjustment without contract upgrades
+3. **Defense in depth**: TPS enforcement cannot be bypassed
 
-### Flexible TPS Parameter
+### TPS Stored in Contract
 
-The `maxTps` value is passed with each call rather than stored in the contract:
+The `maxTps` value is stored in the contract state with the following benefits:
 
-1. **Dynamic adjustment**: TPS limits can change based on network conditions without redeploying
-2. **No migration needed**: Backend can start enforcing TPS or change limits immediately
-3. **Optional enforcement**: Backend can omit `maxTps` when rate limiting isn't needed
+1. **Always enforced**: TPS limiting cannot be accidentally omitted
+2. **Auditable**: Current TPS limit is visible in contract state
+3. **Adjustable**: Operator can change via `SetMaxTps` choice at any time
 
-### First Call Has No Limit
+The `ensure maxTps > 0.0` clause guarantees the TPS limit is always valid.
 
-The first call after contract creation (when `lastMintTime` is `None`) has no TPS check—there's no previous operation to rate-limit against. This is intentional and safe since subsequent calls will be rate-limited.
+### First Call Has No Rate Limit
+
+The first call after contract creation (when `lastMint` is `None`) has no TPS check—there's no previous operation to rate-limit against. This is intentional and safe since subsequent calls will be rate-limited.
 
 ### Metadata for Audit Trail
 
@@ -171,17 +197,19 @@ The `beneficiaries` array specifies reward recipients. The Splice API creates on
 │                                                             │
 │  1. Calculate coupons: ceiling(value / $100)                │
 │  2. Queue minting request                                   │
-│  3. Call MintCoupons with maxTps limit                      │
+│  3. Call MintCoupons (TPS enforced by contract)             │
 │  4. Track new couponMinterCid for next call                 │
+│  5. Optionally call SetMaxTps to adjust rate limit          │
 └─────────────────────────────────────────────────────────────┘
                               │
-                              │ MintCoupons(count, maxTps, ...)
+                              │ MintCoupons(count, ...) or SetMaxTps(newMaxTps)
                               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │                 COUPONMINTER CONTRACT (DAML)                │
 │                                                             │
+│  - Validate maxTps > 0 (ensure clause)                      │
 │  - Validate count >= 1                                      │
-│  - Enforce TPS limit (if maxTps provided)                   │
+│  - Enforce TPS limit based on lastMint                      │
 │  - Exercise FeaturedAppRight_CreateActivityMarker           │
 │  - Archive old contract, create new with updated state      │
 │  - Return new contract ID + marker contract IDs             │
@@ -202,11 +230,12 @@ The `beneficiaries` array specifies reward recipients. The Splice API creates on
 
 ### Benefits
 
-- **Guaranteed rate limiting**: On-chain TPS enforcement cannot be bypassed
-- **Flexible TPS configuration**: Limit can be adjusted per-call without contract changes
+- **Guaranteed rate limiting**: On-chain TPS enforcement cannot be bypassed or omitted
+- **Adjustable TPS**: Operator can change limit anytime via `SetMaxTps` choice
 - **Privacy preserved**: Metadata contains only ContractId, not transaction details
 - **Decoupled operations**: Minting doesn't block cap table updates
 - **Defense in depth**: Even if backend has bugs, ledger enforces limits
+- **Auditable**: Current TPS limit is visible in contract state
 
 ### Tradeoffs
 
@@ -232,20 +261,20 @@ nonconsuming choice MintCoupons : MintCouponsResult
 - Backend bugs or compromise could flood the network
 - Relies entirely on off-chain enforcement
 
-### Store TPS Limit in Contract
+### Optional TPS (Pass Per-Call)
 
-Could store the TPS limit in the contract state:
+An earlier iteration passed `maxTps` as an optional parameter to each `MintCoupons` call:
 
 ```daml
-template CouponMinter
+choice MintCoupons : MintCouponsResult
   with
-    maxTps: Decimal  -- Fixed TPS limit
+    maxTps: Optional Decimal  -- Optional per-call TPS limit
 ```
 
 **Rejected because:**
-- Requires contract upgrade to change TPS limit
-- Less flexible for dynamic rate adjustment
-- Passing TPS per-call provides same guarantees with more flexibility
+- TPS enforcement could be accidentally omitted
+- Less auditable (limit not visible in contract state)
+- Storing in contract with `SetMaxTps` choice provides same flexibility with stronger guarantees
 
 ### Embed in UpdateCapTable
 
@@ -282,7 +311,10 @@ choice UpdateCapTable : UpdateCapTableResult
 | 2026-01-12 | Created ADR | — |
 | 2026-01-12 | Implemented (CouponMinter contract + tests) | — |
 | 2026-01-12 | Added on-chain TPS enforcement with consuming choice | — |
+| 2026-01-13 | Made maxTps required (stored in contract, must be > 0) | — |
+| 2026-01-13 | Added SetMaxTps choice for operator to adjust TPS anytime | — |
+| 2026-01-13 | Combined lastMintTime/lastMintCount into lastMint record | — |
 
 ---
 
-_Last updated: 2026-01-12_
+_Last updated: 2026-01-13_
