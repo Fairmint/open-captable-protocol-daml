@@ -57,13 +57,13 @@ async function main() {
     ],
   });
 
-  const eventsById = response.transactionTree?.eventsById;
-  if (!eventsById || Object.keys(eventsById).length === 0) {
+  const { eventsById } = response.transactionTree;
+  if (Object.keys(eventsById).length === 0) {
     throw new Error('No events in response');
   }
 
   const firstEvent = eventsById[Object.keys(eventsById)[0]];
-  if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
+  if (!('CreatedTreeEvent' in firstEvent)) {
     throw new Error('Expected CreatedTreeEvent');
   }
 

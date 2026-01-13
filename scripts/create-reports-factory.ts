@@ -30,11 +30,6 @@ async function main() {
   console.log(`\n🔨 Creating ReportsFactory on ${network}\n`);
 
   const { Fairmint } = await import('../lib');
-
-  if (!Fairmint?.OpenCapTableReports?.ReportsFactory?.ReportsFactory) {
-    throw new Error('Generated types not found. Run "npm run codegen" first.');
-  }
-
   const client = createLedgerJsonApiClient(network, 'intellect');
   const validatorClient = createValidatorApiClient(network, 'intellect');
   const operatorPartyId = client.getPartyId();
@@ -46,13 +41,13 @@ async function main() {
   // Lookup FeaturedAppRight
   console.log('  Looking up FeaturedAppRight...');
   const featuredAppRight = await validatorClient.lookupFeaturedAppRight({ partyId: operatorPartyId });
-  if (!featuredAppRight?.featured_app_right) {
+  if (!featuredAppRight.featured_app_right) {
     throw new Error(`No FeaturedAppRight found for ${operatorPartyId}`);
   }
   const featuredAppRightContractId =
     typeof featuredAppRight.featured_app_right === 'string'
       ? featuredAppRight.featured_app_right
-      : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
+      : (featuredAppRight.featured_app_right.contract_id ?? featuredAppRight.featured_app_right);
   console.log(`  FeaturedAppRight: ${featuredAppRightContractId}`);
 
   const response = await client.submitAndWaitForTransactionTree({
@@ -69,13 +64,13 @@ async function main() {
     ],
   });
 
-  const eventsById = response.transactionTree?.eventsById;
-  if (!eventsById || Object.keys(eventsById).length === 0) {
+  const { eventsById } = response.transactionTree;
+  if (Object.keys(eventsById).length === 0) {
     throw new Error('No events in response');
   }
 
   const firstEvent = eventsById[Object.keys(eventsById)[0]];
-  if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
+  if (!('CreatedTreeEvent' in firstEvent)) {
     throw new Error('Expected CreatedTreeEvent');
   }
 

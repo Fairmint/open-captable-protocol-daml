@@ -6,7 +6,7 @@ import { getErrorMessage, type PackageJson } from './types';
 
 // Paths
 const PACKAGE_DIRS = [
-  path.join(__dirname, '../generated/js/OpenCapTable-v26-0.0.1'),
+  path.join(__dirname, '../generated/js/OpenCapTable-v28-0.0.1'),
   path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
   path.join(__dirname, '../generated/js/CantonPayments-0.0.30'),
 ];
@@ -422,7 +422,6 @@ function updateMainIndex(targetDir: string): void {
     if (fairmintLine !== -1) {
       const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
       const daImport = "var DA = require('./DA');\n";
-      const daExport = 'exports.DA = DA\n'.replace('\n', '');
       mainIndex = `${mainIndex.slice(0, insertPos) + daImport}exports.DA = DA;\n${mainIndex.slice(insertPos)}`;
       fs.writeFileSync(mainIndexPath, mainIndex);
       console.log('✅ Updated main index.js with DA');

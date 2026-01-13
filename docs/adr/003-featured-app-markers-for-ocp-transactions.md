@@ -104,9 +104,9 @@ Only **financial transactions** (issuances and transfers) create coupons.
 
 ### Price Fallback for StockTransfer
 
-The [StockTransfer OCF schema](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/transactions/transfer/StockTransfer.schema.json) does not include a price field—it only has an optional `consideration_text` field for unstructured text descriptions. See the [DAML implementation](../../../OpenCapTable-v26/daml/Fairmint/OpenCapTable/OCF/StockTransfer.daml).
+The [StockTransfer OCF schema](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/transactions/transfer/StockTransfer.schema.json) does not include a price field—it only has an optional `consideration_text` field for unstructured text descriptions. See the [DAML implementation](../../../OpenCapTable-v28/daml/Fairmint/OpenCapTable/OCF/StockTransfer.daml).
 
-When price is not available (e.g., gift transfers, estate transfers), we look up the fair market value from the most recent [Valuation](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/Valuation.schema.json) object for the relevant stock class. The Valuation object contains `price_per_share` and `stock_class_id`. See the [Valuation DAML implementation](../../../OpenCapTable-v26/daml/Fairmint/OpenCapTable/OCF/Valuation.daml).
+When price is not available (e.g., gift transfers, estate transfers), we look up the fair market value from the most recent [Valuation](https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/objects/Valuation.schema.json) object for the relevant stock class. The Valuation object contains `price_per_share` and `stock_class_id`. See the [Valuation DAML implementation](../../../OpenCapTable-v28/daml/Fairmint/OpenCapTable/OCF/Valuation.daml).
 
 **Fallback logic:**
 1. Look up the `stock_class_id` from the original `StockIssuance` (via `security_id`)

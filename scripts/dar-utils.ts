@@ -135,7 +135,7 @@ export function getBackedUpDarPath(packageName: string, version: string, darName
   const lock = loadDarsLock();
 
   // Check if entry exists in lock file
-  if (!lock.packages[lockKey]) {
+  if (!(lockKey in lock.packages)) {
     return null;
   }
 
@@ -206,7 +206,7 @@ export function requireBackedUpDar(packageName: string, version: string, darName
 export function isDarBackedUp(packageName: string, version: string, darName: string): boolean {
   const lockKey = getDarLockKey(packageName, version, darName);
   const lock = loadDarsLock();
-  if (!lock.packages[lockKey]) return false;
+  if (!(lockKey in lock.packages)) return false;
 
   const darPath = path.join(getDarsDir(), lockKey);
   return fs.existsSync(darPath);
@@ -256,7 +256,7 @@ export function recordNetworkUpload(packageName: string, version: string, darNam
   const lock = loadDarsLock();
 
   // Only update if entry exists
-  if (!lock.packages[lockKey]) {
+  if (!(lockKey in lock.packages)) {
     console.log(`ℹ️ DAR not backed up yet, skipping network record for ${lockKey} (${network})`);
     return;
   }

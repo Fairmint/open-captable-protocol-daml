@@ -31,14 +31,12 @@ for (const { dir, name } of packages) {
   delete generatedPackage.private;
 
   // Ensure publishConfig exists
-  if (!generatedPackage.publishConfig) {
-    generatedPackage.publishConfig = { access: 'public' };
-  }
+  generatedPackage.publishConfig ??= { access: 'public' };
 
   // Normalize peerDependencies: move from non-standard 'peer-dependencies' to 'peerDependencies'
   if (generatedPackage['peer-dependencies']) {
     generatedPackage.peerDependencies = {
-      ...(generatedPackage.peerDependencies || {}),
+      ...(generatedPackage.peerDependencies ?? {}),
       ...generatedPackage['peer-dependencies'],
     };
     delete generatedPackage['peer-dependencies'];

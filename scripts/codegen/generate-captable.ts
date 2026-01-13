@@ -41,7 +41,7 @@ interface TypeDef {
 const REPO_ROOT = process.cwd();
 const CODEGEN_DIR = path.join(REPO_ROOT, 'scripts/codegen');
 const TEMPLATES_DIR = path.join(CODEGEN_DIR, 'templates');
-const OPENCAPTABLE_DIR = path.join(REPO_ROOT, 'OpenCapTable-v26/daml/Fairmint/OpenCapTable');
+const OPENCAPTABLE_DIR = path.join(REPO_ROOT, 'OpenCapTable-v28/daml/Fairmint/OpenCapTable');
 const OCF_DIR = path.join(OPENCAPTABLE_DIR, 'OCF');
 const OUTPUT_PATH = path.join(OPENCAPTABLE_DIR, 'CapTable.daml');
 
@@ -109,7 +109,7 @@ function buildTierMap(config: Config): Map<string, number> {
   const tierMap = new Map<string, number>();
   for (const [tier, types] of Object.entries(config.tiers)) {
     for (const typeName of types) {
-      tierMap.set(typeName, parseInt(tier));
+      tierMap.set(typeName, parseInt(tier, 10));
     }
   }
   return tierMap;
@@ -144,7 +144,7 @@ function discoverTypes(config: Config): TypeDef[] {
     }
 
     const snakeName = toSnakeCase(name);
-    const validationFields = config.validations[name] || [];
+    const validationFields = config.validations[name] ?? [];
 
     const typeDef: TypeDef = {
       name,
