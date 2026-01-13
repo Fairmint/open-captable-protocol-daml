@@ -138,7 +138,7 @@ function verifyDars(update: boolean): VerificationResult {
   return result;
 }
 
-async function main() {
+function main() {
   const { update } = parseArgs();
 
   console.log('🔍 Verifying DAR file integrity...\n');
@@ -176,7 +176,9 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+try {
+  main();
+} catch (error) {
   console.error('❌ Unexpected error:', error);
   process.exit(1);
-});
+}

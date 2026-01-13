@@ -38,11 +38,6 @@ async function main() {
   console.log(`\n🔨 Creating PaymentStreamFactory on ${network}\n`);
 
   const { CantonPayments } = await import('../lib');
-
-  if (!CantonPayments?.PaymentStream?.PaymentStreamFactory?.PaymentStreamFactory) {
-    throw new Error('Generated types not found. Run "npm run codegen" first.');
-  }
-
   const client = createLedgerJsonApiClient(network, '5n');
   const validatorClient = createValidatorApiClient(network, '5n');
   const { templateId } = CantonPayments.PaymentStream.PaymentStreamFactory.PaymentStreamFactory;
@@ -54,7 +49,7 @@ async function main() {
   // Get DSO party
   console.log('  Looking up DSO party...');
   const dsoResponse = await validatorClient.getDsoPartyId();
-  if (!dsoResponse?.dso_party_id) {
+  if (!dsoResponse.dso_party_id) {
     throw new Error('Could not determine DSO party ID');
   }
   console.log(`  DSO: ${dsoResponse.dso_party_id}`);
@@ -76,13 +71,13 @@ async function main() {
     actAs: [processorPartyId],
   });
 
-  const eventsById = response.transactionTree?.eventsById;
-  if (!eventsById || Object.keys(eventsById).length === 0) {
+  const { eventsById } = response.transactionTree;
+  if (Object.keys(eventsById).length === 0) {
     throw new Error('No events in response');
   }
 
   const firstEvent = eventsById[Object.keys(eventsById)[0]];
-  if (!firstEvent || !('CreatedTreeEvent' in firstEvent)) {
+  if (!('CreatedTreeEvent' in firstEvent)) {
     throw new Error('Expected CreatedTreeEvent');
   }
 

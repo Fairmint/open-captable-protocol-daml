@@ -5,7 +5,7 @@ import path from 'path';
 
 const LIB_DIR = path.join(__dirname, '../lib');
 
-function extractNamespaceFromPath(modulePath: string): string | null {
+function _extractNamespaceFromPath(modulePath: string): string | null {
   // Extract namespace from module paths like:
   // '../Api/FeaturedAppRightV1' -> 'Splice.Api.FeaturedAppRightV1'
   // '../../..' (splice-amulet root) -> 'Splice.Amulet' (or other Splice modules)
@@ -28,7 +28,7 @@ function extractNamespaceFromPath(modulePath: string): string | null {
 
 function fixFile(filePath: string): boolean {
   let content = fs.readFileSync(filePath, 'utf8');
-  const originalContent = content;
+  const _originalContent = content;
 
   // Find all package variable declarations
   const packageRegex = /var (pkg[a-f0-9]{64}) = require\('([^']+)'\);/g;
@@ -43,7 +43,7 @@ function fixFile(filePath: string): boolean {
 
   // For each package, check if it has Splice or nested namespace references that need fixing
   let modified = false;
-  for (const [pkgVar, modulePath] of packages.entries()) {
+  for (const [pkgVar, _modulePath] of packages.entries()) {
     // Find all uses of this package variable with nested namespaces
     // Matches patterns like: pkg.Splice.Api.Token.MetadataV1.Metadata -> pkg.Metadata
     // Or: pkg.FeaturedAppRightV1.FeaturedAppActivityMarker -> pkg.FeaturedAppActivityMarker

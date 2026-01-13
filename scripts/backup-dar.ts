@@ -28,13 +28,13 @@ function getSdkVersion(sourceDir: string): string {
   try {
     const content = fs.readFileSync(damlYamlPath, 'utf-8');
     const parsed = yaml.parse(content);
-    return parsed?.['sdk-version'] || 'unknown';
+    return parsed?.['sdk-version'] ?? 'unknown';
   } catch {
     return 'unknown';
   }
 }
 
-async function main() {
+function main() {
   const packageArg = parsePackageArg();
   const version = parseVersionArg();
   const network = parseNetworkArg();
@@ -63,7 +63,7 @@ async function main() {
   const lock = loadDarsLock();
 
   // Already backed up?
-  if (lock.packages[lockKey]) {
+  if (lockKey in lock.packages) {
     console.log(`ℹ️  Already backed up: ${lockKey}`);
 
     if (!fs.existsSync(destPath)) {
@@ -119,7 +119,9 @@ async function main() {
   console.log(`   Size: ${stats.size} bytes`);
 }
 
-main().catch((err) => {
+try {
+  main();
+} catch (err) {
   console.error('❌ Error:', err);
   process.exit(1);
-});
+}

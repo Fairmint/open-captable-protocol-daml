@@ -17,10 +17,10 @@ export function createLedgerJsonApiClient(network: NetworkType, providerType: Pr
     authUrl: envLoader.getAuthUrl(network, providerType),
     apis: {
       LEDGER_JSON_API: {
-        apiUrl: envLoader.getApiUri('LEDGER_JSON_API', network, providerType) || '',
+        apiUrl: envLoader.getApiUri('LEDGER_JSON_API', network, providerType) ?? '',
         auth: {
-          clientId: envLoader.getApiClientId('LEDGER_JSON_API', network, providerType) || '',
-          clientSecret: envLoader.getApiClientSecret('LEDGER_JSON_API', network, providerType) || '',
+          clientId: envLoader.getApiClientId('LEDGER_JSON_API', network, providerType) ?? '',
+          clientSecret: envLoader.getApiClientSecret('LEDGER_JSON_API', network, providerType) ?? '',
           grantType: 'client_credentials',
         },
         partyId: envLoader.getPartyId(network, providerType),

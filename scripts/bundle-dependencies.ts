@@ -422,7 +422,6 @@ function updateMainIndex(targetDir: string): void {
     if (fairmintLine !== -1) {
       const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
       const daImport = "var DA = require('./DA');\n";
-      const daExport = 'exports.DA = DA\n'.replace('\n', '');
       mainIndex = `${mainIndex.slice(0, insertPos) + daImport}exports.DA = DA;\n${mainIndex.slice(insertPos)}`;
       fs.writeFileSync(mainIndexPath, mainIndex);
       console.log('✅ Updated main index.js with DA');

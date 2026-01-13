@@ -109,7 +109,7 @@ function buildTierMap(config: Config): Map<string, number> {
   const tierMap = new Map<string, number>();
   for (const [tier, types] of Object.entries(config.tiers)) {
     for (const typeName of types) {
-      tierMap.set(typeName, parseInt(tier));
+      tierMap.set(typeName, parseInt(tier, 10));
     }
   }
   return tierMap;
@@ -144,7 +144,7 @@ function discoverTypes(config: Config): TypeDef[] {
     }
 
     const snakeName = toSnakeCase(name);
-    const validationFields = config.validations[name] || [];
+    const validationFields = config.validations[name] ?? [];
 
     const typeDef: TypeDef = {
       name,
