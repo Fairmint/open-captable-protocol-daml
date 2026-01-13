@@ -68,9 +68,9 @@ function prepareRelease(): void {
       throw new Error('Invalid version format. Expected format: x.y.z');
     }
 
-    const major: number = versionParts[0]!;
-    const minor: number = versionParts[1]!;
-    const patch: number = versionParts[2]!;
+    const major: number = versionParts[0];
+    const minor: number = versionParts[1];
+    const patch: number = versionParts[2];
 
     // Find next available version (increment patch until we find one that doesn't exist)
     const newVersion: string = findNextAvailableVersion(major, minor, patch);

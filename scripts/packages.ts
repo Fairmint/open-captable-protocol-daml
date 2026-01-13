@@ -1,7 +1,6 @@
 /**
- * Shared package configurations and CLI utilities.
- * Single source of truth: daml.yaml files.
- * Versions are read dynamically from each package's daml.yaml.
+ * Shared package configurations and CLI utilities. Single source of truth: daml.yaml files. Versions are read
+ * dynamically from each package's daml.yaml.
  */
 
 import * as fs from 'fs';
@@ -26,10 +25,7 @@ export interface PackageConfig {
 
 const ROOT_DIR = path.join(__dirname, '..');
 
-/**
- * Read version from a package's daml.yaml file.
- * This ensures daml.yaml is the single source of truth.
- */
+/** Read version from a package's daml.yaml file. This ensures daml.yaml is the single source of truth. */
 function readVersionFromDamlYaml(sourceDir: string): string {
   const yamlPath = path.join(ROOT_DIR, sourceDir, 'daml.yaml');
   if (!fs.existsSync(yamlPath)) {
@@ -40,10 +36,7 @@ function readVersionFromDamlYaml(sourceDir: string): string {
   return parsed.version;
 }
 
-/**
- * Package definitions - versions are loaded lazily from daml.yaml.
- * Keys are short aliases used in CLI commands.
- */
+/** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
   ocp: { name: 'OpenCapTable-v26', sourceDir: 'OpenCapTable-v26' },
   reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
@@ -53,9 +46,7 @@ const PACKAGE_DEFS = {
 
 type PackageDefKey = keyof typeof PACKAGE_DEFS;
 
-/**
- * Build full package config by reading version from daml.yaml.
- */
+/** Build full package config by reading version from daml.yaml. */
 function buildPackageConfig(def: { name: string; sourceDir: string }): PackageConfig {
   return {
     name: def.name,
@@ -65,10 +56,7 @@ function buildPackageConfig(def: { name: string; sourceDir: string }): PackageCo
   };
 }
 
-/**
- * All known DAML packages with versions read from daml.yaml.
- * Computed lazily on first access.
- */
+/** All known DAML packages with versions read from daml.yaml. Computed lazily on first access. */
 let _packagesCache: Record<PackageDefKey, PackageConfig> | null = null;
 
 function getPackages(): Record<PackageDefKey, PackageConfig> {
@@ -100,24 +88,22 @@ export const PACKAGES = new Proxy({} as Record<PackageDefKey, PackageConfig>, {
 export type PackageKey = PackageDefKey;
 
 /**
- * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v26').
- * Key lookup is case-insensitive.
+ * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v26'). Key lookup is
+ * case-insensitive.
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {
   const packages = getPackages();
   const lowerKey = keyOrName.toLowerCase();
   // Case-insensitive key lookup
-  const matchingKey = Object.keys(packages).find(k => k.toLowerCase() === lowerKey);
+  const matchingKey = Object.keys(packages).find((k) => k.toLowerCase() === lowerKey);
   if (matchingKey) {
     return packages[matchingKey as PackageKey];
   }
   // Also support lookup by full name (case-insensitive)
-  return Object.values(packages).find(pkg => pkg.name.toLowerCase() === lowerKey);
+  return Object.values(packages).find((pkg) => pkg.name.toLowerCase() === lowerKey);
 }
 
-/**
- * Get all package keys.
- */
+/** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
   return Object.keys(PACKAGE_DEFS) as PackageKey[];
 }
@@ -126,37 +112,29 @@ export function getPackageKeys(): PackageKey[] {
 // CLI Argument Parsing
 // =============================================================================
 
-/**
- * Parse --network or -n argument.
- */
+/** Parse --network or -n argument. */
 export function parseNetworkArg(args: string[] = process.argv.slice(2)): ContractNetwork | undefined {
-  const idx = args.findIndex(arg => arg === '--network' || arg === '-n');
+  const idx = args.findIndex((arg) => arg === '--network' || arg === '-n');
   if (idx === -1 || idx === args.length - 1) return undefined;
   const value = args[idx + 1].toLowerCase();
   return isContractNetwork(value) ? value : undefined;
 }
 
-/**
- * Parse --package or -p argument.
- */
+/** Parse --package or -p argument. */
 export function parsePackageArg(args: string[] = process.argv.slice(2)): string | undefined {
-  const idx = args.findIndex(arg => arg === '--package' || arg === '-p');
+  const idx = args.findIndex((arg) => arg === '--package' || arg === '-p');
   if (idx === -1 || idx === args.length - 1) return undefined;
   return args[idx + 1].toLowerCase();
 }
 
-/**
- * Parse --version or -v argument.
- */
+/** Parse --version or -v argument. */
 export function parseVersionArg(args: string[] = process.argv.slice(2)): string | undefined {
-  const idx = args.findIndex(arg => arg === '--version' || arg === '-v');
+  const idx = args.findIndex((arg) => arg === '--version' || arg === '-v');
   if (idx === -1 || idx === args.length - 1) return undefined;
   return args[idx + 1];
 }
 
-/**
- * Require network argument or exit with error.
- */
+/** Require network argument or exit with error. */
 export function requireNetwork(scriptName: string): ContractNetwork {
   const network = parseNetworkArg();
   if (!network) {
@@ -167,9 +145,7 @@ export function requireNetwork(scriptName: string): ContractNetwork {
   return network;
 }
 
-/**
- * Require package argument or exit with error.
- */
+/** Require package argument or exit with error. */
 export function requirePackage(scriptName: string): PackageConfig {
   const packageKey = parsePackageArg();
   if (!packageKey) {
@@ -188,9 +164,7 @@ export function requirePackage(scriptName: string): PackageConfig {
 // Usage Helpers
 // =============================================================================
 
-/**
- * Print usage with available packages.
- */
+/** Print usage with available packages. */
 export function printPackageUsage(scriptName: string, errorMessage?: string): void {
   if (errorMessage) {
     console.error(`❌ ${errorMessage}`);
@@ -212,11 +186,10 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
 // =============================================================================
 
 /**
- * Build a DAML template ID dynamically from package config.
- * Format: #<package-name>:<module>:<template>
+ * Build a DAML template ID dynamically from package config. Format: #<package-name>:<module>:<template>
  *
- * This ensures we always use the correct package version from daml.yaml (single source of truth),
- * avoiding hardcoded version references that become stale after upgrades.
+ * This ensures we always use the correct package version from daml.yaml (single source of truth), avoiding hardcoded
+ * version references that become stale after upgrades.
  *
  * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v26')
  * @param module - Full module path (e.g., 'Fairmint.OpenCapTable.OcpFactory')

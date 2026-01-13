@@ -2,21 +2,18 @@
 /**
  * Upload a DAR file to devnet or mainnet.
  *
- * Requires the DAR to be backed up first. If not backed up, the script will
- * automatically run the backup process before uploading.
+ * Requires the DAR to be backed up first. If not backed up, the script will automatically run the backup process before
+ * uploading.
  *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
  */
 
-import { createLedgerJsonApiClient } from './utils';
-import { isDarBackedUp, requireBackedUpDar, getFreshDarPath, recordNetworkUpload } from './dar-utils';
-import { requireNetwork, requirePackage, printPackageUsage, parseNetworkArg, parsePackageArg } from './packages';
 import { execSync } from 'child_process';
+import { getFreshDarPath, isDarBackedUp, recordNetworkUpload, requireBackedUpDar } from './dar-utils';
+import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
+import { createLedgerJsonApiClient } from './utils';
 
-/**
- * Ensure the DAR is backed up before upload.
- * If not backed up, automatically run the backup process.
- */
+/** Ensure the DAR is backed up before upload. If not backed up, automatically run the backup process. */
 function ensureDarBackedUp(packageName: string, version: string, darName: string): void {
   if (isDarBackedUp(packageName, version, darName)) {
     return;
@@ -75,4 +72,4 @@ async function main() {
   console.log(`\n🎉 Upload complete\n`);
 }
 
-main();
+void main();

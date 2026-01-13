@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 /**
- * Create the ReportsFactory contract.
- * Saves contract ID to generated/reports-factory-contract-id.json.
+ * Create the ReportsFactory contract. Saves contract ID to generated/reports-factory-contract-id.json.
  *
  * Usage: tsx scripts/create-reports-factory.ts --network <devnet|mainnet>
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 import { requireNetwork } from './packages';
+import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 
 interface ContractIdData {
   mainnet?: { reportsFactoryContractId: string; templateId: string };
@@ -39,7 +38,7 @@ async function main() {
   const client = createLedgerJsonApiClient(network, 'intellect');
   const validatorClient = createValidatorApiClient(network, 'intellect');
   const operatorPartyId = client.getPartyId();
-  const templateId = Fairmint.OpenCapTableReports.ReportsFactory.ReportsFactory.templateId;
+  const { templateId } = Fairmint.OpenCapTableReports.ReportsFactory.ReportsFactory;
 
   console.log(`  Template: ${templateId}`);
   console.log(`  Operator: ${operatorPartyId}`);
@@ -50,21 +49,24 @@ async function main() {
   if (!featuredAppRight?.featured_app_right) {
     throw new Error(`No FeaturedAppRight found for ${operatorPartyId}`);
   }
-  const featuredAppRightContractId = typeof featuredAppRight.featured_app_right === 'string'
-    ? featuredAppRight.featured_app_right
-    : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
+  const featuredAppRightContractId =
+    typeof featuredAppRight.featured_app_right === 'string'
+      ? featuredAppRight.featured_app_right
+      : featuredAppRight.featured_app_right.contract_id || featuredAppRight.featured_app_right;
   console.log(`  FeaturedAppRight: ${featuredAppRightContractId}`);
 
   const response = await client.submitAndWaitForTransactionTree({
-    commands: [{
-      CreateCommand: {
-        templateId,
-        createArguments: {
-          system_operator: operatorPartyId,
-          featured_app_right: featuredAppRightContractId,
+    commands: [
+      {
+        CreateCommand: {
+          templateId,
+          createArguments: {
+            system_operator: operatorPartyId,
+            featured_app_right: featuredAppRightContractId,
+          },
         },
       },
-    }],
+    ],
   });
 
   const eventsById = response.transactionTree?.eventsById;
@@ -77,7 +79,7 @@ async function main() {
     throw new Error('Expected CreatedTreeEvent');
   }
 
-  const contractId = firstEvent.CreatedTreeEvent.value.contractId;
+  const { contractId } = firstEvent.CreatedTreeEvent.value;
   const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
 
   // Save to file
@@ -90,7 +92,7 @@ async function main() {
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}\n`);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('❌ Failed:', err);
   process.exit(1);
 });

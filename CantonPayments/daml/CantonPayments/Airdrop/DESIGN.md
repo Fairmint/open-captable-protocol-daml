@@ -7,8 +7,9 @@
 ## Simplifications from Initial Design
 
 ### What We Started With
+
 - AirdropFactory (proposal pattern)
-- AirdropProposal (approval workflow)  
+- AirdropProposal (approval workflow)
 - ActiveAirdrop (execution)
 - AirdropResult (return value)
 - AirdropContext (wrapper for single field)
@@ -16,6 +17,7 @@
 - Complex state tracking
 
 ### What We Have Now
+
 - **1 template**: `Airdrop`
 - **3 choices**: `Join`, `Execute`, `Cancel`
 - **0 return values**: Everything returns `()`
@@ -36,6 +38,7 @@ template Airdrop where
 ```
 
 **Benefits:**
+
 - Lower deployment cost
 - Simpler queries
 - No state transitions between templates
@@ -52,6 +55,7 @@ choice Airdrop_Cancel : ()
 ```
 
 **Benefits:**
+
 - Minimal response payload
 - Lower bandwidth
 - Faster execution
@@ -64,18 +68,21 @@ choice Airdrop_Cancel : ()
 **Why:** Unnecessary intermediary
 
 **Before:**
+
 ```daml
 processor : Party
 choice Airdrop_UpdateContext : () -- processor controls
 ```
 
 **After:**
+
 ```daml
 -- Sender manages amuletRulesCid and featuredAppRight at creation
 -- No processor field needed
 ```
 
 **Benefits:**
+
 - Fewer parties involved
 - No approval bottleneck
 - Sender has full control
@@ -86,18 +93,21 @@ choice Airdrop_UpdateContext : () -- processor controls
 **Why:** One-field wrappers add no value
 
 **Before:**
+
 ```daml
 data AirdropContext = AirdropContext with
   openMiningRoundCid : ContractId OpenMiningRound
 ```
 
 **After:**
+
 ```daml
 choice Airdrop_Execute : () with
   openMiningRoundCid : ContractId OpenMiningRound  -- direct param
 ```
 
 **Benefits:**
+
 - Less code
 - Clearer signatures
 - No unnecessary deriving instances
@@ -115,11 +125,13 @@ observer invitees  -- (plus others)
 ```
 
 **Flow:**
+
 1. Invitee sees airdrop (observer)
 2. Invitee joins → becomes signatory
 3. Sender executes regardless
 
 **Benefits:**
+
 - Invitees aware before committing
 - Optional signatory upgrade
 - No blocking on acceptance
@@ -140,6 +152,7 @@ do
 ```
 
 **Benefits:**
+
 - Clean state transition
 - No dangling contract IDs
 - Returns `()` (minimal overhead)
@@ -149,11 +162,11 @@ do
 
 ### Network Traffic
 
-| Operation | Data Returned | Size |
-|-----------|--------------|------|
-| Join | `()` | Minimal |
-| Execute | `()` | Minimal |
-| Cancel | `()` | Minimal |
+| Operation | Data Returned | Size    |
+| --------- | ------------- | ------- |
+| Join      | `()`          | Minimal |
+| Execute   | `()`          | Minimal |
+| Cancel    | `()`          | Minimal |
 
 **Total overhead:** Near zero
 
@@ -162,11 +175,13 @@ do
 For N invitees:
 
 **Individual transfers:**
+
 ```
 Cost = N × (transfer_cost + fees)
 ```
 
 **Bulk airdrop:**
+
 ```
 Cost = 1 × (transfer_cost_for_N_outputs + fees)
 ```
@@ -175,11 +190,11 @@ Cost = 1 × (transfer_cost_for_N_outputs + fees)
 
 ### State Overhead
 
-| Aspect | Count |
-|--------|-------|
-| Templates | 1 |
-| Persistent State After Execution | 0 |
-| Return Values Tracked | 0 |
+| Aspect                           | Count |
+| -------------------------------- | ----- |
+| Templates                        | 1     |
+| Persistent State After Execution | 0     |
+| Return Values Tracked            | 0     |
 
 **Memory footprint:** Minimal
 
@@ -200,45 +215,51 @@ Complexity:
 
 ## Comparison: Before vs After
 
-| Metric | Complex Design | Simple Design |
-|--------|----------------|---------------|
-| Templates | 3 | 1 |
-| Data Types | 3 | 0 |
-| Choices | 7 | 3 |
-| Return Types | 3 | 1 (`()`) |
-| Roles | 4 (sender, processor, recipient, provider) | 3 (sender, provider, dso) |
-| Network Overhead | High | Minimal |
-| Lines of Code | ~350 | ~100 |
+| Metric           | Complex Design                             | Simple Design             |
+| ---------------- | ------------------------------------------ | ------------------------- |
+| Templates        | 3                                          | 1                         |
+| Data Types       | 3                                          | 0                         |
+| Choices          | 7                                          | 3                         |
+| Return Types     | 3                                          | 1 (`()`)                  |
+| Roles            | 4 (sender, processor, recipient, provider) | 3 (sender, provider, dso) |
+| Network Overhead | High                                       | Minimal                   |
+| Lines of Code    | ~350                                       | ~100                      |
 
 **Reduction:** ~70% less code, ~90% less network overhead
 
 ## What We Gave Up
 
 ### No Processor Approval
+
 - **Trade-off:** Less control/validation
 - **Mitigation:** Sender is responsible party anyway
 
 ### No Complex Return Values
+
 - **Trade-off:** Must query for results
 - **Mitigation:** Query API is efficient
 
 ### No Proposal Pattern
-- **Trade-off:** No formal approval workflow  
+
+- **Trade-off:** No formal approval workflow
 - **Mitigation:** Observer pattern provides transparency
 
 ### No Stats Tracking
+
 - **Trade-off:** Can't track distribution metrics on-chain
 - **Mitigation:** Off-chain analytics can query events
 
 ## When To Use This Design
 
 **Good For:**
+
 - High-volume airdrops (100s-1000s recipients)
 - Regular bulk distributions
 - Cost-sensitive operations
 - Simple sender-controlled flows
 
 **Not Good For:**
+
 - Complex approval workflows
 - Multi-stage distributions
 - Requiring on-chain audit trails
@@ -257,12 +278,14 @@ Complexity:
 If requirements change:
 
 **Add Back Only What's Needed:**
+
 - Processor → if compliance requires approval
 - Return values → if async clients can't query
 - Proposal pattern → if formal workflow required
 - Stats → if on-chain metrics critical
 
 **Keep:**
+
 - Single template (unless truly necessary)
 - Minimal return types
 - Direct parameters (no unnecessary wrappers)

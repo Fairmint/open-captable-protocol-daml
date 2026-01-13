@@ -2,23 +2,29 @@
 
 ## Overview
 
-This is a new airdrop contract design that uses a factory pattern with individual contracts per recipient. This approach avoids the complexity of TransferPreapproval contracts while maintaining dual-signatory benefits for featured app rewards.
+This is a new airdrop contract design that uses a factory pattern with individual contracts per
+recipient. This approach avoids the complexity of TransferPreapproval contracts while maintaining
+dual-signatory benefits for featured app rewards.
 
 ## Architecture
 
 ### 1. AirdropFactory (Factory Contract)
+
 - **File**: `daml/CantonPayments/Airdrop/AirdropFactory.daml`
-- **Purpose**: Factory contract that allows recipients to join and create their own PersonalAirdrop contracts
+- **Purpose**: Factory contract that allows recipients to join and create their own PersonalAirdrop
+  contracts
 - **Signatory**: `sender` (featured app party)
 - **Observer**: `dso`
 
 **Key Features**:
+
 - One factory contract per sender/campaign
 - Recipients call `Factory_JoinAirdrop` to create their individual PersonalAirdrop contract
 - Validates expiration before allowing joins
 - Sender can archive the factory with `Factory_Archive`
 
 **Fields**:
+
 ```daml
 dso         : Party    -- DSO party
 sender      : Party    -- Featured app party (airdrop creator)
@@ -28,18 +34,21 @@ expiresAt   : Time     -- Factory expiration time
 ```
 
 ### 2. PersonalAirdrop (Individual Recipient Contract)
+
 - **File**: `daml/CantonPayments/Airdrop/PersonalAirdrop.daml`
 - **Purpose**: Personal airdrop contract for a single recipient with dual-signatory design
 - **Signatories**: `sender` (featured app) AND `recipient`
 - **Observer**: `dso`
 
 **Key Features**:
+
 - One contract per recipient
 - Both parties are signatories - enables featured app rewards on transfers
 - Sender executes transfers via `PersonalAirdrop_ExecuteTransfer`
 - Either party can archive with `PersonalAirdrop_Archive`
 
 **Fields**:
+
 ```daml
 dso         : Party    -- DSO party
 sender      : Party    -- Featured app party (executes transfers)
@@ -52,82 +61,82 @@ expiresAt   : Time     -- Contract expiration time
 ## Workflow
 
 ### Phase 1: Factory Creation
+
 ```typescript
 // Sender creates factory (one per campaign)
 const factory = await createAirdropFactory({
   dso,
   sender: featuredAppParty,
   provider: featuredAppParty,
-  description: "Q4 2025 Airdrop Campaign",
-  expiresAt: oneYearFromNow
+  description: 'Q4 2025 Airdrop Campaign',
+  expiresAt: oneYearFromNow,
 });
 ```
 
 ### Phase 2: Recipients Join
+
 ```typescript
 // Each recipient joins to create their PersonalAirdrop contract
-const personalAirdrop = await exerciseChoice(
-  factoryContractId,
-  'Factory_JoinAirdrop',
-  { recipient: recipientParty }
-);
+const personalAirdrop = await exerciseChoice(factoryContractId, 'Factory_JoinAirdrop', {
+  recipient: recipientParty,
+});
 ```
 
 ### Phase 3: Execute Transfers
+
 ```typescript
 // Sender executes transfers using individual PersonalAirdrop contracts
-const result = await exerciseChoice(
-  personalAirdropContractId,
-  'PersonalAirdrop_ExecuteTransfer',
-  {
-    amuletRulesCid,
-    openMiningRoundCid,
-    amuletInputs,
-    amount: 10.0,  // Amount per transfer
-    featuredAppRight,  // Optional: for featured app rewards
-    appRewardBeneficiaries: []  // Additional beneficiaries
-  }
-);
+const result = await exerciseChoice(personalAirdropContractId, 'PersonalAirdrop_ExecuteTransfer', {
+  amuletRulesCid,
+  openMiningRoundCid,
+  amuletInputs,
+  amount: 10.0, // Amount per transfer
+  featuredAppRight, // Optional: for featured app rewards
+  appRewardBeneficiaries: [], // Additional beneficiaries
+});
 ```
 
 ## Benefits
 
 ### ✅ Compared to SimpleAirdrop (with PreApproval)
+
 - **No PreApproval complexity**: No need to manage TransferPreapproval contracts
 - **No provider matching**: No risk of provider mismatches
 - **Simpler setup**: Recipients just need to join, no pre-approval creation needed
 
 ### ✅ Compared to Original Airdrop
+
 - **One contract per recipient**: More granular control and visibility
 - **Explicit opt-in**: Recipients must join (good for compliance)
 - **Independent expiration**: Each recipient's contract has its own lifecycle
 - **Better tracking**: Easy to see which recipients have joined vs. not joined
 
 ### ✅ Featured App Rewards
+
 - **Dual-signatory design**: Both sender and recipient are signatories
 - **Provider control**: Sender sets the provider party explicitly
 - **Reward distribution**: Can split rewards among multiple beneficiaries
 
 ## Comparison Matrix
 
-| Feature | Original Airdrop | SimpleAirdrop | PersonalAirdrop (New) |
-|---------|------------------|---------------|----------------------|
-| Contracts per campaign | 1 | 1 | 1 factory + N personal |
-| Recipient opt-in | No | Via PreApproval | Via Factory join |
-| Dual-signatory | Yes | No | Yes |
-| Featured app rewards | Yes | Yes | Yes |
-| PreApproval complexity | No | Yes (high) | No |
-| Per-recipient control | No | No | Yes |
-| Compliance friendly | Medium | Medium | High (explicit opt-in) |
+| Feature                | Original Airdrop | SimpleAirdrop   | PersonalAirdrop (New)  |
+| ---------------------- | ---------------- | --------------- | ---------------------- |
+| Contracts per campaign | 1                | 1               | 1 factory + N personal |
+| Recipient opt-in       | No               | Via PreApproval | Via Factory join       |
+| Dual-signatory         | Yes              | No              | Yes                    |
+| Featured app rewards   | Yes              | Yes             | Yes                    |
+| PreApproval complexity | No               | Yes (high)      | No                     |
+| Per-recipient control  | No               | No              | Yes                    |
+| Compliance friendly    | Medium           | Medium          | High (explicit opt-in) |
 
 ## Implementation Status
 
 ✅ **DAML Contracts**: Compiled successfully
+
 - `AirdropFactory.daml`
 - `PersonalAirdrop.daml`
 
-⏳ **TypeScript SDK**: Not yet generated
-⏳ **Execution Scripts**: Not yet created
+⏳ **TypeScript SDK**: Not yet generated ⏳ **Execution Scripts**: Not yet created
 
 ## Next Steps
 

@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
-import type { PackageJson } from './types';
 import { getPackage } from './packages';
+import type { PackageJson } from './types';
 
 // Read the root package.json
 const rootPackagePath = path.join(__dirname, '..', 'package.json');
@@ -13,7 +13,10 @@ const reportsPkg = getPackage('reports')!;
 
 const packages = [
   { dir: path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`), name: rootPackage.name },
-  { dir: path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`), name: `${rootPackage.name}-reports` },
+  {
+    dir: path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
+    name: `${rootPackage.name}-reports`,
+  },
 ];
 
 for (const { dir, name } of packages) {
@@ -47,7 +50,7 @@ for (const { dir, name } of packages) {
   }
 
   // Write back the generated package.json
-  fs.writeFileSync(packageJsonPath, JSON.stringify(generatedPackage, null, 4) + '\n');
+  fs.writeFileSync(packageJsonPath, `${JSON.stringify(generatedPackage, null, 4)}\n`);
 
   // Create index files in generated dir
   const generatedDir = dir;

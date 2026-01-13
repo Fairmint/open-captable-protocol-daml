@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 /**
- * Create the PaymentStreamFactory contract.
- * Saves contract ID and disclosed contract to generated/paymentStreams-factory-contract-id.json.
+ * Create the PaymentStreamFactory contract. Saves contract ID and disclosed contract to
+ * generated/paymentStreams-factory-contract-id.json.
  *
  * Usage: tsx scripts/create-paymentStreams-factory.ts --network <devnet|mainnet>
  */
 
+import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clients/ledger-json-api/schemas/api/commands';
 import * as fs from 'fs';
 import * as path from 'path';
-import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
-import type { DisclosedContract } from '@fairmint/canton-node-sdk/build/src/clients/ledger-json-api/schemas/api/commands';
 import { requireNetwork } from './packages';
+import { createLedgerJsonApiClient, createValidatorApiClient } from './utils';
 
 interface ContractIdData {
   mainnet?: { paymentStreamsFactoryContractId: string; templateId: string; disclosedContract: DisclosedContract };
@@ -45,7 +45,7 @@ async function main() {
 
   const client = createLedgerJsonApiClient(network, '5n');
   const validatorClient = createValidatorApiClient(network, '5n');
-  const templateId = CantonPayments.PaymentStream.PaymentStreamFactory.PaymentStreamFactory.templateId;
+  const { templateId } = CantonPayments.PaymentStream.PaymentStreamFactory.PaymentStreamFactory;
   const processorPartyId = PROCESSOR_PARTY_IDS[network];
 
   console.log(`  Template: ${templateId}`);
@@ -60,17 +60,19 @@ async function main() {
   console.log(`  DSO: ${dsoResponse.dso_party_id}`);
 
   const response = await client.submitAndWaitForTransactionTree({
-    commands: [{
-      CreateCommand: {
-        templateId,
-        createArguments: {
-          processorContext: {
-            processor: processorPartyId,
-            dso: dsoResponse.dso_party_id,
+    commands: [
+      {
+        CreateCommand: {
+          templateId,
+          createArguments: {
+            processorContext: {
+              processor: processorPartyId,
+              dso: dsoResponse.dso_party_id,
+            },
           },
         },
       },
-    }],
+    ],
     actAs: [processorPartyId],
   });
 
@@ -84,7 +86,7 @@ async function main() {
     throw new Error('Expected CreatedTreeEvent');
   }
 
-  const contractId = firstEvent.CreatedTreeEvent.value.contractId;
+  const { contractId } = firstEvent.CreatedTreeEvent.value;
   const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
 
   // Fetch disclosed contract data
@@ -116,7 +118,7 @@ async function main() {
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}\n`);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('❌ Failed:', err);
   process.exit(1);
 });
