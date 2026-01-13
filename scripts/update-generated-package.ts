@@ -1,14 +1,19 @@
 import fs from 'fs';
 import path from 'path';
 import type { PackageJson } from './types';
+import { getPackage } from './packages';
 
 // Read the root package.json
 const rootPackagePath = path.join(__dirname, '..', 'package.json');
 const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
 
+// Build package paths dynamically from packages.ts (which reads from daml.yaml)
+const ocpPkg = getPackage('ocp')!;
+const reportsPkg = getPackage('reports')!;
+
 const packages = [
-  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v25-0.0.1'), name: rootPackage.name },
-  { dir: path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'), name: `${rootPackage.name}-reports` },
+  { dir: path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`), name: rootPackage.name },
+  { dir: path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`), name: `${rootPackage.name}-reports` },
 ];
 
 for (const { dir, name } of packages) {
