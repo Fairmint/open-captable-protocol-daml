@@ -33,7 +33,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 
 Current packages that can be upgraded:
 - `Subscriptions` (currently at `CantonPayments`)
-- `OpenCapTable` (currently at `OpenCapTable-v25`)
+- `OpenCapTable` (currently at `OpenCapTable-v26`)
 - `OpenCapTableReports` (currently at `OpenCapTableReports-v01`)
 - `OpenCapTableProofOfOwnership` (currently at `OpenCapTableProofOfOwnership-v01`)
 - `Shared` (no version suffix)

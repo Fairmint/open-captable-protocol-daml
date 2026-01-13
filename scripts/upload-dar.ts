@@ -1,62 +1,78 @@
 #!/usr/bin/env node
+/**
+ * Upload a DAR file to devnet or mainnet.
+ *
+ * Requires the DAR to be backed up first. If not backed up, the script will
+ * automatically run the backup process before uploading.
+ *
+ * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
+ */
 
-import * as path from 'path';
-import * as fs from 'fs';
 import { createLedgerJsonApiClient } from './utils';
-import { isContractNetwork, type ContractNetwork } from './types';
-import {
-  getDarPath,
-  recordNetworkUpload,
-} from './dar-utils';
+import { isDarBackedUp, requireBackedUpDar, getFreshDarPath, recordNetworkUpload } from './dar-utils';
+import { requireNetwork, requirePackage, printPackageUsage, parseNetworkArg, parsePackageArg } from './packages';
+import { execSync } from 'child_process';
 
-const PACKAGE_NAME = 'OpenCapTable-v25';
-const DAR_NAME = 'OpenCapTable-v25';
-const DAR_VERSION = '0.0.1';
+/**
+ * Ensure the DAR is backed up before upload.
+ * If not backed up, automatically run the backup process.
+ */
+function ensureDarBackedUp(packageName: string, version: string, darName: string): void {
+  if (isDarBackedUp(packageName, version, darName)) {
+    return;
+  }
 
-function getNetworkFromArgs(): ContractNetwork {
-  const args = process.argv.slice(2);
-  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
-
-  if (networkIndex === -1 || networkIndex === args.length - 1) {
-    console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
+  // Check if fresh DAR exists to backup
+  const freshPath = getFreshDarPath(packageName, version, darName);
+  if (!freshPath) {
+    console.error(`❌ No DAR found to backup`);
+    console.error(`   Expected: ${packageName}/.daml/dist/${darName}-${version}.dar`);
+    console.error(`   Run "npm run build" first to build the DAR.`);
     process.exit(1);
   }
 
-  const network = args[networkIndex + 1].toLowerCase();
-  if (!isContractNetwork(network)) {
-    console.error('❌ Network must be either "mainnet" or "devnet"');
+  console.log(`📋 DAR not backed up yet, backing up first...\n`);
+
+  try {
+    execSync(`npm run backup-dar -- --package ${packageName} --version ${version}`, {
+      stdio: 'inherit',
+      cwd: process.cwd(),
+    });
+    console.log('');
+  } catch {
+    console.error(`\n❌ Failed to backup DAR`);
     process.exit(1);
   }
-
-  return network;
-}
-
-function getOctDarPath(): string {
-  return getDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
 }
 
 async function main() {
-  const network = getNetworkFromArgs();
-  console.log(`Uploading DAR file to ${network}...`);
-
-  const darPath = getOctDarPath();
-  const providers = ['intellect', '5n'];
-
-  for (const provider of providers) {
-    console.log(`📤 Uploading to ${provider} provider...`);
-
-    // Create client using EnvLoader
-    const client = createLedgerJsonApiClient(network, provider);
-
-    await client.uploadDarFile({ filePath: darPath });
-
-    console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
+  // Validate args (show help if missing)
+  if (!parsePackageArg() || !parseNetworkArg()) {
+    printPackageUsage('upload-dar.ts');
+    process.exit(1);
   }
 
-  // Record the network upload in dars.lock if using backed-up DAR
-  recordNetworkUpload(PACKAGE_NAME, DAR_VERSION, DAR_NAME, network);
+  const pkg = requirePackage('upload-dar.ts');
+  const network = requireNetwork('upload-dar.ts');
 
-  console.log(`🎉 DAR upload process completed for ${network}`);
+  console.log(`\n📦 Uploading ${pkg.name} v${pkg.version} to ${network}\n`);
+
+  // Ensure DAR is backed up first (auto-backup if needed)
+  ensureDarBackedUp(pkg.name, pkg.version, pkg.darName);
+
+  // Now require the backed-up DAR (this verifies integrity)
+  const darPath = requireBackedUpDar(pkg.name, pkg.version, pkg.darName);
+
+  // Upload to both providers
+  for (const provider of ['intellect', '5n'] as const) {
+    console.log(`  → ${provider}...`);
+    const client = createLedgerJsonApiClient(network, provider);
+    await client.uploadDarFile({ filePath: darPath });
+    console.log(`    ✅ Done`);
+  }
+
+  recordNetworkUpload(pkg.name, pkg.version, pkg.darName, network);
+  console.log(`\n🎉 Upload complete\n`);
 }
 
 main();

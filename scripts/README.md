@@ -117,7 +117,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 **Upgrade OpenCapTable from v25 to v26:**
 ```bash
 npm run upgrade-package -- --package OpenCapTable --type major
-# Output: OpenCapTable-v25 (x.y.z) → OpenCapTable-v26 (0.0.1)
+# Output: OpenCapTable-v26 (x.y.z) → OpenCapTable-v26 (0.0.1)
 ```
 
 ### Troubleshooting
