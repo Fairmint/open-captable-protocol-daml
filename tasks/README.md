@@ -4,9 +4,10 @@
 
 ## Open Tasks
 
-| Task                                                 | Date       | Summary                                     |
-| ---------------------------------------------------- | ---------- | ------------------------------------------- |
-| [DAML Linting](./2026/01/2026.01.13-daml-linting.md) | 2026-01-13 | Add `daml lint` to CI for DAML code quality |
+| Task                                                     | Date       | Summary                                            |
+| -------------------------------------------------------- | ---------- | -------------------------------------------------- |
+| [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)   | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm`        |
+| [DAML Linting](./2026/01/2026.01.13-daml-linting.md)     | 2026-01-13 | Add `daml lint` to CI for DAML code quality        |
 
 ## Completed Tasks
 
