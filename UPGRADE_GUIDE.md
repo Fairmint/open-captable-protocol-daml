@@ -110,6 +110,5 @@ See [scripts/README.md](./scripts/README.md) for full documentation of the upgra
 ## Notes
 
 - The script skips `node_modules`, `.daml`, `lib`, and `generated` directories
-- All changes are made to source files only
 - The script validates folder and version formats before making changes
 - Review all changes with `git diff` before committing

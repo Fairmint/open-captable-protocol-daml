@@ -493,167 +493,164 @@ function replaceDependencyReferences(targetDir: string): void {
     const originalContent = content;
     const isDts = filePath.endsWith('.d.ts');
 
-    if (content.includes('@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')) {
+    if (content.includes('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Internal/Template'))
         .replace(/\\/g, '/');
       console.log(`  Updating ${path.relative(targetDir, filePath)} with DA path: ${relativePath}`);
       if (isDts) {
         content = content.replace(
-          /from '@daml\.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0';/g,
+          /from 'daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0';/g,
           `from '${relativePath}';`
         );
       } else {
         content = content.replace(
-          /require\('@daml\.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0'\)/g,
+          /require\('daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-api-featured-app-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-featured-app-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'))
         .replace(/\\/g, '/');
       console.log(`  Updating ${path.relative(targetDir, filePath)} with Splice path: ${relativePath}`);
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/splice-api-featured-app-v1-1\.0\.0';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/splice-api-featured-app-v1-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-featured-app-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-featured-app-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-amulet-0.1.14')) {
+    if (content.includes('daml.js/splice-amulet-0.1.14')) {
       const relativePath = path.relative(path.dirname(filePath), path.join(targetDir, 'lib')).replace(/\\/g, '/');
       console.log(`  Updating ${path.relative(targetDir, filePath)} with splice-amulet path: ${relativePath}`);
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/splice-amulet-0\.1\.14';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/splice-amulet-0\.1\.14';/g, `from '${relativePath}';`);
       } else {
-        content = content.replace(/require\('@daml\.js\/splice-amulet-0\.1\.14'\)/g, `require('${relativePath}')`);
+        content = content.replace(/require\('daml.js\/splice-amulet-0\.1\.14'\)/g, `require('${relativePath}')`);
       }
     }
 
-    if (content.includes('@daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
+    if (content.includes('daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Time/Types'))
         .replace(/\\/g, '/');
       console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Time Types path: ${relativePath}`);
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/daml-stdlib-DA-Time-Types-1\.0\.0';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/daml-stdlib-DA-Time-Types-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
-          /require\('@daml\.js\/daml-stdlib-DA-Time-Types-1\.0\.0'\)/g,
+          /require\('daml.js\/daml-stdlib-DA-Time-Types-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/daml-prim-DA-Types-1.0.0')) {
+    if (content.includes('daml.js/daml-prim-DA-Types-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Types'))
         .replace(/\\/g, '/');
       console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Types path: ${relativePath}`);
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/daml-prim-DA-Types-1\.0\.0';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/daml-prim-DA-Types-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
-        content = content.replace(/require\('@daml\.js\/daml-prim-DA-Types-1\.0\.0'\)/g, `require('${relativePath}')`);
+        content = content.replace(/require\('daml.js\/daml-prim-DA-Types-1\.0\.0'\)/g, `require('${relativePath}')`);
       }
     }
 
-    if (content.includes('@daml.js/splice-api-token-metadata-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-token-metadata-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'))
         .replace(/\\/g, '/');
       if (isDts) {
-        content = content.replace(
-          /from '@daml\.js\/splice-api-token-metadata-v1-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
+        content = content.replace(/from 'daml.js\/splice-api-token-metadata-v1-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-api-token-holding-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-token-holding-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1'))
         .replace(/\\/g, '/');
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/splice-api-token-holding-v1-1\.0\.0';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/splice-api-token-holding-v1-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-token-holding-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-token-holding-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-api-token-allocation-instruction-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-token-allocation-instruction-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1'))
         .replace(/\\/g, '/');
       if (isDts) {
         content = content.replace(
-          /from '@daml\.js\/splice-api-token-allocation-instruction-v1-1\.0\.0';/g,
+          /from 'daml.js\/splice-api-token-allocation-instruction-v1-1\.0\.0';/g,
           `from '${relativePath}';`
         );
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-token-allocation-instruction-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-token-allocation-instruction-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-api-token-transfer-instruction-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-token-transfer-instruction-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1'))
         .replace(/\\/g, '/');
       if (isDts) {
         content = content.replace(
-          /from '@daml\.js\/splice-api-token-transfer-instruction-v1-1\.0\.0';/g,
+          /from 'daml.js\/splice-api-token-transfer-instruction-v1-1\.0\.0';/g,
           `from '${relativePath}';`
         );
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-token-transfer-instruction-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-token-transfer-instruction-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/splice-api-token-allocation-v1-1.0.0')) {
+    if (content.includes('daml.js/splice-api-token-allocation-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1'))
         .replace(/\\/g, '/');
       if (isDts) {
         content = content.replace(
-          /from '@daml\.js\/splice-api-token-allocation-v1-1\.0\.0';/g,
+          /from 'daml.js\/splice-api-token-allocation-v1-1\.0\.0';/g,
           `from '${relativePath}';`
         );
       } else {
         content = content.replace(
-          /require\('@daml\.js\/splice-api-token-allocation-v1-1\.0\.0'\)/g,
+          /require\('daml.js\/splice-api-token-allocation-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
     }
 
-    if (content.includes('@daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
+    if (content.includes('daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Set/Types'))
         .replace(/\\/g, '/');
       if (isDts) {
-        content = content.replace(/from '@daml\.js\/daml-stdlib-DA-Set-Types-1\.0\.0';/g, `from '${relativePath}';`);
+        content = content.replace(/from 'daml.js\/daml-stdlib-DA-Set-Types-1\.0\.0';/g, `from '${relativePath}';`);
       } else {
         content = content.replace(
-          /require\('@daml\.js\/daml-stdlib-DA-Set-Types-1\.0\.0'\)/g,
+          /require\('daml.js\/daml-stdlib-DA-Set-Types-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
@@ -673,17 +670,17 @@ function removeLocalDependency(targetDir: string): void {
   const packageJsonPath = path.join(targetDir, 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   const localDependencies = [
-    '@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
-    '@daml.js/splice-api-featured-app-v1-1.0.0',
-    '@daml.js/splice-amulet-0.1.14',
-    '@daml.js/daml-stdlib-DA-Time-Types-1.0.0',
-    '@daml.js/daml-prim-DA-Types-1.0.0',
-    '@daml.js/splice-api-token-metadata-v1-1.0.0',
-    '@daml.js/splice-api-token-holding-v1-1.0.0',
-    '@daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
-    '@daml.js/splice-api-token-transfer-instruction-v1-1.0.0',
-    '@daml.js/splice-api-token-allocation-v1-1.0.0',
-    '@daml.js/daml-stdlib-DA-Set-Types-1.0.0',
+    'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+    'daml.js/splice-api-featured-app-v1-1.0.0',
+    'daml.js/splice-amulet-0.1.14',
+    'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
+    'daml.js/daml-prim-DA-Types-1.0.0',
+    'daml.js/splice-api-token-metadata-v1-1.0.0',
+    'daml.js/splice-api-token-holding-v1-1.0.0',
+    'daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
+    'daml.js/splice-api-token-transfer-instruction-v1-1.0.0',
+    'daml.js/splice-api-token-allocation-v1-1.0.0',
+    'daml.js/daml-stdlib-DA-Set-Types-1.0.0',
   ];
   let removedCount = 0;
   for (const dep of localDependencies) {
