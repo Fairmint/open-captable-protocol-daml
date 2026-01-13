@@ -26,7 +26,7 @@
 |-----|-------|--------|----------|
 | ADR-001 | OCF Cap Table on Canton | Accepted | [canton repo](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md) |
 | ADR-002 | Stateful Cap Table with OCF Object References | Implemented | [docs/adr/002](../docs/adr/002-stateful-issuer-with-position-tracking.md) |
-| ADR-003 | Value-Based Coupon Minting for OCP Transactions | Proposed | [docs/adr/003](../docs/adr/003-featured-app-markers-for-ocp-transactions.md) |
+| ADR-003 | Value-Based Coupon Minting for OCP Transactions | Implemented | [docs/adr/003](../docs/adr/003-featured-app-markers-for-ocp-transactions.md) |
 | ADR-004 | CouponMinter Contract | Implemented | [docs/adr/004](../docs/adr/004-couponminter-contract.md) |
 
 ## Task File Naming
