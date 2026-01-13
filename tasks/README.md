@@ -10,10 +10,10 @@
 
 ## Completed Tasks
 
-| Task                                                                   | Date       | Summary                                    |
-| ---------------------------------------------------------------------- | ---------- | ------------------------------------------ |
-| [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)                 | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm` |
-| [Canton 3.4 Upgrade](./2026/01/2026.01.12-canton-3.4-upgrade.md)       | 2026-01-12 | Upgrade DAML SDK from 3.3 to Canton 3.4.10 |
+| Task                                                                                             | Date       | Summary                                                            |
+| ------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------ |
+| [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)                                           | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm`                        |
+| [Canton 3.4 Upgrade](./2026/01/2026.01.12-canton-3.4-upgrade.md)                                 | 2026-01-12 | Upgrade DAML SDK from 3.3 to Canton 3.4.10                         |
 | [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md)           | 2026-01-12 | Replace string building with template files for reviewable codegen |
 | [CouponMinter Contract](./2026/01/2026.01.12-couponminter-contract-design.md)                    | 2026-01-12 | DAML implementation per ADR-004                                    |
 | [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md)                         | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks            |
