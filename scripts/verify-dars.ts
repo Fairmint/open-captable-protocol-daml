@@ -1,26 +1,17 @@
 #!/usr/bin/env node
 
 /**
- * Verify DAR integrity script
- * Checks that all DAR files in dars/ match their recorded hashes in dars.lock.
- * Used both for manual verification and CI enforcement.
+ * Verify DAR integrity script Checks that all DAR files in dars/ match their recorded hashes in dars.lock. Used both
+ * for manual verification and CI enforcement.
  *
  * Usage: tsx scripts/verify-dars.ts [--update]
  *
- * Options:
- *   --update  Update dars.lock with current hashes (use with caution)
+ * Options: --update Update dars.lock with current hashes (use with caution)
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import {
-  loadDarsLock,
-  saveDarsLock,
-  computeSha256,
-  getDarsDir,
-  findDarFiles,
-  type DarsLockEntry,
-} from './dar-utils';
+import { computeSha256, findDarFiles, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
 
 function parseArgs(): { update: boolean } {
   const args = process.argv.slice(2);
@@ -135,7 +126,7 @@ function verifyDars(update: boolean): VerificationResult {
     const sortedPackages: Record<string, DarsLockEntry> = {};
     Object.keys(lock.packages)
       .sort()
-      .forEach(key => {
+      .forEach((key) => {
         sortedPackages[key] = lock.packages[key];
       });
     lock.packages = sortedPackages;
@@ -170,7 +161,7 @@ async function main() {
   }
 
   if (hasErrors && !update) {
-    console.error('\n' + '─'.repeat(60));
+    console.error(`\n${'─'.repeat(60)}`);
     console.error(`\n❌ Verification failed with ${result.errors.length} error(s)\n`);
     console.error('To fix these issues:');
     console.error('  1. If changes were intentional, run: npm run backup-dar -- --package <name> --version <version>');
@@ -185,7 +176,7 @@ async function main() {
   }
 }
 
-main().catch(error => {
+main().catch((error) => {
   console.error('❌ Unexpected error:', error);
   process.exit(1);
 });

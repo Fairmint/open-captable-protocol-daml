@@ -1,15 +1,14 @@
 #!/usr/bin/env node
 /**
- * Create the OcpFactory contract.
- * Saves contract ID to generated/ocp-factory-contract-id.json.
+ * Create the OcpFactory contract. Saves contract ID to generated/ocp-factory-contract-id.json.
  *
  * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
+import { buildTemplateId, requireNetwork } from './packages';
 import { createLedgerJsonApiClient } from './utils';
-import { requireNetwork, buildTemplateId } from './packages';
 
 interface ContractIdData {
   mainnet?: { ocpFactoryContractId: string; templateId: string };
@@ -48,12 +47,14 @@ async function main() {
 
   // Create arguments matching current OcpFactory DAML (only system_operator required)
   const response = await client.submitAndWaitForTransactionTree({
-    commands: [{
-      CreateCommand: {
-        templateId,
-        createArguments: { system_operator: operatorPartyId },
+    commands: [
+      {
+        CreateCommand: {
+          templateId,
+          createArguments: { system_operator: operatorPartyId },
+        },
       },
-    }],
+    ],
   });
 
   const eventsById = response.transactionTree?.eventsById;
@@ -66,7 +67,7 @@ async function main() {
     throw new Error('Expected CreatedTreeEvent');
   }
 
-  const contractId = firstEvent.CreatedTreeEvent.value.contractId;
+  const { contractId } = firstEvent.CreatedTreeEvent.value;
   const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
 
   // Save to file
@@ -83,7 +84,7 @@ async function main() {
   console.log('');
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('❌ Failed:', err);
   process.exit(1);
 });

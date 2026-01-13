@@ -1,16 +1,14 @@
-import { LedgerJsonApiClient, EnvLoader, FileLogger, ValidatorApiClient } from '@fairmint/canton-node-sdk';
-import type { NetworkType, ProviderType, ClientConfig } from '@fairmint/canton-node-sdk';
+import type { ClientConfig, NetworkType, ProviderType } from '@fairmint/canton-node-sdk';
+import { EnvLoader, FileLogger, LedgerJsonApiClient, ValidatorApiClient } from '@fairmint/canton-node-sdk';
 
 /**
  * Create a LedgerJsonApiClient instance using EnvLoader for scripts
+ *
  * @param network Network type ('devnet' | 'testnet' | 'mainnet' | 'localnet')
  * @param providerType Provider type
  * @returns Configured LedgerJsonApiClient instance
  */
-export function createLedgerJsonApiClient(
-  network: NetworkType,
-  providerType: ProviderType
-): LedgerJsonApiClient {
+export function createLedgerJsonApiClient(network: NetworkType, providerType: ProviderType): LedgerJsonApiClient {
   const envLoader = EnvLoader.getInstance();
 
   return new LedgerJsonApiClient({
@@ -19,25 +17,10 @@ export function createLedgerJsonApiClient(
     authUrl: envLoader.getAuthUrl(network, providerType),
     apis: {
       LEDGER_JSON_API: {
-        apiUrl:
-          envLoader.getApiUri(
-            'LEDGER_JSON_API',
-            network,
-            providerType
-          ) || '',
+        apiUrl: envLoader.getApiUri('LEDGER_JSON_API', network, providerType) || '',
         auth: {
-          clientId:
-            envLoader.getApiClientId(
-              'LEDGER_JSON_API',
-              network,
-              providerType
-            ) || '',
-          clientSecret:
-            envLoader.getApiClientSecret(
-              'LEDGER_JSON_API',
-              network,
-              providerType
-            ) || '',
+          clientId: envLoader.getApiClientId('LEDGER_JSON_API', network, providerType) || '',
+          clientSecret: envLoader.getApiClientSecret('LEDGER_JSON_API', network, providerType) || '',
           grantType: 'client_credentials',
         },
         partyId: envLoader.getPartyId(network, providerType),
@@ -49,49 +32,24 @@ export function createLedgerJsonApiClient(
 
 /**
  * Create a ValidatorApiClient instance using EnvLoader for scripts
+ *
  * @param network Network type ('devnet' | 'testnet' | 'mainnet' | 'localnet')
  * @param providerType Provider type
  * @returns Configured ValidatorApiClient instance
  */
-export function createValidatorApiClient(
-  network: NetworkType,
-  providerType: ProviderType
-): ValidatorApiClient {
+export function createValidatorApiClient(network: NetworkType, providerType: ProviderType): ValidatorApiClient {
   const envLoader = EnvLoader.getInstance();
   const apiUrl = envLoader.getApiUri('VALIDATOR_API', network, providerType);
-  const clientId = envLoader.getApiClientId(
-    'VALIDATOR_API',
-    network,
-    providerType
-  );
-  const clientSecret = envLoader.getApiClientSecret(
-    'VALIDATOR_API',
-    network,
-    providerType
-  );
+  const clientId = envLoader.getApiClientId('VALIDATOR_API', network, providerType);
+  const clientSecret = envLoader.getApiClientSecret('VALIDATOR_API', network, providerType);
   const authUrl = envLoader.getAuthUrl(network, providerType);
   const partyId = envLoader.getPartyId(network, providerType);
   const userId = envLoader.getUserId(network, providerType);
-  const username = envLoader.getApiUsername(
-    'VALIDATOR_API',
-    network,
-    providerType
-  );
-  const password = envLoader.getApiPassword(
-    'VALIDATOR_API',
-    network,
-    providerType
-  );
+  const username = envLoader.getApiUsername('VALIDATOR_API', network, providerType);
+  const password = envLoader.getApiPassword('VALIDATOR_API', network, providerType);
 
-  if (
-    !apiUrl ||
-    !clientId ||
-    (!clientSecret && !(username && password)) ||
-    !authUrl
-  ) {
-    throw new Error(
-      'Missing required environment configuration for ValidatorApiClient'
-    );
+  if (!apiUrl || !clientId || (!clientSecret && !(username && password)) || !authUrl) {
+    throw new Error('Missing required environment configuration for ValidatorApiClient');
   }
 
   const clientConfig: ClientConfig = {
@@ -116,4 +74,4 @@ export function createValidatorApiClient(
   };
 
   return new ValidatorApiClient(clientConfig);
-} 
+}

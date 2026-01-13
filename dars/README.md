@@ -1,10 +1,13 @@
 # DAR File Backup System
 
-This directory preserves versioned DAR (DAML Archive) files that have been uploaded to mainnet/devnet. Since DAML builds are only deterministic when using the exact same compiler version, we store the exact bytes of published packages here.
+This directory preserves versioned DAR (DAML Archive) files that have been uploaded to
+mainnet/devnet. Since DAML builds are only deterministic when using the exact same compiler version,
+we store the exact bytes of published packages here.
 
 ## Why We Need This
 
-1. **Package verification** - Canton validates package hashes; rebuilt packages have different hashes
+1. **Package verification** - Canton validates package hashes; rebuilt packages have different
+   hashes
 2. **Reproducibility** - Ensures we can always redeploy the exact same artifact
 3. **Rollback safety** - Allows redeploying a known-good version if needed
 
@@ -36,6 +39,7 @@ npm run backup-dar -- --package OpenCapTable-v26 --version 0.0.1
 ```
 
 This will:
+
 1. Copy the DAR from `.daml/dist/` to `dars/{package}/{version}/`
 2. Compute and store the SHA256 hash in `dars.lock`
 3. Fail if the DAR already exists (prevents accidental overwrites)
@@ -51,6 +55,7 @@ npm run verify-dars
 ### CI Integration
 
 The CI workflow automatically:
+
 1. Verifies all DAR hashes match `dars.lock`
 2. Fails PRs that modify DAR files without updating `dars.lock`
 
@@ -75,7 +80,8 @@ The `dars.lock` file contains SHA256 hashes and metadata for all backed-up DARs:
 
 ## Git LFS
 
-DAR files are stored using Git LFS to keep the repository performant. The `.gitattributes` file configures this automatically.
+DAR files are stored using Git LFS to keep the repository performant. The `.gitattributes` file
+configures this automatically.
 
 ## Modifying DARs
 
@@ -92,11 +98,14 @@ The CI will reject any PR that modifies existing DAR files without a correspondi
 
 ### "DAR already exists" error
 
-If you see this error when running `backup-dar`, it means the DAR for that package/version already exists. This is intentional—we never overwrite backed-up DARs. If you need to deploy changes, bump the version number.
+If you see this error when running `backup-dar`, it means the DAR for that package/version already
+exists. This is intentional—we never overwrite backed-up DARs. If you need to deploy changes, bump
+the version number.
 
 ### "Hash mismatch" error in CI
 
 This means a DAR file has been modified without updating `dars.lock`. Either:
+
 1. Restore the original DAR file
 2. If intentional, update `dars.lock` with `npm run verify-dars -- --update`
 
@@ -111,5 +120,6 @@ git lfs pull
 
 ## References
 
-- [Splice DAR storage](https://github.com/hyperledger-labs/splice/tree/main/daml/dars) - Inspiration for this system
+- [Splice DAR storage](https://github.com/hyperledger-labs/splice/tree/main/daml/dars) - Inspiration
+  for this system
 - [Git LFS documentation](https://git-lfs.github.com/)

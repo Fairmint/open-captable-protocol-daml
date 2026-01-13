@@ -1,11 +1,8 @@
-/**
- * Shared utilities for DAR file management.
- * Used by upload scripts and backup scripts.
- */
+/** Shared utilities for DAR file management. Used by upload scripts and backup scripts. */
 
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
 
 export interface DarsLockEntry {
   sha256: string;
@@ -20,9 +17,7 @@ export interface DarsLock {
   packages: Record<string, DarsLockEntry>;
 }
 
-/**
- * Error thrown when DAR integrity verification fails.
- */
+/** Error thrown when DAR integrity verification fails. */
 export class DarIntegrityError extends Error {
   constructor(
     message: string,
@@ -35,16 +30,12 @@ export class DarIntegrityError extends Error {
   }
 }
 
-/**
- * Get the path to the dars directory.
- */
+/** Get the path to the dars directory. */
 export function getDarsDir(): string {
   return path.join(__dirname, '..', 'dars');
 }
 
-/**
- * Load the dars.lock file.
- */
+/** Load the dars.lock file. */
 export function loadDarsLock(): DarsLock {
   const lockPath = path.join(getDarsDir(), 'dars.lock');
 
@@ -75,17 +66,12 @@ export function loadDarsLock(): DarsLock {
   }
 }
 
-/**
- * Save the dars.lock file.
- */
+/** Save the dars.lock file. */
 export function saveDarsLock(lock: DarsLock): void {
   const lockPath = path.join(getDarsDir(), 'dars.lock');
   const lockDir = path.dirname(lockPath);
-  const tempPath = path.join(
-    lockDir,
-    `dars.lock.tmp-${process.pid}-${Date.now()}`
-  );
-  const data = JSON.stringify(lock, null, 2) + '\n';
+  const tempPath = path.join(lockDir, `dars.lock.tmp-${process.pid}-${Date.now()}`);
+  const data = `${JSON.stringify(lock, null, 2)}\n`;
 
   try {
     // Write to a temporary file first to avoid partial writes to the lock file
@@ -104,9 +90,7 @@ export function saveDarsLock(lock: DarsLock): void {
   }
 }
 
-/**
- * Compute SHA256 hash of a file.
- */
+/** Compute SHA256 hash of a file. */
 export function computeSha256(filePath: string): string {
   const fileBuffer = fs.readFileSync(filePath);
   const hash = crypto.createHash('sha256');
@@ -114,18 +98,13 @@ export function computeSha256(filePath: string): string {
   return hash.digest('hex');
 }
 
-/**
- * Get the lock key for a DAR file.
- * Always uses forward slashes for consistency across platforms.
- */
+/** Get the lock key for a DAR file. Always uses forward slashes for consistency across platforms. */
 export function getDarLockKey(packageName: string, version: string, darName: string): string {
   const key = path.join(packageName, version, `${darName}.dar`);
   return key.replace(/\\/g, '/');
 }
 
-/**
- * Find all DAR files in a directory recursively.
- */
+/** Find all DAR files in a directory recursively. */
 export function findDarFiles(darsDir: string): string[] {
   const files: string[] = [];
 
@@ -148,15 +127,10 @@ export function findDarFiles(darsDir: string): string[] {
 }
 
 /**
- * Check if a backed-up DAR exists and return its path.
- * Returns null if no backed-up DAR exists or file is missing.
+ * Check if a backed-up DAR exists and return its path. Returns null if no backed-up DAR exists or file is missing.
  * Throws DarIntegrityError if the file exists but hash doesn't match.
  */
-export function getBackedUpDarPath(
-  packageName: string,
-  version: string,
-  darName: string
-): string | null {
+export function getBackedUpDarPath(packageName: string, version: string, darName: string): string | null {
   const lockKey = getDarLockKey(packageName, version, darName);
   const lock = loadDarsLock();
 
@@ -189,10 +163,7 @@ export function getBackedUpDarPath(
   return darPath;
 }
 
-/**
- * Get the path to a freshly built DAR file (from .daml/dist/).
- * Returns the path if it exists, null otherwise.
- */
+/** Get the path to a freshly built DAR file (from .daml/dist/). Returns the path if it exists, null otherwise. */
 export function getFreshDarPath(packageName: string, version: string, darName: string): string | null {
   const rootDir = path.join(__dirname, '..');
   const freshPath = path.join(rootDir, packageName, '.daml', 'dist', `${darName}-${version}.dar`);
@@ -200,9 +171,8 @@ export function getFreshDarPath(packageName: string, version: string, darName: s
 }
 
 /**
- * Require a backed-up DAR file to exist and be verified.
- * This is the strict mode - it will NOT fall back to fresh builds.
- * Use this when you want to ensure the DAR has been properly backed up before proceeding.
+ * Require a backed-up DAR file to exist and be verified. This is the strict mode - it will NOT fall back to fresh
+ * builds. Use this when you want to ensure the DAR has been properly backed up before proceeding.
  *
  * @throws Error if no backup exists
  * @throws DarIntegrityError if backup exists but hash doesn't match
@@ -232,9 +202,7 @@ export function requireBackedUpDar(packageName: string, version: string, darName
   process.exit(1);
 }
 
-/**
- * Check if a DAR has been backed up.
- */
+/** Check if a DAR has been backed up. */
 export function isDarBackedUp(packageName: string, version: string, darName: string): boolean {
   const lockKey = getDarLockKey(packageName, version, darName);
   const lock = loadDarsLock();
@@ -245,9 +213,9 @@ export function isDarBackedUp(packageName: string, version: string, darName: str
 }
 
 /**
- * @deprecated Use requireBackedUpDar instead to ensure backups are mandatory.
- * Get the path to a DAR file, preferring backed-up version over fresh build.
- * Returns the backed-up DAR path if available and verified, otherwise falls back to fresh build.
+ * @deprecated Use requireBackedUpDar instead to ensure backups are mandatory. Get the path to a DAR file, preferring
+ *   backed-up version over fresh build. Returns the backed-up DAR path if available and verified, otherwise falls back
+ *   to fresh build.
  */
 export function getDarPath(packageName: string, version: string, darName: string): string {
   const rootDir = path.join(__dirname, '..');
@@ -282,16 +250,8 @@ export function getDarPath(packageName: string, version: string, darName: string
   return freshPath;
 }
 
-/**
- * Record that a DAR was uploaded to a specific network.
- * Updates the networks array in dars.lock.
- */
-export function recordNetworkUpload(
-  packageName: string,
-  version: string,
-  darName: string,
-  network: string
-): void {
+/** Record that a DAR was uploaded to a specific network. Updates the networks array in dars.lock. */
+export function recordNetworkUpload(packageName: string, version: string, darName: string, network: string): void {
   const lockKey = getDarLockKey(packageName, version, darName);
   const lock = loadDarsLock();
 

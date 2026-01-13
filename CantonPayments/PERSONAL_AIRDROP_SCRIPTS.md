@@ -1,15 +1,18 @@
 # PersonalAirdrop Scripts Documentation
 
-This document describes the three TypeScript scripts created for managing the PersonalAirdrop system.
+This document describes the three TypeScript scripts created for managing the PersonalAirdrop
+system.
 
 ## Overview
 
 The PersonalAirdrop system uses a factory pattern where:
+
 1. **Sender** creates an `AirdropFactory` contract with shared configuration
 2. **Recipients** join the factory to create their own `PersonalAirdrop` contracts
 3. **Sender** executes transfers using the `PersonalAirdrop` contracts
 
-Each `PersonalAirdrop` contract is dual-signatory (sender + recipient), enabling featured app rewards.
+Each `PersonalAirdrop` contract is dual-signatory (sender + recipient), enabling featured app
+rewards.
 
 ## Scripts
 
@@ -20,6 +23,7 @@ Each `PersonalAirdrop` contract is dual-signatory (sender + recipient), enabling
 **Location**: `canton/scripts/src/scripts/app/airdrop/createAirdropFactory.ts`
 
 **Usage**:
+
 ```bash
 # Create with sender getting 100% of app rewards
 npm run airdrop:create-factory -- \
@@ -34,6 +38,7 @@ npm run airdrop:create-factory -- \
 ```
 
 **Options**:
+
 - `--network` (required): `mainnet` or `devnet`
 - `--provider` (required): `intellect` or `5n`
 - `--beneficiaries` (optional): Comma-separated list of `partyId:weight` pairs
@@ -43,6 +48,7 @@ npm run airdrop:create-factory -- \
 **Output**: Factory contract ID for use in next step
 
 **Features**:
+
 - Automatically fetches DSO party, amulet rules, and featured app right
 - Validates beneficiary weights sum to 1.0
 - Uses sender's party ID from environment
@@ -57,6 +63,7 @@ npm run airdrop:create-factory -- \
 **Location**: `canton/scripts/src/scripts/app/airdrop/joinAirdropFactory.ts`
 
 **Usage**:
+
 ```bash
 # Join with specific factory contract ID
 npm run airdrop:join-factory -- \
@@ -73,6 +80,7 @@ npm run airdrop:join-factory -- \
 ```
 
 **Options**:
+
 - `--network` (required): `mainnet` or `devnet`
 - `--provider` (required): `intellect` or `5n` - Provider where the recipient party exists
 - `--recipient-party` (required): Recipient party ID that will join the factory
@@ -81,6 +89,7 @@ npm run airdrop:join-factory -- \
 **Output**: `PersonalAirdrop` contract ID
 
 **Features**:
+
 - Automatically gets sender party from **intellect** client environment
 - Searches for factory on **intellect** (where sender created it)
 - Executes join on **recipient's provider** (usually 5n)
@@ -98,6 +107,7 @@ npm run airdrop:join-factory -- \
 **Location**: `canton/scripts/src/scripts/app/airdrop/payAllPersonalAirdrops.ts`
 
 **Usage**:
+
 ```bash
 npm run airdrop:execute-personal -- \
   --network mainnet \
@@ -112,20 +122,26 @@ npm run airdrop:execute-personal -- \
 ```
 
 **Options**:
+
 - `--network` (required): `mainnet` or `devnet`
 - `--provider` (required): `intellect` or `5n`
 - `--amount-per-transfer` (required): Amount in CC per transfer
 - `--batch-size` (optional, default 200): Number of PersonalAirdrop contracts per batch
 - `--threads` (optional, default 1): Number of parallel workers
-- `--max-recipients-per-round` (optional): Upper bound of PersonalAirdrop contracts processed each round; if omitted all eligible contracts are considered
+- `--max-recipients-per-round` (optional): Upper bound of PersonalAirdrop contracts processed each
+  round; if omitted all eligible contracts are considered
 - `--merge-utxos` (optional): Enable merging of extra unlocked amulets (dust consolidation)
-- `--merge-utxo-per-recipient` (optional): Cap on the number of merged amulets assigned to a single recipient when merging is enabled
-- `--create-featured-marker` (optional): Emit a featured app activity marker alongside each batch execution
+- `--merge-utxo-per-recipient` (optional): Cap on the number of merged amulets assigned to a single
+  recipient when merging is enabled
+- `--create-featured-marker` (optional): Emit a featured app activity marker alongside each batch
+  execution
 
 **Output**: Transaction results with update IDs and success counts
 
 **Features**:
-- Automatically discovers active `PersonalAirdrop` contracts and selects a randomized subset each round
+
+- Automatically discovers active `PersonalAirdrop` contracts and selects a randomized subset each
+  round
 - Fetches the current mining round before every execution
 - Chooses the largest available amulets (plus optional dust merges) to fund the batch
 - Optional UTXO merging with per-recipient caps
@@ -154,6 +170,7 @@ npm run airdrop:create-factory -- \
 ### Step 2: Recipients Join Factory
 
 **Recipient 1:**
+
 ```bash
 npm run airdrop:join-factory -- \
   --network devnet \
@@ -165,6 +182,7 @@ npm run airdrop:join-factory -- \
 ```
 
 **Recipient 2:**
+
 ```bash
 npm run airdrop:join-factory -- \
   --network devnet \
@@ -222,14 +240,14 @@ const personalAirdropId = await findPersonalAirdropContract(
 
 ## Key Differences from SimpleAirdrop
 
-| Feature | SimpleAirdrop | PersonalAirdrop |
-|---------|---------------|-----------------|
-| **Pre-approval** | Required `TransferPreapproval` contracts | No pre-approval needed |
-| **Signatories** | Single signatory (sender) | Dual signatory (sender + recipient) |
-| **Recipient onboarding** | Automatic | Recipients must join factory |
-| **Featured app rewards** | Via provider field | Native via dual signatories |
-| **Contract per recipient** | No | Yes |
-| **Multiple transfers** | Multiple choice calls | Single choice with `numberOfTransfers` |
+| Feature                    | SimpleAirdrop                            | PersonalAirdrop                        |
+| -------------------------- | ---------------------------------------- | -------------------------------------- |
+| **Pre-approval**           | Required `TransferPreapproval` contracts | No pre-approval needed                 |
+| **Signatories**            | Single signatory (sender)                | Dual signatory (sender + recipient)    |
+| **Recipient onboarding**   | Automatic                                | Recipients must join factory           |
+| **Featured app rewards**   | Via provider field                       | Native via dual signatories            |
+| **Contract per recipient** | No                                       | Yes                                    |
+| **Multiple transfers**     | Multiple choice calls                    | Single choice with `numberOfTransfers` |
 
 ---
 
@@ -238,6 +256,7 @@ const personalAirdropId = await findPersonalAirdropContract(
 Ensure you have the following environment variables set:
 
 **For Sender (creating factory and executing transfers):**
+
 ```env
 # Intellect provider
 DEVNET_INTELLECT_ADMIN_API_URL=...
@@ -247,6 +266,7 @@ DEVNET_INTELLECT_JWT_TOKEN=...
 ```
 
 **For Recipients (joining factory):**
+
 ```env
 # 5n provider
 DEVNET_5N_ADMIN_API_URL=...
@@ -260,20 +280,24 @@ DEVNET_5N_JWT_TOKEN=...
 ## Troubleshooting
 
 ### "No AirdropFactory contracts found"
+
 - Ensure you've created a factory using `airdrop:create-factory`
 - Check you're using the correct network and provider
 - Verify the sender has shared the factory with recipients
 
 ### "No PersonalAirdrop contract found"
+
 - Ensure recipients have joined using `airdrop:join-factory`
 - Verify you're querying with the correct party IDs
 - Check network and provider match where contracts were created
 
 ### "Beneficiary weights must sum to 1.0"
+
 - When creating factory, ensure all beneficiary weights sum to exactly 1.0
 - Use decimals like `0.7,0.3` not `70,30`
 
 ### "No amulets available"
+
 - Sender needs sufficient CC balance
 - Check amulets aren't locked in other transactions
 - Verify you're querying the correct party ID
@@ -294,7 +318,8 @@ DEVNET_5N_JWT_TOKEN=...
 
 ## Next Steps
 
-1. **Generate DAML Bindings**: Update the OCP Canton SDK to include bindings for `AirdropFactory` and `PersonalAirdrop`
+1. **Generate DAML Bindings**: Update the OCP Canton SDK to include bindings for `AirdropFactory`
+   and `PersonalAirdrop`
 2. **Testing**: Test the complete workflow on devnet
 3. **Monitoring**: Set up Slack notifications for production usage
 4. **Documentation**: Update main README with PersonalAirdrop workflow

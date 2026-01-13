@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 /**
- * Backup a DAR file after mainnet upload.
- * Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
+ * Backup a DAR file after mainnet upload. Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
  *
  * Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]
  */
@@ -9,8 +8,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
-import { loadDarsLock, saveDarsLock, computeSha256, getDarsDir, type DarsLockEntry } from './dar-utils';
-import { PACKAGES, getPackage, parsePackageArg, parseVersionArg, parseNetworkArg } from './packages';
+import { computeSha256, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
+import { PACKAGES, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
 
 function printUsage(errorMessage?: string): never {
   if (errorMessage) console.error(`❌ ${errorMessage}\n`);
@@ -106,7 +105,11 @@ async function main() {
 
   // Sort for consistent ordering
   const sorted: Record<string, DarsLockEntry> = {};
-  Object.keys(lock.packages).sort().forEach(k => { sorted[k] = lock.packages[k]; });
+  Object.keys(lock.packages)
+    .sort()
+    .forEach((k) => {
+      sorted[k] = lock.packages[k];
+    });
   lock.packages = sorted;
 
   saveDarsLock(lock);
@@ -116,7 +119,7 @@ async function main() {
   console.log(`   Size: ${stats.size} bytes`);
 }
 
-main().catch(err => {
+main().catch((err) => {
   console.error('❌ Error:', err);
   process.exit(1);
 });

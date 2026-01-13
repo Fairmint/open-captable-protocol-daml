@@ -17,6 +17,7 @@ Ultra-simple bulk transfer contract with rewards for distributing tokens to mult
 ### Airdrop Template
 
 **Fields:**
+
 - `sender` - Party creating and executing the airdrop
 - `provider` - Validator provider for transfers
 - `dso` - DSO party
@@ -40,10 +41,12 @@ Allows an invitee to join the airdrop (becomes a signatory).
 **Controller:** Invitee  
 **Returns:** `()`  
 **Validations:**
+
 - Party must be in invitees list
 - Party cannot join twice (de-duplication check)
 
 **Example:**
+
 ```daml
 exercise airdropCid Airdrop_Join with
   joiningParty = bob
@@ -56,18 +59,21 @@ Sender executes the bulk transfer to all invitees.
 **Controller:** Sender  
 **Returns:** `()`  
 **Parameters:**
+
 - `amuletInputs` - List of amulet contracts to spend
 - `amounts` - List of amounts (must match invitees length)
 - `openMiningRoundCid` - Current open mining round
 - `activityMarkerFeaturedAppRightCid` - Optional FAR for activity marker
 
 **Validations:**
+
 - At least one amulet input
-- Amounts length matches invitees length  
+- Amounts length matches invitees length
 - All amounts are positive
 - App reward beneficiaries are valid
 
 **Example:**
+
 ```daml
 exercise airdropCid Airdrop_Execute with
   amuletInputs = [amulet1, amulet2]
@@ -133,6 +139,7 @@ submitMulti [alice] [dso] do
 ### 3. Bulk Efficiency
 
 For N recipients:
+
 - **1 transaction** vs N individual transactions
 - **~95% gas savings** compared to individual transfers
 - **Atomic execution** - all or nothing
@@ -146,14 +153,17 @@ For N recipients:
 ## Validation Rules
 
 **At Creation:**
+
 - Must have at least one invitee
 - Sender cannot be an invitee
 
 **At Join:**
+
 - Party must be in invitees list
 - Cannot join twice (fails if no change to joinedParties)
 
 **At Execution:**
+
 - At least one amulet input required
 - Amounts array must match invitees length
 - All amounts must be positive
@@ -161,22 +171,23 @@ For N recipients:
 
 ## Comparison to PaymentStream
 
-| Aspect | PaymentStream | Airdrop |
-|--------|--------------|---------|
-| Purpose | Recurring payments | One-time bulk distribution |
-| Complexity | High | Minimal |
-| Templates | 6+ | 1 |
-| Locked Funds | Required | Not required |
-| Processor | Required approval | Not needed |
-| Recipients | Single | Multiple |
-| Network Impact | Moderate | Minimal |
-| Return Values | Contract IDs, Results | None (`()`) |
+| Aspect         | PaymentStream         | Airdrop                    |
+| -------------- | --------------------- | -------------------------- |
+| Purpose        | Recurring payments    | One-time bulk distribution |
+| Complexity     | High                  | Minimal                    |
+| Templates      | 6+                    | 1                          |
+| Locked Funds   | Required              | Not required               |
+| Processor      | Required approval     | Not needed                 |
+| Recipients     | Single                | Multiple                   |
+| Network Impact | Moderate              | Minimal                    |
+| Return Values  | Contract IDs, Results | None (`()`)                |
 
 ## Design Decisions
 
 ### Why No Processor?
 
-Simplicity. Sender controls their own funds and can manage `amuletRulesCid` and `featuredAppRight` at creation.
+Simplicity. Sender controls their own funds and can manage `amuletRulesCid` and `featuredAppRight`
+at creation.
 
 ### Why Return `()`?
 
@@ -184,11 +195,13 @@ Minimizes network overhead. Clients can query the ledger if they need to see res
 
 ### Why Archive-and-Recreate for Join?
 
-Consuming choices that return `()` provide clean state transitions without additional network overhead.
+Consuming choices that return `()` provide clean state transitions without additional network
+overhead.
 
 ### Why Separate Amounts Parameter?
 
-Flexibility. Invitees list is just parties. Amounts can be decided at execution time based on current logic/prices.
+Flexibility. Invitees list is just parties. Amounts can be decided at execution time based on
+current logic/prices.
 
 ## Example Use Cases
 
@@ -201,6 +214,7 @@ Flexibility. Invitees list is just parties. Amounts can be decided at execution 
 ## Future Enhancements
 
 Possible (if needed):
+
 - Scheduled execution time
 - Batch size limits for very large distributions
 - Vesting schedules

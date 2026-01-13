@@ -1,19 +1,15 @@
 #!/usr/bin/env ts-node
 /**
- * Script to upgrade DAML package versions.
- * Supports both major and minor version upgrades.
+ * Script to upgrade DAML package versions. Supports both major and minor version upgrades.
  *
- * Usage:
- *   npm run upgrade-package -- --package <name> --type <major|minor>
+ * Usage: npm run upgrade-package -- --package <name> --type <major|minor>
  *
- * Example:
- *   npm run upgrade-package -- --package Subscriptions --type major
- *   npm run upgrade-package -- --package Subscriptions --type minor
+ * Example: npm run upgrade-package -- --package Subscriptions --type major npm run upgrade-package -- --package
+ * Subscriptions --type minor
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { execSync } from 'child_process';
 import * as yaml from 'yaml';
 
 interface UpgradeOptions {
@@ -32,9 +28,7 @@ interface PackageInfo {
 
 const ROOT_DIR = path.join(__dirname, '..');
 
-/**
- * Parse command line arguments
- */
+/** Parse command line arguments */
 function parseArgs(): UpgradeOptions {
   const args = process.argv.slice(2);
   let packageName = '';
@@ -61,9 +55,7 @@ function parseArgs(): UpgradeOptions {
   return { packageName, upgradeType };
 }
 
-/**
- * Find the package folder that matches the given package name
- */
+/** Find the package folder that matches the given package name */
 function findPackageFolder(packageName: string): string {
   const entries = fs.readdirSync(ROOT_DIR, { withFileTypes: true });
 
@@ -84,9 +76,7 @@ function findPackageFolder(packageName: string): string {
   throw new Error(`Package folder not found for: ${packageName}`);
 }
 
-/**
- * Read the daml.yaml file and extract version information
- */
+/** Read the daml.yaml file and extract version information */
 function readDamlYaml(folderPath: string): { name: string; version: string } {
   const yamlPath = path.join(ROOT_DIR, folderPath, 'daml.yaml');
   const content = fs.readFileSync(yamlPath, 'utf8');
@@ -98,9 +88,7 @@ function readDamlYaml(folderPath: string): { name: string; version: string } {
   };
 }
 
-/**
- * Get package information for upgrade
- */
+/** Get package information for upgrade */
 function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): PackageInfo {
   const currentFolder = findPackageFolder(packageName);
   const match = currentFolder.match(/^(.+)-(v(\d+))$/);
@@ -111,7 +99,9 @@ function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): Pa
   if (!hasVersionSuffix) {
     // Package doesn't have version suffix (e.g., "CantonPayments")
     if (upgradeType === 'major') {
-      throw new Error(`Package ${currentFolder} does not have a version suffix and does not support major upgrades. Only minor upgrades are supported.`);
+      throw new Error(
+        `Package ${currentFolder} does not have a version suffix and does not support major upgrades. Only minor upgrades are supported.`
+      );
     }
 
     const { version: currentFullVersion } = readDamlYaml(currentFolder);
@@ -162,9 +152,7 @@ function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): Pa
   return info;
 }
 
-/**
- * Update daml.yaml file with new version
- */
+/** Update daml.yaml file with new version */
 function updateDamlYaml(folderPath: string, newVersion: string, newName?: string): void {
   const yamlPath = path.join(ROOT_DIR, folderPath, 'daml.yaml');
   const content = fs.readFileSync(yamlPath, 'utf8');
@@ -179,10 +167,13 @@ function updateDamlYaml(folderPath: string, newVersion: string, newName?: string
   console.log(`✓ Updated ${yamlPath}`);
 }
 
-/**
- * Recursively search and replace in files
- */
-function searchAndReplaceInFiles(directory: string, oldText: string, newText: string, fileExtensions: string[] = ['.yaml', '.ts', '.md', '.json', '.daml']): number {
+/** Recursively search and replace in files */
+function searchAndReplaceInFiles(
+  directory: string,
+  oldText: string,
+  newText: string,
+  fileExtensions: string[] = ['.yaml', '.ts', '.md', '.json', '.daml']
+): number {
   let replacementCount = 0;
 
   function processDirectory(dir: string): void {
@@ -216,16 +207,12 @@ function searchAndReplaceInFiles(directory: string, oldText: string, newText: st
   return replacementCount;
 }
 
-/**
- * Escape special characters for regex
- */
+/** Escape special characters for regex */
 function escapeRegExp(string: string): string {
   return string.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/**
- * Perform major upgrade
- */
+/** Perform major upgrade */
 function performMajorUpgrade(info: PackageInfo): void {
   console.log('\n🚀 Performing MAJOR upgrade...\n');
   console.log(`Package: ${info.currentFolder}`);
@@ -270,9 +257,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   console.log(`4. Commit: git add -A && git commit -m "Upgrade ${info.newFolder} to ${info.newFullVersion}"`);
 }
 
-/**
- * Perform minor upgrade
- */
+/** Perform minor upgrade */
 function performMinorUpgrade(info: PackageInfo): void {
   console.log('\n🔄 Performing MINOR upgrade...\n');
   console.log(`Package: ${info.currentFolder}`);
@@ -304,9 +289,7 @@ function performMinorUpgrade(info: PackageInfo): void {
   console.log(`4. Commit: git add -A && git commit -m "Upgrade ${info.currentFolder} to ${info.newFullVersion}"`);
 }
 
-/**
- * Main function
- */
+/** Main function */
 function main(): void {
   try {
     const options = parseArgs();
