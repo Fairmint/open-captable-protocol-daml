@@ -10,9 +10,8 @@
  */
 
 import { createLedgerJsonApiClient } from './utils';
-import { requireNetwork } from './packages';
+import { requireNetwork, buildTemplateId } from './packages';
 
-const TEMPLATE_ID = 'Fairmint.CouponMinter:CouponMinter';
 const DEFAULT_MAX_TPS = '100.0'; // Default TPS limit for minting coupons
 
 async function main() {
@@ -23,14 +22,17 @@ async function main() {
   const client = createLedgerJsonApiClient(network, 'intellect');
   const operatorPartyId = client.getPartyId();
 
-  console.log(`  Template: ${TEMPLATE_ID}`);
+  // Build template ID dynamically from package config (single source of truth)
+  const templateId = buildTemplateId('couponMinter', 'Fairmint.CouponMinter', 'CouponMinter');
+
+  console.log(`  Template: ${templateId}`);
   console.log(`  Operator: ${operatorPartyId}`);
   console.log(`  Max TPS: ${DEFAULT_MAX_TPS}`);
 
   const response = await client.submitAndWaitForTransactionTree({
     commands: [{
       CreateCommand: {
-        templateId: TEMPLATE_ID,
+        templateId,
         createArguments: {
           operator: operatorPartyId,
           maxTps: DEFAULT_MAX_TPS,
