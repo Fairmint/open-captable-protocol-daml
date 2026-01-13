@@ -2,7 +2,7 @@
 
 ## Status
 
-**Accepted** | 2026-01-13
+**Implemented** | 2026-01-13
 
 ---
 
@@ -272,7 +272,7 @@ These represent company-wide structural changes that affect all securities of a 
 
 | Date | Change | PR |
 |------|--------|-----|
-| 2026-01-13 | Status updated to Accepted (CouponMinter contract implemented per ADR-004) | — |
+| 2026-01-13 | Status updated to Implemented (CouponMinter contract implemented per ADR-004) | — |
 | 2026-01-12 | Changed to value-based coupons, added CouponMinter service | — |
 | 2026-01-09 | Created proposal | — |
 
