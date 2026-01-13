@@ -9,6 +9,7 @@ const eslintConfig = [
   {
     ignores: [
       '**/lib/**',
+      '**/libs/**',
       '**/build/**',
       '**/dist/**',
       '**/node_modules/**',
