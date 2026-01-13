@@ -1,62 +1,103 @@
 #!/usr/bin/env node
 
-import * as path from 'path';
-import * as fs from 'fs';
 import { createLedgerJsonApiClient } from './utils';
 import { isContractNetwork, type ContractNetwork } from './types';
-import {
-  getDarPath,
-  recordNetworkUpload,
-} from './dar-utils';
+import { getDarPath, recordNetworkUpload } from './dar-utils';
 
-const PACKAGE_NAME = 'OpenCapTable-v25';
-const DAR_NAME = 'OpenCapTable-v25';
-const DAR_VERSION = '0.0.1';
-
-function getNetworkFromArgs(): ContractNetwork {
-  const args = process.argv.slice(2);
-  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
-
-  if (networkIndex === -1 || networkIndex === args.length - 1) {
-    console.error('❌ Please specify a network using --network or -n (e.g., --network mainnet or --network devnet)');
-    process.exit(1);
-  }
-
-  const network = args[networkIndex + 1].toLowerCase();
-  if (!isContractNetwork(network)) {
-    console.error('❌ Network must be either "mainnet" or "devnet"');
-    process.exit(1);
-  }
-
-  return network;
+interface PackageConfig {
+  packageName: string;
+  darName: string;
+  version: string;
 }
 
-function getOctDarPath(): string {
-  return getDarPath(PACKAGE_NAME, DAR_VERSION, DAR_NAME);
+// Known package configurations
+const PACKAGE_CONFIGS: Record<string, PackageConfig> = {
+  ocp: {
+    packageName: 'OpenCapTable-v25',
+    darName: 'OpenCapTable-v25',
+    version: '0.0.1',
+  },
+  reports: {
+    packageName: 'OpenCapTableReports-v01',
+    darName: 'OpenCapTableReports-v01',
+    version: '0.0.2',
+  },
+  paymentStreams: {
+    packageName: 'CantonPayments',
+    darName: 'CantonPayments',
+    version: '0.0.30',
+  },
+  couponMinter: {
+    packageName: 'CouponMinter',
+    darName: 'CouponMinter',
+    version: '0.0.1',
+  },
+};
+
+type PackageKey = keyof typeof PACKAGE_CONFIGS;
+
+function parseArgs(): { network: ContractNetwork; package: PackageKey } {
+  const args = process.argv.slice(2);
+
+  // Parse network
+  const networkIndex = args.findIndex(arg => arg === '--network' || arg === '-n');
+  if (networkIndex === -1 || networkIndex === args.length - 1) {
+    printUsageAndExit('Please specify a network using --network or -n');
+  }
+  const network = args[networkIndex + 1].toLowerCase();
+  if (!isContractNetwork(network)) {
+    printUsageAndExit('Network must be either "mainnet" or "devnet"');
+  }
+
+  // Parse package
+  const packageIndex = args.findIndex(arg => arg === '--package' || arg === '-p');
+  if (packageIndex === -1 || packageIndex === args.length - 1) {
+    printUsageAndExit('Please specify a package using --package or -p');
+  }
+  const packageKey = args[packageIndex + 1].toLowerCase();
+  if (!(packageKey in PACKAGE_CONFIGS)) {
+    printUsageAndExit(`Unknown package: ${packageKey}`);
+  }
+
+  return { network, package: packageKey as PackageKey };
+}
+
+function printUsageAndExit(message: string): never {
+  console.error(`❌ ${message}`);
+  console.error('');
+  console.error('Usage: tsx scripts/upload-dar.ts --package <package> --network <network>');
+  console.error('');
+  console.error('Available packages:');
+  Object.entries(PACKAGE_CONFIGS).forEach(([key, config]) => {
+    console.error(`  ${key.padEnd(15)} → ${config.packageName} v${config.version}`);
+  });
+  console.error('');
+  console.error('Networks: devnet, mainnet');
+  process.exit(1);
 }
 
 async function main() {
-  const network = getNetworkFromArgs();
-  console.log(`Uploading DAR file to ${network}...`);
+  const { network, package: packageKey } = parseArgs();
+  const config = PACKAGE_CONFIGS[packageKey];
 
-  const darPath = getOctDarPath();
-  const providers = ['intellect', '5n'];
+  console.log(`Uploading ${config.packageName} v${config.version} DAR to ${network}...`);
+
+  const darPath = getDarPath(config.packageName, config.version, config.darName);
+  const providers = ['intellect', '5n'] as const;
 
   for (const provider of providers) {
     console.log(`📤 Uploading to ${provider} provider...`);
 
-    // Create client using EnvLoader
     const client = createLedgerJsonApiClient(network, provider);
-
     await client.uploadDarFile({ filePath: darPath });
 
-    console.log(`✅ DAR file uploaded successfully to ${provider} on ${network}`);
+    console.log(`✅ DAR uploaded successfully to ${provider} on ${network}`);
   }
 
   // Record the network upload in dars.lock if using backed-up DAR
-  recordNetworkUpload(PACKAGE_NAME, DAR_VERSION, DAR_NAME, network);
+  recordNetworkUpload(config.packageName, config.version, config.darName, network);
 
-  console.log(`🎉 DAR upload process completed for ${network}`);
+  console.log(`🎉 ${config.packageName} DAR upload completed for ${network}`);
 }
 
 main();

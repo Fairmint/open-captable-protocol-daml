@@ -46,6 +46,12 @@ const PACKAGE_CONFIGS: Record<string, PackageConfig> = {
     sourceDir: 'CantonPayments',
     damlYamlPath: 'CantonPayments/daml.yaml',
   },
+  CouponMinter: {
+    name: 'CouponMinter',
+    darName: 'CouponMinter',
+    sourceDir: 'CouponMinter',
+    damlYamlPath: 'CouponMinter/daml.yaml',
+  },
 };
 
 function parseArgs(): { package: string; version: string; network?: string } {
@@ -85,7 +91,7 @@ function getSdkVersion(damlYamlPath: string): string {
   }
 
   const content = fs.readFileSync(fullPath, 'utf-8');
-  
+
   try {
     const parsed = yaml.parse(content);
     if (parsed && typeof parsed === 'object') {

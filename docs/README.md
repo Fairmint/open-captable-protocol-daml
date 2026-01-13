@@ -3,6 +3,7 @@
 ## Contents
 
 - [OCP_CONTRACT_DIAGRAM.md](./OCP_CONTRACT_DIAGRAM.md) - **OCP contract architecture diagrams** (Mermaid)
+- [releases/](./releases/) - **Release notes** for deployed versions
 
 ## Architecture Decision Records
 
