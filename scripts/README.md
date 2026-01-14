@@ -30,13 +30,13 @@ npm run upgrade-package -- --package Subscriptions --type major
 
 **What it does:**
 
-1. Renames folder: `CantonPayments/` → `CantonPayments/`
+1. Renames folder: `ExamplePackage-v01/` → `ExamplePackage-v02/`
 2. Updates `daml.yaml`:
-   - `name`: `CantonPayments` → `CantonPayments`
+   - `name`: `ExamplePackage-v01` → `ExamplePackage-v02`
    - `version`: `0.2.3` → `0.0.1`
 3. Searches and replaces across all files:
-   - `CantonPayments-0.2.3` → `CantonPayments-0.0.31`
-   - `CantonPayments` → `CantonPayments`
+   - `ExamplePackage-v01-0.2.3` → `ExamplePackage-v02-0.0.1`
+   - `ExamplePackage-v01` → `ExamplePackage-v02`
 4. Updates references in:
    - `daml.yaml` files
    - TypeScript files (`.ts`)
@@ -61,7 +61,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 2. Increments patch version: `0.2.3` → `0.2.4`
 3. Updates `daml.yaml` with the new version
 4. Searches and replaces across all files:
-   - `CantonPayments-0.2.3` → `CantonPayments-0.2.4`
+   - `ExamplePackage-0.2.3` → `ExamplePackage-0.2.4`
 
 ### Files Modified
 
@@ -115,21 +115,21 @@ After running the script, you should:
 
 ```bash
 npm run upgrade-package -- --package Subscriptions --type major
-# Output: CantonPayments (0.2.3) → CantonPayments (0.0.1)
+# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v08 (0.0.1)
 ```
 
 **Bump Subscriptions patch version:**
 
 ```bash
 npm run upgrade-package -- --package Subscriptions --type minor
-# Output: CantonPayments (0.2.3) → CantonPayments (0.2.4)
+# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v07 (0.2.4)
 ```
 
-**Upgrade OpenCapTable from v25 to v26:**
+**Upgrade OpenCapTable from v27 to v28:**
 
 ```bash
 npm run upgrade-package -- --package OpenCapTable --type major
-# Output: OpenCapTable-v28 (x.y.z) → OpenCapTable-v28 (0.0.1)
+# Output: OpenCapTable-v27 (x.y.z) → OpenCapTable-v28 (0.0.1)
 ```
 
 ### Troubleshooting
