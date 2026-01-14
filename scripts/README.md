@@ -35,7 +35,7 @@ npm run upgrade-package -- --package Subscriptions --type major
    - `name`: `CantonPayments` → `CantonPayments`
    - `version`: `0.2.3` → `0.0.1`
 3. Searches and replaces across all files:
-   - `CantonPayments-0.2.3` → `CantonPayments-0.0.30`
+   - `CantonPayments-0.2.3` → `CantonPayments-0.0.31`
    - `CantonPayments` → `CantonPayments`
 4. Updates references in:
    - `daml.yaml` files
