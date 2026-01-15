@@ -4,24 +4,24 @@
 
 ## Open Tasks
 
-| Task                                                                                   | Date       | Summary                                                                  |
-| -------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
-| [OCF Schema Field Completeness](./2026/01/2026.01.15-ocf-schema-field-completeness.md) | 2026-01-15 | Add missing `option_grant_type` and fix `initial_shares_authorized` type |
-| [DAML Linting](./2026/01/2026.01.13-daml-linting.md)                                   | 2026-01-13 | Add `daml lint` to CI for DAML code quality                              |
+| Task                                                 | Date       | Summary                                     |
+| ---------------------------------------------------- | ---------- | ------------------------------------------- |
+| [DAML Linting](./2026/01/2026.01.13-daml-linting.md) | 2026-01-13 | Add `daml lint` to CI for DAML code quality |
 
 ## Completed Tasks
 
-| Task                                                                                             | Date       | Summary                                                            |
-| ------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------ |
-| [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)                                           | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm`                        |
-| [Canton 3.4 Upgrade](./2026/01/2026.01.12-canton-3.4-upgrade.md)                                 | 2026-01-12 | Upgrade DAML SDK from 3.3 to Canton 3.4.10                         |
-| [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md)           | 2026-01-12 | Replace string building with template files for reviewable codegen |
-| [CouponMinter Contract](./2026/01/2026.01.12-couponminter-contract-design.md)                    | 2026-01-12 | DAML implementation per ADR-004                                    |
-| [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md)                         | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks            |
-| [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md)                 | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable`                   |
-| [TypeScript Strict Typing](./2026/01/2026.01.07-typescript-strict-typing.md)                     | 2026-01-07 | Eliminated all `any` types in scripts                              |
-| [Stateful CapTable](./2026/01/2026.01.05-stateful-captable-with-position-tracking.md)            | 2026-01-05 | Implemented ADR-002: CapTable with O(1) lookups                    |
-| [Complete DAML Implementation](./2025/12/2025.12.17-milestone-1-complete-daml-implementation.md) | 2025-12-17 | 100% OCF type coverage (48/48 objects)                             |
+| Task                                                                                             | Date       | Summary                                                                  |
+| ------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------ |
+| [OCF Schema Field Completeness](./2026/01/2026.01.15-ocf-schema-field-completeness.md)           | 2026-01-15 | Add missing `option_grant_type` and fix `initial_shares_authorized` type |
+| [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)                                           | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm`                              |
+| [Canton 3.4 Upgrade](./2026/01/2026.01.12-canton-3.4-upgrade.md)                                 | 2026-01-12 | Upgrade DAML SDK from 3.3 to Canton 3.4.10                               |
+| [Contract Generation Templates](./2026/01/2026.01.12-contract-generation-templates.md)           | 2026-01-12 | Replace string building with template files for reviewable codegen       |
+| [CouponMinter Contract](./2026/01/2026.01.12-couponminter-contract-design.md)                    | 2026-01-12 | DAML implementation per ADR-004                                          |
+| [DAR File Backup System](./2026/01/2026.01.09-dar-file-backup-system.md)                         | 2026-01-09 | Preserve mainnet DARs with Git LFS and integrity checks                  |
+| [Batch CapTable App Rewards](./2026/01/2026.01.08-batch-captable-app-rewards.md)                 | 2026-01-08 | Add `appRewards` param to batch `UpdateCapTable`                         |
+| [TypeScript Strict Typing](./2026/01/2026.01.07-typescript-strict-typing.md)                     | 2026-01-07 | Eliminated all `any` types in scripts                                    |
+| [Stateful CapTable](./2026/01/2026.01.05-stateful-captable-with-position-tracking.md)            | 2026-01-05 | Implemented ADR-002: CapTable with O(1) lookups                          |
+| [Complete DAML Implementation](./2025/12/2025.12.17-milestone-1-complete-daml-implementation.md) | 2025-12-17 | 100% OCF type coverage (48/48 objects)                                   |
 
 ## Architecture Decision Records
 
