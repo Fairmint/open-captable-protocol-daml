@@ -4,9 +4,10 @@
 
 ## Open Tasks
 
-| Task                                                 | Date       | Summary                                     |
-| ---------------------------------------------------- | ---------- | ------------------------------------------- |
-| [DAML Linting](./2026/01/2026.01.13-daml-linting.md) | 2026-01-13 | Add `daml lint` to CI for DAML code quality |
+| Task                                                                                   | Date       | Summary                                                                  |
+| -------------------------------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------ |
+| [OCF Schema Field Completeness](./2026/01/2026.01.15-ocf-schema-field-completeness.md) | 2026-01-15 | Add missing `option_grant_type` and fix `initial_shares_authorized` type |
+| [DAML Linting](./2026/01/2026.01.13-daml-linting.md)                                   | 2026-01-13 | Add `daml lint` to CI for DAML code quality                              |
 
 ## Completed Tasks
 
