@@ -4,9 +4,10 @@
 
 ## Open Tasks
 
-| Task                                                 | Date       | Summary                                     |
-| ---------------------------------------------------- | ---------- | ------------------------------------------- |
-| [DAML Linting](./2026/01/2026.01.13-daml-linting.md) | 2026-01-13 | Add `daml lint` to CI for DAML code quality |
+| Task                                                                             | Date       | Summary                                            |
+| -------------------------------------------------------------------------------- | ---------- | -------------------------------------------------- |
+| [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md) | 2026-01-15 | Automate releases via Git tags with CI deployments |
+| [DAML Linting](./2026/01/2026.01.13-daml-linting.md)                             | 2026-01-13 | Add `daml lint` to CI for DAML code quality        |
 
 ## Completed Tasks
 
