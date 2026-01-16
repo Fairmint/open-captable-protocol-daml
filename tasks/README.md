@@ -4,7 +4,9 @@
 
 ## Open Tasks
 
-_No open tasks_
+| Task                                                                             | Date       | Summary                                        |
+| -------------------------------------------------------------------------------- | ---------- | ---------------------------------------------- |
+| [CI Backwards Compatibility](./2026/01/2026.01.16-ci-backwards-compatibility.md) | 2026-01-16 | Fail CI if changes break upgrade compatibility |
 
 ## Completed Tasks
 
