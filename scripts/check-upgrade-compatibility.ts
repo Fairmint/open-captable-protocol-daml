@@ -1,8 +1,10 @@
 /**
  * CI backwards compatibility checker.
  *
- * Validates that DAML package changes are backwards compatible using `dpm upgrade-check`. Fails CI if changes would
- * break upgrade compatibility without a major version bump.
+ * Validates that DAML package changes are backwards compatible using `dpm upgrade-check`. Compares the current build
+ * against the most recent backup for each package. Fails CI if:
+ *
+ * - Breaking changes are introduced without a major version bump
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  */
@@ -27,16 +29,65 @@ function parsePackageName(name: string): { baseName: string; majorVersion: numbe
   return { baseName: name, majorVersion: null };
 }
 
-/** Get all unique package base names from dars.lock. */
+/** Get all backed-up packages from dars.lock, grouped by exact package name. */
 function getBackedUpPackages(): Map<string, Array<{ packageName: string; version: string; darPath: string }>> {
   const lock = loadDarsLock();
   const darsDir = getDarsDir();
 
-  // Group by base name (e.g., "OpenCapTable" groups v26, v27, v28, v29)
-  const byBaseName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
+  // Group by exact package name (e.g., "OpenCapTable-v29")
+  const byPackageName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
 
   for (const [lockKey, _entry] of Object.entries(lock.packages)) {
     // lockKey format: "OpenCapTable-v29/0.0.1/OpenCapTable-v29.dar"
+    const parts = lockKey.split('/');
+    if (parts.length !== 3) continue;
+
+    const [packageName, version, _darFile] = parts;
+    const darPath = path.join(darsDir, lockKey);
+
+    if (!fs.existsSync(darPath)) continue;
+
+    if (!byPackageName.has(packageName)) {
+      byPackageName.set(packageName, []);
+    }
+    byPackageName.get(packageName)!.push({ packageName, version, darPath });
+  }
+
+  return byPackageName;
+}
+
+/** Find the most recent backed-up version for a package. */
+function getMostRecentBackup(
+  backups: Array<{ packageName: string; version: string; darPath: string }>
+): { packageName: string; version: string; darPath: string } | null {
+  if (backups.length === 0) return null;
+
+  // Sort by semver descending to find most recent
+  const sorted = [...backups].sort((a, b) => {
+    const aVer = a.version.split('.').map(Number);
+    const bVer = b.version.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if ((aVer[i] || 0) !== (bVer[i] || 0)) {
+        return (bVer[i] || 0) - (aVer[i] || 0);
+      }
+    }
+    return 0;
+  });
+
+  return sorted[0];
+}
+
+/** Get all backed-up packages grouped by base name (for finding previous major versions). */
+function getBackedUpPackagesByBaseName(): Map<
+  string,
+  Array<{ packageName: string; version: string; darPath: string }>
+> {
+  const lock = loadDarsLock();
+  const darsDir = getDarsDir();
+
+  const byBaseName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
+
+  for (const [lockKey, _entry] of Object.entries(lock.packages)) {
     const parts = lockKey.split('/');
     if (parts.length !== 3) continue;
 
@@ -53,32 +104,6 @@ function getBackedUpPackages(): Map<string, Array<{ packageName: string; version
   }
 
   return byBaseName;
-}
-
-/** Find the most recent backed-up version for a package base name. */
-function getMostRecentBackup(
-  backups: Array<{ packageName: string; version: string; darPath: string }>
-): { packageName: string; version: string; darPath: string } | null {
-  if (backups.length === 0) return null;
-
-  // Sort by major version descending, then by semver descending
-  const sorted = [...backups].sort((a, b) => {
-    const aMajor = parsePackageName(a.packageName).majorVersion ?? 0;
-    const bMajor = parsePackageName(b.packageName).majorVersion ?? 0;
-    if (aMajor !== bMajor) return bMajor - aMajor;
-
-    // Compare semver versions
-    const aVer = a.version.split('.').map(Number);
-    const bVer = b.version.split('.').map(Number);
-    for (let i = 0; i < 3; i++) {
-      if ((aVer[i] || 0) !== (bVer[i] || 0)) {
-        return (bVer[i] || 0) - (aVer[i] || 0);
-      }
-    }
-    return 0;
-  });
-
-  return sorted[0];
 }
 
 /** Find the current DAR for a package directory. */
@@ -157,7 +182,8 @@ function runUpgradeCheck(oldDar: string, newDar: string): { success: boolean; ou
 function main(): void {
   console.log('🔍 Checking DAML package upgrade compatibility...\n');
 
-  const backedUpByBase = getBackedUpPackages();
+  const backedUpByPackageName = getBackedUpPackages();
+  const backedUpByBaseName = getBackedUpPackagesByBaseName();
   const currentPackages = findCurrentPackages();
 
   let hasFailures = false;
@@ -188,71 +214,48 @@ function main(): void {
     const currentPackageName = nameMatch[1].trim();
     const { baseName, majorVersion: currentMajor } = parsePackageName(currentPackageName);
 
-    // Find backed-up versions for this base name
-    const backups = backedUpByBase.get(baseName) ?? [];
-    const mostRecentBackup = getMostRecentBackup(backups);
+    // Find backed-up versions for this exact package name
+    const backupsForPackage = backedUpByPackageName.get(currentPackageName) ?? [];
+    const mostRecentBackup = getMostRecentBackup(backupsForPackage);
 
-    if (!mostRecentBackup) {
-      console.log(`✅ ${currentPackageName}: No previous backup (new package)`);
-      checkedCount++;
-      continue;
-    }
-
-    const { majorVersion: backedUpMajor } = parsePackageName(mostRecentBackup.packageName);
-
-    // Check if this is a major version change
-    const isMajorVersionChange = currentMajor !== null && backedUpMajor !== null && currentMajor > backedUpMajor;
-
-    if (isMajorVersionChange) {
+    if (mostRecentBackup) {
+      // Compare against the most recent backup of the same package
       console.log(
-        `✅ ${currentPackageName}: Major version upgrade from ${mostRecentBackup.packageName} (breaking changes expected)`
+        `🔄 Checking ${currentPackageName} v${currentDar.version} against backup v${mostRecentBackup.version}...`
       );
-      checkedCount++;
-      continue;
-    }
 
-    // If same package name AND same version, check if it's the SAME DAR file path
-    // (meaning no changes to check - we're building from the backed-up state)
-    if (currentPackageName === mostRecentBackup.packageName && currentDar.version === mostRecentBackup.version) {
-      // Find a previous version to compare against (not the same version)
-      const previousBackups = backups.filter(
-        (b) => b.packageName === currentPackageName && b.version !== currentDar.version
-      );
-      const previousBackup = getMostRecentBackup(previousBackups);
+      const result = runUpgradeCheck(mostRecentBackup.darPath, currentDar.darPath);
 
-      if (!previousBackup) {
-        console.log(`✅ ${currentPackageName} v${currentDar.version}: No previous version to compare`);
+      if (result.success) {
+        console.log(`✅ ${currentPackageName}: Backwards compatible\n`);
         checkedCount++;
         continue;
       }
 
-      // Compare against the previous version
-      console.log(`🔄 Checking ${currentPackageName} v${currentDar.version} against v${previousBackup.version}...`);
-
-      const result = runUpgradeCheck(previousBackup.darPath, currentDar.darPath);
-      if (result.success) {
-        console.log(`✅ ${currentPackageName}: Backwards compatible\n`);
-      } else {
-        reportUpgradeFailure(currentPackageName, baseName, result.output);
-        hasFailures = true;
-      }
+      // Upgrade check failed - this is only OK if it's a new major version
+      // But since we're comparing against the same package name, a failure here means
+      // breaking changes without a major version bump
+      reportUpgradeFailure(currentPackageName, baseName, result.output);
+      hasFailures = true;
       checkedCount++;
       continue;
     }
 
-    // Same major version, different minor version - must be backwards compatible
-    console.log(
-      `🔄 Checking ${currentPackageName} v${currentDar.version} against ${mostRecentBackup.packageName} v${mostRecentBackup.version}...`
-    );
+    // No backup for this exact package name - check if there's a previous major version
+    const allBackupsForBase = backedUpByBaseName.get(baseName) ?? [];
+    const previousMajorBackup = getMostRecentBackupForPreviousMajor(allBackupsForBase, currentMajor);
 
-    const result = runUpgradeCheck(mostRecentBackup.darPath, currentDar.darPath);
-
-    if (result.success) {
-      console.log(`✅ ${currentPackageName}: Backwards compatible\n`);
-    } else {
-      reportUpgradeFailure(currentPackageName, baseName, result.output);
-      hasFailures = true;
+    if (previousMajorBackup) {
+      // This is a new major version - compare against previous major to show what changed
+      console.log(
+        `✅ ${currentPackageName}: New major version (previous was ${previousMajorBackup.packageName} v${previousMajorBackup.version})`
+      );
+      checkedCount++;
+      continue;
     }
+
+    // Truly new package with no backups at all
+    console.log(`✅ ${currentPackageName}: No previous backup (new package)`);
     checkedCount++;
   }
 
@@ -266,6 +269,40 @@ function main(): void {
   }
 
   console.log('\n✅ All packages are backwards compatible.');
+}
+
+/** Find the most recent backup for a previous major version. */
+function getMostRecentBackupForPreviousMajor(
+  backups: Array<{ packageName: string; version: string; darPath: string }>,
+  currentMajor: number | null
+): { packageName: string; version: string; darPath: string } | null {
+  if (currentMajor === null) return null;
+
+  // Filter to only previous major versions
+  const previousMajorBackups = backups.filter((b) => {
+    const { majorVersion } = parsePackageName(b.packageName);
+    return majorVersion !== null && majorVersion < currentMajor;
+  });
+
+  if (previousMajorBackups.length === 0) return null;
+
+  // Sort by major version descending, then by semver descending
+  const sorted = [...previousMajorBackups].sort((a, b) => {
+    const aMajor = parsePackageName(a.packageName).majorVersion ?? 0;
+    const bMajor = parsePackageName(b.packageName).majorVersion ?? 0;
+    if (aMajor !== bMajor) return bMajor - aMajor;
+
+    const aVer = a.version.split('.').map(Number);
+    const bVer = b.version.split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+      if ((aVer[i] || 0) !== (bVer[i] || 0)) {
+        return (bVer[i] || 0) - (aVer[i] || 0);
+      }
+    }
+    return 0;
+  });
+
+  return sorted[0];
 }
 
 try {
