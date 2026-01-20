@@ -7,6 +7,7 @@
 | Task                                                                                                 | Date       | Summary                                                        |
 | ---------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------- |
 | [Package Upgrade Directory Generation](./2026/01/2026.01.15-package-upgrade-directory-generation.md) | 2026-01-15 | Generate versioned directories at build time for cleaner diffs |
+| [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md)                     | 2026-01-15 | Automate releases via Git tags with CI deployments             |
 
 ## Completed Tasks
 
