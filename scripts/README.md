@@ -129,7 +129,7 @@ npm run upgrade-package -- --package Subscriptions --type minor
 
 ```bash
 npm run upgrade-package -- --package OpenCapTable --type major
-# Output: OpenCapTable-v27 (x.y.z) → OpenCapTable-v28 (0.0.1)
+# Output: OpenCapTable-v27 (x.y.z) → OpenCapTable-v29 (0.0.1)
 ```
 
 ### Troubleshooting
