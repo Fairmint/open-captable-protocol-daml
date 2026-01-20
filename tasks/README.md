@@ -4,9 +4,10 @@
 
 ## Open Tasks
 
-| Task                                                                             | Date       | Summary                                        |
-| -------------------------------------------------------------------------------- | ---------- | ---------------------------------------------- |
-| [CI Backwards Compatibility](./2026/01/2026.01.16-ci-backwards-compatibility.md) | 2026-01-16 | Fail CI if changes break upgrade compatibility |
+| Task                                                                             | Date       | Summary                                            |
+| -------------------------------------------------------------------------------- | ---------- | -------------------------------------------------- |
+| [CI Backwards Compatibility](./2026/01/2026.01.16-ci-backwards-compatibility.md) | 2026-01-16 | Fail CI if changes break upgrade compatibility     |
+| [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md) | 2026-01-15 | Automate releases via Git tags with CI deployments |
 
 ## Completed Tasks
 
