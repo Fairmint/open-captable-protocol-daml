@@ -4,7 +4,9 @@
 
 ## Open Tasks
 
-_No open tasks_
+| Task                                                                             | Date       | Summary                                            |
+| -------------------------------------------------------------------------------- | ---------- | -------------------------------------------------- |
+| [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md) | 2026-01-15 | Automate releases via Git tags with CI deployments |
 
 ## Completed Tasks
 
