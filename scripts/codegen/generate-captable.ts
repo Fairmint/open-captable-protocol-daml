@@ -26,6 +26,11 @@ interface Validation {
   field: string;
   map: string;
   error: string;
+  // For OR-based lookups across multiple maps
+  or_maps?: boolean;
+  firstMap?: string;
+  secondMap?: string;
+  thirdMap?: string;
 }
 
 // Maps issuance type names to their security_id index map names
@@ -164,14 +169,28 @@ function discoverTypes(config: Config): TypeDef[] {
       map_field: pluralize(snakeName),
       tier,
       validations: validationFields.map((fieldSpec) => {
-        // Support two formats:
+        // Support three formats:
         // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
         // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
+        // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
         if (fieldSpec.includes(':')) {
-          const [field, map] = fieldSpec.split(':');
+          const [field, mapSpec] = fieldSpec.split(':');
+          // Check for OR-based multiple maps (e.g., "map1|map2|map3")
+          if (mapSpec.includes('|')) {
+            const maps = mapSpec.split('|');
+            return {
+              field,
+              map: maps[0], // Default map (not used when or_maps is true)
+              error: `Security not found`,
+              or_maps: true,
+              firstMap: maps[0],
+              secondMap: maps[1],
+              thirdMap: maps[2],
+            };
+          }
           return {
             field,
-            map,
+            map: mapSpec,
             error: `Security not found`,
           };
         }
