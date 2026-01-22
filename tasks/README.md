@@ -6,6 +6,10 @@
 
 | Task                                                                                                 | Date       | Summary                                                        |
 | ---------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------- |
+| [Security ID Validation](./2026/01/2026.01.21-security-id-validation.md)                             | 2026-01-21 | Add security_id validation for tier 4 transactions             |
+| [Types Module Splitting](./2026/01/2026.01.21-types-module-splitting.md)                             | 2026-01-21 | Split large Types.daml into domain-focused modules             |
+| [Test Helper Functions](./2026/01/2026.01.21-test-helper-functions.md)                               | 2026-01-21 | Create reusable test helpers to reduce boilerplate             |
+| [Validator Naming Consistency](./2026/01/2026.01.21-validator-naming-consistency.md)                 | 2026-01-21 | Standardize validator function naming patterns                 |
 | [Package Upgrade Directory Generation](./2026/01/2026.01.15-package-upgrade-directory-generation.md) | 2026-01-15 | Generate versioned directories at build time for cleaner diffs |
 | [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md)                     | 2026-01-15 | Automate releases via Git tags with CI deployments             |
 
