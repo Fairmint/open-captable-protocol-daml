@@ -28,6 +28,14 @@ interface Validation {
   error: string;
 }
 
+// Maps issuance type names to their security_id index map names
+const SECURITY_ID_INDEX_MAPS: Record<string, string> = {
+  ConvertibleIssuance: 'convertible_issuances_by_security_id',
+  EquityCompensationIssuance: 'equity_compensation_issuances_by_security_id',
+  StockIssuance: 'stock_issuances_by_security_id',
+  WarrantIssuance: 'warrant_issuances_by_security_id',
+};
+
 interface TypeDef {
   name: string;
   module: string;
@@ -36,6 +44,8 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
+  security_id_index_map: string | null;
 }
 
 const REPO_ROOT = process.cwd();
@@ -153,11 +163,25 @@ function discoverTypes(config: Config): TypeDef[] {
       data_param: typeInfo.fieldName,
       map_field: pluralize(snakeName),
       tier,
-      validations: validationFields.map((field) => ({
-        field,
-        map: pluralize(toSnakeCase(field.replace('_id', ''))),
-        error: `${toTitleCase(field)} not found`,
-      })),
+      validations: validationFields.map((fieldSpec) => {
+        // Support two formats:
+        // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
+        // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
+        if (fieldSpec.includes(':')) {
+          const [field, map] = fieldSpec.split(':');
+          return {
+            field,
+            map,
+            error: `Security not found`,
+          };
+        }
+        return {
+          field: fieldSpec,
+          map: pluralize(toSnakeCase(fieldSpec.replace('_id', ''))),
+          error: `${toTitleCase(fieldSpec)} not found`,
+        };
+      }),
+      security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
     types.push(typeDef);
