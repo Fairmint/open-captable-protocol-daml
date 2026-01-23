@@ -31,6 +31,8 @@ interface Validation {
   firstMap?: string;
   secondMap?: string;
   thirdMap?: string;
+  // For array field validation (validates each element in the array)
+  is_array?: boolean;
 }
 
 // Maps issuance type names to their security_id index map names
@@ -169,12 +171,18 @@ function discoverTypes(config: Config): TypeDef[] {
       map_field: pluralize(snakeName),
       tier,
       validations: validationFields.map((fieldSpec) => {
-        // Support three formats:
+        // Support four formats:
         // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
         // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
         // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
+        // - Array: "security_ids[]:stock_issuances_by_security_id" -> field: security_ids, validates each element in array
         if (fieldSpec.includes(':')) {
-          const [field, mapSpec] = fieldSpec.split(':');
+          let [field, mapSpec] = fieldSpec.split(':');
+          // Check for array syntax (e.g., "security_ids[]")
+          const is_array = field.endsWith('[]');
+          if (is_array) {
+            field = field.slice(0, -2); // Remove [] suffix
+          }
           // Check for OR-based multiple maps (e.g., "map1|map2|map3")
           if (mapSpec.includes('|')) {
             const maps = mapSpec.split('|');
@@ -192,12 +200,14 @@ function discoverTypes(config: Config): TypeDef[] {
               firstMap: maps[0],
               secondMap: maps[1],
               thirdMap: maps[2],
+              is_array,
             };
           }
           return {
             field,
             map: mapSpec,
             error: `Security not found`,
+            is_array,
           };
         }
         return {
