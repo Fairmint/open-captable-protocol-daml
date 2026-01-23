@@ -177,7 +177,9 @@ function discoverTypes(config: Config): TypeDef[] {
         // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
         // - Array: "security_ids[]:stock_issuances_by_security_id" -> field: security_ids, validates each element in array
         if (fieldSpec.includes(':')) {
-          let [field, mapSpec] = fieldSpec.split(':');
+          const parts = fieldSpec.split(':');
+          let field = parts[0];
+          const mapSpec = parts[1];
           // Check for array syntax (e.g., "security_ids[]")
           const is_array = field.endsWith('[]');
           if (is_array) {
