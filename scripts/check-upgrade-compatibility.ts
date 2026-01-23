@@ -10,18 +10,11 @@
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  */
 
-import { createHash } from 'crypto';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
-import { getDarsDir, loadDarsLock } from './dar-utils';
-
-/** Compute SHA256 hash of a file. */
-function computeFileHash(filePath: string): string {
-  const content = fs.readFileSync(filePath);
-  return createHash('sha256').update(content).digest('hex');
-}
+import { computeSha256, getDarsDir, loadDarsLock } from './dar-utils';
 
 const ROOT_DIR = path.join(__dirname, '..');
 
@@ -238,8 +231,8 @@ function main(): void {
         // Upgrade check passed - verify version was bumped if there are actual changes
         if (currentDar.version === mostRecentBackup.version) {
           // Same version - check if DAR contents actually changed
-          const currentHash = computeFileHash(currentDar.darPath);
-          const backupHash = computeFileHash(mostRecentBackup.darPath);
+          const currentHash = computeSha256(currentDar.darPath);
+          const backupHash = computeSha256(mostRecentBackup.darPath);
 
           if (currentHash !== backupHash) {
             // DAR changed but version wasn't bumped - fail CI
