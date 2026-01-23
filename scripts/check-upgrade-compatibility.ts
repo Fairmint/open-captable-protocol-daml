@@ -5,15 +5,23 @@
  * against the most recent backup for each package. Fails CI if:
  *
  * - Breaking changes are introduced without a major version bump
+ * - Compatible changes are made without bumping the minor version
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  */
 
+import { createHash } from 'crypto';
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
 import { getDarsDir, loadDarsLock } from './dar-utils';
+
+/** Compute SHA256 hash of a file. */
+function computeFileHash(filePath: string): string {
+  const content = fs.readFileSync(filePath);
+  return createHash('sha256').update(content).digest('hex');
+}
 
 const ROOT_DIR = path.join(__dirname, '..');
 
@@ -227,7 +235,32 @@ function main(): void {
       const result = runUpgradeCheck(mostRecentBackup.darPath, currentDar.darPath);
 
       if (result.success) {
-        console.log(`✅ ${currentPackageName}: Backwards compatible\n`);
+        // Upgrade check passed - verify version was bumped if there are actual changes
+        if (currentDar.version === mostRecentBackup.version) {
+          // Same version - check if DAR contents actually changed
+          const currentHash = computeFileHash(currentDar.darPath);
+          const backupHash = computeFileHash(mostRecentBackup.darPath);
+
+          if (currentHash !== backupHash) {
+            // DAR changed but version wasn't bumped - fail CI
+            console.error(`❌ ${currentPackageName}: Compatible changes detected but version not bumped!\n`);
+            console.error(`   Current DAR hash:  ${currentHash.slice(0, 16)}...`);
+            console.error(`   Backup DAR hash:   ${backupHash.slice(0, 16)}...`);
+            console.error('');
+            console.error('   To fix, bump the minor version:');
+            console.error(`   npm run upgrade-package -- --package ${baseName} --type minor\n`);
+            hasFailures = true;
+            checkedCount++;
+            continue;
+          }
+          // DAR is identical - no actual changes
+          console.log(`✅ ${currentPackageName} v${currentDar.version}: No changes from backup\n`);
+        } else {
+          // Version was bumped and upgrade-check passed - proper workflow
+          console.log(
+            `✅ ${currentPackageName}: Backwards compatible (v${mostRecentBackup.version} → v${currentDar.version})\n`
+          );
+        }
         checkedCount++;
         continue;
       }
