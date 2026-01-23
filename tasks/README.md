@@ -6,9 +6,6 @@
 
 | Task                                                                                                 | Date       | Summary                                                        |
 | ---------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------- |
-| [Types Module Splitting](./2026/01/2026.01.21-types-module-splitting.md)                             | 2026-01-21 | Split large Types.daml into domain-focused modules             |
-| [Test Helper Functions](./2026/01/2026.01.21-test-helper-functions.md)                               | 2026-01-21 | Create reusable test helpers to reduce boilerplate             |
-| [Validator Naming Consistency](./2026/01/2026.01.21-validator-naming-consistency.md)                 | 2026-01-21 | Standardize validator function naming patterns                 |
 | [Package Upgrade Directory Generation](./2026/01/2026.01.15-package-upgrade-directory-generation.md) | 2026-01-15 | Generate versioned directories at build time for cleaner diffs |
 | [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md)                     | 2026-01-15 | Automate releases via Git tags with CI deployments             |
 
@@ -17,6 +14,9 @@
 | Task                                                                                             | Date       | Summary                                                                  |
 | ------------------------------------------------------------------------------------------------ | ---------- | ------------------------------------------------------------------------ |
 | [Security ID Validation](./2026/01/2026.01.21-security-id-validation.md)                         | 2026-01-22 | Add security_id validation for tier 4 transactions                       |
+| [Validator Naming Consistency](./2026/01/2026.01.21-validator-naming-consistency.md)             | 2026-01-22 | Standardize validator function naming patterns                           |
+| [Types Module Splitting](./2026/01/2026.01.21-types-module-splitting.md)                         | 2026-01-22 | Split large Types.daml into domain-focused modules                       |
+| [Test Helper Functions](./2026/01/2026.01.21-test-helper-functions.md)                           | 2026-01-22 | Create reusable test helpers to reduce boilerplate                       |
 | [DAML Linting](./2026/01/2026.01.13-daml-linting.md)                                             | 2026-01-16 | Add `daml lint` to CI for DAML code quality                              |
 | [OCF Schema Field Completeness](./2026/01/2026.01.15-ocf-schema-field-completeness.md)           | 2026-01-15 | Add missing `option_grant_type` and fix `initial_shares_authorized` type |
 | [dpm Migration](./2026/01/2026.01.13-dpm-migration.md)                                           | 2026-01-13 | Migrate from deprecated `daml` CLI to `dpm`                              |

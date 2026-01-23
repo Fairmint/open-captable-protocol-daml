@@ -1,102 +1,317 @@
 module OpenCapTable.TestHelpers where
 
+import DA.Assert ((===), assertMsg)
 import Fairmint.OpenCapTable.OCF.Stakeholder
 import Fairmint.OpenCapTable.OCF.StockClass
 import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
-import Fairmint.OpenCapTable.Types (OcfStockClassType(..), OcfInitialSharesAuthorized(..), OcfMonetary(..), OcfCompensationType(..), OcfConvertibleType(..), OcfConversionTriggerType(..), OcfConvertibleConversionRight(..), OcfConvertibleConversionMechanism(..), OcfSAFEConversionMechanism(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..), OcfInitialSharesAuthorized(..))
+import Fairmint.OpenCapTable.Types.Compensation (OcfCompensationType(..))
+import Fairmint.OpenCapTable.Types.Convertible (OcfConvertibleType(..), OcfConversionTriggerType(..), OcfConvertibleConversionRight(..), OcfConvertibleConversionMechanism(..), OcfSAFEConversionMechanism(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
-import Daml.Script
 import qualified DA.Date as DA
 import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
 import DA.Time (time)
+
+-- =============================================================================
+-- DEFAULT DATA FACTORIES
+-- =============================================================================
+-- Functions that return valid default OCF data with sensible defaults.
+-- Use these to reduce boilerplate in tests that don't care about specific values.
+
+-- | Default initial shares authorized for test stock classes.
+-- Configurable constant to avoid magic numbers.
+defaultInitialSharesAuthorized : Decimal
+defaultInitialSharesAuthorized = 1_000_000.0
+
+-- | Returns valid StockClassOcfData with sensible defaults.
+-- Only the ID is required; all other fields use reasonable test values.
+--
+-- Example:
+--   let stockClass = defaultStockClass "SC_COMMON"
+--   let customClass = (defaultStockClass "SC_PREF") with class_type = OcfStockClassTypePreferred
+defaultStockClass : Text -> StockClassOcfData
+defaultStockClass classId = StockClassOcfData with
+  id = classId
+  name = "Common Stock"
+  class_type = OcfStockClassTypeCommon
+  default_id_prefix = "CS-"
+  initial_shares_authorized = OcfInitialSharesNumeric defaultInitialSharesAuthorized
+  votes_per_share = 1.0
+  seniority = 1.0
+  board_approval_date = None
+  stockholder_approval_date = None
+  par_value = None
+  price_per_share = None
+  liquidation_preference_multiple = None
+  participation_cap_multiple = None
+  conversion_rights = []
+  comments = []
+
+-- | Returns valid StakeholderOcfData with sensible defaults.
+-- Provide ID and name; all other fields use reasonable test values.
+--
+-- Example:
+--   let stakeholder = defaultStakeholder "SH-1" "Alice"
+--   let employee = (defaultStakeholder "SH-2" "Bob") with current_relationships = [OcfRelEmployee]
+defaultStakeholder : Text -> Text -> StakeholderOcfData
+defaultStakeholder stakeholderId legalName = StakeholderOcfData with
+  id = stakeholderId
+  name = OcfName with legal_name = legalName, first_name = None, last_name = None
+  stakeholder_type = OcfStakeholderTypeIndividual
+  issuer_assigned_id = None
+  current_relationships = []
+  current_status = None
+  primary_contact = None
+  contact_info = None
+  addresses = []
+  tax_ids = []
+  comments = []
+
+-- | Default date for test data (2024-01-01).
+-- Extracted as a constant to make it easy to update if needed.
+defaultTestDate : Time
+defaultTestDate = DT.time (DA.date 2024 Jan 01) 0 0 0
+
+-- | Default stock legend IDs for test issuances.
+-- Using "L1" as a placeholder - tests should override if specific legends matter.
+defaultStockLegendIds : [Text]
+defaultStockLegendIds = ["L1"]
+
+-- | Returns valid StockIssuanceOcfData with sensible defaults.
+-- Provide IDs for the issuance, security, stakeholder, and stock class.
+--
+-- Example:
+--   let issuance = defaultStockIssuance "TX_1" "SEC-1" "SH-1" "SC_COMMON"
+--   let largeIssuance = (defaultStockIssuance "TX_2" "SEC-2" "SH-1" "SC_COMMON") with quantity = 10000.0
+defaultStockIssuance : Text -> Text -> Text -> Text -> StockIssuanceOcfData
+defaultStockIssuance issuanceId securityId stakeholderId stockClassId = StockIssuanceOcfData with
+  id = issuanceId
+  date = defaultTestDate
+  security_id = securityId
+  custom_id = "CERT-" <> issuanceId
+  stakeholder_id = stakeholderId
+  board_approval_date = None
+  stockholder_approval_date = None
+  consideration_text = None
+  security_law_exemptions = []
+  stock_class_id = stockClassId
+  stock_plan_id = None
+  share_numbers_issued = []
+  share_price = OcfMonetary with amount = 1.0, currency = "USD"
+  quantity = 100.0
+  vesting_terms_id = None
+  vestings = []
+  cost_basis = None
+  stock_legend_ids = defaultStockLegendIds
+  issuance_type = None
+  comments = []
+
+-- =============================================================================
+-- SETUP COMBINATORS
+-- =============================================================================
+-- Functions that set up common test scenarios by creating prerequisite objects.
+-- These return the updated cap table ID along with created object IDs.
+
+-- | Default stock class ID used in setup helpers.
+defaultStockClassId : Text
+defaultStockClassId = "SC_COMMON"
+
+-- | Default stakeholder ID used in setup helpers.
+defaultStakeholderId : Text
+defaultStakeholderId = "SH-1"
+
+-- | Create a stock class with default values and return updated cap table + class ID.
+--
+-- Example:
+--   (capTable', classId) <- setupStockClass issuer capTable
+setupStockClass : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable, Text)
+setupStockClass issuer capTable = setupStockClassWithId issuer capTable defaultStockClassId
+
+-- | Create a stock class with a custom ID.
+--
+-- Example:
+--   (capTable', classId) <- setupStockClassWithId issuer capTable "SC_PREFERRED"
+setupStockClassWithId : Party -> ContractId CT.CapTable -> Text -> Script (ContractId CT.CapTable, Text)
+setupStockClassWithId issuer capTable classId = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass (defaultStockClass classId)]
+      edits = []
+      deletes = []
+  pure (result.updatedCapTableCid, classId)
+
+-- | Create a stock class with custom data.
+--
+-- Example:
+--   let customClass = (defaultStockClass "SC_PREF") with class_type = OcfStockClassTypePreferred
+--   (capTable', classId) <- setupStockClassWith issuer capTable customClass
+setupStockClassWith : Party -> ContractId CT.CapTable -> StockClassOcfData -> Script (ContractId CT.CapTable, Text)
+setupStockClassWith issuer capTable stockClassData = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass stockClassData]
+      edits = []
+      deletes = []
+  pure (result.updatedCapTableCid, stockClassData.id)
+
+-- | Create a stakeholder with default values and return updated cap table + stakeholder ID.
+--
+-- Example:
+--   (capTable', stakeholderId) <- setupStakeholder issuer capTable "Alice"
+setupStakeholder : Party -> ContractId CT.CapTable -> Text -> Script (ContractId CT.CapTable, Text)
+setupStakeholder issuer capTable name = do
+  let stakeholderId = "SH_" <> name
+  setupStakeholderWith issuer capTable (defaultStakeholder stakeholderId name)
+
+-- | Create a stakeholder with a specific ID.
+--
+-- Example:
+--   (capTable', stakeholderId) <- setupStakeholderWithId issuer capTable "SH-123" "Alice"
+setupStakeholderWithId : Party -> ContractId CT.CapTable -> Text -> Text -> Script (ContractId CT.CapTable, Text)
+setupStakeholderWithId issuer capTable stakeholderId name = do
+  setupStakeholderWith issuer capTable (defaultStakeholder stakeholderId name)
+
+-- | Create a stakeholder with custom data.
+--
+-- Example:
+--   let employee = (defaultStakeholder "SH-1" "Bob") with current_relationships = [OcfRelEmployee]
+--   (capTable', shId) <- setupStakeholderWith issuer capTable employee
+setupStakeholderWith : Party -> ContractId CT.CapTable -> StakeholderOcfData -> Script (ContractId CT.CapTable, Text)
+setupStakeholderWith issuer capTable stakeholderData = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateStakeholder stakeholderData]
+      edits = []
+      deletes = []
+  pure (result.updatedCapTableCid, stakeholderData.id)
+
+-- | Combined setup: Create stock class + stakeholder for issuance tests.
+-- Returns (updatedCapTable, stockClassId, stakeholderId)
+--
+-- Example:
+--   (capTable', classId, stakeholderId) <- setupForStockIssuance issuer capTable
+setupForStockIssuance : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable, Text, Text)
+setupForStockIssuance issuer capTable = setupForStockIssuanceNamed issuer capTable "Test Holder"
+
+-- | Combined setup with custom stakeholder name.
+--
+-- Example:
+--   (capTable', classId, stakeholderId) <- setupForStockIssuanceNamed issuer capTable "Alice"
+setupForStockIssuanceNamed : Party -> ContractId CT.CapTable -> Text -> Script (ContractId CT.CapTable, Text, Text)
+setupForStockIssuanceNamed issuer capTable holderName = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClass (defaultStockClass defaultStockClassId)
+        , CT.OcfCreateStakeholder (defaultStakeholder defaultStakeholderId holderName)
+        ]
+      edits = []
+      deletes = []
+  pure (result.updatedCapTableCid, defaultStockClassId, defaultStakeholderId)
+
+-- =============================================================================
+-- CREATE HELPERS
+-- =============================================================================
+-- Functions that perform common create operations on the cap table.
+
+-- | Default ID prefixes for generated test data.
+-- Configurable constants to avoid magic strings.
+defaultTransactionIdPrefix : Text
+defaultTransactionIdPrefix = "TX_"
+
+defaultSecurityIdPrefix : Text
+defaultSecurityIdPrefix = "SEC_"
+
+-- | Create a stock issuance with default values.
+-- Returns updated cap table.
+--
+-- Example:
+--   capTable' <- createStockIssuance issuer capTable "SC_COMMON" "SH-1"
+createStockIssuance : Party -> ContractId CT.CapTable -> Text -> Text -> Script (ContractId CT.CapTable)
+createStockIssuance issuer capTable stockClassId stakeholderId = do
+  let issuanceId = defaultTransactionIdPrefix <> stakeholderId
+  let securityId = defaultSecurityIdPrefix <> stakeholderId
+  createStockIssuanceWith issuer capTable (defaultStockIssuance issuanceId securityId stakeholderId stockClassId)
+
+-- | Create a stock issuance with custom data.
+-- Returns updated cap table.
+--
+-- Example:
+--   let issuance = (defaultStockIssuance "TX_1" "SEC-1" "SH-1" "SC_COMMON") with quantity = 500.0
+--   capTable' <- createStockIssuanceWith issuer capTable issuance
+createStockIssuanceWith : Party -> ContractId CT.CapTable -> StockIssuanceOcfData -> Script (ContractId CT.CapTable)
+createStockIssuanceWith issuer capTable issuanceData = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuanceData]
+      edits = []
+      deletes = []
+  pure result.updatedCapTableCid
+
+-- | Create a stock issuance and return both cap table and result for further testing.
+--
+-- Example:
+--   (capTable', result) <- createStockIssuanceWithResult issuer capTable issuanceData
+createStockIssuanceWithResult : Party -> ContractId CT.CapTable -> StockIssuanceOcfData -> Script (ContractId CT.CapTable, CT.UpdateCapTableResult)
+createStockIssuanceWithResult issuer capTable issuanceData = do
+  result <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuanceData]
+      edits = []
+      deletes = []
+  pure (result.updatedCapTableCid, result)
+
+-- =============================================================================
+-- ASSERTION HELPERS
+-- =============================================================================
+-- Functions for common test assertions.
+
+-- | Assert that a batch operation created exactly N objects.
+--
+-- Example:
+--   result <- submit issuer do exerciseCmd capTable CT.UpdateCapTable with ...
+--   assertCreatedCount 3 result
+assertCreatedCount : Int -> CT.UpdateCapTableResult -> Script ()
+assertCreatedCount expected result =
+  assertMsg ("Expected " <> show expected <> " created objects, but got " <> show (length result.createdCids)) $
+    length result.createdCids == expected
+
+-- | Assert update succeeded and return cap table for chaining.
+-- This is useful when you want to verify success and continue testing.
+--
+-- Example:
+--   capTable' <- assertUpdateSuccess result
+assertUpdateSuccess : CT.UpdateCapTableResult -> Script (ContractId CT.CapTable)
+assertUpdateSuccess result = pure result.updatedCapTableCid
+
+-- =============================================================================
+-- LEGACY HELPERS (for backwards compatibility)
+-- =============================================================================
+-- These are the original helper functions, kept for backwards compatibility.
 
 -- Helper to add a default stakeholder (required for issuance validations)
 addDefaultStakeholder : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
 addDefaultStakeholder issuer capTableCid = do
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStakeholder StakeholderOcfData with
-        id = "SH-1"
-        name = OcfName with legal_name = "Test Holder", first_name = None, last_name = None
-        stakeholder_type = OcfStakeholderTypeIndividual
-        issuer_assigned_id = None
-        current_relationships = []
-        current_status = None
-        primary_contact = None
-        contact_info = None
-        addresses = []
-        tax_ids = []
-        comments = []]
-      edits = []
-      deletes = []
-  pure result.updatedCapTableCid
+  (updatedCid, _) <- setupStakeholderWithId issuer capTableCid defaultStakeholderId "Test Holder"
+  pure updatedCid
 
 -- Helper to add a default stock class (required for stock issuance validations)
 addDefaultStockClass : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
 addDefaultStockClass issuer capTableCid = do
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
-        id = "SC_COMMON"
-        name = "Common"
-        class_type = OcfStockClassTypeCommon
-        default_id_prefix = "CS-"
-        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
-        votes_per_share = 1.0
-        seniority = 1.0
-        board_approval_date = None
-        stockholder_approval_date = None
-        par_value = None
-        price_per_share = None
-        liquidation_preference_multiple = None
-        participation_cap_multiple = None
-        conversion_rights = []
-        comments = []]
-      edits = []
-      deletes = []
-  pure result.updatedCapTableCid
+  (updatedCid, _) <- setupStockClass issuer capTableCid
+  pure updatedCid
 
 -- Helper to add both stakeholder and stock class (common setup for stock issuances)
 addPrerequisites : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
 addPrerequisites issuer capTableCid = do
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStakeholder StakeholderOcfData with
-            id = "SH-1"
-            name = OcfName with legal_name = "Test Holder", first_name = None, last_name = None
-            stakeholder_type = OcfStakeholderTypeIndividual
-            issuer_assigned_id = None
-            current_relationships = []
-            current_status = None
-            primary_contact = None
-            contact_info = None
-            addresses = []
-            tax_ids = []
-            comments = []
-        , CT.OcfCreateStockClass StockClassOcfData with
-            id = "SC_COMMON"
-            name = "Common"
-            class_type = OcfStockClassTypeCommon
-            default_id_prefix = "CS-"
-            initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
-            votes_per_share = 1.0
-            seniority = 1.0
-            board_approval_date = None
-            stockholder_approval_date = None
-            par_value = None
-            price_per_share = None
-            liquidation_preference_multiple = None
-            participation_cap_multiple = None
-            conversion_rights = []
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure result.updatedCapTableCid
+  (updatedCid, _, _) <- setupForStockIssuance issuer capTableCid
+  pure updatedCid
 
 -- =============================================================================
 -- ISSUANCE HELPERS
@@ -106,7 +321,6 @@ addPrerequisites issuer capTableCid = do
 -- which require a valid security_id to reference.
 
 -- Helper to add a stock issuance (requires stakeholder and stock class)
--- Returns the cap table and the security_id used
 addStockIssuance : Party -> ContractId CT.CapTable -> Text -> Text -> Text -> Text -> Script (ContractId CT.CapTable)
 addStockIssuance issuer capTableCid issuanceId securityId stakeholderId stockClassId = do
   result <- submit issuer do
@@ -138,7 +352,7 @@ addStockIssuance issuer capTableCid issuanceId securityId stakeholderId stockCla
 
 -- Helper to add a default stock issuance with standard test values
 addDefaultStockIssuance : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
-addDefaultStockIssuance issuer capTableCid = 
+addDefaultStockIssuance issuer capTableCid =
   addStockIssuance issuer capTableCid "STOCK-ISS-1" "SEC-STOCK-1" "SH-1" "SC_COMMON"
 
 -- Helper to add an equity compensation issuance (requires stakeholder)
@@ -174,7 +388,7 @@ addEquityCompensationIssuance issuer capTableCid issuanceId securityId stakehold
 
 -- Helper to add a default equity compensation issuance with standard test values
 addDefaultEquityCompensationIssuance : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
-addDefaultEquityCompensationIssuance issuer capTableCid = 
+addDefaultEquityCompensationIssuance issuer capTableCid =
   addEquityCompensationIssuance issuer capTableCid "EC-ISS-1" "SEC-EC-1" "SH-1"
 
 -- Helper to add a warrant issuance (requires stakeholder)
@@ -207,7 +421,7 @@ addWarrantIssuance issuer capTableCid issuanceId securityId stakeholderId = do
 
 -- Helper to add a default warrant issuance with standard test values
 addDefaultWarrantIssuance : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
-addDefaultWarrantIssuance issuer capTableCid = 
+addDefaultWarrantIssuance issuer capTableCid =
   addWarrantIssuance issuer capTableCid "WR-ISS-1" "SEC-WR-1" "SH-1"
 
 -- Helper to add a convertible issuance (requires stakeholder)
@@ -255,16 +469,13 @@ addConvertibleIssuance issuer capTableCid issuanceId securityId stakeholderId = 
 
 -- Helper to add a default convertible issuance with standard test values
 addDefaultConvertibleIssuance : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
-addDefaultConvertibleIssuance issuer capTableCid = 
+addDefaultConvertibleIssuance issuer capTableCid =
   addConvertibleIssuance issuer capTableCid "CV-ISS-1" "SEC-CV-1" "SH-1"
 
 -- Helper to add all prerequisites and all issuance types with their known security_ids
--- This is useful for integration tests that need multiple security types
 addFullTestSetup : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
 addFullTestSetup issuer capTableCid = do
-  -- Add stakeholder and stock class
   capTableCid <- addPrerequisites issuer capTableCid
-  -- Add issuances of each type
   capTableCid <- addDefaultStockIssuance issuer capTableCid
   capTableCid <- addDefaultEquityCompensationIssuance issuer capTableCid
   capTableCid <- addDefaultWarrantIssuance issuer capTableCid
