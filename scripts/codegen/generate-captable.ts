@@ -30,6 +30,8 @@ interface Validation {
   or_maps?: boolean;
   // Pre-computed DAML OR expression (e.g., "isSome (Map.lookup d.security_id maps.map1) || isSome ...")
   or_expression?: string;
+  // Pre-computed DAML OR expression for array lookups (uses secId from mapA_ lambda)
+  array_or_expression?: string;
   // For array field validation (validates each element in the array)
   is_array?: boolean;
 }
@@ -193,14 +195,17 @@ function discoverTypes(config: Config): TypeDef[] {
               );
               process.exit(1);
             }
-            // Pre-compute the DAML OR expression
+            // Pre-compute the DAML OR expression for scalar lookups
             const or_expression = maps.map((m) => `isSome (Map.lookup d.${field} maps.${m})`).join(' || ');
+            // Pre-compute the DAML OR expression for array lookups (uses secId from mapA_ lambda)
+            const array_or_expression = maps.map((m) => `isSome (Map.lookup secId maps.${m})`).join(' || ');
             return {
               field,
               map: maps[0], // Default map (not used when or_maps is true)
               error: `Security not found`,
               or_maps: true,
               or_expression,
+              array_or_expression,
               is_array,
             };
           }
