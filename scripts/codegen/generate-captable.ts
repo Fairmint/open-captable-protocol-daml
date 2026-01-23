@@ -178,6 +178,12 @@ function discoverTypes(config: Config): TypeDef[] {
           // Check for OR-based multiple maps (e.g., "map1|map2|map3")
           if (mapSpec.includes('|')) {
             const maps = mapSpec.split('|');
+            if (maps.length !== 3) {
+              console.error(
+                `  ERROR: OR-based validation for "${field}" in "${name}" must specify exactly 3 maps, got ${maps.length}: "${mapSpec}"`
+              );
+              process.exit(1);
+            }
             return {
               field,
               map: maps[0], // Default map (not used when or_maps is true)
