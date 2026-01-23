@@ -19,7 +19,7 @@ import { computeSha256, getDarsDir, loadDarsLock } from './dar-utils';
 const ROOT_DIR = path.join(__dirname, '..');
 
 /**
- * Extract the base name and major version from a package name. E.g., "OpenCapTable-v29" => { baseName: "OpenCapTable",
+ * Extract the base name and major version from a package name. E.g., "OpenCapTable-v30" => { baseName: "OpenCapTable",
  * majorVersion: 29 }
  */
 function parsePackageName(name: string): { baseName: string; majorVersion: number | null } {
@@ -35,11 +35,11 @@ function getBackedUpPackages(): Map<string, Array<{ packageName: string; version
   const lock = loadDarsLock();
   const darsDir = getDarsDir();
 
-  // Group by exact package name (e.g., "OpenCapTable-v29")
+  // Group by exact package name (e.g., "OpenCapTable-v30")
   const byPackageName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
 
   for (const [lockKey, _entry] of Object.entries(lock.packages)) {
-    // lockKey format: "OpenCapTable-v29/0.0.1/OpenCapTable-v29.dar"
+    // lockKey format: "OpenCapTable-v30/0.0.1/OpenCapTable-v30.dar"
     const parts = lockKey.split('/');
     if (parts.length !== 3) continue;
 

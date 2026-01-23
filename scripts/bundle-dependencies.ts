@@ -6,7 +6,7 @@ import { getErrorMessage, type PackageJson } from './types';
 
 // Paths
 const PACKAGE_DIRS = [
-  path.join(__dirname, '../generated/js/OpenCapTable-v29-0.0.1'),
+  path.join(__dirname, '../generated/js/OpenCapTable-v30-0.0.1'),
   path.join(__dirname, '../generated/js/OpenCapTableReports-v01-0.0.2'),
   path.join(__dirname, '../generated/js/CantonPayments-0.0.32'),
 ];

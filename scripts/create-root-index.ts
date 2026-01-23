@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 
 const ROOT_DIR = path.join(__dirname, '..');
-const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTable-v29-0.0.1');
+const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTable-v30-0.0.1');
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'OpenCapTableReports-v01-0.0.2');
 const SUBSCRIPTIONS_DIR = path.join(ROOT_DIR, 'generated', 'js', 'CantonPayments-0.0.32');
 const OCP_LIB = path.join(OCP_DIR, 'lib');
