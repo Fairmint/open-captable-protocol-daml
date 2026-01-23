@@ -6,6 +6,7 @@
 
 | Task                                                                                                 | Date       | Summary                                                        |
 | ---------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------- |
+| [CI Backwards Compatibility](./2026/01/2026.01.16-ci-backwards-compatibility.md)                     | 2026-01-16 | Fail CI if changes break upgrade compatibility                 |
 | [Security ID Validation](./2026/01/2026.01.21-security-id-validation.md)                             | 2026-01-21 | Add security_id validation for tier 4 transactions             |
 | [Package Upgrade Directory Generation](./2026/01/2026.01.15-package-upgrade-directory-generation.md) | 2026-01-15 | Generate versioned directories at build time for cleaner diffs |
 | [GitHub Tag Release Process](./2026/01/2026.01.15-github-tag-release-process.md)                     | 2026-01-15 | Automate releases via Git tags with CI deployments             |
