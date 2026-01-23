@@ -26,7 +26,22 @@ interface Validation {
   field: string;
   map: string;
   error: string;
+  // For OR-based lookups across multiple maps
+  or_maps?: boolean;
+  firstMap?: string;
+  secondMap?: string;
+  thirdMap?: string;
+  // For array field validation (validates each element in the array)
+  is_array?: boolean;
 }
+
+// Maps issuance type names to their security_id index map names
+const SECURITY_ID_INDEX_MAPS: Record<string, string> = {
+  ConvertibleIssuance: 'convertible_issuances_by_security_id',
+  EquityCompensationIssuance: 'equity_compensation_issuances_by_security_id',
+  StockIssuance: 'stock_issuances_by_security_id',
+  WarrantIssuance: 'warrant_issuances_by_security_id',
+};
 
 interface TypeDef {
   name: string;
@@ -36,6 +51,8 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
+  security_id_index_map: string | null;
 }
 
 const REPO_ROOT = process.cwd();
@@ -153,11 +170,55 @@ function discoverTypes(config: Config): TypeDef[] {
       data_param: typeInfo.fieldName,
       map_field: pluralize(snakeName),
       tier,
-      validations: validationFields.map((field) => ({
-        field,
-        map: pluralize(toSnakeCase(field.replace('_id', ''))),
-        error: `${toTitleCase(field)} not found`,
-      })),
+      validations: validationFields.map((fieldSpec) => {
+        // Support four formats:
+        // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
+        // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
+        // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
+        // - Array: "security_ids[]:stock_issuances_by_security_id" -> field: security_ids, validates each element in array
+        if (fieldSpec.includes(':')) {
+          const parts = fieldSpec.split(':');
+          let field = parts[0];
+          const mapSpec = parts[1];
+          // Check for array syntax (e.g., "security_ids[]")
+          const is_array = field.endsWith('[]');
+          if (is_array) {
+            field = field.slice(0, -2); // Remove [] suffix
+          }
+          // Check for OR-based multiple maps (e.g., "map1|map2|map3")
+          if (mapSpec.includes('|')) {
+            const maps = mapSpec.split('|');
+            if (maps.length !== 3) {
+              console.error(
+                `  ERROR: OR-based validation for "${field}" in "${name}" must specify exactly 3 maps, got ${maps.length}: "${mapSpec}"`
+              );
+              process.exit(1);
+            }
+            return {
+              field,
+              map: maps[0], // Default map (not used when or_maps is true)
+              error: `Security not found`,
+              or_maps: true,
+              firstMap: maps[0],
+              secondMap: maps[1],
+              thirdMap: maps[2],
+              is_array,
+            };
+          }
+          return {
+            field,
+            map: mapSpec,
+            error: `Security not found`,
+            is_array,
+          };
+        }
+        return {
+          field: fieldSpec,
+          map: pluralize(toSnakeCase(fieldSpec.replace('_id', ''))),
+          error: `${toTitleCase(fieldSpec)} not found`,
+        };
+      }),
+      security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
     types.push(typeDef);
