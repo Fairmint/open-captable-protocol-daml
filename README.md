@@ -2,7 +2,7 @@
 
 ## AI context
 
-- **Start here**: `llms.txt`
+- **Start here**: `AGENTS.md`
 - **Docs folder**: `docs/README.md` (optional; keep minimal)
 
 This repository contains multiple DAML packages (e.g., `OpenCapTable-v30`,
