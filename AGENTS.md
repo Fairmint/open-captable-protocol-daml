@@ -4,7 +4,7 @@
 
 ## Shared Conventions
 
-See [canton/llms.txt](https://github.com/fairmint/canton/blob/main/llms.txt#shared-conventions-all-fairmint-repos) for PR workflow, git workflow, dependencies, non-negotiables, and Linear integration.
+See [canton/AGENTS.md](https://github.com/fairmint/canton/blob/main/AGENTS.md#shared-conventions-all-fairmint-repos) for PR workflow, git workflow, dependencies, non-negotiables, and Linear integration.
 
 ## Quick Commands
 
@@ -68,7 +68,7 @@ export PATH="$HOME/.dpm/bin:$PATH"
 
 All OCF object types are implemented. See [ADR-001](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md) for architecture and excluded/deprecated types.
 
-**Tasks:** Tracked in [Linear](https://linear.app/fairmint) under the **Eng** team. See [canton/llms.txt](https://github.com/fairmint/canton/blob/main/llms.txt#linear-integration) for Linear workflow.
+**Tasks:** Tracked in [Linear](https://linear.app/fairmint) under the **Eng** team. See [canton/AGENTS.md](https://github.com/fairmint/canton/blob/main/AGENTS.md#linear-integration) for Linear workflow.
 
 ### Verifying Changes
 
@@ -364,13 +364,48 @@ When adding or modifying contract creation scripts (e.g., `create-*-factory.ts`)
 - Network-specific party IDs
 - Script location and output files
 
+---
+
+## PR Review Format
+
+When writing PR reviews, use this format:
+
+1. **Issues and improvements first** — Call out any problems, bugs, or suggested improvements at the
+   top, outside any collapsed sections. This is the only feedback reviewers need to see immediately.
+   - **Issue**: Something that should be fixed — bugs, security problems, incorrect logic,
+     violations of project standards
+   - **Improvement**: Something that could be better — performance, readability, maintainability,
+     edge cases
+
+2. **Collapse the rest** — Put the full analysis and any positive remarks inside a collapsed
+   `<details>` section:
+
+```markdown
+## Issues
+
+- **[File:Line]** Description of issue or improvement
+
+---
+
+<details>
+<summary>Full Analysis</summary>
+
+... detailed analysis, positive remarks, etc. ...
+
+</details>
+```
+
+Keep the visible portion brief and actionable. The collapsed section is for context if needed.
+
+---
+
 ## Related Repos
 
 | Repo | Purpose | Docs |
 |------|---------|------|
-| `canton` | Trading infrastructure, ADRs, **party configuration** | `llms.txt`, `docs/contract-party-configuration.md` |
-| `canton-explorer` | Next.js explorer UI | `llms.txt`, [cantonops.fairmint.com](https://cantonops.fairmint.com/) |
-| `canton-fairmint-sdk` | Shared TypeScript utilities | `llms.txt` |
-| `canton-node-sdk` | Low-level Canton client | `llms.txt`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
-| `ocp-canton-sdk` | High-level OCP TypeScript SDK | `llms.txt`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
-| `ocp-position-nft` | Soulbound NFT smart contracts | `llms.txt` |
+| `canton` | Trading infrastructure, ADRs, **party configuration** | `AGENTS.md`, `docs/contract-party-configuration.md` |
+| `canton-explorer` | Next.js explorer UI | `AGENTS.md`, [cantonops.fairmint.com](https://cantonops.fairmint.com/) |
+| `canton-fairmint-sdk` | Shared TypeScript utilities | `AGENTS.md` |
+| `canton-node-sdk` | Low-level Canton client | `AGENTS.md`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
+| `ocp-canton-sdk` | High-level OCP TypeScript SDK | `AGENTS.md`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
+| `ocp-position-nft` | Soulbound NFT smart contracts | `AGENTS.md` |
