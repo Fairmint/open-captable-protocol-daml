@@ -4,7 +4,9 @@
 
 ## Shared Conventions
 
-See [canton/llms.txt](https://github.com/fairmint/canton/blob/main/llms.txt#shared-conventions-all-fairmint-repos) for PR workflow, git workflow, dependencies, non-negotiables, and Linear integration.
+See
+[canton/AGENTS.md](https://github.com/fairmint/canton/blob/main/AGENTS.md#shared-conventions-all-fairmint-repos)
+for PR workflow, git workflow, dependencies, non-negotiables, and Linear integration.
 
 ## Quick Commands
 
@@ -28,14 +30,17 @@ npx tsx scripts/create-ocp-factory.ts --network mainnet
 
 ## Build Tooling (dpm)
 
-This repo uses **dpm** (Digital Asset Package Manager) for DAML builds. The `daml` CLI is deprecated.
+This repo uses **dpm** (Digital Asset Package Manager) for DAML builds. The `daml` CLI is
+deprecated.
 
 **Key points:**
+
 - `dpm build` automatically handles multi-package dependencies via `multi-package.yaml`
 - Running `dpm build` from any package directory builds all dependencies first
 - `dpm` is installed to `~/.dpm/bin` (add to PATH)
 
 **Direct dpm commands** (if not using npm scripts):
+
 ```bash
 dpm build              # Build current package + dependencies
 dpm test               # Run tests
@@ -44,6 +49,7 @@ dpm clean              # Clean build artifacts
 ```
 
 **Installation:**
+
 ```bash
 curl https://get.digitalasset.com/install/install.sh | sh
 export PATH="$HOME/.dpm/bin:$PATH"
@@ -51,28 +57,33 @@ export PATH="$HOME/.dpm/bin:$PATH"
 
 ## Repo Structure
 
-| Directory | Purpose |
-|-----------|---------|
-| `OpenCapTable-v28/` | Core OCF contracts (current) |
-| `OpenCapTableReports-v01/` | Reports |
-| `OpenCapTableProofOfOwnership-v01/` | Proof of ownership |
-| `Shared/` | Shared helpers/types |
-| `CantonPayments/` | Payment streams |
-| `CouponMinter/` | Coupon minting contracts |
-| `Test/` | DAML Script tests |
-| `scripts/` | TypeScript deployment scripts |
-| `dars/` | Backed-up DAR files for mainnet deployments |
-| `docs/releases/` | Release documentation |
+| Directory                           | Purpose                                     |
+| ----------------------------------- | ------------------------------------------- |
+| `OpenCapTable-v28/`                 | Core OCF contracts (current)                |
+| `OpenCapTableReports-v01/`          | Reports                                     |
+| `OpenCapTableProofOfOwnership-v01/` | Proof of ownership                          |
+| `Shared/`                           | Shared helpers/types                        |
+| `CantonPayments/`                   | Payment streams                             |
+| `CouponMinter/`                     | Coupon minting contracts                    |
+| `Test/`                             | DAML Script tests                           |
+| `scripts/`                          | TypeScript deployment scripts               |
+| `dars/`                             | Backed-up DAR files for mainnet deployments |
+| `docs/releases/`                    | Release documentation                       |
 
 ## Implementation Status
 
-All OCF object types are implemented. See [ADR-001](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md) for architecture and excluded/deprecated types.
+All OCF object types are implemented. See
+[ADR-001](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md)
+for architecture and excluded/deprecated types.
 
-**Tasks:** Tracked in [Linear](https://linear.app/fairmint) under the **Eng** team. See [canton/llms.txt](https://github.com/fairmint/canton/blob/main/llms.txt#linear-integration) for Linear workflow.
+**Tasks:** Tracked in [Linear](https://linear.app/fairmint) under the **Eng** team. See
+[canton/AGENTS.md](https://github.com/fairmint/canton/blob/main/AGENTS.md#linear-integration) for
+Linear workflow.
 
 ### Verifying Changes
 
 Before submitting a PR, verify by running:
+
 ```bash
 npm run build    # All packages must build
 npm run test     # All tests must pass
@@ -84,16 +95,19 @@ npm run test     # All tests must pass
 
 Use these status values consistently across all ADR documents:
 
-| Status | Meaning |
-|--------|---------|
-| **Proposed** | Design under discussion, not yet approved |
+| Status          | Meaning                                                       |
+| --------------- | ------------------------------------------------------------- |
+| **Proposed**    | Design under discussion, not yet approved                     |
 | **Implemented** | Design approved AND supporting code/contracts are implemented |
 
-Skip "Accepted" as an intermediate state—go directly from "Proposed" to "Implemented" when the implementation is complete.
+Skip "Accepted" as an intermediate state—go directly from "Proposed" to "Implemented" when the
+implementation is complete.
 
 ## DAML Coding Standards
 
-Write tight, concise, easy-to-read DAML code. **Fail fast** on invalid inputs. Code should be self-documenting—only add comments when they provide value beyond what the code itself conveys (e.g., explaining *why* something is done, not *what* it does).
+Write tight, concise, easy-to-read DAML code. **Fail fast** on invalid inputs. Code should be
+self-documenting—only add comments when they provide value beyond what the code itself conveys
+(e.g., explaining _why_ something is done, not _what_ it does).
 
 ### Style
 
@@ -119,7 +133,8 @@ Write tight, concise, easy-to-read DAML code. **Fail fast** on invalid inputs. C
 
 ### Module Header
 
-Every template file must have a header comment after the module declaration linking to the OCF schema:
+Every template file must have a header comment after the module declaration linking to the OCF
+schema:
 
 ```daml
 module Fairmint.OpenCapTable.ConvertibleCancellation where
@@ -148,11 +163,15 @@ data Example = Example with
 
 ## Architecture
 
-See [canton/docs/developer/adr/001-ocf-captable-on-canton.md](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md) for detailed decisions.
+See
+[canton/docs/developer/adr/001-ocf-captable-on-canton.md](https://github.com/fairmint/canton/blob/main/docs/developer/adr/001-ocf-captable-on-canton.md)
+for detailed decisions.
 
-**Contract diagrams**: See [docs/OCP_CONTRACT_DIAGRAM.md](docs/OCP_CONTRACT_DIAGRAM.md) for visual Mermaid diagrams of the contract hierarchy and flow.
+**Contract diagrams**: See [docs/OCP_CONTRACT_DIAGRAM.md](docs/OCP_CONTRACT_DIAGRAM.md) for visual
+Mermaid diagrams of the contract hierarchy and flow.
 
 **Diagram maintenance**: Update `docs/OCP_CONTRACT_DIAGRAM.md` when:
+
 - Adding new OCF object types or transactions
 - Changing the contract hierarchy or relationships
 - Modifying validation patterns or signatories
@@ -184,6 +203,7 @@ npm run build               # Also runs codegen before building
 ### Config Structure
 
 `captable-config.yaml` defines:
+
 - **validations** - Reference validation rules (e.g., stakeholder_id → stakeholders map)
 - **tiers** - Processing order for batch operations (dependency ordering)
 
@@ -191,9 +211,9 @@ npm run build               # Also runs codegen before building
 validations:
   StockIssuance: [stakeholder_id, stock_class_id]
 tiers:
-  1: [Stakeholder, StockClass, ...]     # Create first
-  2: [Valuation, ...]                    # Depends on tier 1
-  3: [StockIssuance, ...]               # Depends on tier 1 & 2
+  1: [Stakeholder, StockClass, ...] # Create first
+  2: [Valuation, ...] # Depends on tier 1
+  3: [StockIssuance, ...] # Depends on tier 1 & 2
 ```
 
 ### DAML Sum Types
@@ -229,7 +249,10 @@ choice CreateFoo : ContractId CapTable
 
 ### Adding New Types
 
-**Before adding a type to `Types.daml`, search the codebase for existing definitions.** Some types like `OcfStakeholderStatusType` are defined in their primary module (e.g., `Stakeholder.daml`) rather than `Types.daml`. Duplicating a type with different constructor names creates incompatible types.
+**Before adding a type to `Types.daml`, search the codebase for existing definitions.** Some types
+like `OcfStakeholderStatusType` are defined in their primary module (e.g., `Stakeholder.daml`)
+rather than `Types.daml`. Duplicating a type with different constructor names creates incompatible
+types.
 
 ```bash
 # Check if type already exists
@@ -240,10 +263,13 @@ grep -r "data OcfYourType" OpenCapTable-v26/daml/
 
 ### Major vs Minor Upgrades
 
-- **Major upgrade** (breaking change): Creates new package directory (e.g., `OpenCapTable-v27` → `OpenCapTable-v28`)
+- **Major upgrade** (breaking change): Creates new package directory (e.g., `OpenCapTable-v27` →
+  `OpenCapTable-v28`)
 - **Minor upgrade** (non-breaking): Increments patch version (e.g., `0.0.1` → `0.0.2`)
 
-> **AI agents:** Never perform a major version upgrade without explicit instructions from the user. Major upgrades introduce breaking changes and require manual coordination with downstream consumers.
+> **AI agents:** Never perform a major version upgrade without explicit instructions from the user.
+> Major upgrades introduce breaking changes and require manual coordination with downstream
+> consumers.
 
 ### Upgrade Script
 
@@ -254,6 +280,7 @@ npm run upgrade-package -- --package OpenCapTable --type major
 ```
 
 This will:
+
 1. Rename folder (e.g., `OpenCapTable-v27/` → `OpenCapTable-v28/`)
 2. Update `daml.yaml` (name and version reset to `0.0.1`)
 3. Search/replace all references across the repo
@@ -276,6 +303,7 @@ This will:
 ### Release Documents
 
 Release docs live in `docs/releases/` and document:
+
 - Breaking changes
 - Deployment commands
 - Pre/post-deployment checklists
@@ -283,7 +311,8 @@ Release docs live in `docs/releases/` and document:
 
 ## DAR File Backup System
 
-DAR files uploaded to mainnet are backed up in `dars/` to preserve the exact bytes. DAML builds are only deterministic with the same compiler version, so rebuilding can produce different hashes.
+DAR files uploaded to mainnet are backed up in `dars/` to preserve the exact bytes. DAML builds are
+only deterministic with the same compiler version, so rebuilding can produce different hashes.
 
 ### Backup Workflow
 
@@ -304,6 +333,7 @@ npm run verify-dars
 ### Upload Scripts
 
 Upload scripts (`upload-dar.ts`, etc.) automatically:
+
 1. **Auto-backup** if no backup exists (runs `backup-dar` before upload)
 2. Use backed-up DAR (verified by hash)
 3. Record network uploads in `dars.lock`
@@ -313,13 +343,15 @@ Upload scripts (`upload-dar.ts`, etc.) automatically:
 ### Dynamic Template IDs
 
 Scripts use `buildTemplateId()` from `packages.ts` to compute template IDs dynamically:
+
 - Reads package name from `packages.ts` (e.g., `OpenCapTable-v26`)
 - Ensures correct version is always used after upgrades
 - Single source of truth: `daml.yaml` → `packages.ts` → scripts
 
 ## NPM Publishing
 
-The package `@fairmint/open-captable-protocol-daml-js` is automatically published to NPM when changes are merged to `main`.
+The package `@fairmint/open-captable-protocol-daml-js` is automatically published to NPM when
+changes are merged to `main`.
 
 ### How It Works
 
@@ -349,6 +381,7 @@ npm publish               # Publishes to NPM (requires NPM_TOKEN)
 ### CI Requirements
 
 The publish workflow requires:
+
 - `NPM_TOKEN` secret configured in GitHub repository settings
 
 ### Monitoring PR CI Status
@@ -359,18 +392,55 @@ See "PR Workflow" section above for CI monitoring instructions.
 
 **Party assignments are documented in `canton/docs/contract-party-configuration.md`.**
 
-When adding or modifying contract creation scripts (e.g., `create-*-factory.ts`), update the party configuration doc to reflect:
+When adding or modifying contract creation scripts (e.g., `create-*-factory.ts`), update the party
+configuration doc to reflect:
+
 - Which party operates the contract
 - Network-specific party IDs
 - Script location and output files
 
+---
+
+## PR Review Format
+
+When writing PR reviews, use this format:
+
+1. **Issues and improvements first** — Call out any problems, bugs, or suggested improvements at the
+   top, outside any collapsed sections. This is the only feedback reviewers need to see immediately.
+   - **Issue**: Something that should be fixed — bugs, security problems, incorrect logic,
+     violations of project standards
+   - **Improvement**: Something that could be better — performance, readability, maintainability,
+     edge cases
+
+2. **Collapse the rest** — Put the full analysis and any positive remarks inside a collapsed
+   `<details>` section:
+
+```markdown
+## Issues
+
+- **[File:Line]** Description of issue or improvement
+
+---
+
+<details>
+<summary>Full Analysis</summary>
+
+... detailed analysis, positive remarks, etc. ...
+
+</details>
+```
+
+Keep the visible portion brief and actionable. The collapsed section is for context if needed.
+
+---
+
 ## Related Repos
 
-| Repo | Purpose | Docs |
-|------|---------|------|
-| `canton` | Trading infrastructure, ADRs, **party configuration** | `llms.txt`, `docs/contract-party-configuration.md` |
-| `canton-explorer` | Next.js explorer UI | `llms.txt`, [cantonops.fairmint.com](https://cantonops.fairmint.com/) |
-| `canton-fairmint-sdk` | Shared TypeScript utilities | `llms.txt` |
-| `canton-node-sdk` | Low-level Canton client | `llms.txt`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
-| `ocp-canton-sdk` | High-level OCP TypeScript SDK | `llms.txt`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
-| `ocp-position-nft` | Soulbound NFT smart contracts | `llms.txt` |
+| Repo                  | Purpose                                               | Docs                                                                     |
+| --------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ |
+| `canton`              | Trading infrastructure, ADRs, **party configuration** | `AGENTS.md`, `docs/contract-party-configuration.md`                      |
+| `canton-explorer`     | Next.js explorer UI                                   | `AGENTS.md`, [cantonops.fairmint.com](https://cantonops.fairmint.com/)   |
+| `canton-fairmint-sdk` | Shared TypeScript utilities                           | `AGENTS.md`                                                              |
+| `canton-node-sdk`     | Low-level Canton client                               | `AGENTS.md`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
+| `ocp-canton-sdk`      | High-level OCP TypeScript SDK                         | `AGENTS.md`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
+| `ocp-position-nft`    | Soulbound NFT smart contracts                         | `AGENTS.md`                                                              |

@@ -17,4 +17,4 @@
 
 - Tasks: [../tasks/README.md](../tasks/README.md)
 - Architecture decisions (canton repo): [canton/docs/developer/adr/](https://github.com/fairmint/canton/tree/main/docs/developer/adr)
-- AI context: [../llms.txt](../llms.txt)
+- AI context: [../AGENTS.md](../AGENTS.md)
