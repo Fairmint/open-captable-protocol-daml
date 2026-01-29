@@ -11,21 +11,12 @@ for PR workflow, git workflow, dependencies, non-negotiables, and Linear integra
 ## Quick Commands
 
 ```bash
-npm run build        # Build all DAML packages (uses dpm)
-npm run test         # Run DAML tests (uses dpm)
-npm run codegen      # Generate JS bindings (uses dpm codegen-js)
-npm run verify-dars  # Verify backed-up DAR integrity
-npm run backup-dar   # Backup DAR after mainnet upload
+npm run build && npm run test    # Verify changes before commit
+npm run codegen                  # Generate JS bindings after DAML changes
 
-# Package version upgrades
-npm run upgrade-package -- --package OpenCapTable --type major  # v27 → v28
-npm run upgrade-package -- --package OpenCapTable --type minor  # 0.0.1 → 0.0.2
-
-# Deployment (after build/test)
+# Deployment (after build/test pass)
 npm run upload-dar -- --package ocp --network devnet
 npm run upload-dar -- --package ocp --network mainnet
-npx tsx scripts/create-ocp-factory.ts --network devnet
-npx tsx scripts/create-ocp-factory.ts --network mainnet
 ```
 
 ## Build Tooling (dpm)
@@ -398,39 +389,6 @@ configuration doc to reflect:
 - Which party operates the contract
 - Network-specific party IDs
 - Script location and output files
-
----
-
-## PR Review Format
-
-When writing PR reviews, use this format:
-
-1. **Issues and improvements first** — Call out any problems, bugs, or suggested improvements at the
-   top, outside any collapsed sections. This is the only feedback reviewers need to see immediately.
-   - **Issue**: Something that should be fixed — bugs, security problems, incorrect logic,
-     violations of project standards
-   - **Improvement**: Something that could be better — performance, readability, maintainability,
-     edge cases
-
-2. **Collapse the rest** — Put the full analysis and any positive remarks inside a collapsed
-   `<details>` section:
-
-```markdown
-## Issues
-
-- **[File:Line]** Description of issue or improvement
-
----
-
-<details>
-<summary>Full Analysis</summary>
-
-... detailed analysis, positive remarks, etc. ...
-
-</details>
-```
-
-Keep the visible portion brief and actionable. The collapsed section is for context if needed.
 
 ---
 
