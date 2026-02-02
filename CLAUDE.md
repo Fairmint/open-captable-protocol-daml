@@ -392,6 +392,44 @@ configuration doc to reflect:
 
 ---
 
+## Living Document
+
+**Keep this file up-to-date.** Update it when:
+
+- A best practice or pattern is established
+- An architectural or coding decision is made
+- New features, endpoints, or patterns are added
+- Before creating a PR: review for generalizable learnings
+
+---
+
+## Communication Style
+
+Be concise in all communications:
+
+- **PR reviews**: Lead with issues, collapse detailed analysis in `<details>`
+- **Commits**: One-line summary, optional bullet points for details
+- **PR descriptions**: Brief summary, link to task file for context
+- **Comments**: Direct and actionable, skip pleasantries
+
+Include all necessary information, but keep it brief and scannable.
+
+---
+
+## Git Hooks
+
+Before committing or pushing, run these checks:
+
+| Step  | Command         | Purpose                |
+| ----- | --------------- | ---------------------- |
+| Lint  | `npm run fix`   | Fix linting/formatting |
+| Test  | `npm test`      | Ensure tests pass      |
+| Build | `npm run build` | Verify compilation     |
+
+**Note**: Husky hooks should enforce this automatically. If hooks aren't set up, run these manually.
+
+---
+
 ## Related Repos
 
 | Repo                  | Purpose                                               | Docs                                                                     |
