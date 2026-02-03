@@ -38,9 +38,11 @@ data OcfCreateData
   deriving (Eq, Show)
 
 -- | Sum type for edits (uses OCF data directly - ID is in the data record)
+-- Issuer is edit-only (no create/delete) - always exactly 1 issuer per CapTable
 data OcfEditData
+  = OcfEditIssuer IssuerOcfData
 {{#each types_alpha}}
-  {{#if @first}}={{else}}|{{/if}} OcfEdit{{name}} {{data_type}}
+  | OcfEdit{{name}} {{data_type}}
 {{/each}}
   deriving (Eq, Show)
 
@@ -52,9 +54,11 @@ data OcfDeleteData
   deriving (Eq, Show)
 
 -- | Sum type for strongly-typed ContractIds returned from batch operations
+-- CidIssuer is included for issuer edits (edit-only, no create/delete)
 data OcfContractId
+  = CidIssuer (ContractId Issuer)
 {{#each types_alpha}}
-  {{#if @first}}={{else}}|{{/if}} Cid{{name}} (ContractId {{name}})
+  | Cid{{name}} (ContractId {{name}})
 {{/each}}
   deriving (Eq, Show)
 
@@ -63,14 +67,6 @@ data UpdateCapTableResult = UpdateCapTableResult with
     updatedCapTableCid: ContractId CapTable
     createdCids: [OcfContractId]
     editedCids: [OcfContractId]
-  deriving (Eq, Show)
-
--- | Result of EditIssuer operation. Returns both contract IDs for consistency
--- with UpdateCapTableResult: updatedCapTableCid for the parent container,
--- editedIssuerCid for the modified object (matching editedCids pattern).
-data EditIssuerResult = EditIssuerResult with
-    updatedCapTableCid: ContractId CapTable
-    editedIssuerCid: ContractId Issuer
   deriving (Eq, Show)
 
 
@@ -117,8 +113,10 @@ processCreate ctx maps createData = case createData of
 {{/each}}
 
 -- | Process a single edit operation, returning updated maps and the edited ContractId
+-- Note: OcfEditIssuer is handled separately in UpdateCapTable since issuer is not a map
 processEdit : Context -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId)
 processEdit ctx maps editData = case editData of
+      OcfEditIssuer _ -> error "OcfEditIssuer should be handled separately in UpdateCapTable"
 {{#each types_alpha}}
       {{> edit-case}}
 {{/each}}
@@ -157,27 +155,10 @@ template CapTable
     signatory context.issuer, context.system_operator
 
     -- ==========================================================================
-    -- ISSUER (Edit only - no Create/Delete)
+    -- BATCH UPDATE (Create/Edit/Delete including Issuer)
     -- ==========================================================================
-
-    choice EditIssuer : EditIssuerResult
-      with
-        new_issuer_data: IssuerOcfData
-      controller context.issuer
-      do
-        archive issuer
-        new_issuer_cid <- create Issuer with
-          context = context
-          issuer_data = new_issuer_data
-
-        new_cap_table_cid <- create this with issuer = new_issuer_cid
-        pure EditIssuerResult with
-          updatedCapTableCid = new_cap_table_cid
-          editedIssuerCid = new_issuer_cid
-
-    -- ==========================================================================
-    -- BATCH UPDATE (Create/Edit/Delete)
-    -- ==========================================================================
+    -- Issuer is edit-only (no create/delete) and is handled separately since
+    -- it's stored as a single reference, not in a map like other entities.
 
     -- | Batch update choice for efficient bulk operations.
     -- This is the primary choice for cap table mutations.
@@ -185,6 +166,7 @@ template CapTable
     -- Parameters:
     -- - creates: List of OCF objects to create (processed in tier order for dependencies)
     -- - edits: List of OCF objects to edit (ID is in the data record)
+    --          Includes OcfEditIssuer for issuer updates (edit-only, no create/delete)
     -- - deletes: List of OCF object IDs to delete
     choice UpdateCapTable : UpdateCapTableResult
       with
@@ -207,13 +189,40 @@ template CapTable
           (initialMaps, [])
           sortedCreates
 
-        -- Process edits
-        (mapsAfterEdits, editedCids) <- foldlA
+        -- Separate issuer edits from regular edits
+        -- Issuer is edit-only and stored differently (single reference, not a map)
+        let isIssuerEdit = \case
+              OcfEditIssuer _ -> True
+              _ -> False
+        let issuerEdits = filter isIssuerEdit edits
+        let regularEdits = filter (not . isIssuerEdit) edits
+
+        -- Validate: at most one issuer edit per batch
+        assertMsg "Cannot edit issuer more than once per batch" (length issuerEdits <= 1)
+
+        -- Process regular edits (map-based entities)
+        (mapsAfterEdits, regularEditedCids) <- foldlA
           (\(maps, cids) editData -> do
             (newMaps, cid) <- processEdit context maps editData
             pure (newMaps, cids ++ [cid]))
           (mapsAfterCreates, [])
-          edits
+          regularEdits
+
+        -- Process issuer edit (if any) - special handling since it's a single reference
+        -- Note: In editedCids output, issuer edits appear first regardless of input position
+        (newIssuerCid, issuerEditedCids) <- case issuerEdits of
+          [] -> pure (issuer, [])  -- No issuer edit, keep current
+          [OcfEditIssuer newIssuerData] -> do
+            -- Validate issuer ID matches (cannot change ID during edit)
+            currentIssuer <- fetch issuer
+            assertMsg "Issuer ID mismatch: cannot change issuer ID during edit"
+              (newIssuerData.id == currentIssuer.issuer_data.id)
+            archive issuer
+            newCid <- create Issuer with
+              context = context
+              issuer_data = newIssuerData
+            pure (newCid, [CidIssuer newCid])
+          _ -> error "Multiple issuer edits not allowed"  -- Defensive: assertMsg above prevents this
 
         -- Process deletes
         finalMaps <- foldlA
@@ -221,8 +230,9 @@ template CapTable
           mapsAfterEdits
           deletes
 
-        -- Create new CapTable with updated maps
+        -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
+          issuer = newIssuerCid
 {{#each types_alpha}}
           {{map_field}} = finalMaps.{{map_field}}
 {{/each}}
@@ -235,4 +245,4 @@ template CapTable
         pure UpdateCapTableResult with
           updatedCapTableCid = newCapTableCid
           createdCids = createdCids
-          editedCids = editedCids
+          editedCids = issuerEditedCids ++ regularEditedCids
