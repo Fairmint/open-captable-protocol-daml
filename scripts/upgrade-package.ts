@@ -55,22 +55,37 @@ function parseArgs(): UpgradeOptions {
   return { packageName, upgradeType };
 }
 
-/** Find the package folder that matches the given package name */
+/** Find the package folder that matches the given package name (returns highest version) */
 function findPackageFolder(packageName: string): string {
   const entries = fs.readdirSync(ROOT_DIR, { withFileTypes: true });
+  let highestVersion = -1;
+  let highestFolder = '';
+  let exactMatch = '';
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "OpenCapTable-v30", "Subscriptions-v05", etc.
-      const match = entry.name.match(new RegExp(`^${packageName}-(v\\d+)$`, 'i'));
+      // Match patterns like "OpenCapTable-v31", "Subscriptions-v05", etc.
+      const match = entry.name.match(new RegExp(`^${packageName}-(v(\\d+))$`, 'i'));
       if (match) {
-        return entry.name;
+        const version = parseInt(match[2], 10);
+        if (version > highestVersion) {
+          highestVersion = version;
+          highestFolder = entry.name;
+        }
       }
       // Also match exact name without version suffix (e.g., "CantonPayments")
       if (entry.name === packageName) {
-        return entry.name;
+        exactMatch = entry.name;
       }
     }
+  }
+
+  // Prefer versioned folder over exact match
+  if (highestFolder) {
+    return highestFolder;
+  }
+  if (exactMatch) {
+    return exactMatch;
   }
 
   throw new Error(`Package folder not found for: ${packageName}`);

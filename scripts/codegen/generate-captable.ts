@@ -58,7 +58,7 @@ interface TypeDef {
 const REPO_ROOT = process.cwd();
 const CODEGEN_DIR = path.join(REPO_ROOT, 'scripts/codegen');
 const TEMPLATES_DIR = path.join(CODEGEN_DIR, 'templates');
-const OPENCAPTABLE_DIR = path.join(REPO_ROOT, 'OpenCapTable-v30/daml/Fairmint/OpenCapTable');
+const OPENCAPTABLE_DIR = path.join(REPO_ROOT, 'OpenCapTable-v31/daml/Fairmint/OpenCapTable');
 const OCF_DIR = path.join(OPENCAPTABLE_DIR, 'OCF');
 const OUTPUT_PATH = path.join(OPENCAPTABLE_DIR, 'CapTable.daml');
 
@@ -133,8 +133,9 @@ function buildTierMap(config: Config): Map<string, number> {
 }
 
 /**
- * Discover all types from DAML files in OCF/ subdirectory Issuer is excluded because it's handled specially (only
- * EditIssuer, no Add/Delete)
+ * Discover all types from DAML files in OCF/ subdirectory. Issuer is excluded because it's handled
+ * specially - it's edit-only (no create/delete) and stored as a single reference, not in a map.
+ * Issuer edits are handled via OcfEditIssuer in the UpdateCapTable batch operation.
  */
 function discoverTypes(config: Config): TypeDef[] {
   const files = fs
@@ -297,8 +298,8 @@ function generate(): void {
 
   fs.writeFileSync(OUTPUT_PATH, output);
   console.log(`\nGenerated ${OUTPUT_PATH}`);
-  console.log(`  - ${types.length} types`);
-  console.log(`  - 2 choices (EditIssuer, UpdateCapTable)`);
+  console.log(`  - ${types.length} types (+ Issuer as edit-only)`);
+  console.log(`  - 1 choice (UpdateCapTable) - handles all creates, edits (including Issuer), deletes`);
   console.log(`  - Batch operations with ${Math.max(...Object.keys(config.tiers).map(Number))} processing tiers`);
 }
 
