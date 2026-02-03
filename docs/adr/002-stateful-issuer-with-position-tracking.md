@@ -97,7 +97,7 @@ graph LR
 | Category | Maps | Notes |
 |----------|------|-------|
 | **Issuer** | `issuer: ContractId Issuer` | Exactly 1. No Add/Delete, only Edit. |
-| **Objects** | `stakeholders`, `stock_classes`, `stock_plans`, `stock_legend_templates`, `vesting_terms`, `valuations`, `financings`, `documents` | Add/Edit/Delete |
+| **Objects** | `stakeholders`, `stock_classes`, `stock_plans`, `stock_legend_templates`, `vesting_terms`, `valuations`, `documents` | Add/Edit/Delete |
 | **Transactions** | `stock_issuances`, `stock_transfers`, `stock_cancellations`, `equity_compensation_issuances`, `convertible_issuances`, `warrant_issuances`, ... | Add/Edit/Delete |
 
 ### Key Points
