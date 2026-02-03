@@ -133,9 +133,9 @@ function buildTierMap(config: Config): Map<string, number> {
 }
 
 /**
- * Discover all types from DAML files in OCF/ subdirectory. Issuer is excluded because it's handled
- * specially - it's edit-only (no create/delete) and stored as a single reference, not in a map.
- * Issuer edits are handled via OcfEditIssuer in the UpdateCapTable batch operation.
+ * Discover all types from DAML files in OCF/ subdirectory. Issuer is excluded because it's handled specially - it's
+ * edit-only (no create/delete) and stored as a single reference, not in a map. Issuer edits are handled via
+ * OcfEditIssuer in the UpdateCapTable batch operation.
  */
 function discoverTypes(config: Config): TypeDef[] {
   const files = fs
