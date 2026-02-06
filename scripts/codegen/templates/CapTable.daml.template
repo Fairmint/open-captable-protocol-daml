@@ -178,16 +178,12 @@ template CapTable
         -- Start with current maps
         let initialMaps = toMaps this
 
-        -- Sort creates by tier for dependency ordering
-        let sortedCreates = sortOn getCreateTier creates
-
-        -- Process creates in tier order
-        (mapsAfterCreates, createdCids) <- foldlA
-          (\(maps, cids) createData -> do
-            (newMaps, cid) <- processCreate context maps createData
-            pure (newMaps, cids ++ [cid]))
-          (initialMaps, [])
-          sortedCreates
+        -- Process deletes first to free unique constraints (e.g., security_id)
+        -- This allows object replacements (delete old + create new with same security_id)
+        mapsAfterDeletes <- foldlA
+          (\maps deleteRef -> processDelete maps deleteRef)
+          initialMaps
+          deletes
 
         -- Separate issuer edits from regular edits
         -- Issuer is edit-only and stored differently (single reference, not a map)
@@ -205,7 +201,7 @@ template CapTable
           (\(maps, cids) editData -> do
             (newMaps, cid) <- processEdit context maps editData
             pure (newMaps, cids ++ [cid]))
-          (mapsAfterCreates, [])
+          (mapsAfterDeletes, [])
           regularEdits
 
         -- Process issuer edit (if any) - special handling since it's a single reference
@@ -224,11 +220,16 @@ template CapTable
             pure (newCid, [CidIssuer newCid])
           _ -> error "Multiple issuer edits not allowed"  -- Defensive: assertMsg above prevents this
 
-        -- Process deletes
-        finalMaps <- foldlA
-          (\maps deleteRef -> processDelete maps deleteRef)
-          mapsAfterEdits
-          deletes
+        -- Sort creates by tier for dependency ordering
+        let sortedCreates = sortOn getCreateTier creates
+
+        -- Process creates last (after deletes freed constraints)
+        (finalMaps, createdCids) <- foldlA
+          (\(maps, cids) createData -> do
+            (newMaps, cid) <- processCreate context maps createData
+            pure (newMaps, cids ++ [cid]))
+          (mapsAfterEdits, [])
+          sortedCreates
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
