@@ -1,10 +1,15 @@
 import fs from 'fs';
 import path from 'path';
+import { requirePackageConfig } from './packages';
+
+const ocpPkg = requirePackageConfig('ocp');
+const reportsPkg = requirePackageConfig('reports');
+const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const packageDirs = [
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTable-v31-0.0.2'),
-  path.join(__dirname, '..', 'generated', 'js', 'OpenCapTableReports-v01-0.0.2'),
-  path.join(__dirname, '..', 'generated', 'js', 'CantonPayments-0.0.33'),
+  path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`),
+  path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '..', 'generated', 'js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 
 // Create index.js and index.d.ts that re-export from lib/index.js if the directory exists
