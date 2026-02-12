@@ -103,6 +103,18 @@ export function getPackage(keyOrName: string): PackageConfig | undefined {
   return Object.values(packages).find((pkg) => pkg.name.toLowerCase() === lowerKey);
 }
 
+/**
+ * Get package config or throw an error if not found. Use this when a package is required and failure should be
+ * an exception (e.g., in scripts that need a package to exist).
+ */
+export function requirePackageConfig(packageKey: string): PackageConfig {
+  const pkg = getPackage(packageKey);
+  if (!pkg) {
+    throw new Error(`Unknown package key: ${packageKey}`);
+  }
+  return pkg;
+}
+
 /** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
   return Object.keys(PACKAGE_DEFS) as PackageKey[];

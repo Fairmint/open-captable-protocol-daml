@@ -2,16 +2,8 @@
 
 import fs from 'fs';
 import path from 'path';
-import { getPackage } from './packages';
+import { requirePackageConfig } from './packages';
 import { getErrorMessage, type PackageJson } from './types';
-
-function requirePackageConfig(packageKey: string) {
-  const pkg = getPackage(packageKey);
-  if (!pkg) {
-    throw new Error(`Unknown package key: ${packageKey}`);
-  }
-  return pkg;
-}
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');

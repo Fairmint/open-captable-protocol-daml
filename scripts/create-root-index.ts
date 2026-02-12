@@ -1,14 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { getPackage } from './packages';
-
-function requirePackageConfig(packageKey: string) {
-  const pkg = getPackage(packageKey);
-  if (!pkg) {
-    throw new Error(`Unknown package key: ${packageKey}`);
-  }
-  return pkg;
-}
+import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
