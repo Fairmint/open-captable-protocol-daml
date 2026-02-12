@@ -116,7 +116,8 @@ self-documenting—only add comments when they provide value beyond what the cod
 ### Schema Alignment Rule (Critical)
 
 - **OCF JSON schema is the source of truth for data validity**.
-- Contract validators must not be stricter than schema unless an explicit ADR documents the stricter rule.
+- Contract validators must not be stricter than schema unless an explicit ADR documents the stricter
+  rule.
 - For any schema/contract mismatch incident:
   1. Fix contract validation to match schema intent.
   2. Add regression tests for the exact offending field/value.
@@ -441,11 +442,11 @@ Before committing or pushing, run these checks:
 
 ## Related Repos
 
-| Repo                  | Purpose                                               | Docs                                                                     |
-| --------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ |
-| `canton`              | Trading infrastructure, ADRs, **party configuration** | `AGENTS.md`, `docs/contract-party-configuration.md`                      |
-| `canton-explorer`     | Next.js explorer UI                                   | `AGENTS.md`, [cantonops.fairmint.com](https://cantonops.fairmint.com/)   |
-| `canton-fairmint-sdk` | Shared TypeScript utilities                           | `AGENTS.md`                                                              |
-| `canton-node-sdk`     | Low-level Canton client                               | `AGENTS.md`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
-| `ocp-canton-sdk`      | High-level OCP TypeScript SDK                         | `AGENTS.md`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
-| `ocp-digital-certificate`    | Soulbound digital certificate smart contracts                         | `AGENTS.md`                                                              |
+| Repo                      | Purpose                                               | Docs                                                                     |
+| ------------------------- | ----------------------------------------------------- | ------------------------------------------------------------------------ |
+| `canton`                  | Trading infrastructure, ADRs, **party configuration** | `AGENTS.md`, `docs/contract-party-configuration.md`                      |
+| `canton-explorer`         | Next.js explorer UI                                   | `AGENTS.md`, [cantonops.fairmint.com](https://cantonops.fairmint.com/)   |
+| `canton-fairmint-sdk`     | Shared TypeScript utilities                           | `AGENTS.md`                                                              |
+| `canton-node-sdk`         | Low-level Canton client                               | `AGENTS.md`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
+| `ocp-canton-sdk`          | High-level OCP TypeScript SDK                         | `AGENTS.md`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
+| `ocp-digital-certificate` | Soulbound digital certificate smart contracts         | `AGENTS.md`                                                              |
