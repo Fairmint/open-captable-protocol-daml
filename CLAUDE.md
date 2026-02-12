@@ -113,6 +113,16 @@ self-documenting—only add comments when they provide value beyond what the cod
 - **`assert*`** - Includes error message, performs assertion (fail fast)
 - **`validate*`** - Returns `Bool` for composability; combine with `assertMsg` for context
 
+### Schema Alignment Rule (Critical)
+
+- **OCF JSON schema is the source of truth for data validity**.
+- Contract validators must not be stricter than schema unless an explicit ADR documents the stricter
+  rule.
+- For any schema/contract mismatch incident:
+  1. Fix contract validation to match schema intent.
+  2. Add regression tests for the exact offending field/value.
+  3. Perform a package **minor upgrade** for the affected DAML package.
+
 ### File Structure
 
 1. Module header comment (OCF schema link)
