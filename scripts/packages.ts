@@ -104,8 +104,8 @@ export function getPackage(keyOrName: string): PackageConfig | undefined {
 }
 
 /**
- * Get package config or throw an error if not found. Use this when a package is required and failure should be
- * an exception (e.g., in scripts that need a package to exist).
+ * Get package config or throw an error if not found. Use this when a package is required and failure should be an
+ * exception (e.g., in scripts that need a package to exist).
  */
 export function requirePackageConfig(packageKey: string): PackageConfig {
   const pkg = getPackage(packageKey);
