@@ -449,4 +449,4 @@ Before committing or pushing, run these checks:
 | `canton-fairmint-sdk`     | Shared TypeScript utilities                           | `AGENTS.md`                                                              |
 | `canton-node-sdk`         | Low-level Canton client                               | `AGENTS.md`, [sdk.canton.fairmint.com](https://sdk.canton.fairmint.com/) |
 | `ocp-canton-sdk`          | High-level OCP TypeScript SDK                         | `AGENTS.md`, [ocp.canton.fairmint.com](https://ocp.canton.fairmint.com/) |
-| `ocp-digital-certificate` | Soulbound digital certificate smart contracts         | `AGENTS.md`                                                              |
+| `ocp-equity-certificate`  | Soulbound equity certificate smart contracts          | `AGENTS.md`                                                              |
