@@ -6,7 +6,7 @@ Open Cap Table Protocol — OCF-compliant cap table management on Canton Network
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| **OpenCapTable-v31** | 0.0.1 | Core OCF: 47 object types, CapTable state management |
+| **OpenCapTable-v32** | 0.0.1 | Core OCF: 47 object types, CapTable state management |
 | **CantonPayments** | 0.0.33 | Payment streams, airdrops, escrow |
 | **OpenCapTableReports** | 0.0.2 | Anonymous valuation reporting |
 | **OpenCapTableProofOfOwnership** | 0.0.1 | Ownership verification (POC) |
