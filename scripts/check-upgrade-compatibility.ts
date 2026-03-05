@@ -20,7 +20,7 @@ const ROOT_DIR = path.join(__dirname, '..');
 
 /**
  * Extract the base name and major version from a package name. E.g., "OpenCapTable-v32" => { baseName: "OpenCapTable",
- * majorVersion: 29 }
+ * majorVersion: 32 }
  */
 function parsePackageName(name: string): { baseName: string; majorVersion: number | null } {
   const match = name.match(/^(.+)-v(\d+)$/);
