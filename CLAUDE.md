@@ -264,8 +264,8 @@ rg "data OcfYourType" OpenCapTable-v32/daml/
 
 ### Major vs Minor Upgrades
 
-- **Major upgrade** (breaking change): Creates a new package directory (e.g.,
-  `OpenCapTable-vNN` → `OpenCapTable-v(NN+1)`)
+- **Major upgrade** (breaking change): Creates a new package directory (e.g., `OpenCapTable-vNN` →
+  `OpenCapTable-v(NN+1)`)
 - **Minor upgrade** (non-breaking): Increments patch version (e.g., `0.0.1` → `0.0.2`)
 
 > **AI agents:** Never perform a major version upgrade without explicit instructions from the user.
