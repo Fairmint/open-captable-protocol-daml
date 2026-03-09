@@ -22,7 +22,7 @@ Open Cap Table Protocol — OCF-compliant cap table management on Canton Network
 | [ADR-004](./adr/004-couponminter-contract.md) | CouponMinter Contract | Implemented |
 | [ADR-005](./adr/005-canton-payments.md) | Payment Streams and Airdrops | Implemented |
 | [ADR-006](./adr/006-reports.md) | Reports Package | Implemented |
-| [ADR-007](./adr/007-proof-of-ownership.md) | Proof of Ownership | Proposed |
+| [ADR-007](./adr/007-proof-of-ownership.md) | Proof of Ownership | Implemented |
 
 ## Other Documentation
 

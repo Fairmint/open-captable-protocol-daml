@@ -50,7 +50,7 @@ export PATH="$HOME/.dpm/bin:$PATH"
 
 | Directory                           | Purpose                                     |
 | ----------------------------------- | ------------------------------------------- |
-| `OpenCapTable-v28/`                 | Core OCF contracts (current)                |
+| `OpenCapTable-v32/`                 | Core OCF contracts (current)                |
 | `OpenCapTableReports-v01/`          | Reports                                     |
 | `OpenCapTableProofOfOwnership-v01/` | Proof of ownership                          |
 | `Shared/`                           | Shared helpers/types                        |
@@ -257,15 +257,15 @@ types.
 
 ```bash
 # Check if type already exists
-grep -r "data OcfYourType" OpenCapTable-v26/daml/
+rg "data OcfYourType" OpenCapTable-v32/daml/
 ```
 
 ## Package Upgrades & Releases
 
 ### Major vs Minor Upgrades
 
-- **Major upgrade** (breaking change): Creates new package directory (e.g., `OpenCapTable-v27` →
-  `OpenCapTable-v28`)
+- **Major upgrade** (breaking change): Creates a new package directory (e.g.,
+  `OpenCapTable-vNN` → `OpenCapTable-v(NN+1)`)
 - **Minor upgrade** (non-breaking): Increments patch version (e.g., `0.0.1` → `0.0.2`)
 
 > **AI agents:** Never perform a major version upgrade without explicit instructions from the user.
@@ -282,7 +282,7 @@ npm run upgrade-package -- --package OpenCapTable --type major
 
 This will:
 
-1. Rename folder (e.g., `OpenCapTable-v27/` → `OpenCapTable-v28/`)
+1. Rename folder (e.g., `OpenCapTable-vNN/` → `OpenCapTable-v(NN+1)/`)
 2. Update `daml.yaml` (name and version reset to `0.0.1`)
 3. Search/replace all references across the repo
 
@@ -319,7 +319,7 @@ only deterministic with the same compiler version, so rebuilding can produce dif
 
 ```bash
 # After successful mainnet upload, backup the DAR:
-npm run backup-dar -- --package OpenCapTable-v26 --version 0.0.1 --network mainnet
+npm run backup-dar -- --package OpenCapTable-v32 --version 0.0.1 --network mainnet
 
 # Verify all backed-up DARs (also runs in CI):
 npm run verify-dars
@@ -345,7 +345,7 @@ Upload scripts (`upload-dar.ts`, etc.) automatically:
 
 Scripts use `buildTemplateId()` from `packages.ts` to compute template IDs dynamically:
 
-- Reads package name from `packages.ts` (e.g., `OpenCapTable-v26`)
+- Reads package name from `packages.ts` (e.g., `OpenCapTable-v32`)
 - Ensures correct version is always used after upgrades
 - Single source of truth: `daml.yaml` → `packages.ts` → scripts
 
@@ -358,18 +358,20 @@ changes are merged to `main`.
 
 1. **Create a PR** with your changes
 2. **Monitor CI status** (see below)
-3. **Open the PR** in browser for review: `open <PR_URL>`
+   - CI may auto-fix lint/format output and push a commit (`ci: auto-fix lint and format changes`)
+   - If that happens, pull/rebase the latest branch state before continuing local work
+3. **Open the PR** in browser for review
 4. **Get it reviewed** and approved
 5. **Merge to main** - CI automatically:
    - Builds DAML packages and generates TypeScript bindings
    - Increments the patch version in `package.json`
    - Generates a changelog from commits since last release
    - Publishes to NPM
-   - Creates and pushes a git tag (e.g., `v0.2.52`)
+   - Creates and pushes a git tag (e.g., `v0.2.137`)
 
 ### Version Bumping
 
-- **Patch bumps** (0.2.51 → 0.2.52): Automatic on every merge to main
+- **Patch bumps** (e.g., `0.2.x` → `0.2.(x+1)`): Automatic on every merge to main
 - **Minor/Major bumps**: Manually update `package.json` version before merging
 
 ### Manual Release (Local)

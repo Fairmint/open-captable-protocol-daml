@@ -2,7 +2,7 @@
 
 ## Status
 
-**Proposed** | 2026-02-03
+**Implemented** | 2026-03-09
 
 ---
 
@@ -134,4 +134,4 @@ This is a proof-of-concept with significant limitations:
 
 ---
 
-_Last updated: 2026-02-03_
+_Last updated: 2026-03-09_

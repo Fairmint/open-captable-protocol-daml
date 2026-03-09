@@ -15,7 +15,7 @@ npm run upgrade-package -- --package <name> --type <major|minor>
 
 ### Parameters
 
-- `--package <name>`: The base name of the package (e.g., `Subscriptions`, `OpenCapTable`)
+- `--package <name>`: The base name of the package (e.g., `OpenCapTable`, `CantonPayments`)
 - `--type <major|minor>`: The type of upgrade to perform
 
 ### Major Upgrade
@@ -25,7 +25,7 @@ A major upgrade increments the major version number and resets the semantic vers
 **Example:**
 
 ```bash
-npm run upgrade-package -- --package Subscriptions --type major
+npm run upgrade-package -- --package OpenCapTable --type major
 ```
 
 **What it does:**
@@ -52,7 +52,7 @@ A minor upgrade increments the patch version (the last number in the semantic ve
 **Example:**
 
 ```bash
-npm run upgrade-package -- --package Subscriptions --type minor
+npm run upgrade-package -- --package OpenCapTable --type minor
 ```
 
 **What it does:**
@@ -91,10 +91,12 @@ After running the script, you should:
    git diff
    ```
 
-2. **Build the package:**
+2. **Build the packages (repo standard):**
 
    ```bash
-   cd <package-folder> && daml build
+   npm run build
+   # Optional package-scoped check:
+   # cd <package-folder> && PATH="$HOME/.dpm/bin:$PATH" dpm build
    ```
 
 3. **Test the changes:**
@@ -111,33 +113,33 @@ After running the script, you should:
 
 ### Examples
 
-**Upgrade Subscriptions from v07 to v08:**
+**Generic major upgrade:**
 
 ```bash
-npm run upgrade-package -- --package Subscriptions --type major
-# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v08 (0.0.1)
+npm run upgrade-package -- --package <PackageName> --type major
+# Output: <PackageName>-vNN (x.y.z) → <PackageName>-v(NN+1) (0.0.1)
 ```
 
-**Bump Subscriptions patch version:**
+**Generic minor (patch) upgrade:**
 
 ```bash
-npm run upgrade-package -- --package Subscriptions --type minor
-# Output: Subscriptions-v07 (0.2.3) → Subscriptions-v07 (0.2.4)
+npm run upgrade-package -- --package <PackageName> --type minor
+# Output: <PackageName>-vNN (x.y.z) → <PackageName>-vNN (x.y.(z+1))
 ```
 
-**Upgrade OpenCapTable from v27 to v28:**
+**Upgrade OpenCapTable major version (current baseline example):**
 
 ```bash
 npm run upgrade-package -- --package OpenCapTable --type major
-# Output: OpenCapTable-v27 (x.y.z) → OpenCapTable-v28 (0.0.1)
+# Output: OpenCapTable-v32 (x.y.z) → OpenCapTable-v33 (0.0.1)
 ```
 
 ### Troubleshooting
 
 **Error: "Package folder not found"**
 
-- Ensure the package name matches a folder in the repository (e.g., `Subscriptions`, not
-  `CantonPayments`)
+- Ensure the package name is the base package name (e.g., `OpenCapTable`), not the full versioned
+  folder name (e.g., `OpenCapTable-v32`)
 - Check that the folder follows the pattern `<PackageName>-v<NN>`
 
 **Error: "Target folder already exists"**

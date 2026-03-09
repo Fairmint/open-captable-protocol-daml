@@ -1,16 +1,27 @@
 ## Shared Coding Guidelines for OCP DAML Packages
 
-## AI context
+## Getting Started
 
-- **Start here**: `AGENTS.md`
-- **Docs folder**: `docs/README.md` (optional; keep minimal)
+- **Start here**: `CLAUDE.md`
+- **Documentation index**: `docs/README.md`
+- **Core package details**: `OpenCapTable-v32/README.md`
+
+From the repository root:
+
+```bash
+npm run build    # Build DAML packages
+npm run test     # Run DAML tests
+npm run codegen  # Regenerate JS bindings
+```
+
+## AI context
 
 This repository contains multiple DAML packages (e.g., `OpenCapTable-v32`,
 `OpenCapTableReports-v01`, `OpenCapTableProofOfOwnership-v01`, `Shared`, `CantonPayments`). This
 document defines coding guidelines that apply to all packages.
 
 For package-specific details about each implementation, see the README.md file in the respective
-package directory (e.g., `open-captable-protocol-daml/OpenCapTable-v32/README.md`).
+package directory (e.g., `OpenCapTable-v32/README.md`).
 
 ### Global exceptions
 
@@ -110,7 +121,7 @@ Update the following files to include your new package:
 
 - **codegen script**: Add codegen step for your package in the `codegen` script
   ```
-  cd NewPackage-v01 && daml codegen js && cd ..
+  cd NewPackage-v01 && PATH="$HOME/.dpm/bin:$PATH" dpm codegen-js && cd ..
   ```
 - **upload-dar script**: Add new script for uploading DAR files
   ```json
