@@ -5,7 +5,7 @@ export type { ApiConfig, AuthConfig, ClientConfig, NetworkType, ProviderType } f
 import type { NetworkType } from '@fairmint/canton-node-sdk';
 
 /** Valid network values accepted by the SDK. */
-export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet'] as const;
+export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet', 'staging'] as const;
 
 /** Type guard to check if a string is a valid NetworkType. */
 export function isValidNetwork(value: string): value is NetworkType {
@@ -51,16 +51,17 @@ export interface NetworkContractData {
   [key: string]: unknown;
 }
 
-/** Contract ID JSON file structure (supports mainnet/devnet). */
+/** Contract ID JSON file structure (supports mainnet/devnet/staging). */
 export interface ContractIdJson {
   mainnet?: NetworkContractData;
   devnet?: NetworkContractData;
+  staging?: NetworkContractData;
 }
 
 /** Valid network keys for contract ID files. */
-export type ContractNetwork = 'mainnet' | 'devnet';
+export type ContractNetwork = 'mainnet' | 'devnet' | 'staging';
 
 /** Type guard for ContractNetwork. */
 export function isContractNetwork(value: string): value is ContractNetwork {
-  return value === 'mainnet' || value === 'devnet';
+  return value === 'mainnet' || value === 'devnet' || value === 'staging';
 }

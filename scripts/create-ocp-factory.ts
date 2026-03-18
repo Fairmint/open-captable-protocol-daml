@@ -2,7 +2,7 @@
 /**
  * Create the OcpFactory contract. Saves contract ID to generated/ocp-factory-contract-id.json.
  *
- * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
+ * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet|staging>
  */
 
 import * as fs from 'fs';
@@ -13,6 +13,7 @@ import { createLedgerJsonApiClient } from './utils';
 interface ContractIdData {
   mainnet?: { ocpFactoryContractId: string; templateId: string };
   devnet?: { ocpFactoryContractId: string; templateId: string };
+  staging?: { ocpFactoryContractId: string; templateId: string };
 }
 
 function loadExistingData(filePath: string): ContractIdData {
@@ -79,8 +80,9 @@ async function main() {
   console.log(`\n✅ Created: ${contractId}`);
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}`);
 
-  if (data.mainnet) console.log(`   Mainnet: ${data.mainnet.ocpFactoryContractId}`);
-  if (data.devnet) console.log(`   Devnet:  ${data.devnet.ocpFactoryContractId}`);
+  if (data.mainnet) console.log(`   Mainnet:  ${data.mainnet.ocpFactoryContractId}`);
+  if (data.devnet) console.log(`   Devnet:   ${data.devnet.ocpFactoryContractId}`);
+  if (data.staging) console.log(`   Staging:  ${data.staging.ocpFactoryContractId}`);
   console.log('');
 }
 
