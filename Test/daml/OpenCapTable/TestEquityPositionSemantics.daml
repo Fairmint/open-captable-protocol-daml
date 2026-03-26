@@ -1,0 +1,144 @@
+module OpenCapTable.TestEquityPositionSemantics where
+
+import DA.Assert (assertFail, assertMsg)
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Map as Map
+import DA.Optional (isSome)
+import qualified DA.Time as DT
+import Daml.Script
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.OCF.StockConsolidation
+import Fairmint.OpenCapTable.OCF.StockReissuance
+import Fairmint.OpenCapTable.OCF.StockTransfer
+import Fairmint.OpenCapTable.Types.Stock (OcfShareNumberRange(..))
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+
+getCapTable : Party -> ContractId CT.CapTable -> Script CT.CapTable
+getCapTable party capTableCid = do
+  capTable <- queryContractId party capTableCid
+  case capTable of
+    Some activeCapTable -> pure activeCapTable
+    None -> assertFail "Expected active CapTable"
+
+assertMapHasKey : Text -> Text -> Map.Map Text a -> Script ()
+assertMapHasKey label key entries =
+  assertMsg (label <> " should contain key " <> key) (isSome (Map.lookup key entries))
+
+testEquityPositionIssuance_MetadataAndSecurityIndex = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPrereqs, classId, stakeholderId) <- setupForStockIssuanceNamed issuer cap_table "Position Holder"
+
+  let issuance = (defaultStockIssuance "TX_POSITION_ISS_1" "SEC-POS-1" stakeholderId classId) with
+        custom_id = "CERT-POS-1"
+        share_numbers_issued =
+          [ OcfShareNumberRange with
+              starting_share_number = 1.0
+              ending_share_number = 100.0
+          ]
+        stock_legend_ids = ["LEGEND-144", "LEGEND-701"]
+        comments = ["Certificate-style issuance metadata kept on the source issuance."]
+
+  (capTableAfterIssuance, result) <- createStockIssuanceWithResult issuer capTableWithPrereqs issuance
+  assertCreatedCount 1 result
+  case result.createdCids of
+    [CT.CidStockIssuance _] -> pure ()
+    _ -> assertFail "Expected one stock issuance CID"
+
+  currentCapTable <- getCapTable issuer capTableAfterIssuance
+  assertMapHasKey "stock_issuances" issuance.id currentCapTable.stock_issuances
+  assertMapHasKey "stock_issuances_by_security_id" issuance.security_id currentCapTable.stock_issuances_by_security_id
+
+testEquityPositionTransfer_TracksContinuityEvent = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPrereqs, classId, stakeholderId) <- setupForStockIssuanceNamed issuer cap_table "Transfer Holder"
+
+  let issuance = (defaultStockIssuance "TX_POSITION_TRANSFER_ISS_1" "SEC-POS-XFER-1" stakeholderId classId) with
+        quantity = 120.0
+  (capTableAfterIssuance, _) <- createStockIssuanceWithResult issuer capTableWithPrereqs issuance
+
+  transferResult <- submit issuer do
+    exerciseCmd capTableAfterIssuance CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockTransfer StockTransferOcfData with
+        id = "TX_POSITION_TRANSFER_1"
+        date = DT.time (DA.date 2025 Jan 15) 0 0 0
+        quantity = 40.0
+        security_id = issuance.security_id
+        resulting_security_ids = ["SEC-POS-XFER-1-NEW"]
+        comments = ["Position continuity is represented as a transfer event today."]
+        balance_security_id = Some "SEC-POS-XFER-1-REMAIN"
+        consideration_text = Some "Secondary transfer to a new holder."]
+      edits = []
+      deletes = []
+
+  assertCreatedCount 1 transferResult
+  case transferResult.createdCids of
+    [CT.CidStockTransfer _] -> pure ()
+    _ -> assertFail "Expected one stock transfer CID"
+
+  currentCapTable <- getCapTable issuer transferResult.updatedCapTableCid
+  assertMapHasKey "stock_transfers" "TX_POSITION_TRANSFER_1" currentCapTable.stock_transfers
+  assertMapHasKey "stock_issuances_by_security_id" issuance.security_id currentCapTable.stock_issuances_by_security_id
+
+testEquityPositionReissuance_TracksReplacementEvent = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPrereqs, classId, stakeholderId) <- setupForStockIssuanceNamed issuer cap_table "Replacement Holder"
+
+  let issuance = (defaultStockIssuance "TX_POSITION_REISS_ISS_1" "SEC-POS-REISS-1" stakeholderId classId) with
+        custom_id = "CERT-REPLACE-ME"
+  (capTableAfterIssuance, _) <- createStockIssuanceWithResult issuer capTableWithPrereqs issuance
+
+  reissuanceResult <- submit issuer do
+    exerciseCmd capTableAfterIssuance CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockReissuance StockReissuanceOcfData with
+        id = "TX_POSITION_REISSUANCE_1"
+        date = DT.time (DA.date 2025 Mar 01) 0 0 0
+        security_id = issuance.security_id
+        resulting_security_ids = ["SEC-POS-REISS-1-REPLACEMENT"]
+        comments = ["Replacement certificate emitted as a stock reissuance event."]
+        reason_text = Some "Lost certificate replacement"
+        split_transaction_id = None]
+      edits = []
+      deletes = []
+
+  assertCreatedCount 1 reissuanceResult
+  case reissuanceResult.createdCids of
+    [CT.CidStockReissuance _] -> pure ()
+    _ -> assertFail "Expected one stock reissuance CID"
+
+  currentCapTable <- getCapTable issuer reissuanceResult.updatedCapTableCid
+  assertMapHasKey "stock_reissuances" "TX_POSITION_REISSUANCE_1" currentCapTable.stock_reissuances
+  assertMapHasKey "stock_issuances_by_security_id" issuance.security_id currentCapTable.stock_issuances_by_security_id
+
+testEquityPositionConsolidation_TracksMergeEvent = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPrereqs, classId, stakeholderId) <- setupForStockIssuanceNamed issuer cap_table "Merge Holder"
+
+  let issuanceA = (defaultStockIssuance "TX_POSITION_MERGE_ISS_A" "SEC-POS-MERGE-A" stakeholderId classId) with quantity = 75.0
+  let issuanceB = (defaultStockIssuance "TX_POSITION_MERGE_ISS_B" "SEC-POS-MERGE-B" stakeholderId classId) with quantity = 25.0
+
+  (capTableAfterIssuanceA, _) <- createStockIssuanceWithResult issuer capTableWithPrereqs issuanceA
+  (capTableAfterIssuanceB, _) <- createStockIssuanceWithResult issuer capTableAfterIssuanceA issuanceB
+
+  consolidationResult <- submit issuer do
+    exerciseCmd capTableAfterIssuanceB CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConsolidation StockConsolidationOcfData with
+        id = "TX_POSITION_CONSOLIDATION_1"
+        date = DT.time (DA.date 2025 Apr 01) 0 0 0
+        security_ids = [issuanceA.security_id, issuanceB.security_id]
+        resulting_security_id = "SEC-POS-MERGED-1"
+        comments = ["Multiple source certificates merged into one position event."]
+        reason_text = Some "Administrative consolidation"]
+      edits = []
+      deletes = []
+
+  assertCreatedCount 1 consolidationResult
+  case consolidationResult.createdCids of
+    [CT.CidStockConsolidation _] -> pure ()
+    _ -> assertFail "Expected one stock consolidation CID"
+
+  currentCapTable <- getCapTable issuer consolidationResult.updatedCapTableCid
+  assertMapHasKey "stock_consolidations" "TX_POSITION_CONSOLIDATION_1" currentCapTable.stock_consolidations
+  assertMapHasKey "stock_issuances_by_security_id" issuanceA.security_id currentCapTable.stock_issuances_by_security_id
+  assertMapHasKey "stock_issuances_by_security_id" issuanceB.security_id currentCapTable.stock_issuances_by_security_id

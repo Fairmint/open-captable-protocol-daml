@@ -1,0 +1,76 @@
+module Fairmint.OpenCapTableEquityPosition.EquityPositionFactory where
+
+-- Equity Position Factory - CIP-0056 BurnMintFactory implementation
+-- Admin-controlled factory for minting, burning, and reassigning equity position holdings.
+--
+-- Design notes:
+-- - Only system_operator authorization is required (extraActors = [] in typical calls).
+--   This is the "admin-controlled" model: the operator can process corporate actions
+--   (cancellations, conversions, splits) unilaterally without per-holder consent.
+-- - The factory is scoped to a single (issuer_id, security_id) instrument so that
+--   BurnMint operations cannot inadvertently cross instrument boundaries.
+-- - Callers must pass "fairmint.com/stakeholder-id" in each BurnMintOutput.context.values
+--   (as AV_Text) so the factory can populate the stakeholder_id field on newly minted holdings.
+
+import DA.Foldable (mapA_)
+
+import Splice.Api.Token.BurnMintV1 qualified as BurnMintV1
+
+import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTableEquityPosition.EquityPositionHolding (EquityPositionHolding(..))
+import Fairmint.OpenCapTableEquityPosition.Metadata
+  ( canonicalInstrumentId
+  , instrumentMetadata
+  , stakeholderIdFromChoiceContext
+  )
+
+template EquityPositionFactory
+  with
+    context : Context
+      -- ^ OCF context: issuer + system_operator parties.
+    issuer_id : Text
+      -- ^ OCF issuer identifier scoping this factory to one company.
+    security_id : Text
+      -- ^ OCF security identifier scoping this factory to one instrument.
+  where
+    signatory context.system_operator
+
+    ensure issuer_id /= "" && security_id /= ""
+
+    interface instance BurnMintV1.BurnMintFactory for EquityPositionFactory where
+      view = BurnMintV1.BurnMintFactoryView with
+        admin = context.system_operator
+        meta = instrumentMetadata issuer_id security_id
+
+      burnMintFactory_burnMintImpl _self arg = do
+        assertMsg "expectedAdmin must equal system_operator" $
+          arg.expectedAdmin == context.system_operator
+        assertMsg "instrumentId must match this factory's instrument" $
+          arg.instrumentId == canonicalInstrumentId context issuer_id security_id
+
+        -- Archive each input holding; safe because system_operator is the sole signatory.
+        mapA_ (\cid -> archive (fromInterfaceContractId @EquityPositionHolding cid))
+          arg.inputHoldingCids
+
+        -- Create output holdings; caller must supply stakeholder_id via output context.
+        outputCids <- mapA
+          (\output -> do
+            let sid = case stakeholderIdFromChoiceContext output.context of
+                  Some stakeholder_id -> stakeholder_id
+                  None -> error "fairmint.com/stakeholder-id (AV_Text) required in output context"
+            holdingCid <- create EquityPositionHolding with
+              context
+              owner = output.owner
+              issuer_id
+              security_id
+              stakeholder_id = sid
+              amount = output.amount
+            pure (toInterfaceContractId holdingCid))
+          arg.outputs
+
+        pure BurnMintV1.BurnMintFactory_BurnMintResult with outputCids
+
+      burnMintFactory_publicFetchImpl _self arg = do
+        assertMsg "expectedAdmin must equal system_operator" $
+          arg.expectedAdmin == context.system_operator
+        pure (view (toInterface @BurnMintV1.BurnMintFactory this))

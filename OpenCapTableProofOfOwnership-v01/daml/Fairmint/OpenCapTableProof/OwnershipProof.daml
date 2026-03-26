@@ -1,9 +1,15 @@
 module Fairmint.OpenCapTableProof.OwnershipProof where
 
-import qualified DA.Set as Set
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..))
 import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellation(..))
+import Fairmint.OpenCapTableProof.OwnershipAccessProof
+  ( OwnershipAccessCredential
+  , addCredentialAudience
+  , addCredentialAuthorizedVerifiers
+  , isAuthorizedVerifier
+  , validateOwnershipAccessCredential
+  )
 
 -- A public proof that a stakeholder (Party) owns an expected quantity of stock
 -- based on a provided list of source transaction contracts.
@@ -12,45 +18,77 @@ import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellation(..))
 template OwnershipProof
   with
     context: Context
-    stakeholder_id: Text
+    access_credential: OwnershipAccessCredential
     expected_total: Decimal
     -- Source transactions that impact the holder's stock balance.
     stock_issuances: [ContractId StockIssuance]
     stock_cancellations: [ContractId StockCancellation]
     created_at: Time
-    observers: [Party]
   where
     signatory context.system_operator
-    observer observers
+    observer access_credential.audience
 
     ensure
-      expected_total >= (0.0) && stakeholder_id /= ""
+      expected_total >= (0.0) &&
+      validateOwnershipAccessCredential access_credential
 
     choice AddObservers : ContractId OwnershipProof
       with
         added: [Party]
       controller context.system_operator
       do
-        let updatedObservers = Set.toList (Set.fromList (observers ++ added))
-        if length updatedObservers == length observers then
+        let updatedCredential = addCredentialAudience added access_credential
+        if length updatedCredential.audience == length access_credential.audience then
           abort "AddObservers: no new observers provided"
         else do
-          create this with observers = updatedObservers
+          create this with access_credential = updatedCredential
 
-    nonconsuming choice Verify : ()
+    choice AddAuthorizedVerifiers : ContractId OwnershipProof
+      with
+        added: [Party]
       controller context.system_operator
       do
+        if not (all (\party -> party `elem` access_credential.audience) added) then
+          abort "AddAuthorizedVerifiers: all verifiers must already be observers"
+        else do
+          let updatedCredential = addCredentialAuthorizedVerifiers added access_credential
+          if length updatedCredential.authorized_verifiers == length access_credential.authorized_verifiers then
+            abort "AddAuthorizedVerifiers: no new verifiers provided"
+          else do
+            create this with access_credential = updatedCredential
+
+    -- Non-operator verifiers must submit with system_operator in readAs so the
+    -- referenced source transactions remain visible during verification.
+    nonconsuming choice Verify : ()
+      with
+        verifier: Party
+      controller verifier
+      do
+        if not (isAuthorizedVerifier context.system_operator verifier access_credential) then
+          abort "Verify: verifier is not authorized"
+        else pure ()
         issuances <- mapA (\cid -> fetch cid) stock_issuances
         let issuanceQuantities = map (\s -> s.issuance_data.quantity) issuances
-        let allIssuanceStakeholdersMatch = all (\s -> s.issuance_data.stakeholder_id == stakeholder_id) issuances
+        let allIssuanceStakeholdersMatch =
+              all
+                (\s -> s.issuance_data.stakeholder_id == access_credential.auth_binding.stakeholder_id)
+                issuances
         if not allIssuanceStakeholdersMatch then
           abort "Verify: issuance stakeholder_id mismatch"
+        else pure ()
+        let allIssuanceSecurityIdsMatch =
+              all
+                (\s -> s.issuance_data.security_id == access_credential.auth_binding.position_identity.security_id)
+                issuances
+        if not allIssuanceSecurityIdsMatch then
+          abort "Verify: issuance security_id mismatch"
         else pure ()
         -- Cancellations must reference securities from those issuances
         let issuanceSecurityIds = map (\s -> s.issuance_data.security_id) issuances
         cancellations <- mapA (\cid -> fetch cid) stock_cancellations
         let cancellationQuantities = map (\c -> c.cancellation_data.quantity) cancellations
-        let allCancellationsMatchSecurities = all (\c -> c.cancellation_data.security_id `elem` issuanceSecurityIds) cancellations
+        let allCancellationsMatchSecurities =
+              all (\c -> c.cancellation_data.security_id `elem` issuanceSecurityIds) cancellations
         if not allCancellationsMatchSecurities then
           abort "Verify: cancellation refers to unrelated security_id"
         else pure ()

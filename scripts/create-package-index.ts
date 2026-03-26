@@ -4,11 +4,13 @@ import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const equityPositionPkg = requirePackageConfig('equityPosition');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const packageDirs = [
   path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '..', 'generated', 'js', `${equityPositionPkg.name}-${equityPositionPkg.version}`),
   path.join(__dirname, '..', 'generated', 'js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 

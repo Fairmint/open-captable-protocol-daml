@@ -40,6 +40,7 @@ function readVersionFromDamlYaml(sourceDir: string): string {
 const PACKAGE_DEFS = {
   ocp: { name: 'OpenCapTable-v34', sourceDir: 'OpenCapTable-v34' },
   reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
+  equityPosition: { name: 'OpenCapTableEquityPosition-v01', sourceDir: 'OpenCapTableEquityPosition-v01' },
   paymentStreams: { name: 'CantonPayments', sourceDir: 'CantonPayments' },
   couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
 } as const;

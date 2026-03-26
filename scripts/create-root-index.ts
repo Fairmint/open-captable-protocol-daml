@@ -4,11 +4,18 @@ import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const equityPositionPkg = requirePackageConfig('equityPosition');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`);
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`);
+const EQUITY_POSITION_DIR = path.join(
+  ROOT_DIR,
+  'generated',
+  'js',
+  `${equityPositionPkg.name}-${equityPositionPkg.version}`
+);
 const SUBSCRIPTIONS_DIR = path.join(
   ROOT_DIR,
   'generated',
@@ -17,6 +24,7 @@ const SUBSCRIPTIONS_DIR = path.join(
 );
 const OCP_LIB = path.join(OCP_DIR, 'lib');
 const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
+const EQUITY_POSITION_LIB = path.join(EQUITY_POSITION_DIR, 'lib');
 const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
 const DEST_LIB = path.join(ROOT_DIR, 'lib');
 
@@ -67,6 +75,10 @@ function buildCombinedLib() {
   const destFairmint = path.join(DEST_LIB, 'Fairmint');
   copyDir(path.join(OCP_LIB, 'Fairmint', 'OpenCapTable'), path.join(destFairmint, 'OpenCapTable'));
   copyDir(path.join(REPORTS_LIB, 'Fairmint', 'OpenCapTableReports'), path.join(destFairmint, 'OpenCapTableReports'));
+  copyDir(
+    path.join(EQUITY_POSITION_LIB, 'Fairmint', 'OpenCapTableEquityPosition'),
+    path.join(destFairmint, 'OpenCapTableEquityPosition')
+  );
 
   // Copy CantonPayments at root level (not under Fairmint)
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'CantonPayments'), path.join(DEST_LIB, 'CantonPayments'));
@@ -85,12 +97,15 @@ var OpenCapTable = require('./OpenCapTable');
 exports.OpenCapTable = OpenCapTable;
 var OpenCapTableReports = require('./OpenCapTableReports');
 exports.OpenCapTableReports = OpenCapTableReports;
+var OpenCapTableEquityPosition = require('./OpenCapTableEquityPosition');
+exports.OpenCapTableEquityPosition = OpenCapTableEquityPosition;
 `
   );
   ensureFile(
     path.join(destFairmint, 'index.d.ts'),
     `export * as OpenCapTable from './OpenCapTable';
 export * as OpenCapTableReports from './OpenCapTableReports';
+export * as OpenCapTableEquityPosition from './OpenCapTableEquityPosition';
 `
   );
 

@@ -7,12 +7,14 @@ import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const equityPositionPkg = requirePackageConfig('equityPosition');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 // Paths
 const PACKAGE_DIRS = [
   path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '../generated/js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '../generated/js', `${equityPositionPkg.name}-${equityPositionPkg.version}`),
   path.join(__dirname, '../generated/js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
@@ -20,6 +22,7 @@ const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-f
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
+const TOKEN_BURN_MINT_DIR = path.join(__dirname, '../generated/js/splice-api-token-burn-mint-v1-1.0.0');
 const TOKEN_METADATA_DIR = path.join(__dirname, '../generated/js/splice-api-token-metadata-v1-1.0.0');
 const TOKEN_HOLDING_DIR = path.join(__dirname, '../generated/js/splice-api-token-holding-v1-1.0.0');
 const TOKEN_ALLOCATION_INSTRUCTION_DIR = path.join(
@@ -32,6 +35,11 @@ const TOKEN_TRANSFER_INSTRUCTION_DIR = path.join(
 );
 const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-v1-1.0.0');
 const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
+const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 function createDirectoryIfNotExists(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
@@ -350,6 +358,16 @@ function createBundledDATypesFiles(targetDir: string): void {
 function createBundledSpliceApiTokenDependencies(targetDir: string): void {
   console.log('📦 Bundling Splice API Token dependencies...');
 
+  // Copy token burn/mint
+  if (fs.existsSync(TOKEN_BURN_MINT_DIR)) {
+    const destDir = path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1');
+    const sourceDir = path.join(TOKEN_BURN_MINT_DIR, 'lib/Splice/Api/Token/BurnMintV1');
+    if (fs.existsSync(sourceDir)) {
+      copyDirectory(sourceDir, destDir);
+      console.log('✅ Copied token-burn-mint-v1');
+    }
+  }
+
   // Copy token metadata
   if (fs.existsSync(TOKEN_METADATA_DIR)) {
     const destDir = path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1');
@@ -515,6 +533,18 @@ function replaceDependencyReferences(targetDir: string): void {
       }
     }
 
+    if (content.includes(OCP_DAML_JS_IMPORT)) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib', 'index'))
+        .replace(/\\/g, '/');
+      const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
+      if (isDts) {
+        content = content.replace(new RegExp(`from '${escapedImport}';`, 'g'), `from '${relativePath}';`);
+      } else {
+        content = content.replace(new RegExp(`require\\('${escapedImport}'\\)`, 'g'), `require('${relativePath}')`);
+      }
+    }
+
     if (content.includes('daml.js/splice-api-featured-app-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'))
@@ -576,6 +606,20 @@ function replaceDependencyReferences(targetDir: string): void {
       } else {
         content = content.replace(
           /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
+          `require('${relativePath}')`
+        );
+      }
+    }
+
+    if (content.includes('daml.js/splice-api-token-burn-mint-v1-1.0.0')) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'))
+        .replace(/\\/g, '/');
+      if (isDts) {
+        content = content.replace(/from 'daml.js\/splice-api-token-burn-mint-v1-1\.0\.0';/g, `from '${relativePath}';`);
+      } else {
+        content = content.replace(
+          /require\('daml.js\/splice-api-token-burn-mint-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
@@ -679,6 +723,7 @@ function removeLocalDependency(targetDir: string): void {
     'daml.js/splice-amulet-0.1.14',
     'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
     'daml.js/daml-prim-DA-Types-1.0.0',
+    'daml.js/splice-api-token-burn-mint-v1-1.0.0',
     'daml.js/splice-api-token-metadata-v1-1.0.0',
     'daml.js/splice-api-token-holding-v1-1.0.0',
     'daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
@@ -713,7 +758,11 @@ function main(): void {
       console.log(`📦 Processing package: ${targetDir}`);
       createBundledFiles(targetDir);
       createBundledSpliceFiles(targetDir);
-      // Only bundle splice-amulet and additional dependencies for Subscriptions package
+      // Bundle token dependencies for packages that expose Splice token interfaces directly.
+      if (targetDir.includes('OpenCapTableEquityPosition')) {
+        createBundledSpliceApiTokenDependencies(targetDir);
+      }
+      // Only bundle splice-amulet and additional DA dependencies for Subscriptions package
       if (targetDir.includes('CantonPayments')) {
         createBundledSpliceAmuletFiles(targetDir);
         createBundledDATimeTypesFiles(targetDir);

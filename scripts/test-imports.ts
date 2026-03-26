@@ -8,8 +8,10 @@ try {
   }
   const hasOcp = Boolean(rootPkg.Fairmint?.OpenCapTable);
   const hasReports = Boolean(rootPkg.Fairmint?.OpenCapTableReports);
+  const hasEquityPosition = Boolean(rootPkg.Fairmint?.OpenCapTableEquityPosition);
   if (!hasOcp) console.warn('Warning: OpenCapTable namespace not detected');
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
+  if (!hasEquityPosition) console.warn('Warning: OpenCapTableEquityPosition namespace not detected');
 
   // Verify JSON import via package subpath exports
   const ocp = require('@fairmint/open-captable-protocol-daml-js/ocp-factory-contract-id.json');

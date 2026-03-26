@@ -1,0 +1,131 @@
+module OpenCapTable.TestEquityPositionHolding where
+
+import DA.TextMap qualified as TextMap
+import Daml.Script
+
+import OpenCapTable.Setup
+
+import Fairmint.OpenCapTableEquityPosition.EquityPositionFactory
+import Fairmint.OpenCapTableEquityPosition.EquityPositionHolding
+import Fairmint.OpenCapTableEquityPosition.Metadata
+  ( canonicalInstrumentId
+  , canonicalInstrumentIdText
+  , instrumentIdMetadataKey
+  , issuerIdMetadataKey
+  , securityIdMetadataKey
+  , stakeholderIdMetadataKey
+  )
+import Splice.Api.Token.BurnMintV1 qualified as BurnMintV1
+import Splice.Api.Token.HoldingV1 qualified as HoldingV1
+import Splice.Api.Token.MetadataV1 qualified as MetadataV1
+
+issuerId : Text
+issuerId = "ISSUER_1"
+
+securityId : Text
+securityId = "SEC-EQPOS-1"
+
+aliceStakeholderId : Text
+aliceStakeholderId = "SH-EQPOS-ALICE"
+
+bobStakeholderId : Text
+bobStakeholderId = "SH-EQPOS-BOB"
+
+positionAmount : Decimal
+positionAmount = 100.5
+
+emptyExtraArgs : MetadataV1.ExtraArgs
+emptyExtraArgs = MetadataV1.ExtraArgs with
+  context = MetadataV1.ChoiceContext with values = TextMap.empty
+  meta = MetadataV1.Metadata with values = TextMap.empty
+
+mkOutput : Party -> Decimal -> Text -> BurnMintV1.BurnMintOutput
+mkOutput owner amount stakeholder_id = BurnMintV1.BurnMintOutput with
+  owner
+  amount
+  context = MetadataV1.ChoiceContext with
+    values = TextMap.fromList
+      [(stakeholderIdMetadataKey, MetadataV1.AV_Text stakeholder_id)]
+
+assertMetadataValue : Text -> Text -> MetadataV1.Metadata -> Script ()
+assertMetadataValue key expected meta =
+  assertMsg ("expected metadata " <> key <> " = " <> expected) $
+    TextMap.lookup key meta.values == Some expected
+
+assertHoldingViewMatches :
+  Party ->
+  HoldingV1.HoldingView ->
+  Party ->
+  Decimal ->
+  Text ->
+  Script ()
+assertHoldingViewMatches system_operator holding owner amount stakeholder_id = do
+  assertMsg "holding owner mismatch" (holding.owner == owner)
+  assertMsg "holding instrument admin mismatch" (holding.instrumentId.admin == system_operator)
+  assertMsg "holding instrument id mismatch" (holding.instrumentId.id == canonicalInstrumentIdText issuerId securityId)
+  assertMsg "holding amount mismatch" (holding.amount == amount)
+  assertMetadataValue instrumentIdMetadataKey (canonicalInstrumentIdText issuerId securityId) holding.meta
+  assertMetadataValue issuerIdMetadataKey issuerId holding.meta
+  assertMetadataValue securityIdMetadataKey securityId holding.meta
+  assertMetadataValue stakeholderIdMetadataKey stakeholder_id holding.meta
+
+testEquityPositionFactoryLifecycle_MintsBurnsAndReassigns = script do
+  TestOcp{system_operator, ctx, alice} <- setupTestOcp
+  bob <- allocateParty "EquityPositionBob"
+
+  let instrument_id = canonicalInstrumentId ctx issuerId securityId
+
+  factoryCid <- submit system_operator do
+    createCmd EquityPositionFactory with
+      context = ctx
+      issuer_id = issuerId
+      security_id = securityId
+
+  let factoryIfaceCid = toInterfaceContractId @BurnMintV1.BurnMintFactory factoryCid
+
+  Some factoryView <- queryInterfaceContractId @BurnMintV1.BurnMintFactory system_operator factoryIfaceCid
+  assertMsg "factory admin mismatch" (factoryView.admin == system_operator)
+  assertMetadataValue instrumentIdMetadataKey instrument_id.id factoryView.meta
+  assertMetadataValue issuerIdMetadataKey issuerId factoryView.meta
+  assertMetadataValue securityIdMetadataKey securityId factoryView.meta
+
+  let mintCmd = BurnMintV1.BurnMintFactory_BurnMint with
+        expectedAdmin = system_operator
+        instrumentId = instrument_id
+        inputHoldingCids = []
+        outputs = [mkOutput alice positionAmount aliceStakeholderId]
+        extraActors = []
+        extraArgs = emptyExtraArgs
+  (mintResult : BurnMintV1.BurnMintFactory_BurnMintResult) <- submit system_operator do
+    exerciseCmd factoryIfaceCid mintCmd
+
+  [aliceHoldingIfaceCid] <- pure mintResult.outputCids
+  Some aliceHoldingView <- queryInterfaceContractId @HoldingV1.Holding alice aliceHoldingIfaceCid
+  assertHoldingViewMatches system_operator aliceHoldingView alice positionAmount aliceStakeholderId
+
+  Some aliceHolding <- queryContractId alice (fromInterfaceContractId @EquityPositionHolding aliceHoldingIfaceCid)
+  assertMsg "template owner mismatch" (aliceHolding.owner == alice)
+  assertMsg "template amount mismatch" (aliceHolding.amount == positionAmount)
+  assertMsg "template issuer_id mismatch" (aliceHolding.issuer_id == issuerId)
+  assertMsg "template security_id mismatch" (aliceHolding.security_id == securityId)
+  assertMsg "template stakeholder_id mismatch" (aliceHolding.stakeholder_id == aliceStakeholderId)
+
+  let reassignCmd = BurnMintV1.BurnMintFactory_BurnMint with
+        expectedAdmin = system_operator
+        instrumentId = instrument_id
+        inputHoldingCids = [aliceHoldingIfaceCid]
+        outputs = [mkOutput bob positionAmount bobStakeholderId]
+        extraActors = []
+        extraArgs = emptyExtraArgs
+  (reassignResult : BurnMintV1.BurnMintFactory_BurnMintResult) <- submit system_operator do
+    exerciseCmd factoryIfaceCid reassignCmd
+
+  [bobHoldingIfaceCid] <- pure reassignResult.outputCids
+  None <- queryInterfaceContractId @HoldingV1.Holding alice aliceHoldingIfaceCid
+  Some bobHoldingView <- queryInterfaceContractId @HoldingV1.Holding bob bobHoldingIfaceCid
+  assertHoldingViewMatches system_operator bobHoldingView bob positionAmount bobStakeholderId
+
+  Some bobHolding <- queryContractId bob (fromInterfaceContractId @EquityPositionHolding bobHoldingIfaceCid)
+  assertMsg "reassigned holding owner mismatch" (bobHolding.owner == bob)
+  assertMsg "reassigned holding amount mismatch" (bobHolding.amount == positionAmount)
+  assertMsg "reassigned holding stakeholder_id mismatch" (bobHolding.stakeholder_id == bobStakeholderId)

@@ -10,12 +10,17 @@ const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as Pack
 // Build package paths dynamically from packages.ts (which reads from daml.yaml)
 const ocpPkg = getPackage('ocp')!;
 const reportsPkg = getPackage('reports')!;
+const equityPositionPkg = getPackage('equityPosition')!;
 
 const packages = [
   { dir: path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`), name: rootPackage.name },
   {
     dir: path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
     name: `${rootPackage.name}-reports`,
+  },
+  {
+    dir: path.join(__dirname, '..', 'generated', 'js', `${equityPositionPkg.name}-${equityPositionPkg.version}`),
+    name: `${rootPackage.name}-equity-position`,
   },
 ];
 
