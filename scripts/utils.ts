@@ -12,6 +12,19 @@ function toSdkNetwork(network: ScriptNetwork): NetworkType {
   return network;
 }
 
+function getMissingEnvVarFromError(error: unknown): string | null {
+  if (!(error instanceof Error)) {
+    return null;
+  }
+
+  const prefix = 'Missing required environment variable: ';
+  if (!error.message.startsWith(prefix)) {
+    return null;
+  }
+
+  return error.message.slice(prefix.length);
+}
+
 /**
  * Create a LedgerJsonApiClient instance using EnvLoader for scripts
  *
@@ -22,20 +35,66 @@ function toSdkNetwork(network: ScriptNetwork): NetworkType {
 export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: ProviderType): LedgerJsonApiClient {
   const envLoader = EnvLoader.getInstance();
   const sdkNetwork = toSdkNetwork(network);
+  const envPrefix = `CANTON_${sdkNetwork.toUpperCase()}_${providerType.toUpperCase()}`;
+  const apiUrlEnvVar = `${envPrefix}_LEDGER_JSON_API_URI`;
+  const clientIdEnvVar = `${envPrefix}_LEDGER_JSON_API_CLIENT_ID`;
+  const clientSecretEnvVar = `${envPrefix}_LEDGER_JSON_API_CLIENT_SECRET`;
+  const apiUrl = envLoader.getApiUri('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
+  const clientId = envLoader.getApiClientId('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
+  const clientSecret = envLoader.getApiClientSecret('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
+  const missingEnvVars: string[] = [];
+  let authUrl = '';
+  let partyId = '';
+
+  if (!apiUrl) {
+    missingEnvVars.push(apiUrlEnvVar);
+  }
+  if (!clientId) {
+    missingEnvVars.push(clientIdEnvVar);
+  }
+  if (!clientSecret) {
+    missingEnvVars.push(clientSecretEnvVar);
+  }
+
+  try {
+    authUrl = envLoader.getAuthUrl(sdkNetwork, providerType);
+  } catch (error) {
+    const missingEnvVar = getMissingEnvVarFromError(error);
+    if (!missingEnvVar) {
+      throw error;
+    }
+    missingEnvVars.push(missingEnvVar);
+  }
+
+  try {
+    partyId = envLoader.getPartyId(sdkNetwork, providerType);
+  } catch (error) {
+    const missingEnvVar = getMissingEnvVarFromError(error);
+    if (!missingEnvVar) {
+      throw error;
+    }
+    missingEnvVars.push(missingEnvVar);
+  }
+
+  if (missingEnvVars.length > 0) {
+    throw new Error(
+      `Missing required LedgerJsonApiClient environment variables: ${missingEnvVars.join(', ')}`,
+    );
+  }
 
   return new LedgerJsonApiClient({
     network: sdkNetwork,
     provider: providerType,
-    authUrl: envLoader.getAuthUrl(sdkNetwork, providerType),
+    authUrl,
     apis: {
       LEDGER_JSON_API: {
-        apiUrl: envLoader.getApiUri('LEDGER_JSON_API', sdkNetwork, providerType) ?? '',
+        apiUrl,
         auth: {
-          clientId: envLoader.getApiClientId('LEDGER_JSON_API', sdkNetwork, providerType) ?? '',
-          clientSecret: envLoader.getApiClientSecret('LEDGER_JSON_API', sdkNetwork, providerType) ?? '',
+          clientId,
+          clientSecret,
           grantType: 'client_credentials',
         },
-        partyId: envLoader.getPartyId(sdkNetwork, providerType),
+        partyId,
       },
     },
     logger: new FileLogger(),

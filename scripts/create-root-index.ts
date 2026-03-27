@@ -70,6 +70,9 @@ function buildCombinedLib() {
   // This will merge with what was already copied from OCP
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
+  copyDir(path.join(REPORTS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
+  copyDir(path.join(EQUITY_POSITION_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
+  copyDir(path.join(SUBSCRIPTIONS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
 
   // Combine Fairmint sub-namespaces
   const destFairmint = path.join(DEST_LIB, 'Fairmint');

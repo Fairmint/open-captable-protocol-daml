@@ -11,6 +11,7 @@ import Fairmint.OpenCapTableEquityPosition.Metadata
   ( canonicalInstrumentId
   , canonicalInstrumentIdText
   , instrumentIdMetadataKey
+  , instrumentMetadata
   , issuerIdMetadataKey
   , securityIdMetadataKey
   , stakeholderIdMetadataKey
@@ -24,6 +25,9 @@ issuerId = "ISSUER_1"
 
 securityId : Text
 securityId = "SEC-EQPOS-1"
+
+otherSecurityId : Text
+otherSecurityId = "SEC-EQPOS-2"
 
 aliceStakeholderId : Text
 aliceStakeholderId = "SH-EQPOS-ALICE"
@@ -49,24 +53,28 @@ mkOutput owner amount stakeholder_id = BurnMintV1.BurnMintOutput with
 
 assertMetadataValue : Text -> Text -> MetadataV1.Metadata -> Script ()
 assertMetadataValue key expected meta =
-  assertMsg ("expected metadata " <> key <> " = " <> expected) $
-    TextMap.lookup key meta.values == Some expected
+  let actual = TextMap.lookup key meta.values
+  in assertMsg ("expected metadata " <> key <> " = " <> expected <> ", but got " <> show actual) $
+       actual == Some expected
 
 assertHoldingViewMatches :
   Party ->
   HoldingV1.HoldingView ->
   Party ->
+  Text ->
+  Text ->
   Decimal ->
   Text ->
   Script ()
-assertHoldingViewMatches system_operator holding owner amount stakeholder_id = do
+assertHoldingViewMatches system_operator holding owner issuer_id security_id amount stakeholder_id = do
+  let instrument_id = canonicalInstrumentIdText issuer_id security_id
   assertMsg "holding owner mismatch" (holding.owner == owner)
   assertMsg "holding instrument admin mismatch" (holding.instrumentId.admin == system_operator)
-  assertMsg "holding instrument id mismatch" (holding.instrumentId.id == canonicalInstrumentIdText issuerId securityId)
+  assertMsg "holding instrument id mismatch" (holding.instrumentId.id == instrument_id)
   assertMsg "holding amount mismatch" (holding.amount == amount)
-  assertMetadataValue instrumentIdMetadataKey (canonicalInstrumentIdText issuerId securityId) holding.meta
-  assertMetadataValue issuerIdMetadataKey issuerId holding.meta
-  assertMetadataValue securityIdMetadataKey securityId holding.meta
+  assertMetadataValue instrumentIdMetadataKey instrument_id holding.meta
+  assertMetadataValue issuerIdMetadataKey issuer_id holding.meta
+  assertMetadataValue securityIdMetadataKey security_id holding.meta
   assertMetadataValue stakeholderIdMetadataKey stakeholder_id holding.meta
 
 testEquityPositionFactoryLifecycle_MintsBurnsAndReassigns = script do
@@ -101,7 +109,7 @@ testEquityPositionFactoryLifecycle_MintsBurnsAndReassigns = script do
 
   [aliceHoldingIfaceCid] <- pure mintResult.outputCids
   Some aliceHoldingView <- queryInterfaceContractId @HoldingV1.Holding alice aliceHoldingIfaceCid
-  assertHoldingViewMatches system_operator aliceHoldingView alice positionAmount aliceStakeholderId
+  assertHoldingViewMatches system_operator aliceHoldingView alice issuerId securityId positionAmount aliceStakeholderId
 
   Some aliceHolding <- queryContractId alice (fromInterfaceContractId @EquityPositionHolding aliceHoldingIfaceCid)
   assertMsg "template owner mismatch" (aliceHolding.owner == alice)
@@ -123,9 +131,92 @@ testEquityPositionFactoryLifecycle_MintsBurnsAndReassigns = script do
   [bobHoldingIfaceCid] <- pure reassignResult.outputCids
   None <- queryInterfaceContractId @HoldingV1.Holding alice aliceHoldingIfaceCid
   Some bobHoldingView <- queryInterfaceContractId @HoldingV1.Holding bob bobHoldingIfaceCid
-  assertHoldingViewMatches system_operator bobHoldingView bob positionAmount bobStakeholderId
+  assertHoldingViewMatches system_operator bobHoldingView bob issuerId securityId positionAmount bobStakeholderId
 
   Some bobHolding <- queryContractId bob (fromInterfaceContractId @EquityPositionHolding bobHoldingIfaceCid)
   assertMsg "reassigned holding owner mismatch" (bobHolding.owner == bob)
   assertMsg "reassigned holding amount mismatch" (bobHolding.amount == positionAmount)
   assertMsg "reassigned holding stakeholder_id mismatch" (bobHolding.stakeholder_id == bobStakeholderId)
+
+testEquityPositionFactoryRejectsCrossInstrumentInput = script do
+  TestOcp{system_operator, ctx, alice} <- setupTestOcp
+
+  let instrument_id = canonicalInstrumentId ctx issuerId securityId
+  let other_instrument_id = canonicalInstrumentId ctx issuerId otherSecurityId
+
+  factoryCid <- submit system_operator do
+    createCmd EquityPositionFactory with
+      context = ctx
+      issuer_id = issuerId
+      security_id = securityId
+
+  otherFactoryCid <- submit system_operator do
+    createCmd EquityPositionFactory with
+      context = ctx
+      issuer_id = issuerId
+      security_id = otherSecurityId
+
+  let factoryIfaceCid = toInterfaceContractId @BurnMintV1.BurnMintFactory factoryCid
+  let otherFactoryIfaceCid = toInterfaceContractId @BurnMintV1.BurnMintFactory otherFactoryCid
+
+  (mintResult : BurnMintV1.BurnMintFactory_BurnMintResult) <- submit system_operator do
+    exerciseCmd otherFactoryIfaceCid (BurnMintV1.BurnMintFactory_BurnMint with
+      expectedAdmin = system_operator
+      instrumentId = other_instrument_id
+      inputHoldingCids = []
+      outputs = [mkOutput alice positionAmount aliceStakeholderId]
+      extraActors = []
+      extraArgs = emptyExtraArgs)
+
+  [otherHoldingIfaceCid] <- pure mintResult.outputCids
+
+  submitMustFail system_operator do
+    exerciseCmd factoryIfaceCid (BurnMintV1.BurnMintFactory_BurnMint with
+      expectedAdmin = system_operator
+      instrumentId = instrument_id
+      inputHoldingCids = [otherHoldingIfaceCid]
+      outputs = [mkOutput alice positionAmount aliceStakeholderId]
+      extraActors = []
+      extraArgs = emptyExtraArgs)
+
+  Some otherHoldingView <- queryInterfaceContractId @HoldingV1.Holding alice otherHoldingIfaceCid
+  assertHoldingViewMatches system_operator otherHoldingView alice issuerId otherSecurityId positionAmount aliceStakeholderId
+
+testEquityPositionFactoryRejectsMissingStakeholderContext = script do
+  TestOcp{system_operator, ctx, alice} <- setupTestOcp
+
+  let instrument_id = canonicalInstrumentId ctx issuerId securityId
+
+  factoryCid <- submit system_operator do
+    createCmd EquityPositionFactory with
+      context = ctx
+      issuer_id = issuerId
+      security_id = securityId
+
+  let factoryIfaceCid = toInterfaceContractId @BurnMintV1.BurnMintFactory factoryCid
+
+  submitMustFail system_operator do
+    exerciseCmd factoryIfaceCid (BurnMintV1.BurnMintFactory_BurnMint with
+      expectedAdmin = system_operator
+      instrumentId = instrument_id
+      inputHoldingCids = []
+      outputs =
+        [ BurnMintV1.BurnMintOutput with
+            owner = alice
+            amount = positionAmount
+            context = MetadataV1.ChoiceContext with values = TextMap.empty
+        ]
+      extraActors = []
+      extraArgs = emptyExtraArgs)
+
+testCanonicalInstrumentIdTextIsUnambiguous = script do
+  let issuer_id_a = "issuer/a"
+  let security_id_a = "b"
+  let issuer_id_b = "issuer"
+  let security_id_b = "a/b"
+  let canonical_a = canonicalInstrumentIdText issuer_id_a security_id_a
+  let canonical_b = canonicalInstrumentIdText issuer_id_b security_id_b
+  assertMsg "canonical instrument ids should differ for slash-colliding inputs" $
+    canonical_a /= canonical_b
+  assertMetadataValue instrumentIdMetadataKey canonical_a (instrumentMetadata issuer_id_a security_id_a)
+  assertMetadataValue instrumentIdMetadataKey canonical_b (instrumentMetadata issuer_id_b security_id_b)

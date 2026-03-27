@@ -35,7 +35,9 @@ const TOKEN_TRANSFER_INSTRUCTION_DIR = path.join(
 );
 const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-v1-1.0.0');
 const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
+const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
 const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
+const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -434,6 +436,44 @@ function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('✅ Copied DA Set Types modules');
 }
 
+function createBundledOcpFiles(targetDir: string): void {
+  console.log('📦 Bundling OpenCapTable dependency...');
+
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    const ocpSourceDir = path.join(OCP_PACKAGE_DIR, 'lib/Fairmint/OpenCapTable');
+    const ocpDestDir = path.join(targetDir, 'lib/Fairmint/OpenCapTable');
+
+    if (!fs.existsSync(ocpSourceDir)) {
+      console.log('⚠️  OpenCapTable dependency directory not found');
+      return;
+    }
+
+    copyDirectory(ocpSourceDir, ocpDestDir);
+    console.log('✅ Copied OpenCapTable modules');
+  }
+
+  const ocpWrapperDir = path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR);
+  createDirectoryIfNotExists(ocpWrapperDir);
+
+  const ocpWrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var OpenCapTable = require('../../Fairmint/OpenCapTable');
+exports.Fairmint = {
+  OpenCapTable: OpenCapTable,
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.js'), ocpWrapperIndex);
+
+  const ocpWrapperIndexDts = `import * as OpenCapTable from '../../Fairmint/OpenCapTable';
+
+export declare const Fairmint: {
+  OpenCapTable: typeof OpenCapTable;
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.d.ts'), ocpWrapperIndexDts);
+  console.log('✅ Created OpenCapTable dependency wrapper');
+}
+
 function updateMainIndex(targetDir: string): void {
   console.log('📝 Updating main index files...');
 
@@ -535,7 +575,7 @@ function replaceDependencyReferences(targetDir: string): void {
 
     if (content.includes(OCP_DAML_JS_IMPORT)) {
       const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib', 'index'))
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR))
         .replace(/\\/g, '/');
       const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
       if (isDts) {
@@ -719,6 +759,7 @@ function removeLocalDependency(targetDir: string): void {
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   const localDependencies = [
     'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+    OCP_DAML_JS_IMPORT,
     'daml.js/splice-api-featured-app-v1-1.0.0',
     'daml.js/splice-amulet-0.1.14',
     'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
@@ -757,6 +798,7 @@ function main(): void {
       }
       console.log(`📦 Processing package: ${targetDir}`);
       createBundledFiles(targetDir);
+      createBundledOcpFiles(targetDir);
       createBundledSpliceFiles(targetDir);
       // Bundle token dependencies for packages that expose Splice token interfaces directly.
       if (targetDir.includes('OpenCapTableEquityPosition')) {
@@ -791,6 +833,7 @@ export {
   createBundledDATimeTypesFiles,
   createBundledDATypesFiles,
   createBundledFiles,
+  createBundledOcpFiles,
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
   createBundledSpliceFiles,
