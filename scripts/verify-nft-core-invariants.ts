@@ -21,10 +21,7 @@ function getErrorMessage(error: unknown): string {
 }
 
 function collectBlockedDependencies(config: DamlConfig): string[] {
-  const declaredDependencies = [
-    ...(config.dependencies ?? []),
-    ...(config['data-dependencies'] ?? []),
-  ];
+  const declaredDependencies = [...(config.dependencies ?? []), ...(config['data-dependencies'] ?? [])];
 
   return declaredDependencies.filter((dependency) =>
     BLOCKED_DEPENDENCY_PATTERNS.some((pattern) => pattern.test(dependency))

@@ -77,9 +77,7 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
   }
 
   if (missingEnvVars.length > 0) {
-    throw new Error(
-      `Missing required LedgerJsonApiClient environment variables: ${missingEnvVars.join(', ')}`,
-    );
+    throw new Error(`Missing required LedgerJsonApiClient environment variables: ${missingEnvVars.join(', ')}`);
   }
 
   return new LedgerJsonApiClient({
