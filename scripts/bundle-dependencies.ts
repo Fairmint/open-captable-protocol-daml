@@ -38,6 +38,28 @@ const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Se
 const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
 const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
 const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
+const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
+const SPLICE_FEATURED_APP_IMPORT = 'daml.js/splice-api-featured-app-v1-1.0.0';
+const SPLICE_AMULET_IMPORT = 'daml.js/splice-amulet-0.1.14';
+const DA_TIME_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Time-Types-1.0.0';
+const DA_TYPES_IMPORT = 'daml.js/daml-prim-DA-Types-1.0.0';
+const TOKEN_BURN_MINT_IMPORT = 'daml.js/splice-api-token-burn-mint-v1-1.0.0';
+const TOKEN_METADATA_IMPORT = 'daml.js/splice-api-token-metadata-v1-1.0.0';
+const TOKEN_HOLDING_IMPORT = 'daml.js/splice-api-token-holding-v1-1.0.0';
+const TOKEN_ALLOCATION_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-allocation-instruction-v1-1.0.0';
+const TOKEN_TRANSFER_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-transfer-instruction-v1-1.0.0';
+const TOKEN_ALLOCATION_IMPORT = 'daml.js/splice-api-token-allocation-v1-1.0.0';
+const DA_SET_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Set-Types-1.0.0';
+
+interface BundleRequirements {
+  hasBundledOcp: boolean;
+  hasBundledSpliceFeaturedApp: boolean;
+  hasBundledSpliceAmulet: boolean;
+  hasBundledDATimeTypes: boolean;
+  hasBundledDATypes: boolean;
+  hasBundledSpliceApiTokenDependencies: boolean;
+  hasBundledDASetTypes: boolean;
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -110,6 +132,62 @@ function packageHasGeneratedImport(targetDir: string, importPath: string): boole
   }
 
   return false;
+}
+
+function packageHasBundledArtifacts(targetDir: string, ...relativePaths: string[]): boolean {
+  return relativePaths.some((relativePath) => fs.existsSync(path.join(targetDir, relativePath)));
+}
+
+function packageHasBundledSpliceAmuletArtifacts(targetDir: string): boolean {
+  const spliceDir = path.join(targetDir, 'lib', 'Splice');
+
+  if (!fs.existsSync(spliceDir)) {
+    return false;
+  }
+
+  return fs.readdirSync(spliceDir).some((entry) => !['Api', 'index.d.ts', 'index.js'].includes(entry));
+}
+
+function collectBundleRequirements(targetDir: string): BundleRequirements {
+  return {
+    hasBundledOcp:
+      packageHasGeneratedImport(targetDir, OCP_DAML_JS_IMPORT) ||
+      packageHasBundledArtifacts(
+        targetDir,
+        path.join('lib', OCP_BUNDLED_WRAPPER_DIR),
+        path.join('lib', 'Fairmint', 'OpenCapTable')
+      ),
+    hasBundledSpliceFeaturedApp:
+      packageHasGeneratedImport(targetDir, SPLICE_FEATURED_APP_IMPORT) ||
+      packageHasBundledArtifacts(targetDir, path.join('lib', 'Splice', 'Api', 'FeaturedAppRightV1')),
+    hasBundledSpliceAmulet:
+      packageHasGeneratedImport(targetDir, SPLICE_AMULET_IMPORT) || packageHasBundledSpliceAmuletArtifacts(targetDir),
+    hasBundledDATimeTypes:
+      packageHasGeneratedImport(targetDir, DA_TIME_TYPES_IMPORT) ||
+      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Time', 'Types')),
+    hasBundledDATypes:
+      packageHasGeneratedImport(targetDir, DA_TYPES_IMPORT) ||
+      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Types')),
+    hasBundledSpliceApiTokenDependencies:
+      packageHasGeneratedImport(targetDir, TOKEN_BURN_MINT_IMPORT) ||
+      packageHasGeneratedImport(targetDir, TOKEN_METADATA_IMPORT) ||
+      packageHasGeneratedImport(targetDir, TOKEN_HOLDING_IMPORT) ||
+      packageHasGeneratedImport(targetDir, TOKEN_ALLOCATION_INSTRUCTION_IMPORT) ||
+      packageHasGeneratedImport(targetDir, TOKEN_TRANSFER_INSTRUCTION_IMPORT) ||
+      packageHasGeneratedImport(targetDir, TOKEN_ALLOCATION_IMPORT) ||
+      packageHasBundledArtifacts(
+        targetDir,
+        path.join('lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
+        path.join('lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
+        path.join('lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
+        path.join('lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
+        path.join('lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
+        path.join('lib', 'Splice', 'Api', 'Token', 'AllocationV1')
+      ),
+    hasBundledDASetTypes:
+      packageHasGeneratedImport(targetDir, DA_SET_TYPES_IMPORT) ||
+      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Set', 'Types')),
+  };
 }
 
 function clearBundledArtifacts(targetDir: string): void {
@@ -808,19 +886,19 @@ function removeLocalDependency(targetDir: string): void {
   const packageJsonPath = path.join(targetDir, 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   const localDependencies = [
-    'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+    DA_INTERNAL_TEMPLATE_IMPORT,
     OCP_DAML_JS_IMPORT,
-    'daml.js/splice-api-featured-app-v1-1.0.0',
-    'daml.js/splice-amulet-0.1.14',
-    'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
-    'daml.js/daml-prim-DA-Types-1.0.0',
-    'daml.js/splice-api-token-burn-mint-v1-1.0.0',
-    'daml.js/splice-api-token-metadata-v1-1.0.0',
-    'daml.js/splice-api-token-holding-v1-1.0.0',
-    'daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
-    'daml.js/splice-api-token-transfer-instruction-v1-1.0.0',
-    'daml.js/splice-api-token-allocation-v1-1.0.0',
-    'daml.js/daml-stdlib-DA-Set-Types-1.0.0',
+    SPLICE_FEATURED_APP_IMPORT,
+    SPLICE_AMULET_IMPORT,
+    DA_TIME_TYPES_IMPORT,
+    DA_TYPES_IMPORT,
+    TOKEN_BURN_MINT_IMPORT,
+    TOKEN_METADATA_IMPORT,
+    TOKEN_HOLDING_IMPORT,
+    TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
+    TOKEN_TRANSFER_INSTRUCTION_IMPORT,
+    TOKEN_ALLOCATION_IMPORT,
+    DA_SET_TYPES_IMPORT,
   ];
   let removedCount = 0;
   for (const dep of localDependencies) {
@@ -847,41 +925,35 @@ function main(): void {
         continue;
       }
       console.log(`📦 Processing package: ${targetDir}`);
+      const bundleRequirements = collectBundleRequirements(targetDir);
       clearBundledArtifacts(targetDir);
       createBundledFiles(targetDir);
 
-      if (packageHasGeneratedImport(targetDir, OCP_DAML_JS_IMPORT)) {
+      if (bundleRequirements.hasBundledOcp) {
         createBundledOcpFiles(targetDir);
       }
 
-      if (packageHasGeneratedImport(targetDir, 'daml.js/splice-api-featured-app-v1-1.0.0')) {
+      if (bundleRequirements.hasBundledSpliceFeaturedApp) {
         createBundledSpliceFiles(targetDir);
       }
 
-      if (packageHasGeneratedImport(targetDir, 'daml.js/splice-amulet-0.1.14')) {
+      if (bundleRequirements.hasBundledSpliceAmulet) {
         createBundledSpliceAmuletFiles(targetDir);
       }
 
-      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
+      if (bundleRequirements.hasBundledDATimeTypes) {
         createBundledDATimeTypesFiles(targetDir);
       }
 
-      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-prim-DA-Types-1.0.0')) {
+      if (bundleRequirements.hasBundledDATypes) {
         createBundledDATypesFiles(targetDir);
       }
 
-      if (
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-burn-mint-v1-1.0.0') ||
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-metadata-v1-1.0.0') ||
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-holding-v1-1.0.0') ||
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-allocation-instruction-v1-1.0.0') ||
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-transfer-instruction-v1-1.0.0') ||
-        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-allocation-v1-1.0.0')
-      ) {
+      if (bundleRequirements.hasBundledSpliceApiTokenDependencies) {
         createBundledSpliceApiTokenDependencies(targetDir);
       }
 
-      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
+      if (bundleRequirements.hasBundledDASetTypes) {
         createBundledDASetTypesFiles(targetDir);
       }
       updateMainIndex(targetDir);
@@ -901,6 +973,7 @@ if (require.main === module) {
 }
 
 export {
+  collectBundleRequirements,
   createBundledDASetTypesFiles,
   createBundledDATimeTypesFiles,
   createBundledDATypesFiles,

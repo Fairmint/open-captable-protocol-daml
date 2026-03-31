@@ -84,4 +84,8 @@ function main(): void {
   console.log('✅ NFT core package has no Splice package dependencies or imports.');
 }
 
-main();
+if (require.main === module) {
+  main();
+}
+
+export { collectDamlFiles, findSpliceImports, findSplicePackageDependencies, main, readDamlConfig };
