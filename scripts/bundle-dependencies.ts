@@ -101,7 +101,10 @@ function removeDirectoryIfExists(dirPath: string): void {
 }
 
 function normalizeImportTarget(importPath: string): string {
-  return path.normalize(importPath).replace(/(\.d\.ts|\.js)$/, '').replace(/[/\\]index$/, '');
+  return path
+    .normalize(importPath)
+    .replace(/(\.d\.ts|\.js)$/, '')
+    .replace(/[/\\]index$/, '');
 }
 
 function isWithinDir(dirPath: string, candidatePath: string): boolean {
@@ -195,35 +198,55 @@ function packageHasDependencyReference(targetDir: string, rawImports: string[], 
 
 function collectBundleRequirements(targetDir: string): BundleRequirements {
   return {
-    hasBundledOcp: packageHasDependencyReference(targetDir, [OCP_DAML_JS_IMPORT], [path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR)]),
-    hasBundledSpliceFeaturedApp:
-      packageHasDependencyReference(targetDir, [SPLICE_FEATURED_APP_IMPORT], [path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1')]),
-    hasBundledSpliceAmulet: packageHasDependencyReference(targetDir, [SPLICE_AMULET_IMPORT], [path.join(targetDir, 'lib')]),
-    hasBundledDATimeTypes:
-      packageHasDependencyReference(targetDir, [DA_TIME_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Time', 'Types')]),
-    hasBundledDATypes: packageHasDependencyReference(targetDir, [DA_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Types')]),
-    hasBundledSpliceApiTokenDependencies:
-      packageHasDependencyReference(
-        targetDir,
-        [
-          TOKEN_BURN_MINT_IMPORT,
-          TOKEN_METADATA_IMPORT,
-          TOKEN_HOLDING_IMPORT,
-          TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
-          TOKEN_TRANSFER_INSTRUCTION_IMPORT,
-          TOKEN_ALLOCATION_IMPORT,
-        ],
-        [
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
-          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationV1'),
-        ]
-      ),
-    hasBundledDASetTypes:
-      packageHasDependencyReference(targetDir, [DA_SET_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Set', 'Types')]),
+    hasBundledOcp: packageHasDependencyReference(
+      targetDir,
+      [OCP_DAML_JS_IMPORT],
+      [path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR)]
+    ),
+    hasBundledSpliceFeaturedApp: packageHasDependencyReference(
+      targetDir,
+      [SPLICE_FEATURED_APP_IMPORT],
+      [path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1')]
+    ),
+    hasBundledSpliceAmulet: packageHasDependencyReference(
+      targetDir,
+      [SPLICE_AMULET_IMPORT],
+      [path.join(targetDir, 'lib')]
+    ),
+    hasBundledDATimeTypes: packageHasDependencyReference(
+      targetDir,
+      [DA_TIME_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Time', 'Types')]
+    ),
+    hasBundledDATypes: packageHasDependencyReference(
+      targetDir,
+      [DA_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Types')]
+    ),
+    hasBundledSpliceApiTokenDependencies: packageHasDependencyReference(
+      targetDir,
+      [
+        TOKEN_BURN_MINT_IMPORT,
+        TOKEN_METADATA_IMPORT,
+        TOKEN_HOLDING_IMPORT,
+        TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
+        TOKEN_TRANSFER_INSTRUCTION_IMPORT,
+        TOKEN_ALLOCATION_IMPORT,
+      ],
+      [
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationV1'),
+      ]
+    ),
+    hasBundledDASetTypes: packageHasDependencyReference(
+      targetDir,
+      [DA_SET_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Set', 'Types')]
+    ),
   };
 }
 
@@ -684,7 +707,10 @@ function normalizeMainIndexDts(content: string, hasSpliceDir: boolean): string {
   const insertIndex = firstNonImportIndex === -1 ? lines.length : firstNonImportIndex;
   lines.splice(insertIndex, 0, ...importsToAdd);
 
-  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
+  return `${lines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd()}\n`;
 }
 
 function updateMainIndex(targetDir: string): void {
