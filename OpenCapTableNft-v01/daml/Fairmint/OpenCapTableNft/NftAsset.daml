@@ -1,0 +1,156 @@
+module Fairmint.OpenCapTableNft.NftAsset where
+
+import Fairmint.OpenCapTableNft.Metadata
+import Fairmint.OpenCapTableNft.Nft
+import Fairmint.OpenCapTableNft.ReceiveAuthorization
+import Fairmint.OpenCapTableNft.Types
+
+template NftAsset
+  with
+    registry_admin : Party
+    holder : Party
+    registration : NftRegistration
+  where
+    signatory registry_admin
+    observer holder
+
+    ensure
+      validateNftRegistration registration
+
+    interface instance CantonNft for NftAsset where
+      view = activeNftView registry_admin holder registration
+
+    choice OfferTransfer : ContractId CantonNft
+      with
+        transfer_offer : TransferOfferTerms
+        receive_authorization_cid : Optional (ContractId StandingReceiveAuthorization)
+      controller registry_admin, holder
+      do
+        now <- getTime
+        assertMsg "registered NFT must remain valid" $
+          validateNftRegistration registration
+        assertMsg "transfer receiver must differ from current holder" $
+          validateTransferOfferReceiver holder transfer_offer
+        assertMsg "transfer offer must expire in the future" $
+          validateTransferOfferWindow now transfer_offer
+
+        case receive_authorization_cid of
+          Some cid -> do
+            authorization <- fetch cid
+            assertMsg "standing receive authorization does not match this NFT transfer" $
+              matchesReceiveAuthorization
+                now
+                registry_admin
+                transfer_offer.receiver
+                registration
+                authorization
+            nft_asset_cid <- create NftAsset with
+              registry_admin
+              holder = transfer_offer.receiver
+              registration
+            pure (toInterfaceContractId nft_asset_cid)
+          None -> do
+            transfer_offer_cid <- create NftTransferOffer with
+              registry_admin
+              sender = holder
+              registration
+              transfer_offer
+            pure (toInterfaceContractId transfer_offer_cid)
+
+template NftTransferOffer
+  with
+    registry_admin : Party
+    sender : Party
+    registration : NftRegistration
+    transfer_offer : TransferOfferTerms
+  where
+    signatory registry_admin
+    observer sender, transfer_offer.receiver
+
+    ensure
+      validateNftRegistration registration
+        && validateTransferOfferReceiver sender transfer_offer
+
+    interface instance CantonNft for NftTransferOffer where
+      view = offeredNftView registry_admin sender registration transfer_offer
+
+    choice Accept : ContractId CantonNft
+      controller registry_admin, transfer_offer.receiver
+      do
+        now <- getTime
+        assertMsg "transfer offer has expired" $
+          not (isTransferOfferExpired now transfer_offer)
+        nft_asset_cid <- create NftAsset with
+          registry_admin
+          holder = transfer_offer.receiver
+          registration
+        pure (toInterfaceContractId nft_asset_cid)
+
+    choice Reject : ContractId CantonNft
+      controller registry_admin, transfer_offer.receiver
+      do
+        now <- getTime
+        assertMsg "transfer offer has expired" $
+          not (isTransferOfferExpired now transfer_offer)
+        nft_asset_cid <- create NftAsset with
+          registry_admin
+          holder = sender
+          registration
+        pure (toInterfaceContractId nft_asset_cid)
+
+    choice Withdraw : ContractId CantonNft
+      controller registry_admin, sender
+      do
+        now <- getTime
+        assertMsg "transfer offer has expired" $
+          not (isTransferOfferExpired now transfer_offer)
+        nft_asset_cid <- create NftAsset with
+          registry_admin
+          holder = sender
+          registration
+        pure (toInterfaceContractId nft_asset_cid)
+
+    choice Expire : ContractId CantonNft
+      with
+        actor : Party
+      controller registry_admin, actor
+      do
+        now <- getTime
+        assertMsg "transfer offer has not expired" $
+          isTransferOfferExpired now transfer_offer
+        assertMsg "only the sender or receiver may expire this transfer offer" $
+          actor == sender || actor == transfer_offer.receiver
+        nft_asset_cid <- create NftAsset with
+          registry_admin
+          holder = sender
+          registration
+        pure (toInterfaceContractId nft_asset_cid)
+
+activeNftView : Party -> Party -> NftRegistration -> NftView
+activeNftView registry_admin holder registration = NftView with
+  registry_admin
+  registry = registryOfNftId registration.nft_id
+  collection = registration.nft_id.collection
+  nft_id = registration.nft_id
+  holder
+  metadata = registration.metadata
+  confidentiality_ref = registration.confidentiality_ref
+  state = NftLifecycleState_Active
+  transfer_offer = None
+
+offeredNftView :
+  Party ->
+  Party ->
+  NftRegistration ->
+  TransferOfferTerms ->
+  NftView
+offeredNftView registry_admin holder registration transfer_offer = NftView with
+  registry_admin
+  registry = registryOfNftId registration.nft_id
+  collection = registration.nft_id.collection
+  nft_id = registration.nft_id
+  holder
+  metadata = registration.metadata
+  confidentiality_ref = registration.confidentiality_ref
+  state = NftLifecycleState_TransferOffered
+  transfer_offer = Some (transferOfferView transfer_offer)

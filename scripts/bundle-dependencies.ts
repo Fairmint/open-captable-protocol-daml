@@ -7,12 +7,14 @@ import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const nftPkg = requirePackageConfig('nft');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 // Paths
 const PACKAGE_DIRS = [
   path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '../generated/js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '../generated/js', `${nftPkg.name}-${nftPkg.version}`),
   path.join(__dirname, '../generated/js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
@@ -20,6 +22,7 @@ const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-f
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
+const TOKEN_BURN_MINT_DIR = path.join(__dirname, '../generated/js/splice-api-token-burn-mint-v1-1.0.0');
 const TOKEN_METADATA_DIR = path.join(__dirname, '../generated/js/splice-api-token-metadata-v1-1.0.0');
 const TOKEN_HOLDING_DIR = path.join(__dirname, '../generated/js/splice-api-token-holding-v1-1.0.0');
 const TOKEN_ALLOCATION_INSTRUCTION_DIR = path.join(
@@ -32,6 +35,13 @@ const TOKEN_TRANSFER_INSTRUCTION_DIR = path.join(
 );
 const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-v1-1.0.0');
 const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
+const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
+const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
+const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 function createDirectoryIfNotExists(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
@@ -59,6 +69,55 @@ function copyDirectory(src: string, dest: string): void {
     } else {
       copyFile(srcPath, destPath);
     }
+  }
+}
+
+function removeDirectoryIfExists(dirPath: string): void {
+  if (fs.existsSync(dirPath)) {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  }
+}
+
+function packageHasGeneratedImport(targetDir: string, importPath: string): boolean {
+  const libDir = path.join(targetDir, 'lib');
+
+  if (!fs.existsSync(libDir)) {
+    return false;
+  }
+
+  const pendingDirs = [libDir];
+
+  while (pendingDirs.length > 0) {
+    const currentDir = pendingDirs.pop();
+    if (!currentDir) continue;
+
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const entryPath = path.join(currentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        pendingDirs.push(entryPath);
+        continue;
+      }
+
+      if (!entry.isFile() || (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts'))) {
+        continue;
+      }
+
+      if (fs.readFileSync(entryPath, 'utf8').includes(importPath)) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
+function clearBundledArtifacts(targetDir: string): void {
+  removeDirectoryIfExists(path.join(targetDir, 'lib', 'Splice'));
+  removeDirectoryIfExists(path.join(targetDir, 'lib', '__bundled__'));
+
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    removeDirectoryIfExists(path.join(targetDir, 'lib', 'Fairmint', 'OpenCapTable'));
   }
 }
 
@@ -350,6 +409,16 @@ function createBundledDATypesFiles(targetDir: string): void {
 function createBundledSpliceApiTokenDependencies(targetDir: string): void {
   console.log('📦 Bundling Splice API Token dependencies...');
 
+  // Copy token burn/mint
+  if (fs.existsSync(TOKEN_BURN_MINT_DIR)) {
+    const destDir = path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1');
+    const sourceDir = path.join(TOKEN_BURN_MINT_DIR, 'lib/Splice/Api/Token/BurnMintV1');
+    if (fs.existsSync(sourceDir)) {
+      copyDirectory(sourceDir, destDir);
+      console.log('✅ Copied token-burn-mint-v1');
+    }
+  }
+
   // Copy token metadata
   if (fs.existsSync(TOKEN_METADATA_DIR)) {
     const destDir = path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1');
@@ -416,8 +485,47 @@ function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('✅ Copied DA Set Types modules');
 }
 
+function createBundledOcpFiles(targetDir: string): void {
+  console.log('📦 Bundling OpenCapTable dependency...');
+
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    const ocpSourceDir = path.join(OCP_PACKAGE_DIR, 'lib/Fairmint/OpenCapTable');
+    const ocpDestDir = path.join(targetDir, 'lib/Fairmint/OpenCapTable');
+
+    if (!fs.existsSync(ocpSourceDir)) {
+      console.log('⚠️  OpenCapTable dependency directory not found');
+      return;
+    }
+
+    copyDirectory(ocpSourceDir, ocpDestDir);
+    console.log('✅ Copied OpenCapTable modules');
+  }
+
+  const ocpWrapperDir = path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR);
+  createDirectoryIfNotExists(ocpWrapperDir);
+
+  const ocpWrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var OpenCapTable = require('../../Fairmint/OpenCapTable');
+exports.Fairmint = {
+  OpenCapTable: OpenCapTable,
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.js'), ocpWrapperIndex);
+
+  const ocpWrapperIndexDts = `import * as OpenCapTable from '../../Fairmint/OpenCapTable';
+
+export declare const Fairmint: {
+  OpenCapTable: typeof OpenCapTable;
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.d.ts'), ocpWrapperIndexDts);
+  console.log('✅ Created OpenCapTable dependency wrapper');
+}
+
 function updateMainIndex(targetDir: string): void {
   console.log('📝 Updating main index files...');
+  const hasSpliceDir = fs.existsSync(path.join(targetDir, 'lib/Splice'));
 
   const mainIndexPath = path.join(targetDir, 'lib/index.js');
   let mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
@@ -433,7 +541,7 @@ function updateMainIndex(targetDir: string): void {
     }
   }
 
-  if (!mainIndex.includes("var Splice = require('./Splice')")) {
+  if (hasSpliceDir && !mainIndex.includes("var Splice = require('./Splice')")) {
     const fairmintLine = mainIndex.indexOf('exports.Fairmint = Fairmint;');
     if (fairmintLine !== -1) {
       const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
@@ -459,7 +567,7 @@ function updateMainIndex(targetDir: string): void {
     }
   }
 
-  if (!mainIndexDts.includes("import * as Splice from './Splice'")) {
+  if (hasSpliceDir && !mainIndexDts.includes("import * as Splice from './Splice'")) {
     const fairmintImport = mainIndexDts.indexOf("import * as Fairmint from './Fairmint';");
     if (fairmintImport !== -1) {
       const insertPos = mainIndexDts.indexOf('\n', fairmintImport) + 1;
@@ -512,6 +620,18 @@ function replaceDependencyReferences(targetDir: string): void {
           /require\('daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
+      }
+    }
+
+    if (content.includes(OCP_DAML_JS_IMPORT)) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR))
+        .replace(/\\/g, '/');
+      const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
+      if (isDts) {
+        content = content.replace(new RegExp(`from '${escapedImport}';`, 'g'), `from '${relativePath}';`);
+      } else {
+        content = content.replace(new RegExp(`require\\('${escapedImport}'\\)`, 'g'), `require('${relativePath}')`);
       }
     }
 
@@ -576,6 +696,20 @@ function replaceDependencyReferences(targetDir: string): void {
       } else {
         content = content.replace(
           /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
+          `require('${relativePath}')`
+        );
+      }
+    }
+
+    if (content.includes('daml.js/splice-api-token-burn-mint-v1-1.0.0')) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'))
+        .replace(/\\/g, '/');
+      if (isDts) {
+        content = content.replace(/from 'daml.js\/splice-api-token-burn-mint-v1-1\.0\.0';/g, `from '${relativePath}';`);
+      } else {
+        content = content.replace(
+          /require\('daml.js\/splice-api-token-burn-mint-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
@@ -675,10 +809,12 @@ function removeLocalDependency(targetDir: string): void {
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   const localDependencies = [
     'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+    OCP_DAML_JS_IMPORT,
     'daml.js/splice-api-featured-app-v1-1.0.0',
     'daml.js/splice-amulet-0.1.14',
     'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
     'daml.js/daml-prim-DA-Types-1.0.0',
+    'daml.js/splice-api-token-burn-mint-v1-1.0.0',
     'daml.js/splice-api-token-metadata-v1-1.0.0',
     'daml.js/splice-api-token-holding-v1-1.0.0',
     'daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
@@ -711,14 +847,41 @@ function main(): void {
         continue;
       }
       console.log(`📦 Processing package: ${targetDir}`);
+      clearBundledArtifacts(targetDir);
       createBundledFiles(targetDir);
-      createBundledSpliceFiles(targetDir);
-      // Only bundle splice-amulet and additional dependencies for Subscriptions package
-      if (targetDir.includes('CantonPayments')) {
+
+      if (packageHasGeneratedImport(targetDir, OCP_DAML_JS_IMPORT)) {
+        createBundledOcpFiles(targetDir);
+      }
+
+      if (packageHasGeneratedImport(targetDir, 'daml.js/splice-api-featured-app-v1-1.0.0')) {
+        createBundledSpliceFiles(targetDir);
+      }
+
+      if (packageHasGeneratedImport(targetDir, 'daml.js/splice-amulet-0.1.14')) {
         createBundledSpliceAmuletFiles(targetDir);
+      }
+
+      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
         createBundledDATimeTypesFiles(targetDir);
+      }
+
+      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-prim-DA-Types-1.0.0')) {
         createBundledDATypesFiles(targetDir);
+      }
+
+      if (
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-burn-mint-v1-1.0.0') ||
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-metadata-v1-1.0.0') ||
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-holding-v1-1.0.0') ||
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-allocation-instruction-v1-1.0.0') ||
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-transfer-instruction-v1-1.0.0') ||
+        packageHasGeneratedImport(targetDir, 'daml.js/splice-api-token-allocation-v1-1.0.0')
+      ) {
         createBundledSpliceApiTokenDependencies(targetDir);
+      }
+
+      if (packageHasGeneratedImport(targetDir, 'daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
         createBundledDASetTypesFiles(targetDir);
       }
       updateMainIndex(targetDir);
@@ -742,6 +905,7 @@ export {
   createBundledDATimeTypesFiles,
   createBundledDATypesFiles,
   createBundledFiles,
+  createBundledOcpFiles,
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
   createBundledSpliceFiles,

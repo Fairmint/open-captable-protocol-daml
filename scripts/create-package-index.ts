@@ -4,11 +4,13 @@ import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const nftPkg = requirePackageConfig('nft');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const packageDirs = [
   path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '..', 'generated', 'js', `${nftPkg.name}-${nftPkg.version}`),
   path.join(__dirname, '..', 'generated', 'js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 
