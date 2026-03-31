@@ -444,8 +444,10 @@ function createBundledOcpFiles(targetDir: string): void {
     const ocpDestDir = path.join(targetDir, 'lib/Fairmint/OpenCapTable');
 
     if (!fs.existsSync(ocpSourceDir)) {
-      console.log('⚠️  OpenCapTable dependency directory not found');
-      return;
+      throw new Error(
+        `OpenCapTable dependency directory not found: ${ocpSourceDir}. ` +
+          'Bundling would rewrite daml.js OpenCapTable imports to a local wrapper that requires this tree; aborting.'
+      );
     }
 
     copyDirectory(ocpSourceDir, ocpDestDir);
