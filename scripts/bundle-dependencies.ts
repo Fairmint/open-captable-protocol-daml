@@ -100,14 +100,42 @@ function removeDirectoryIfExists(dirPath: string): void {
   }
 }
 
-function packageHasGeneratedImport(targetDir: string, importPath: string): boolean {
+function normalizeImportTarget(importPath: string): string {
+  return path.normalize(importPath).replace(/(\.d\.ts|\.js)$/, '').replace(/[/\\]index$/, '');
+}
+
+function isWithinDir(dirPath: string, candidatePath: string): boolean {
+  const normalizedDir = path.resolve(dirPath);
+  const normalizedCandidate = path.resolve(candidatePath);
+  return normalizedCandidate === normalizedDir || normalizedCandidate.startsWith(`${normalizedDir}${path.sep}`);
+}
+
+function getBundledArtifactDirs(targetDir: string): string[] {
+  const bundledDirs = [
+    path.join(targetDir, 'lib', 'Splice'),
+    path.join(targetDir, 'lib', '__bundled__'),
+    path.join(targetDir, 'lib', 'DA', 'Time'),
+    path.join(targetDir, 'lib', 'DA', 'Types'),
+    path.join(targetDir, 'lib', 'DA', 'Set'),
+  ];
+
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    bundledDirs.push(path.join(targetDir, 'lib', 'Fairmint', 'OpenCapTable'));
+  }
+
+  return bundledDirs;
+}
+
+function collectDependencyReferenceFiles(targetDir: string): string[] {
   const libDir = path.join(targetDir, 'lib');
+  const ignoredDirs = getBundledArtifactDirs(targetDir);
 
   if (!fs.existsSync(libDir)) {
-    return false;
+    return [];
   }
 
   const pendingDirs = [libDir];
+  const files: string[] = [];
 
   while (pendingDirs.length > 0) {
     const currentDir = pendingDirs.pop();
@@ -117,16 +145,47 @@ function packageHasGeneratedImport(targetDir: string, importPath: string): boole
       const entryPath = path.join(currentDir, entry.name);
 
       if (entry.isDirectory()) {
+        if (ignoredDirs.some((ignoredDir) => isWithinDir(ignoredDir, entryPath))) {
+          continue;
+        }
         pendingDirs.push(entryPath);
         continue;
       }
 
-      if (!entry.isFile() || (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts'))) {
-        continue;
+      if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.d.ts'))) {
+        files.push(entryPath);
       }
+    }
+  }
 
-      if (fs.readFileSync(entryPath, 'utf8').includes(importPath)) {
-        return true;
+  return files;
+}
+
+function packageHasDependencyReference(targetDir: string, rawImports: string[], bundledTargets: string[]): boolean {
+  const normalizedTargets = bundledTargets.map((bundledTarget) => normalizeImportTarget(bundledTarget));
+  const moduleSpecifierPatterns = [/require\(['"]([^'"]+)['"]\)/g, /from ['"]([^'"]+)['"]/g];
+
+  for (const filePath of collectDependencyReferenceFiles(targetDir)) {
+    const fileContents = fs.readFileSync(filePath, 'utf8');
+
+    if (rawImports.some((rawImport) => fileContents.includes(rawImport))) {
+      return true;
+    }
+
+    for (const pattern of moduleSpecifierPatterns) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null = pattern.exec(fileContents);
+
+      while (match) {
+        const specifier = match[1];
+        if (specifier.startsWith('.')) {
+          const resolvedImport = normalizeImportTarget(path.resolve(path.dirname(filePath), specifier));
+          if (normalizedTargets.some((bundledTarget) => bundledTarget === resolvedImport)) {
+            return true;
+          }
+        }
+
+        match = pattern.exec(fileContents);
       }
     }
   }
@@ -134,68 +193,43 @@ function packageHasGeneratedImport(targetDir: string, importPath: string): boole
   return false;
 }
 
-function packageHasBundledArtifacts(targetDir: string, ...relativePaths: string[]): boolean {
-  return relativePaths.some((relativePath) => fs.existsSync(path.join(targetDir, relativePath)));
-}
-
-function packageHasBundledSpliceAmuletArtifacts(targetDir: string): boolean {
-  const spliceDir = path.join(targetDir, 'lib', 'Splice');
-
-  if (!fs.existsSync(spliceDir)) {
-    return false;
-  }
-
-  return fs.readdirSync(spliceDir).some((entry) => !['Api', 'index.d.ts', 'index.js'].includes(entry));
-}
-
 function collectBundleRequirements(targetDir: string): BundleRequirements {
   return {
-    hasBundledOcp:
-      packageHasGeneratedImport(targetDir, OCP_DAML_JS_IMPORT) ||
-      packageHasBundledArtifacts(
-        targetDir,
-        path.join('lib', OCP_BUNDLED_WRAPPER_DIR),
-        path.join('lib', 'Fairmint', 'OpenCapTable')
-      ),
+    hasBundledOcp: packageHasDependencyReference(targetDir, [OCP_DAML_JS_IMPORT], [path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR)]),
     hasBundledSpliceFeaturedApp:
-      packageHasGeneratedImport(targetDir, SPLICE_FEATURED_APP_IMPORT) ||
-      packageHasBundledArtifacts(targetDir, path.join('lib', 'Splice', 'Api', 'FeaturedAppRightV1')),
-    hasBundledSpliceAmulet:
-      packageHasGeneratedImport(targetDir, SPLICE_AMULET_IMPORT) || packageHasBundledSpliceAmuletArtifacts(targetDir),
+      packageHasDependencyReference(targetDir, [SPLICE_FEATURED_APP_IMPORT], [path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1')]),
+    hasBundledSpliceAmulet: packageHasDependencyReference(targetDir, [SPLICE_AMULET_IMPORT], [path.join(targetDir, 'lib')]),
     hasBundledDATimeTypes:
-      packageHasGeneratedImport(targetDir, DA_TIME_TYPES_IMPORT) ||
-      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Time', 'Types')),
-    hasBundledDATypes:
-      packageHasGeneratedImport(targetDir, DA_TYPES_IMPORT) ||
-      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Types')),
+      packageHasDependencyReference(targetDir, [DA_TIME_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Time', 'Types')]),
+    hasBundledDATypes: packageHasDependencyReference(targetDir, [DA_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Types')]),
     hasBundledSpliceApiTokenDependencies:
-      packageHasGeneratedImport(targetDir, TOKEN_BURN_MINT_IMPORT) ||
-      packageHasGeneratedImport(targetDir, TOKEN_METADATA_IMPORT) ||
-      packageHasGeneratedImport(targetDir, TOKEN_HOLDING_IMPORT) ||
-      packageHasGeneratedImport(targetDir, TOKEN_ALLOCATION_INSTRUCTION_IMPORT) ||
-      packageHasGeneratedImport(targetDir, TOKEN_TRANSFER_INSTRUCTION_IMPORT) ||
-      packageHasGeneratedImport(targetDir, TOKEN_ALLOCATION_IMPORT) ||
-      packageHasBundledArtifacts(
+      packageHasDependencyReference(
         targetDir,
-        path.join('lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
-        path.join('lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
-        path.join('lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
-        path.join('lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
-        path.join('lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
-        path.join('lib', 'Splice', 'Api', 'Token', 'AllocationV1')
+        [
+          TOKEN_BURN_MINT_IMPORT,
+          TOKEN_METADATA_IMPORT,
+          TOKEN_HOLDING_IMPORT,
+          TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
+          TOKEN_TRANSFER_INSTRUCTION_IMPORT,
+          TOKEN_ALLOCATION_IMPORT,
+        ],
+        [
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
+          path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationV1'),
+        ]
       ),
     hasBundledDASetTypes:
-      packageHasGeneratedImport(targetDir, DA_SET_TYPES_IMPORT) ||
-      packageHasBundledArtifacts(targetDir, path.join('lib', 'DA', 'Set', 'Types')),
+      packageHasDependencyReference(targetDir, [DA_SET_TYPES_IMPORT], [path.join(targetDir, 'lib', 'DA', 'Set', 'Types')]),
   };
 }
 
 function clearBundledArtifacts(targetDir: string): void {
-  removeDirectoryIfExists(path.join(targetDir, 'lib', 'Splice'));
-  removeDirectoryIfExists(path.join(targetDir, 'lib', '__bundled__'));
-
-  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
-    removeDirectoryIfExists(path.join(targetDir, 'lib', 'Fairmint', 'OpenCapTable'));
+  for (const bundledDir of getBundledArtifactDirs(targetDir)) {
+    removeDirectoryIfExists(bundledDir);
   }
 }
 
@@ -601,60 +635,76 @@ export declare const Fairmint: {
   console.log('✅ Created OpenCapTable dependency wrapper');
 }
 
+function normalizeMainIndexJs(content: string, hasSpliceDir: boolean): string {
+  let normalizedContent = content
+    .replace(/var DA = require\('\.\/DA'\);\nexports\.DA = DA;\n?/g, '')
+    .replace(/var Splice = require\('\.\/Splice'\);\nexports\.Splice = Splice;\n?/g, '')
+    .trimEnd();
+
+  normalizedContent = `${normalizedContent}\nvar DA = require('./DA');\nexports.DA = DA;\n`;
+
+  if (hasSpliceDir) {
+    normalizedContent = `${normalizedContent}var Splice = require('./Splice');\nexports.Splice = Splice;\n`;
+  }
+
+  return normalizedContent;
+}
+
+function normalizeMainIndexDts(content: string, hasSpliceDir: boolean): string {
+  const importsToAdd = ["import * as DA from './DA';"];
+  if (hasSpliceDir) {
+    importsToAdd.push("import * as Splice from './Splice';");
+  }
+
+  let normalizedContent = content
+    .replace(/^import \* as DA from '\.\/DA';\n?/gm, '')
+    .replace(/^import \* as Splice from '\.\/Splice';\n?/gm, '');
+
+  const exportMatch = normalizedContent.match(/export \{([^}]*)\} ;/);
+  const exportNames = exportMatch
+    ? exportMatch[1]
+        .split(',')
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .filter((name) => name !== 'DA' && name !== 'Splice')
+    : [];
+
+  exportNames.push('DA');
+  if (hasSpliceDir) {
+    exportNames.push('Splice');
+  }
+
+  const exportLine = `export { ${[...new Set(exportNames)].join(', ')} } ;`;
+  normalizedContent = exportMatch
+    ? normalizedContent.replace(/export \{[^}]*\} ;/, exportLine)
+    : `${normalizedContent.trimEnd()}\n${exportLine}\n`;
+
+  const lines = normalizedContent.split('\n');
+  const firstNonImportIndex = lines.findIndex((line) => line.trim() !== '' && !line.startsWith('import '));
+  const insertIndex = firstNonImportIndex === -1 ? lines.length : firstNonImportIndex;
+  lines.splice(insertIndex, 0, ...importsToAdd);
+
+  return `${lines.join('\n').replace(/\n{3,}/g, '\n\n').trimEnd()}\n`;
+}
+
 function updateMainIndex(targetDir: string): void {
   console.log('📝 Updating main index files...');
   const hasSpliceDir = fs.existsSync(path.join(targetDir, 'lib/Splice'));
 
   const mainIndexPath = path.join(targetDir, 'lib/index.js');
-  let mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
-
-  if (!mainIndex.includes("var DA = require('./DA')")) {
-    const fairmintLine = mainIndex.indexOf('exports.Fairmint = Fairmint;');
-    if (fairmintLine !== -1) {
-      const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
-      const daImport = "var DA = require('./DA');\n";
-      mainIndex = `${mainIndex.slice(0, insertPos) + daImport}exports.DA = DA;\n${mainIndex.slice(insertPos)}`;
-      fs.writeFileSync(mainIndexPath, mainIndex);
-      console.log('✅ Updated main index.js with DA');
-    }
-  }
-
-  if (hasSpliceDir && !mainIndex.includes("var Splice = require('./Splice')")) {
-    const fairmintLine = mainIndex.indexOf('exports.Fairmint = Fairmint;');
-    if (fairmintLine !== -1) {
-      const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
-      const spliceImport = "var Splice = require('./Splice');\n";
-      mainIndex = `${mainIndex.slice(0, insertPos) + spliceImport}exports.Splice = Splice;\n${mainIndex.slice(insertPos)}`;
-      fs.writeFileSync(mainIndexPath, mainIndex);
-      console.log('✅ Updated main index.js with Splice');
-    }
+  const mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
+  const normalizedMainIndex = normalizeMainIndexJs(mainIndex, hasSpliceDir);
+  if (normalizedMainIndex !== mainIndex) {
+    fs.writeFileSync(mainIndexPath, normalizedMainIndex);
+    console.log('✅ Updated main index.js');
   }
 
   const mainIndexDtsPath = path.join(targetDir, 'lib/index.d.ts');
-  let mainIndexDts = fs.readFileSync(mainIndexDtsPath, 'utf8');
-
-  if (!mainIndexDts.includes("import * as DA from './DA'")) {
-    const fairmintImport = mainIndexDts.indexOf("import * as Fairmint from './Fairmint';");
-    if (fairmintImport !== -1) {
-      const insertPos = mainIndexDts.indexOf('\n', fairmintImport) + 1;
-      const daImport = "import * as DA from './DA';\n";
-      mainIndexDts = mainIndexDts.slice(0, insertPos) + daImport + mainIndexDts.slice(insertPos);
-      mainIndexDts = mainIndexDts.replace('export { Fairmint } ;', 'export { Fairmint, DA } ;');
-      fs.writeFileSync(mainIndexDtsPath, mainIndexDts);
-      console.log('✅ Updated main index.d.ts with DA');
-    }
-  }
-
-  if (hasSpliceDir && !mainIndexDts.includes("import * as Splice from './Splice'")) {
-    const fairmintImport = mainIndexDts.indexOf("import * as Fairmint from './Fairmint';");
-    if (fairmintImport !== -1) {
-      const insertPos = mainIndexDts.indexOf('\n', fairmintImport) + 1;
-      const spliceImport = "import * as Splice from './Splice';\n";
-      mainIndexDts = mainIndexDts.slice(0, insertPos) + spliceImport + mainIndexDts.slice(insertPos);
-      mainIndexDts = mainIndexDts.replace('export { Fairmint, DA } ;', 'export { Fairmint, DA, Splice } ;');
-      fs.writeFileSync(mainIndexDtsPath, mainIndexDts);
-      console.log('✅ Updated main index.d.ts with Splice');
-    }
+  const mainIndexDts = fs.readFileSync(mainIndexDtsPath, 'utf8');
+  const normalizedMainIndexDts = normalizeMainIndexDts(mainIndexDts, hasSpliceDir);
+  if (normalizedMainIndexDts !== mainIndexDts) {
+    fs.writeFileSync(mainIndexDtsPath, normalizedMainIndexDts);
+    console.log('✅ Updated main index.d.ts');
   }
 }
 
@@ -925,8 +975,9 @@ function main(): void {
         continue;
       }
       console.log(`📦 Processing package: ${targetDir}`);
-      const bundleRequirements = collectBundleRequirements(targetDir);
       clearBundledArtifacts(targetDir);
+      // Detect dependency references from the surviving generated modules after stale bundled output is removed.
+      const bundleRequirements = collectBundleRequirements(targetDir);
       createBundledFiles(targetDir);
 
       if (bundleRequirements.hasBundledOcp) {

@@ -13,7 +13,7 @@ const ROOT_DIR = path.join(__dirname, '..');
 const NFT_PACKAGE_DIR = path.join(ROOT_DIR, 'OpenCapTableNft-v01');
 const NFT_DAML_YAML_PATH = path.join(NFT_PACKAGE_DIR, 'daml.yaml');
 const NFT_DAML_SOURCE_DIR = path.join(NFT_PACKAGE_DIR, 'daml');
-const SPLICE_IMPORT_PATTERN = /^\s*import\s+Splice\./m;
+const SPLICE_IMPORT_PATTERN = /^\s*import\b[^\n]*\bSplice\.[A-Za-z0-9_.']+/m;
 
 function readDamlConfig(): DamlConfig {
   const fileContents = fs.readFileSync(NFT_DAML_YAML_PATH, 'utf8');
