@@ -1,11 +1,13 @@
 module OpenCapTable.TestOwnershipProof where
 
+import DA.List (head)
 import Daml.Script
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
 
 import OpenCapTable.Setup
+import Fairmint.OpenCapTable.OCF.Issuer (Issuer)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.OCF.StockIssuance
@@ -16,6 +18,9 @@ import Fairmint.OpenCapTableProof.PositionIdentity (OwnershipAuthBinding(..), Po
 
 -- Note: OwnershipProof needs actual StockIssuance/StockCancellation contract IDs
 -- so we create them directly (not via CapTable) for this test
+
+testIssuerId : Text
+testIssuerId = "ISSUER_1"
 
 createIssuanceWith issuer system_operator ctx issuanceId securityId stakeholderId quantity customId =
   submit (actAs [issuer, system_operator]) do
@@ -74,6 +79,13 @@ mkAccessCredential owner stakeholderId issuerId securityId audience authorizedVe
     audience = audience
     authorized_verifiers = authorizedVerifiers
 
+getIssuerCid : Party -> Script (ContractId Issuer)
+getIssuerCid observer = do
+  issuerContracts <- query @Issuer observer
+  assertMsg "Expected exactly one issuer contract" (length issuerContracts == 1)
+  let (issuerCid, _) = head issuerContracts
+  pure issuerCid
+
 createOwnershipProof :
   Party ->
   Context ->
@@ -83,11 +95,13 @@ createOwnershipProof :
   [ContractId StockCancellation] ->
   Script (ContractId OwnershipProof)
 createOwnershipProof system_operator ctx accessCredential expectedTotal stockIssuances stockCancellations = do
+  issuerCid <- getIssuerCid system_operator
   now <- getTime
   submit system_operator do
     createCmd OwnershipProof with
       context = ctx
       access_credential = accessCredential
+      issuer = issuerCid
       expected_total = expectedTotal
       stock_issuances = stockIssuances
       stock_cancellations = stockCancellations
@@ -97,7 +111,7 @@ testOwnershipProof_Verify_Succeeds = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submit system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
@@ -107,7 +121,7 @@ testOwnershipProof_Verify_SucceedsForAuthorizedObserver = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submit (actAs alice <> readAs [system_operator]) do
     exerciseCmd proofCid (Verify with verifier = alice)
@@ -117,7 +131,7 @@ testOwnershipProof_Verify_FailsForUnauthorizedObserver = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail issuer do
     exerciseCmd proofCid (Verify with verifier = issuer)
@@ -127,7 +141,7 @@ testOwnershipProof_Verify_FailsOnMismatch = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 70.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
@@ -138,7 +152,7 @@ testOwnershipProof_Verify_FailsAcrossMultipleSecurityIds = script do
   issCidA <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_A" "SEC-PROOF-A" "SH-PROOF" 100.0 "CERT-PROOF-A"
   issCidB <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_B" "SEC-PROOF-B" "SH-PROOF" 25.0 "CERT-PROOF-B"
   canCid <- createCancellationWith issuer system_operator ctx "TX_STOCK_CANCEL_PROOF_B" "SEC-PROOF-B" 10.0
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-A" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-A" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 115.0 [issCidA, issCidB] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
@@ -148,8 +162,18 @@ testOwnershipProof_Verify_FailsOnStakeholderMismatch = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCidA <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_MATCH" "SEC-PROOF-MATCH" "SH-PROOF" 100.0 "CERT-PROOF-MATCH"
   issCidB <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_OTHER" "SEC-PROOF-OTHER" "SH-OTHER" 50.0 "CERT-PROOF-OTHER"
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-MATCH" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-MATCH" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 150.0 [issCidA, issCidB] []
+  submitMustFail system_operator do
+    exerciseCmd proofCid (Verify with verifier = system_operator)
+  pure ()
+
+testOwnershipProof_Verify_FailsOnIssuerMismatch = script do
+  TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
+  issCid <- createIssuance issuer system_operator ctx
+  canCid <- createCancellation issuer system_operator ctx
+  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-OTHER" "SEC-PROOF-1" [alice, issuer] [alice]
+  proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
   pure ()
@@ -158,7 +182,7 @@ testOwnershipProof_Verify_FailsOnSecurityMismatch = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-OTHER" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-OTHER" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
@@ -169,7 +193,7 @@ testOwnershipProof_Verify_FailsOnUnrelatedCancellation = script do
   issCid <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_RELATED" "SEC-PROOF-RELATED" "SH-PROOF" 100.0 "CERT-PROOF-RELATED"
   _ <- createIssuanceWith issuer system_operator ctx "TX_STOCK_ISS_PROOF_UNRELATED" "SEC-PROOF-UNRELATED" "SH-PROOF" 25.0 "CERT-PROOF-UNRELATED"
   unrelatedCanCid <- createCancellationWith issuer system_operator ctx "TX_STOCK_CANCEL_PROOF_UNRELATED" "SEC-PROOF-UNRELATED" 5.0
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-RELATED" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-RELATED" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 95.0 [issCid] [unrelatedCanCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (Verify with verifier = system_operator)
@@ -179,11 +203,13 @@ testOwnershipProof_RejectsCredentialWithoutOwnerAudience = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let invalidCredential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [issuer] []
+  issuerCid <- getIssuerCid system_operator
+  let invalidCredential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [issuer] []
   submitMustFail system_operator do
     createCmd OwnershipProof with
       context = ctx
       access_credential = invalidCredential
+      issuer = issuerCid
       expected_total = 60.0
       stock_issuances = [issCid]
       stock_cancellations = [canCid]
@@ -194,11 +220,13 @@ testOwnershipProof_RejectsCredentialWithoutIssuerIdentity = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
+  issuerCid <- getIssuerCid system_operator
   let invalidCredential = mkAccessCredential alice "SH-PROOF" "" "SEC-PROOF-1" [alice, issuer] [alice]
   submitMustFail system_operator do
     createCmd OwnershipProof with
       context = ctx
       access_credential = invalidCredential
+      issuer = issuerCid
       expected_total = 60.0
       stock_issuances = [issCid]
       stock_cancellations = [canCid]
@@ -209,7 +237,7 @@ testOwnershipProof_AddObserversAndAuthorizedVerifiers = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   newProofCid <- submit system_operator do
     exerciseCmd proofCid (AddObservers with added = [issuer])
@@ -225,7 +253,7 @@ testOwnershipProof_AddObservers_FailsForDuplicateObserver = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (AddObservers with added = [issuer])
@@ -235,7 +263,7 @@ testOwnershipProof_AddAuthorizedVerifiers_FailsForNonObserverVerifier = script d
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice] [alice]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice] [alice]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (AddAuthorizedVerifiers with added = [issuer])
@@ -245,7 +273,7 @@ testOwnershipProof_AddAuthorizedVerifiers_FailsForDuplicateVerifier = script do
   TestOcp{system_operator, issuer, alice, ctx} <- setupTestOcp
   issCid <- createIssuance issuer system_operator ctx
   canCid <- createCancellation issuer system_operator ctx
-  let credential = mkAccessCredential alice "SH-PROOF" "ISSUER-PROOF" "SEC-PROOF-1" [alice, issuer] [alice, issuer]
+  let credential = mkAccessCredential alice "SH-PROOF" testIssuerId "SEC-PROOF-1" [alice, issuer] [alice, issuer]
   proofCid <- createOwnershipProof system_operator ctx credential 60.0 [issCid] [canCid]
   submitMustFail system_operator do
     exerciseCmd proofCid (AddAuthorizedVerifiers with added = [issuer])
