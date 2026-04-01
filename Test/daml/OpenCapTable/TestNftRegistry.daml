@@ -1,5 +1,6 @@
 module OpenCapTable.TestNftRegistry where
 
+import DA.Map qualified as Map
 import DA.TextMap qualified as TextMap
 import DA.Optional qualified as Optional
 import Daml.Script
@@ -49,6 +50,40 @@ testNftCoreMintRejectsDuplicateCanonicalId = script do
     parties.alice
     defaultRegistration
   assertRegistryEntryCount parties.registry_admin minted_registry_cid 1
+  assertRegistryCollectionCount parties.registry_admin minted_registry_cid 1
+
+testNftCoreMintRejectsOutsideCollectionScope = script do
+  parties <- allocateNftCoreParties "ScopedMintReject"
+  registry_cid <- createRegistry parties.registry_admin (Some defaultCollection)
+  let out_of_scope_registration =
+        registrationWithPayload
+          otherCollection
+          alternateTokenId
+          defaultMetadata
+          None
+
+  submitMustFail parties.registry_admin do
+    exerciseCmd registry_cid
+      (NftRegistry.Mint with
+        holder = parties.alice
+        registration = out_of_scope_registration
+      )
+
+  assertRegistryIsEmpty parties.registry_admin registry_cid
+
+testNftCoreRegistryCreationRejectsMismatchedCollectionScopeRegistry = script do
+  parties <- allocateNftCoreParties "ScopedRegistryMismatch"
+  let mismatched_scope =
+        CollectionIdentity with
+          registry_id = "NFT-REGISTRY-OTHER"
+          collection_id = defaultCollection.collection_id
+
+  submitMustFail parties.registry_admin do
+    createCmd NftRegistry.NftRegistry with
+      registry_admin = parties.registry_admin
+      registry = defaultRegistry
+      collection_scope = Some mismatched_scope
+      collection_registries = Map.empty
 
 testNftCorePendingTransferConsumesPriorActiveRepresentation = script do
   setTime baseTime
@@ -372,6 +407,7 @@ testNftCoreMetadataAndConfidentialityHookRoundTrip = script do
     after_second_registry_cid
     no_confidentiality_registration
   assertRegistryEntryCount parties.registry_admin after_second_registry_cid 2
+  assertRegistryCollectionCount parties.registry_admin after_second_registry_cid 1
 
   Some first_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_admin first_nft_cid
   assertMsg "reserved-looking public metadata keys must round-trip unchanged" $
@@ -383,6 +419,33 @@ testNftCoreMetadataAndConfidentialityHookRoundTrip = script do
   Some second_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_admin second_nft_cid
   assertMsg "confidentiality hook may be intentionally absent" $
     Optional.isNone second_view.confidentiality_ref
+
+testNftCoreRegistryShardsUniquenessLedgerByCollection = script do
+  parties <- allocateNftCoreParties "CollectionLedgerShards"
+  registry_cid <- createRegistry parties.registry_admin None
+  let other_collection_registration =
+        registrationWithPayload
+          otherCollection
+          alternateTokenId
+          defaultMetadata
+          None
+
+  NftRegistry.MintResult{registry_cid = after_first_registry_cid} <-
+    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+  NftRegistry.MintResult{registry_cid = after_second_registry_cid} <-
+    mintRegistration
+      parties.registry_admin
+      after_first_registry_cid
+      parties.bob
+      other_collection_registration
+
+  assertRegistryTracksNft parties.registry_admin after_second_registry_cid defaultRegistration
+  assertRegistryTracksNft
+    parties.registry_admin
+    after_second_registry_cid
+    other_collection_registration
+  assertRegistryEntryCount parties.registry_admin after_second_registry_cid 2
+  assertRegistryCollectionCount parties.registry_admin after_second_registry_cid 2
 
 testNftCoreReservedNamespaceRejectedOutsideStandardMetadata = script do
   parties <- allocateNftCoreParties "ReservedNamespace"

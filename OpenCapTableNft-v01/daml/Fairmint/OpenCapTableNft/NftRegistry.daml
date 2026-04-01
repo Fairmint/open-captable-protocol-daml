@@ -12,24 +12,75 @@ data MintResult = MintResult with
     nft_cid : ContractId Nft.CantonNft
   deriving (Eq, Show)
 
+data CollectionMintResult = CollectionMintResult with
+    collection_registry_cid : ContractId CollectionRegistry
+    nft_cid : ContractId Nft.CantonNft
+  deriving (Eq, Show)
+
+template CollectionRegistry
+  with
+    registry_admin : Party
+    registry : RegistryIdentity
+    collection : CollectionIdentity
+    registered_tokens : Map.Map Text ()
+  where
+    signatory registry_admin
+
+    ensure
+      validateRegistryIdentity registry
+        && validateCollectionIdentity collection
+        && collection.registry_id == registry.registry_id
+        && all
+          (\(token_key, ()) -> validateRequiredText token_key)
+          (Map.toList registered_tokens)
+
+    choice MintInCollection : CollectionMintResult
+      with
+        holder : Party
+        registration : NftRegistration
+      controller registry_admin
+      do
+        assertMsg "NFT registration must be valid" $
+          validateNftRegistration registration
+        assertMsg "NFT must belong to this collection registry" $
+          registration.nft_id.collection == collection
+
+        let token_key = registration.nft_id.token_id
+
+        assertMsg "NFT id has already been minted in this collection registry" $
+          case Map.lookup token_key registered_tokens of
+            None -> True
+            Some _ -> False
+
+        nft_asset_cid <- create NftAsset.NftAsset with
+          registry_admin
+          holder
+          registration
+
+        collection_registry_cid <- create this with
+          registered_tokens = Map.insert token_key () registered_tokens
+
+        pure CollectionMintResult with
+          collection_registry_cid
+          nft_cid = toInterfaceContractId nft_asset_cid
+
 template NftRegistry
   with
     registry_admin : Party
     registry : RegistryIdentity
     collection_scope : Optional CollectionIdentity
-    registered_nfts : Map.Map Text NftRegistration
+    collection_registries : Map.Map CollectionIdentity (ContractId CollectionRegistry)
   where
     signatory registry_admin
 
     ensure
       validateRegistryConfiguration registry collection_scope
         && all
-          ( \(nft_key, registration) ->
-              nft_key == registeredNftKey registration
-                && matchesRegistryScope registry collection_scope registration
-                && validateNftRegistration registration
+          ( \(collection, _) ->
+              validateCollectionIdentity collection
+                && matchesCollectionScope registry collection_scope collection
           )
-          (Map.toList registered_nfts)
+          (Map.toList collection_registries)
 
     choice Mint : MintResult
       with
@@ -42,22 +93,41 @@ template NftRegistry
         assertMsg "NFT must belong to this registry scope" $
           matchesRegistryScope registry collection_scope registration
 
-        let nft_key = registeredNftKey registration
+        let collection = registration.nft_id.collection
 
-        assertMsg "NFT id has already been minted in this registry" $
-          case Map.lookup nft_key registered_nfts of
-            None -> True
-            Some _ -> False
+        current_collection_registry_cid <- case Map.lookup collection collection_registries of
+          Some collection_registry_cid -> pure collection_registry_cid
+          None ->
+            create CollectionRegistry with
+              registry_admin
+              registry
+              collection
+              registered_tokens = Map.empty
 
-        nft_asset_cid <- create NftAsset.NftAsset with
-          registry_admin
-          holder
-          registration
+        CollectionMintResult{collection_registry_cid, nft_cid} <-
+          exercise current_collection_registry_cid
+            (MintInCollection with holder, registration)
 
-        -- The registry contract is the on-ledger uniqueness ledger for NFT ids.
+        -- The root registry now tracks collection-scoped uniqueness ledgers instead of
+        -- rewriting one registry-wide NFT map on every mint. Without contract-key
+        -- singleton enforcement, duplicate protection still only holds within the
+        -- active registry lineage referenced by this contract.
         registry_cid <- create this with
-          registered_nfts = Map.insert nft_key registration registered_nfts
+          collection_registries =
+            Map.insert collection collection_registry_cid collection_registries
 
         pure MintResult with
           registry_cid
-          nft_cid = toInterfaceContractId nft_asset_cid
+          nft_cid
+
+matchesCollectionScope :
+  RegistryIdentity ->
+  Optional CollectionIdentity ->
+  CollectionIdentity ->
+  Bool
+matchesCollectionScope registry collection_scope collection =
+  collection.registry_id == registry.registry_id
+    && case collection_scope of
+      None -> True
+      Some scoped_collection ->
+        collection == scoped_collection
