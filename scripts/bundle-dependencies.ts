@@ -129,9 +129,15 @@ ${childNamespaces
 `;
   fs.writeFileSync(path.join(dirPath, 'index.js'), indexJs);
 
-  const indexDts = `${childNamespaces.map((childNamespace) => `export * from './${childNamespace}';`).join('\n')}
-`;
+  const indexDts = createNamespaceIndexDts(childNamespaces);
   fs.writeFileSync(path.join(dirPath, 'index.d.ts'), indexDts);
+}
+
+function createNamespaceIndexDts(childNamespaces: string[]): string {
+  return `${childNamespaces
+    .map((childNamespace) => `export * as ${childNamespace} from './${childNamespace}';`)
+    .join('\n')}
+`;
 }
 
 function removeDirectoryIfExists(dirPath: string): void {
@@ -391,8 +397,7 @@ exports.Template = Template;
 `;
   fs.writeFileSync(path.join(internalDir, 'index.js'), internalIndex);
 
-  const internalIndexDts = `export * from './Template';
-`;
+  const internalIndexDts = createNamespaceIndexDts(['Template']);
   fs.writeFileSync(path.join(internalDir, 'index.d.ts'), internalIndexDts);
 
   const daDir = path.join(targetDir, 'lib/DA');
@@ -409,8 +414,7 @@ exports.Internal = Internal;
 `;
   fs.writeFileSync(path.join(daDir, 'index.js'), daIndex);
 
-  const daIndexDts = `export * from './Internal';
-`;
+  const daIndexDts = createNamespaceIndexDts(['Internal']);
   fs.writeFileSync(path.join(daDir, 'index.d.ts'), daIndexDts);
 
   console.log('✅ Created bundled DA.Internal.Template structure');
@@ -511,8 +515,7 @@ exports.FeaturedAppRightV1 = FeaturedAppRightV1;
 `;
   fs.writeFileSync(path.join(apiDir, 'index.js'), apiIndex);
 
-  const apiIndexDts = `export * from './FeaturedAppRightV1';
-`;
+  const apiIndexDts = createNamespaceIndexDts(['FeaturedAppRightV1']);
   fs.writeFileSync(path.join(apiDir, 'index.d.ts'), apiIndexDts);
 
   const spliceMainDir = path.join(targetDir, 'lib/Splice');
@@ -529,8 +532,7 @@ exports.Api = Api;
 `;
   fs.writeFileSync(path.join(spliceMainDir, 'index.js'), spliceMainIndex);
 
-  const spliceMainIndexDts = `export * from './Api';
-`;
+  const spliceMainIndexDts = createNamespaceIndexDts(['Api']);
   fs.writeFileSync(path.join(spliceMainDir, 'index.d.ts'), spliceMainIndexDts);
 
   console.log('✅ Created bundled splice-api-featured-app-v1 structure');
