@@ -94,6 +94,43 @@ function copyDirectory(src: string, dest: string): void {
   }
 }
 
+function getImmediateChildDirs(dirPath: string): string[] {
+  if (!fs.existsSync(dirPath)) {
+    return [];
+  }
+
+  return fs
+    .readdirSync(dirPath, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function writeNamespaceIndexFiles(dirPath: string, childNamespaces: string[]): void {
+  if (childNamespaces.length === 0) {
+    return;
+  }
+
+  createDirectoryIfNotExists(dirPath);
+
+  const indexJs = `"use strict";
+/* eslint-disable-next-line no-unused-vars */
+function __export(m) {
+/* eslint-disable-next-line no-prototype-builtins */
+    for (var p in m) if (!exports.hasOwnProperty(p)) exports[p] = m[p];
+}
+Object.defineProperty(exports, "__esModule", { value: true });
+${childNamespaces
+  .map((childNamespace) => `var ${childNamespace} = require('./${childNamespace}');\nexports.${childNamespace} = ${childNamespace};`)
+  .join('\n')}
+`;
+  fs.writeFileSync(path.join(dirPath, 'index.js'), indexJs);
+
+  const indexDts = `${childNamespaces.map((childNamespace) => `export * from './${childNamespace}';`).join('\n')}
+`;
+  fs.writeFileSync(path.join(dirPath, 'index.d.ts'), indexDts);
+}
+
 function removeDirectoryIfExists(dirPath: string): void {
   if (fs.existsSync(dirPath)) {
     fs.rmSync(dirPath, { recursive: true, force: true });
@@ -605,6 +642,27 @@ function createBundledSpliceApiTokenDependencies(targetDir: string): void {
   }
 }
 
+function ensureBundledSpliceNamespaceIndexes(targetDir: string): void {
+  const spliceDir = path.join(targetDir, 'lib/Splice');
+  const apiDir = path.join(spliceDir, 'Api');
+  const tokenDir = path.join(apiDir, 'Token');
+
+  const tokenNamespaces = getImmediateChildDirs(tokenDir);
+  if (tokenNamespaces.length > 0) {
+    writeNamespaceIndexFiles(tokenDir, tokenNamespaces);
+  }
+
+  const apiNamespaces = getImmediateChildDirs(apiDir);
+  if (apiNamespaces.length > 0) {
+    writeNamespaceIndexFiles(apiDir, apiNamespaces);
+  }
+
+  const spliceNamespaces = getImmediateChildDirs(spliceDir);
+  if (spliceNamespaces.length > 0) {
+    writeNamespaceIndexFiles(spliceDir, spliceNamespaces);
+  }
+}
+
 function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('📦 Bundling DA Set Types dependency...');
   const daDestDir = path.join(targetDir, 'lib/DA/Set');
@@ -715,7 +773,9 @@ function normalizeMainIndexDts(content: string, hasSpliceDir: boolean): string {
 
 function updateMainIndex(targetDir: string): void {
   console.log('📝 Updating main index files...');
-  const hasSpliceDir = fs.existsSync(path.join(targetDir, 'lib/Splice'));
+  const hasSpliceDir =
+    fs.existsSync(path.join(targetDir, 'lib/Splice/index.js')) &&
+    fs.existsSync(path.join(targetDir, 'lib/Splice/index.d.ts'));
 
   const mainIndexPath = path.join(targetDir, 'lib/index.js');
   const mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
@@ -781,6 +841,7 @@ function replaceDependencyReferences(targetDir: string): void {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR))
         .replace(/\\/g, '/');
+      // Package names include dots and other regex metacharacters, so escape before building the matcher.
       const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
       if (isDts) {
         content = content.replace(new RegExp(`from '${escapedImport}';`, 'g'), `from '${relativePath}';`);
@@ -1033,6 +1094,7 @@ function main(): void {
       if (bundleRequirements.hasBundledDASetTypes) {
         createBundledDASetTypesFiles(targetDir);
       }
+      ensureBundledSpliceNamespaceIndexes(targetDir);
       updateMainIndex(targetDir);
       replaceDependencyReferences(targetDir);
       removeLocalDependency(targetDir);
@@ -1059,6 +1121,7 @@ export {
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
   createBundledSpliceFiles,
+  ensureBundledSpliceNamespaceIndexes,
   main,
   removeLocalDependency,
   replaceDependencyReferences,
