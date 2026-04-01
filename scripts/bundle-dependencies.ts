@@ -121,7 +121,10 @@ function __export(m) {
 }
 Object.defineProperty(exports, "__esModule", { value: true });
 ${childNamespaces
-  .map((childNamespace) => `var ${childNamespace} = require('./${childNamespace}');\nexports.${childNamespace} = ${childNamespace};`)
+  .map(
+    (childNamespace) =>
+      `var ${childNamespace} = require('./${childNamespace}');\nexports.${childNamespace} = ${childNamespace};`
+  )
   .join('\n')}
 `;
   fs.writeFileSync(path.join(dirPath, 'index.js'), indexJs);
