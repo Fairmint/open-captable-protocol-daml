@@ -668,6 +668,15 @@ function ensureBundledSpliceNamespaceIndexes(targetDir: string): void {
   }
 }
 
+/** Regenerate `lib/DA/index.js` and `index.d.ts` from actual child dirs (Internal, Time, Types, Set, …). */
+function ensureBundledDANamespaceIndexes(targetDir: string): void {
+  const daDir = path.join(targetDir, 'lib/DA');
+  const daNamespaces = getImmediateChildDirs(daDir);
+  if (daNamespaces.length > 0) {
+    writeNamespaceIndexFiles(daDir, daNamespaces);
+  }
+}
+
 function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('📦 Bundling DA Set Types dependency...');
   const daDestDir = path.join(targetDir, 'lib/DA/Set');
@@ -1099,6 +1108,7 @@ function main(): void {
       if (bundleRequirements.hasBundledDASetTypes) {
         createBundledDASetTypesFiles(targetDir);
       }
+      ensureBundledDANamespaceIndexes(targetDir);
       ensureBundledSpliceNamespaceIndexes(targetDir);
       updateMainIndex(targetDir);
       replaceDependencyReferences(targetDir);
@@ -1126,6 +1136,7 @@ export {
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
   createBundledSpliceFiles,
+  ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
   main,
   removeLocalDependency,
