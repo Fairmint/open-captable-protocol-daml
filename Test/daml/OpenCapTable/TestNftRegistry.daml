@@ -1,14 +1,15 @@
 module OpenCapTable.TestNftRegistry where
 
 import DA.Map qualified as Map
-import DA.TextMap qualified as TextMap
 import DA.Optional qualified as Optional
+import DA.TextMap qualified as TextMap
 import Daml.Script
 
 import Fairmint.OpenCapTableNft.Metadata (canonicalNftIdText, standardMetadataKey)
 import Fairmint.OpenCapTableNft.Nft qualified as Nft
 import Fairmint.OpenCapTableNft.NftAsset qualified as NftAsset
 import Fairmint.OpenCapTableNft.NftRegistry qualified as NftRegistry
+import Fairmint.OpenCapTableNft.ReceiveAuthorization qualified as ReceiveAuthorization
 import Fairmint.OpenCapTableNft.Types
 import OpenCapTable.TestNftCoreHelpers
 
@@ -28,33 +29,75 @@ testNftCoreCanonicalNftIdIsStableAndDelimiterSafe = script do
     canonicalNftIdText delimiter_collision_left.nft_id
       /= canonicalNftIdText delimiter_collision_right.nft_id
 
+testNftCoreDirectAssetCreateRequiresRegistryAuthorityAndOperator = script do
+  parties <- allocateNftCoreParties "DirectAssetCreate"
+
+  submitMustFail parties.registry_authority do
+    createCmd NftAsset.NftAsset with
+      registry_authority = parties.registry_authority
+      operator = parties.operator
+      holder = parties.alice
+      registration = defaultRegistration
+
+  submitMustFail parties.operator do
+    createCmd NftAsset.NftAsset with
+      registry_authority = parties.registry_authority
+      operator = parties.operator
+      holder = parties.alice
+      registration = defaultRegistration
+
+testNftCoreMintRequiresRegistryAuthorityAndOperator = script do
+  parties <- allocateNftCoreParties "MintAuthorization"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
+
+  submitMustFail parties.registry_authority do
+    exerciseCmd registry_cid
+      (NftRegistry.Mint with
+        holder = parties.alice
+        registration = defaultRegistration
+      )
+
+  submitMustFail parties.operator do
+    exerciseCmd registry_cid
+      (NftRegistry.Mint with
+        holder = parties.alice
+        registration = defaultRegistration
+      )
+
+  assertRegistryIsEmpty parties.registry_authority registry_cid
+
 testNftCoreMintRejectsDuplicateCanonicalId = script do
   parties <- allocateNftCoreParties "DuplicateMint"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
 
   NftRegistry.MintResult{registry_cid = minted_registry_cid, nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
 
-  submitMustFail parties.registry_admin do
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
     exerciseCmd minted_registry_cid
       (NftRegistry.Mint with
         holder = parties.bob
         registration = defaultRegistration
       )
 
-  assertRegistryTracksNft parties.registry_admin minted_registry_cid defaultRegistration
+  assertRegistryTracksNft parties.registry_authority minted_registry_cid defaultRegistration
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
-  assertRegistryEntryCount parties.registry_admin minted_registry_cid 1
-  assertRegistryCollectionCount parties.registry_admin minted_registry_cid 1
+  assertRegistryEntryCount parties.registry_authority minted_registry_cid 1
+  assertRegistryCollectionCount parties.registry_authority minted_registry_cid 1
 
 testNftCoreMintRejectsOutsideCollectionScope = script do
   parties <- allocateNftCoreParties "ScopedMintReject"
-  registry_cid <- createRegistry parties.registry_admin (Some defaultCollection)
+  registry_cid <- createRegistry parties.registry_authority parties.operator (Some defaultCollection)
   let out_of_scope_registration =
         registrationWithPayload
           otherCollection
@@ -62,14 +105,14 @@ testNftCoreMintRejectsOutsideCollectionScope = script do
           defaultMetadata
           None
 
-  submitMustFail parties.registry_admin do
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
     exerciseCmd registry_cid
       (NftRegistry.Mint with
         holder = parties.alice
         registration = out_of_scope_registration
       )
 
-  assertRegistryIsEmpty parties.registry_admin registry_cid
+  assertRegistryIsEmpty parties.registry_authority registry_cid
 
 testNftCoreRegistryCreationRejectsMismatchedCollectionScopeRegistry = script do
   parties <- allocateNftCoreParties "ScopedRegistryMismatch"
@@ -78,175 +121,405 @@ testNftCoreRegistryCreationRejectsMismatchedCollectionScopeRegistry = script do
           registry_id = "NFT-REGISTRY-OTHER"
           collection_id = defaultCollection.collection_id
 
-  submitMustFail parties.registry_admin do
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
     createCmd NftRegistry.NftRegistry with
-      registry_admin = parties.registry_admin
+      registry_authority = parties.registry_authority
+      operator = parties.operator
       registry = defaultRegistry
       collection_scope = Some mismatched_scope
       collection_registries = Map.empty
 
+testNftCoreOfferTransferRequiresRegistryAuthorityOperatorAndCurrentHolderAuthorization = script do
+  setTime baseTime
+  parties <- allocateNftCoreParties "OfferAuthorization"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
+  NftRegistry.MintResult{nft_cid} <-
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
+  let transfer_offer =
+        TransferOfferTerms with
+          receiver = parties.bob
+          expires_at = firstTransferExpiry
+
+  submitMustFail parties.alice do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with transfer_offer, receive_authorization_cid = None)
+
+  submitMustFail parties.registry_authority do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with transfer_offer, receive_authorization_cid = None)
+
+  submitMustFail parties.operator do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with transfer_offer, receive_authorization_cid = None)
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with transfer_offer, receive_authorization_cid = None)
+
+  assertActiveNftView
+    parties.registry_authority
+    nft_cid
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+
 testNftCorePendingTransferConsumesPriorActiveRepresentation = script do
   setTime baseTime
   parties <- allocateNftCoreParties "PendingRepresentation"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{registry_cid = minted_registry_cid, nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   let transfer_offer =
         TransferOfferTerms with
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
 
-  assertNoNftView parties.registry_admin nft_cid
+  assertNoNftView parties.registry_authority nft_cid
   assertPendingNftView
-    parties.registry_admin
+    parties.registry_authority
     pending_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
     transfer_offer
-  assertRegistryTracksNft parties.registry_admin minted_registry_cid defaultRegistration
-  assertRegistryEntryCount parties.registry_admin minted_registry_cid 1
+  assertRegistryTracksNft parties.registry_authority minted_registry_cid defaultRegistration
+  assertRegistryEntryCount parties.registry_authority minted_registry_cid 1
 
 testNftCoreAcceptTransfersWholeAssetWithoutChangingPayload = script do
   setTime baseTime
   parties <- allocateNftCoreParties "AcceptWholeAsset"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{registry_cid = minted_registry_cid, nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   let transfer_offer =
         TransferOfferTerms with
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
-  accepted_cid <- acceptPendingTransfer parties.registry_admin parties.bob pending_cid
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
+  accepted_cid <-
+    acceptPendingTransfer
+      parties.registry_authority
+      parties.operator
+      parties.bob
+      pending_cid
 
-  assertNoNftView parties.registry_admin pending_cid
+  assertNoNftView parties.registry_authority pending_cid
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     accepted_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.bob
     defaultRegistration
-  assertRegistryTracksNft parties.registry_admin minted_registry_cid defaultRegistration
-  assertRegistryEntryCount parties.registry_admin minted_registry_cid 1
+  assertRegistryTracksNft parties.registry_authority minted_registry_cid defaultRegistration
+  assertRegistryEntryCount parties.registry_authority minted_registry_cid 1
 
-  Some accepted_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_admin accepted_cid
+  Some accepted_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_authority accepted_cid
   assertMsg "whole-asset transfer must preserve the NFT registration exactly" $
     accepted_view.nft_id == defaultRegistration.nft_id
       && accepted_view.metadata == defaultRegistration.metadata
       && accepted_view.confidentiality_ref == defaultRegistration.confidentiality_ref
 
-testNftCoreRejectRestoresSenderOwnership = script do
+testNftCoreAcceptRequiresRegistryAuthorityOperatorAndDesignatedReceiverAuthorization = script do
   setTime baseTime
-  parties <- allocateNftCoreParties "Reject"
-  registry_cid <- createRegistry parties.registry_admin None
+  parties <- allocateNftCoreParties "AcceptAuthorization"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   let transfer_offer =
         TransferOfferTerms with
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
-  rejected_cid <- rejectPendingTransfer parties.registry_admin parties.bob pending_cid
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
 
-  assertNoNftView parties.registry_admin pending_cid
+  submitMustFail parties.bob do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Accept
+
+  submitMustFail parties.registry_authority do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Accept
+
+  submitMustFail parties.operator do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Accept
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Accept
+
+  assertPendingNftView
+    parties.registry_authority
+    pending_cid
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+    transfer_offer
+
+testNftCoreRejectRestoresSenderOwnership = script do
+  setTime baseTime
+  parties <- allocateNftCoreParties "Reject"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
+  NftRegistry.MintResult{nft_cid} <-
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
+  let transfer_offer =
+        TransferOfferTerms with
+          receiver = parties.bob
+          expires_at = firstTransferExpiry
+
+  pending_cid <-
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
+  rejected_cid <-
+    rejectPendingTransfer
+      parties.registry_authority
+      parties.operator
+      parties.bob
+      pending_cid
+
+  assertNoNftView parties.registry_authority pending_cid
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     rejected_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
 
 testNftCoreWithdrawRestoresSenderOwnership = script do
   setTime baseTime
   parties <- allocateNftCoreParties "Withdraw"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   let transfer_offer =
         TransferOfferTerms with
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
-  withdrawn_cid <- withdrawPendingTransfer parties.registry_admin parties.alice pending_cid
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
+  withdrawn_cid <-
+    withdrawPendingTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      pending_cid
 
-  assertNoNftView parties.registry_admin pending_cid
+  assertNoNftView parties.registry_authority pending_cid
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     withdrawn_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
+
+testNftCoreWithdrawRequiresRegistryAuthorityOperatorAndOriginalSenderAuthorization = script do
+  setTime baseTime
+  parties <- allocateNftCoreParties "WithdrawAuthorization"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
+  NftRegistry.MintResult{nft_cid} <-
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
+  let transfer_offer =
+        TransferOfferTerms with
+          receiver = parties.bob
+          expires_at = firstTransferExpiry
+
+  pending_cid <-
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
+
+  submitMustFail parties.alice do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Withdraw
+
+  submitMustFail parties.registry_authority do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Withdraw
+
+  submitMustFail parties.operator do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Withdraw
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.bob]) do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
+      NftAsset.Withdraw
+
+  assertPendingNftView
+    parties.registry_authority
+    pending_cid
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+    transfer_offer
 
 testNftCoreExpiryBlocksResolutionUntilExpiredThenRestoresSender = script do
   setTime baseTime
   parties <- allocateNftCoreParties "Expire"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   let transfer_offer =
         TransferOfferTerms with
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
 
-  submitMustFail (actAs [parties.registry_admin, parties.bob]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.bob]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       (NftAsset.Expire with actor = parties.bob)
 
   setTime afterFirstTransferExpiry
 
-  submitMustFail (actAs [parties.registry_admin, parties.bob]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.bob]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Accept
 
-  submitMustFail (actAs [parties.registry_admin, parties.bob]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.bob]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Reject
 
-  submitMustFail (actAs [parties.registry_admin, parties.alice]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Withdraw
 
-  submitMustFail (actAs [parties.registry_admin, parties.charlie]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.charlie]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       (NftAsset.Expire with actor = parties.charlie)
 
-  expired_cid <- expirePendingTransfer parties.registry_admin parties.bob pending_cid
+  expired_cid <-
+    expirePendingTransfer
+      parties.registry_authority
+      parties.operator
+      parties.bob
+      pending_cid
 
-  assertNoNftView parties.registry_admin pending_cid
+  assertNoNftView parties.registry_authority pending_cid
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     expired_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
 
 testNftCoreStandingReceiveAuthorizationCompletesTransferImmediately = script do
   setTime baseTime
   parties <- allocateNftCoreParties "StandingAuth"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   auth_cid <-
     createStandingReceiveAuthorization
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.bob
       (Some defaultCollection)
       (Some afterFirstTransferExpiry)
@@ -257,37 +530,46 @@ testNftCoreStandingReceiveAuthorizationCompletesTransferImmediately = script do
 
   transferred_cid <-
     offerTransfer
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.alice
       nft_cid
       transfer_offer
       (Some auth_cid)
 
-  assertNoNftView parties.registry_admin nft_cid
+  assertNoNftView parties.registry_authority nft_cid
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     transferred_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.bob
     defaultRegistration
-  assertStandingReceiveAuthorizationVisibleTo parties.registry_admin auth_cid
+  assertStandingReceiveAuthorizationVisibleTo parties.registry_authority auth_cid
+  assertStandingReceiveAuthorizationVisibleTo parties.operator auth_cid
   assertStandingReceiveAuthorizationVisibleTo parties.bob auth_cid
 
 testNftCoreStandingReceiveAuthorizationRejectsExpiredOrMismatchedScope = script do
   setTime baseTime
   parties <- allocateNftCoreParties "StandingAuthValidation"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   mismatched_auth_cid <-
     createStandingReceiveAuthorization
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.bob
       (Some otherCollection)
       (Some afterFirstTransferExpiry)
   expired_auth_cid <-
     createStandingReceiveAuthorization
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.bob
       (Some defaultCollection)
       (Some baseTime)
@@ -296,7 +578,7 @@ testNftCoreStandingReceiveAuthorizationRejectsExpiredOrMismatchedScope = script 
           receiver = parties.bob
           expires_at = firstTransferExpiry
 
-  submitMustFail (actAs [parties.registry_admin, parties.alice]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
       (NftAsset.OfferTransfer with
@@ -304,7 +586,7 @@ testNftCoreStandingReceiveAuthorizationRejectsExpiredOrMismatchedScope = script 
         receive_authorization_cid = Some mismatched_auth_cid
       )
 
-  submitMustFail (actAs [parties.registry_admin, parties.alice]) do
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
       (NftAsset.OfferTransfer with
@@ -313,16 +595,17 @@ testNftCoreStandingReceiveAuthorizationRejectsExpiredOrMismatchedScope = script 
       )
 
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
 
 testNftCoreStandingReceiveAuthorizationSupportsCollectionWildcard = script do
   setTime baseTime
   parties <- allocateNftCoreParties "StandingAuthWildcard"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   let wildcard_registration =
         registrationWithPayload
           otherCollection
@@ -330,10 +613,16 @@ testNftCoreStandingReceiveAuthorizationSupportsCollectionWildcard = script do
           defaultMetadata
           (Some defaultConfidentialityRef)
   NftRegistry.MintResult{nft_cid} <-
-    mintRegistration parties.registry_admin registry_cid parties.alice wildcard_registration
+    mintRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
+      wildcard_registration
   auth_cid <-
     createStandingReceiveAuthorization
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.bob
       None
       (Some afterFirstTransferExpiry)
@@ -344,22 +633,84 @@ testNftCoreStandingReceiveAuthorizationSupportsCollectionWildcard = script do
 
   transferred_cid <-
     offerTransfer
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.alice
       nft_cid
       transfer_offer
       (Some auth_cid)
 
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     transferred_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.bob
     wildcard_registration
 
+testNftCoreStandingReceiveAuthorizationRejectsWrongReceiverAndRevokedAuth = script do
+  setTime baseTime
+  parties <- allocateNftCoreParties "StandingAuthControllerValidation"
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
+  NftRegistry.MintResult{nft_cid} <-
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
+  wrong_receiver_auth_cid <-
+    createStandingReceiveAuthorization
+      parties.registry_authority
+      parties.operator
+      parties.charlie
+      (Some defaultCollection)
+      (Some afterFirstTransferExpiry)
+  revocable_auth_cid <-
+    createStandingReceiveAuthorization
+      parties.registry_authority
+      parties.operator
+      parties.bob
+      (Some defaultCollection)
+      (Some afterFirstTransferExpiry)
+  let transfer_offer =
+        TransferOfferTerms with
+          receiver = parties.bob
+          expires_at = firstTransferExpiry
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with
+        transfer_offer
+        receive_authorization_cid = Some wrong_receiver_auth_cid
+      )
+
+  submit parties.bob do
+    exerciseCmd revocable_auth_cid ReceiveAuthorization.Revoke
+
+  assertStandingReceiveAuthorizationHiddenFrom parties.registry_authority revocable_auth_cid
+  assertStandingReceiveAuthorizationHiddenFrom parties.operator revocable_auth_cid
+  assertStandingReceiveAuthorizationHiddenFrom parties.bob revocable_auth_cid
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator, parties.alice]) do
+    exerciseCmd
+      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
+      (NftAsset.OfferTransfer with
+        transfer_offer
+        receive_authorization_cid = Some revocable_auth_cid
+      )
+
+  assertActiveNftView
+    parties.registry_authority
+    nft_cid
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+
 testNftCoreMetadataAndConfidentialityHookRoundTrip = script do
   parties <- allocateNftCoreParties "Metadata"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   let reserved_public_registration =
         registrationWithPayload
           defaultCollection
@@ -375,54 +726,58 @@ testNftCoreMetadataAndConfidentialityHookRoundTrip = script do
 
   NftRegistry.MintResult{registry_cid = after_first_registry_cid, nft_cid = first_nft_cid} <-
     mintRegistration
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       registry_cid
       parties.alice
       reserved_public_registration
   NftRegistry.MintResult{registry_cid = after_second_registry_cid, nft_cid = second_nft_cid} <-
     mintRegistration
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       after_first_registry_cid
       parties.bob
       no_confidentiality_registration
 
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     first_nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     reserved_public_registration
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     second_nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.bob
     no_confidentiality_registration
   assertRegistryTracksNft
-    parties.registry_admin
+    parties.registry_authority
     after_second_registry_cid
     reserved_public_registration
   assertRegistryTracksNft
-    parties.registry_admin
+    parties.registry_authority
     after_second_registry_cid
     no_confidentiality_registration
-  assertRegistryEntryCount parties.registry_admin after_second_registry_cid 2
-  assertRegistryCollectionCount parties.registry_admin after_second_registry_cid 1
+  assertRegistryEntryCount parties.registry_authority after_second_registry_cid 2
+  assertRegistryCollectionCount parties.registry_authority after_second_registry_cid 1
 
-  Some first_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_admin first_nft_cid
+  Some first_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_authority first_nft_cid
   assertMsg "reserved-looking public metadata keys must round-trip unchanged" $
     first_view.metadata.public_metadata == reservedAwareMetadata.public_metadata
   assertMsg "confidentiality hook must round-trip when present" $
     first_view.confidentiality_ref
       == Some (ConfidentialityRef with reference = "vault://confidentiality/sensitive")
 
-  Some second_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_admin second_nft_cid
+  Some second_view <- queryInterfaceContractId @Nft.CantonNft parties.registry_authority second_nft_cid
   assertMsg "confidentiality hook may be intentionally absent" $
     Optional.isNone second_view.confidentiality_ref
 
 testNftCoreRegistryShardsUniquenessLedgerByCollection = script do
   parties <- allocateNftCoreParties "CollectionLedgerShards"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   let other_collection_registration =
         registrationWithPayload
           otherCollection
@@ -431,25 +786,30 @@ testNftCoreRegistryShardsUniquenessLedgerByCollection = script do
           None
 
   NftRegistry.MintResult{registry_cid = after_first_registry_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   NftRegistry.MintResult{registry_cid = after_second_registry_cid} <-
     mintRegistration
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       after_first_registry_cid
       parties.bob
       other_collection_registration
 
-  assertRegistryTracksNft parties.registry_admin after_second_registry_cid defaultRegistration
+  assertRegistryTracksNft parties.registry_authority after_second_registry_cid defaultRegistration
   assertRegistryTracksNft
-    parties.registry_admin
+    parties.registry_authority
     after_second_registry_cid
     other_collection_registration
-  assertRegistryEntryCount parties.registry_admin after_second_registry_cid 2
-  assertRegistryCollectionCount parties.registry_admin after_second_registry_cid 2
+  assertRegistryEntryCount parties.registry_authority after_second_registry_cid 2
+  assertRegistryCollectionCount parties.registry_authority after_second_registry_cid 2
 
 testNftCoreReservedNamespaceRejectedOutsideStandardMetadata = script do
   parties <- allocateNftCoreParties "ReservedNamespace"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   let invalid_metadata =
         reservedAwareMetadata with
           public_metadata =
@@ -463,24 +823,29 @@ testNftCoreReservedNamespaceRejectedOutsideStandardMetadata = script do
           invalid_metadata
           None
 
-  submitMustFail parties.registry_admin do
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
     exerciseCmd registry_cid
       (NftRegistry.Mint with
         holder = parties.alice
         registration = invalid_registration
       )
 
-  assertRegistryIsEmpty parties.registry_admin registry_cid
+  assertRegistryIsEmpty parties.registry_authority registry_cid
 
 testNftCoreVisibilityBoundariesMatchStakeholders = script do
   setTime baseTime
   parties <- allocateNftCoreParties "Visibility"
-  registry_cid <- createRegistry parties.registry_admin None
+  registry_cid <- createRegistry parties.registry_authority parties.operator None
   NftRegistry.MintResult{registry_cid = minted_registry_cid, nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
+    mintDefaultRegistration
+      parties.registry_authority
+      parties.operator
+      registry_cid
+      parties.alice
   auth_cid <-
     createStandingReceiveAuthorization
-      parties.registry_admin
+      parties.registry_authority
+      parties.operator
       parties.bob
       (Some defaultCollection)
       (Some afterFirstTransferExpiry)
@@ -490,88 +855,78 @@ testNftCoreVisibilityBoundariesMatchStakeholders = script do
           expires_at = firstTransferExpiry
 
   assertActiveNftView
-    parties.registry_admin
+    parties.registry_authority
     nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+  assertActiveNftView
+    parties.operator
+    nft_cid
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
   assertActiveNftView
     parties.alice
     nft_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
   assertNoNftView parties.bob nft_cid
   assertNoNftView parties.charlie nft_cid
-  assertRegistryTracksNft parties.registry_admin minted_registry_cid defaultRegistration
+  assertRegistryTracksNft parties.registry_authority minted_registry_cid defaultRegistration
   assertRegistryHiddenFrom parties.alice minted_registry_cid
   assertRegistryHiddenFrom parties.bob minted_registry_cid
+  assertRegistryHiddenFrom parties.charlie minted_registry_cid
 
-  assertStandingReceiveAuthorizationVisibleTo parties.registry_admin auth_cid
+  assertStandingReceiveAuthorizationVisibleTo parties.registry_authority auth_cid
+  assertStandingReceiveAuthorizationVisibleTo parties.operator auth_cid
   assertStandingReceiveAuthorizationVisibleTo parties.bob auth_cid
   assertStandingReceiveAuthorizationHiddenFrom parties.alice auth_cid
   assertStandingReceiveAuthorizationHiddenFrom parties.charlie auth_cid
 
   pending_cid <-
-    offerTransfer parties.registry_admin parties.alice nft_cid transfer_offer None
+    offerTransfer
+      parties.registry_authority
+      parties.operator
+      parties.alice
+      nft_cid
+      transfer_offer
+      None
 
   assertPendingNftView
-    parties.registry_admin
+    parties.registry_authority
     pending_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
+    parties.alice
+    defaultRegistration
+    transfer_offer
+  assertPendingNftView
+    parties.operator
+    pending_cid
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
     transfer_offer
   assertPendingNftView
     parties.alice
     pending_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
     transfer_offer
   assertPendingNftView
     parties.bob
     pending_cid
-    parties.registry_admin
+    parties.registry_authority
+    parties.operator
     parties.alice
     defaultRegistration
     transfer_offer
   assertNoNftView parties.charlie pending_cid
-
-testNftCoreOfferTransferRejectsSelfTransferAndPastExpiry = script do
-  setTime baseTime
-  parties <- allocateNftCoreParties "OfferValidation"
-  registry_cid <- createRegistry parties.registry_admin None
-  NftRegistry.MintResult{nft_cid} <-
-    mintDefaultRegistration parties.registry_admin registry_cid parties.alice
-  let same_holder_offer =
-        TransferOfferTerms with
-          receiver = parties.alice
-          expires_at = firstTransferExpiry
-  let expired_offer =
-        TransferOfferTerms with
-          receiver = parties.bob
-          expires_at = baseTime
-
-  submitMustFail (actAs [parties.registry_admin, parties.alice]) do
-    exerciseCmd
-      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
-      (NftAsset.OfferTransfer with
-        transfer_offer = same_holder_offer
-        receive_authorization_cid = None
-      )
-
-  submitMustFail (actAs [parties.registry_admin, parties.alice]) do
-    exerciseCmd
-      (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
-      (NftAsset.OfferTransfer with
-        transfer_offer = expired_offer
-        receive_authorization_cid = None
-      )
-
-  assertActiveNftView
-    parties.registry_admin
-    nft_cid
-    parties.registry_admin
-    parties.alice
-    defaultRegistration

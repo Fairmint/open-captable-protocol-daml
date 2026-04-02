@@ -15,7 +15,8 @@ import Fairmint.OpenCapTableNft.ReceiveAuthorization qualified as ReceiveAuthori
 import Fairmint.OpenCapTableNft.Types
 
 data NftCoreParties = NftCoreParties with
-    registry_admin : Party
+    registry_authority : Party
+    operator : Party
     alice : Party
     bob : Party
     charlie : Party
@@ -133,7 +134,8 @@ registrationWithPayload collection token_id metadata confidentiality_ref =
 
 allocateNftCoreParties : Text -> Script NftCoreParties
 allocateNftCoreParties suffix = do
-  registry_admin <- allocateParty ("NftRegistryAdmin-" <> suffix)
+  registry_authority <- allocateParty ("NftRegistryAuthority-" <> suffix)
+  operator <- allocateParty ("NftOperator-" <> suffix)
   alice <- allocateParty ("NftAlice-" <> suffix)
   bob <- allocateParty ("NftBob-" <> suffix)
   charlie <- allocateParty ("NftCharlie-" <> suffix)
@@ -141,44 +143,50 @@ allocateNftCoreParties suffix = do
 
 createRegistry :
   Party ->
+  Party ->
   Optional CollectionIdentity ->
   Script (ContractId NftRegistry.NftRegistry)
-createRegistry registry_admin collection_scope =
-  submit registry_admin do
+createRegistry registry_authority operator collection_scope =
+  submit (actAs [registry_authority, operator]) do
     createCmd NftRegistry.NftRegistry with
-      registry_admin
+      registry_authority
+      operator
       registry = defaultRegistry
       collection_scope
       collection_registries = Map.empty
 
 mintRegistration :
   Party ->
+  Party ->
   ContractId NftRegistry.NftRegistry ->
   Party ->
   NftRegistration ->
   Script NftRegistry.MintResult
-mintRegistration registry_admin registry_cid holder registration =
-  submit registry_admin do
+mintRegistration registry_authority operator registry_cid holder registration =
+  submit (actAs [registry_authority, operator]) do
     exerciseCmd registry_cid (NftRegistry.Mint with holder, registration)
 
 mintDefaultRegistration :
   Party ->
+  Party ->
   ContractId NftRegistry.NftRegistry ->
   Party ->
   Script NftRegistry.MintResult
-mintDefaultRegistration registry_admin registry_cid holder =
-  mintRegistration registry_admin registry_cid holder defaultRegistration
+mintDefaultRegistration registry_authority operator registry_cid holder =
+  mintRegistration registry_authority operator registry_cid holder defaultRegistration
 
 createStandingReceiveAuthorization :
+  Party ->
   Party ->
   Party ->
   Optional CollectionIdentity ->
   Optional Time ->
   Script (ContractId ReceiveAuthorization.StandingReceiveAuthorization)
-createStandingReceiveAuthorization registry_admin receiver collection_scope expires_at =
+createStandingReceiveAuthorization registry_authority operator receiver collection_scope expires_at =
   submit receiver do
     createCmd ReceiveAuthorization.StandingReceiveAuthorization with
-      registry_admin
+      registry_authority
+      operator
       receiver
       registry = defaultRegistry
       collection_scope
@@ -187,12 +195,13 @@ createStandingReceiveAuthorization registry_admin receiver collection_scope expi
 offerTransfer :
   Party ->
   Party ->
+  Party ->
   ContractId Nft.CantonNft ->
   TransferOfferTerms ->
   Optional (ContractId ReceiveAuthorization.StandingReceiveAuthorization) ->
   Script (ContractId Nft.CantonNft)
-offerTransfer registry_admin holder nft_cid transfer_offer receive_authorization_cid =
-  submit (actAs [registry_admin, holder]) do
+offerTransfer registry_authority operator holder nft_cid transfer_offer receive_authorization_cid =
+  submit (actAs [registry_authority, operator, holder]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftAsset nft_cid)
       (NftAsset.OfferTransfer with transfer_offer, receive_authorization_cid)
@@ -200,10 +209,11 @@ offerTransfer registry_admin holder nft_cid transfer_offer receive_authorization
 acceptPendingTransfer :
   Party ->
   Party ->
+  Party ->
   ContractId Nft.CantonNft ->
   Script (ContractId Nft.CantonNft)
-acceptPendingTransfer registry_admin receiver pending_cid =
-  submit (actAs [registry_admin, receiver]) do
+acceptPendingTransfer registry_authority operator receiver pending_cid =
+  submit (actAs [registry_authority, operator, receiver]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Accept
@@ -211,10 +221,11 @@ acceptPendingTransfer registry_admin receiver pending_cid =
 rejectPendingTransfer :
   Party ->
   Party ->
+  Party ->
   ContractId Nft.CantonNft ->
   Script (ContractId Nft.CantonNft)
-rejectPendingTransfer registry_admin receiver pending_cid =
-  submit (actAs [registry_admin, receiver]) do
+rejectPendingTransfer registry_authority operator receiver pending_cid =
+  submit (actAs [registry_authority, operator, receiver]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Reject
@@ -222,10 +233,11 @@ rejectPendingTransfer registry_admin receiver pending_cid =
 withdrawPendingTransfer :
   Party ->
   Party ->
+  Party ->
   ContractId Nft.CantonNft ->
   Script (ContractId Nft.CantonNft)
-withdrawPendingTransfer registry_admin sender pending_cid =
-  submit (actAs [registry_admin, sender]) do
+withdrawPendingTransfer registry_authority operator sender pending_cid =
+  submit (actAs [registry_authority, operator, sender]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       NftAsset.Withdraw
@@ -233,10 +245,11 @@ withdrawPendingTransfer registry_admin sender pending_cid =
 expirePendingTransfer :
   Party ->
   Party ->
+  Party ->
   ContractId Nft.CantonNft ->
   Script (ContractId Nft.CantonNft)
-expirePendingTransfer registry_admin expiring_actor pending_cid =
-  submit (actAs [registry_admin, expiring_actor]) do
+expirePendingTransfer registry_authority operator expiring_actor pending_cid =
+  submit (actAs [registry_authority, operator, expiring_actor]) do
     exerciseCmd
       (fromInterfaceContractId @NftAsset.NftTransferOffer pending_cid)
       (NftAsset.Expire with actor = expiring_actor)
@@ -246,12 +259,15 @@ assertActiveNftView :
   ContractId Nft.CantonNft ->
   Party ->
   Party ->
+  Party ->
   NftRegistration ->
   Script ()
-assertActiveNftView querying_party nft_cid expected_registry_admin expected_holder expected_registration = do
+assertActiveNftView querying_party nft_cid expected_registry_authority expected_operator expected_holder expected_registration = do
   Some nft_view <- queryInterfaceContractId @Nft.CantonNft querying_party nft_cid
-  assertMsg "active NFT registry admin mismatch" $
-    nft_view.registry_admin == expected_registry_admin
+  assertMsg "active NFT registry authority mismatch" $
+    nft_view.registry_authority == expected_registry_authority
+  assertMsg "active NFT operator mismatch" $
+    nft_view.operator == expected_operator
   assertMsg "active NFT registry mismatch" $
     nft_view.registry == registryOfNftId expected_registration.nft_id
   assertMsg "active NFT collection mismatch" $
@@ -274,13 +290,16 @@ assertPendingNftView :
   ContractId Nft.CantonNft ->
   Party ->
   Party ->
+  Party ->
   NftRegistration ->
   TransferOfferTerms ->
   Script ()
-assertPendingNftView querying_party nft_cid expected_registry_admin expected_holder expected_registration transfer_offer = do
+assertPendingNftView querying_party nft_cid expected_registry_authority expected_operator expected_holder expected_registration transfer_offer = do
   Some nft_view <- queryInterfaceContractId @Nft.CantonNft querying_party nft_cid
-  assertMsg "pending NFT registry admin mismatch" $
-    nft_view.registry_admin == expected_registry_admin
+  assertMsg "pending NFT registry authority mismatch" $
+    nft_view.registry_authority == expected_registry_authority
+  assertMsg "pending NFT operator mismatch" $
+    nft_view.operator == expected_operator
   assertMsg "pending NFT registry mismatch" $
     nft_view.registry == registryOfNftId expected_registration.nft_id
   assertMsg "pending NFT collection mismatch" $
