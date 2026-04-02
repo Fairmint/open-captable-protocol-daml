@@ -7,12 +7,14 @@ import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
+const nftPkg = requirePackageConfig('nft');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 // Paths
 const PACKAGE_DIRS = [
   path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '../generated/js', `${reportsPkg.name}-${reportsPkg.version}`),
+  path.join(__dirname, '../generated/js', `${nftPkg.name}-${nftPkg.version}`),
   path.join(__dirname, '../generated/js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
@@ -20,6 +22,7 @@ const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-f
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
+const TOKEN_BURN_MINT_DIR = path.join(__dirname, '../generated/js/splice-api-token-burn-mint-v1-1.0.0');
 const TOKEN_METADATA_DIR = path.join(__dirname, '../generated/js/splice-api-token-metadata-v1-1.0.0');
 const TOKEN_HOLDING_DIR = path.join(__dirname, '../generated/js/splice-api-token-holding-v1-1.0.0');
 const TOKEN_ALLOCATION_INSTRUCTION_DIR = path.join(
@@ -32,6 +35,35 @@ const TOKEN_TRANSFER_INSTRUCTION_DIR = path.join(
 );
 const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-token-allocation-v1-1.0.0');
 const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
+const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
+const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
+const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
+const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
+const SPLICE_FEATURED_APP_IMPORT = 'daml.js/splice-api-featured-app-v1-1.0.0';
+const SPLICE_AMULET_IMPORT = 'daml.js/splice-amulet-0.1.14';
+const DA_TIME_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Time-Types-1.0.0';
+const DA_TYPES_IMPORT = 'daml.js/daml-prim-DA-Types-1.0.0';
+const TOKEN_BURN_MINT_IMPORT = 'daml.js/splice-api-token-burn-mint-v1-1.0.0';
+const TOKEN_METADATA_IMPORT = 'daml.js/splice-api-token-metadata-v1-1.0.0';
+const TOKEN_HOLDING_IMPORT = 'daml.js/splice-api-token-holding-v1-1.0.0';
+const TOKEN_ALLOCATION_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-allocation-instruction-v1-1.0.0';
+const TOKEN_TRANSFER_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-transfer-instruction-v1-1.0.0';
+const TOKEN_ALLOCATION_IMPORT = 'daml.js/splice-api-token-allocation-v1-1.0.0';
+const DA_SET_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Set-Types-1.0.0';
+
+interface BundleRequirements {
+  hasBundledOcp: boolean;
+  hasBundledSpliceFeaturedApp: boolean;
+  hasBundledSpliceAmulet: boolean;
+  hasBundledDATimeTypes: boolean;
+  hasBundledDATypes: boolean;
+  hasBundledSpliceApiTokenDependencies: boolean;
+  hasBundledDASetTypes: boolean;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
 
 function createDirectoryIfNotExists(dirPath: string): void {
   if (!fs.existsSync(dirPath)) {
@@ -59,6 +91,214 @@ function copyDirectory(src: string, dest: string): void {
     } else {
       copyFile(srcPath, destPath);
     }
+  }
+}
+
+function getImmediateChildDirs(dirPath: string): string[] {
+  if (!fs.existsSync(dirPath)) {
+    return [];
+  }
+
+  return fs
+    .readdirSync(dirPath, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name)
+    .sort();
+}
+
+function writeNamespaceIndexFiles(dirPath: string, childNamespaces: string[]): void {
+  if (childNamespaces.length === 0) {
+    return;
+  }
+
+  createDirectoryIfNotExists(dirPath);
+
+  const indexJs = `"use strict";
+/* eslint-disable-next-line no-unused-vars */
+function __export(m) {
+/* eslint-disable-next-line no-prototype-builtins */
+    for (var p in m) if (!exports.hasOwnProperty(p)) exports[p] = m[p];
+}
+Object.defineProperty(exports, "__esModule", { value: true });
+${childNamespaces
+  .map(
+    (childNamespace) =>
+      `var ${childNamespace} = require('./${childNamespace}');\nexports.${childNamespace} = ${childNamespace};`
+  )
+  .join('\n')}
+`;
+  fs.writeFileSync(path.join(dirPath, 'index.js'), indexJs);
+
+  const indexDts = createNamespaceIndexDts(childNamespaces);
+  fs.writeFileSync(path.join(dirPath, 'index.d.ts'), indexDts);
+}
+
+function createNamespaceIndexDts(childNamespaces: string[]): string {
+  return `${childNamespaces
+    .map((childNamespace) => `export * as ${childNamespace} from './${childNamespace}';`)
+    .join('\n')}
+`;
+}
+
+function removeDirectoryIfExists(dirPath: string): void {
+  if (fs.existsSync(dirPath)) {
+    fs.rmSync(dirPath, { recursive: true, force: true });
+  }
+}
+
+function normalizeImportTarget(importPath: string): string {
+  return path
+    .normalize(importPath)
+    .replace(/(\.d\.ts|\.js)$/, '')
+    .replace(/[/\\]index$/, '');
+}
+
+function isWithinDir(dirPath: string, candidatePath: string): boolean {
+  const normalizedDir = path.resolve(dirPath);
+  const normalizedCandidate = path.resolve(candidatePath);
+  return normalizedCandidate === normalizedDir || normalizedCandidate.startsWith(`${normalizedDir}${path.sep}`);
+}
+
+function getBundledArtifactDirs(targetDir: string): string[] {
+  const bundledDirs = [
+    path.join(targetDir, 'lib', 'Splice'),
+    path.join(targetDir, 'lib', '__bundled__'),
+    path.join(targetDir, 'lib', 'DA', 'Time'),
+    path.join(targetDir, 'lib', 'DA', 'Types'),
+    path.join(targetDir, 'lib', 'DA', 'Set'),
+  ];
+
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    bundledDirs.push(path.join(targetDir, 'lib', 'Fairmint', 'OpenCapTable'));
+  }
+
+  return bundledDirs;
+}
+
+function collectDependencyReferenceFiles(targetDir: string): string[] {
+  const libDir = path.join(targetDir, 'lib');
+  const ignoredDirs = getBundledArtifactDirs(targetDir);
+
+  if (!fs.existsSync(libDir)) {
+    return [];
+  }
+
+  const pendingDirs = [libDir];
+  const files: string[] = [];
+
+  while (pendingDirs.length > 0) {
+    const currentDir = pendingDirs.pop();
+    if (!currentDir) continue;
+
+    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
+      const entryPath = path.join(currentDir, entry.name);
+
+      if (entry.isDirectory()) {
+        if (ignoredDirs.some((ignoredDir) => isWithinDir(ignoredDir, entryPath))) {
+          continue;
+        }
+        pendingDirs.push(entryPath);
+        continue;
+      }
+
+      if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.d.ts'))) {
+        files.push(entryPath);
+      }
+    }
+  }
+
+  return files;
+}
+
+function packageHasDependencyReference(targetDir: string, rawImports: string[], bundledTargets: string[]): boolean {
+  const normalizedTargets = bundledTargets.map((bundledTarget) => normalizeImportTarget(bundledTarget));
+  const moduleSpecifierPatterns = [/require\(['"]([^'"]+)['"]\)/g, /from ['"]([^'"]+)['"]/g];
+
+  for (const filePath of collectDependencyReferenceFiles(targetDir)) {
+    const fileContents = fs.readFileSync(filePath, 'utf8');
+
+    if (rawImports.some((rawImport) => fileContents.includes(rawImport))) {
+      return true;
+    }
+
+    for (const pattern of moduleSpecifierPatterns) {
+      pattern.lastIndex = 0;
+      let match: RegExpExecArray | null = pattern.exec(fileContents);
+
+      while (match) {
+        const specifier = match[1];
+        if (specifier.startsWith('.')) {
+          const resolvedImport = normalizeImportTarget(path.resolve(path.dirname(filePath), specifier));
+          if (normalizedTargets.some((bundledTarget) => bundledTarget === resolvedImport)) {
+            return true;
+          }
+        }
+
+        match = pattern.exec(fileContents);
+      }
+    }
+  }
+
+  return false;
+}
+
+function collectBundleRequirements(targetDir: string): BundleRequirements {
+  return {
+    hasBundledOcp: packageHasDependencyReference(
+      targetDir,
+      [OCP_DAML_JS_IMPORT],
+      [path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR)]
+    ),
+    hasBundledSpliceFeaturedApp: packageHasDependencyReference(
+      targetDir,
+      [SPLICE_FEATURED_APP_IMPORT],
+      [path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1')]
+    ),
+    hasBundledSpliceAmulet: packageHasDependencyReference(
+      targetDir,
+      [SPLICE_AMULET_IMPORT],
+      [path.join(targetDir, 'lib')]
+    ),
+    hasBundledDATimeTypes: packageHasDependencyReference(
+      targetDir,
+      [DA_TIME_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Time', 'Types')]
+    ),
+    hasBundledDATypes: packageHasDependencyReference(
+      targetDir,
+      [DA_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Types')]
+    ),
+    hasBundledSpliceApiTokenDependencies: packageHasDependencyReference(
+      targetDir,
+      [
+        TOKEN_BURN_MINT_IMPORT,
+        TOKEN_METADATA_IMPORT,
+        TOKEN_HOLDING_IMPORT,
+        TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
+        TOKEN_TRANSFER_INSTRUCTION_IMPORT,
+        TOKEN_ALLOCATION_IMPORT,
+      ],
+      [
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'BurnMintV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'MetadataV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'HoldingV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationV1'),
+      ]
+    ),
+    hasBundledDASetTypes: packageHasDependencyReference(
+      targetDir,
+      [DA_SET_TYPES_IMPORT],
+      [path.join(targetDir, 'lib', 'DA', 'Set', 'Types')]
+    ),
+  };
+}
+
+function clearBundledArtifacts(targetDir: string): void {
+  for (const bundledDir of getBundledArtifactDirs(targetDir)) {
+    removeDirectoryIfExists(bundledDir);
   }
 }
 
@@ -157,8 +397,7 @@ exports.Template = Template;
 `;
   fs.writeFileSync(path.join(internalDir, 'index.js'), internalIndex);
 
-  const internalIndexDts = `export * from './Template';
-`;
+  const internalIndexDts = createNamespaceIndexDts(['Template']);
   fs.writeFileSync(path.join(internalDir, 'index.d.ts'), internalIndexDts);
 
   const daDir = path.join(targetDir, 'lib/DA');
@@ -175,8 +414,7 @@ exports.Internal = Internal;
 `;
   fs.writeFileSync(path.join(daDir, 'index.js'), daIndex);
 
-  const daIndexDts = `export * from './Internal';
-`;
+  const daIndexDts = createNamespaceIndexDts(['Internal']);
   fs.writeFileSync(path.join(daDir, 'index.d.ts'), daIndexDts);
 
   console.log('✅ Created bundled DA.Internal.Template structure');
@@ -277,8 +515,7 @@ exports.FeaturedAppRightV1 = FeaturedAppRightV1;
 `;
   fs.writeFileSync(path.join(apiDir, 'index.js'), apiIndex);
 
-  const apiIndexDts = `export * from './FeaturedAppRightV1';
-`;
+  const apiIndexDts = createNamespaceIndexDts(['FeaturedAppRightV1']);
   fs.writeFileSync(path.join(apiDir, 'index.d.ts'), apiIndexDts);
 
   const spliceMainDir = path.join(targetDir, 'lib/Splice');
@@ -295,8 +532,7 @@ exports.Api = Api;
 `;
   fs.writeFileSync(path.join(spliceMainDir, 'index.js'), spliceMainIndex);
 
-  const spliceMainIndexDts = `export * from './Api';
-`;
+  const spliceMainIndexDts = createNamespaceIndexDts(['Api']);
   fs.writeFileSync(path.join(spliceMainDir, 'index.d.ts'), spliceMainIndexDts);
 
   console.log('✅ Created bundled splice-api-featured-app-v1 structure');
@@ -350,6 +586,16 @@ function createBundledDATypesFiles(targetDir: string): void {
 function createBundledSpliceApiTokenDependencies(targetDir: string): void {
   console.log('📦 Bundling Splice API Token dependencies...');
 
+  // Copy token burn/mint
+  if (fs.existsSync(TOKEN_BURN_MINT_DIR)) {
+    const destDir = path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1');
+    const sourceDir = path.join(TOKEN_BURN_MINT_DIR, 'lib/Splice/Api/Token/BurnMintV1');
+    if (fs.existsSync(sourceDir)) {
+      copyDirectory(sourceDir, destDir);
+      console.log('✅ Copied token-burn-mint-v1');
+    }
+  }
+
   // Copy token metadata
   if (fs.existsSync(TOKEN_METADATA_DIR)) {
     const destDir = path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1');
@@ -401,6 +647,36 @@ function createBundledSpliceApiTokenDependencies(targetDir: string): void {
   }
 }
 
+function ensureBundledSpliceNamespaceIndexes(targetDir: string): void {
+  const spliceDir = path.join(targetDir, 'lib/Splice');
+  const apiDir = path.join(spliceDir, 'Api');
+  const tokenDir = path.join(apiDir, 'Token');
+
+  const tokenNamespaces = getImmediateChildDirs(tokenDir);
+  if (tokenNamespaces.length > 0) {
+    writeNamespaceIndexFiles(tokenDir, tokenNamespaces);
+  }
+
+  const apiNamespaces = getImmediateChildDirs(apiDir);
+  if (apiNamespaces.length > 0) {
+    writeNamespaceIndexFiles(apiDir, apiNamespaces);
+  }
+
+  const spliceNamespaces = getImmediateChildDirs(spliceDir);
+  if (spliceNamespaces.length > 0) {
+    writeNamespaceIndexFiles(spliceDir, spliceNamespaces);
+  }
+}
+
+/** Regenerate `lib/DA/index.js` and `index.d.ts` from actual child dirs (Internal, Time, Types, Set, …). */
+function ensureBundledDANamespaceIndexes(targetDir: string): void {
+  const daDir = path.join(targetDir, 'lib/DA');
+  const daNamespaces = getImmediateChildDirs(daDir);
+  if (daNamespaces.length > 0) {
+    writeNamespaceIndexFiles(daDir, daNamespaces);
+  }
+}
+
 function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('📦 Bundling DA Set Types dependency...');
   const daDestDir = path.join(targetDir, 'lib/DA/Set');
@@ -416,59 +692,119 @@ function createBundledDASetTypesFiles(targetDir: string): void {
   console.log('✅ Copied DA Set Types modules');
 }
 
-function updateMainIndex(targetDir: string): void {
-  console.log('📝 Updating main index files...');
+function createBundledOcpFiles(targetDir: string): void {
+  console.log('📦 Bundling OpenCapTable dependency...');
 
-  const mainIndexPath = path.join(targetDir, 'lib/index.js');
-  let mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
+  if (path.resolve(targetDir) !== path.resolve(OCP_PACKAGE_DIR)) {
+    const ocpSourceDir = path.join(OCP_PACKAGE_DIR, 'lib/Fairmint/OpenCapTable');
+    const ocpDestDir = path.join(targetDir, 'lib/Fairmint/OpenCapTable');
 
-  if (!mainIndex.includes("var DA = require('./DA')")) {
-    const fairmintLine = mainIndex.indexOf('exports.Fairmint = Fairmint;');
-    if (fairmintLine !== -1) {
-      const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
-      const daImport = "var DA = require('./DA');\n";
-      mainIndex = `${mainIndex.slice(0, insertPos) + daImport}exports.DA = DA;\n${mainIndex.slice(insertPos)}`;
-      fs.writeFileSync(mainIndexPath, mainIndex);
-      console.log('✅ Updated main index.js with DA');
+    if (!fs.existsSync(ocpSourceDir)) {
+      console.log('⚠️  OpenCapTable dependency directory not found');
+      return;
     }
+
+    copyDirectory(ocpSourceDir, ocpDestDir);
+    console.log('✅ Copied OpenCapTable modules');
   }
 
-  if (!mainIndex.includes("var Splice = require('./Splice')")) {
-    const fairmintLine = mainIndex.indexOf('exports.Fairmint = Fairmint;');
-    if (fairmintLine !== -1) {
-      const insertPos = mainIndex.indexOf('\n', fairmintLine) + 1;
-      const spliceImport = "var Splice = require('./Splice');\n";
-      mainIndex = `${mainIndex.slice(0, insertPos) + spliceImport}exports.Splice = Splice;\n${mainIndex.slice(insertPos)}`;
-      fs.writeFileSync(mainIndexPath, mainIndex);
-      console.log('✅ Updated main index.js with Splice');
-    }
+  const ocpWrapperDir = path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR);
+  createDirectoryIfNotExists(ocpWrapperDir);
+
+  const ocpWrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var OpenCapTable = require('../../Fairmint/OpenCapTable');
+exports.Fairmint = {
+  OpenCapTable: OpenCapTable,
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.js'), ocpWrapperIndex);
+
+  const ocpWrapperIndexDts = `import * as OpenCapTable from '../../Fairmint/OpenCapTable';
+
+export declare const Fairmint: {
+  OpenCapTable: typeof OpenCapTable;
+};
+`;
+  fs.writeFileSync(path.join(ocpWrapperDir, 'index.d.ts'), ocpWrapperIndexDts);
+  console.log('✅ Created OpenCapTable dependency wrapper');
+}
+
+function normalizeMainIndexJs(content: string, hasSpliceDir: boolean): string {
+  let normalizedContent = content
+    .replace(/var DA = require\('\.\/DA'\);\nexports\.DA = DA;\n?/g, '')
+    .replace(/var Splice = require\('\.\/Splice'\);\nexports\.Splice = Splice;\n?/g, '')
+    .trimEnd();
+
+  normalizedContent = `${normalizedContent}\nvar DA = require('./DA');\nexports.DA = DA;\n`;
+
+  if (hasSpliceDir) {
+    normalizedContent = `${normalizedContent}var Splice = require('./Splice');\nexports.Splice = Splice;\n`;
+  }
+
+  return normalizedContent;
+}
+
+function normalizeMainIndexDts(content: string, hasSpliceDir: boolean): string {
+  const importsToAdd = ["import * as DA from './DA';"];
+  if (hasSpliceDir) {
+    importsToAdd.push("import * as Splice from './Splice';");
+  }
+
+  let normalizedContent = content
+    .replace(/^import \* as DA from '\.\/DA';\n?/gm, '')
+    .replace(/^import \* as Splice from '\.\/Splice';\n?/gm, '');
+
+  const exportMatch = normalizedContent.match(/export \{([^}]*)\} ;/);
+  const exportNames = exportMatch
+    ? exportMatch[1]
+        .split(',')
+        .map((name) => name.trim())
+        .filter(Boolean)
+        .filter((name) => name !== 'DA' && name !== 'Splice')
+    : [];
+
+  exportNames.push('DA');
+  if (hasSpliceDir) {
+    exportNames.push('Splice');
+  }
+
+  const exportLine = `export { ${[...new Set(exportNames)].join(', ')} } ;`;
+  normalizedContent = exportMatch
+    ? normalizedContent.replace(/export \{[^}]*\} ;/, exportLine)
+    : `${normalizedContent.trimEnd()}\n${exportLine}\n`;
+
+  const lines = normalizedContent.split('\n');
+  const firstNonImportIndex = lines.findIndex((line) => line.trim() !== '' && !line.startsWith('import '));
+  const insertIndex = firstNonImportIndex === -1 ? lines.length : firstNonImportIndex;
+  lines.splice(insertIndex, 0, ...importsToAdd);
+
+  return `${lines
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trimEnd()}\n`;
+}
+
+function updateMainIndex(targetDir: string): void {
+  console.log('📝 Updating main index files...');
+  const hasSpliceDir =
+    fs.existsSync(path.join(targetDir, 'lib/Splice/index.js')) &&
+    fs.existsSync(path.join(targetDir, 'lib/Splice/index.d.ts'));
+
+  const mainIndexPath = path.join(targetDir, 'lib/index.js');
+  const mainIndex = fs.readFileSync(mainIndexPath, 'utf8');
+  const normalizedMainIndex = normalizeMainIndexJs(mainIndex, hasSpliceDir);
+  if (normalizedMainIndex !== mainIndex) {
+    fs.writeFileSync(mainIndexPath, normalizedMainIndex);
+    console.log('✅ Updated main index.js');
   }
 
   const mainIndexDtsPath = path.join(targetDir, 'lib/index.d.ts');
-  let mainIndexDts = fs.readFileSync(mainIndexDtsPath, 'utf8');
-
-  if (!mainIndexDts.includes("import * as DA from './DA'")) {
-    const fairmintImport = mainIndexDts.indexOf("import * as Fairmint from './Fairmint';");
-    if (fairmintImport !== -1) {
-      const insertPos = mainIndexDts.indexOf('\n', fairmintImport) + 1;
-      const daImport = "import * as DA from './DA';\n";
-      mainIndexDts = mainIndexDts.slice(0, insertPos) + daImport + mainIndexDts.slice(insertPos);
-      mainIndexDts = mainIndexDts.replace('export { Fairmint } ;', 'export { Fairmint, DA } ;');
-      fs.writeFileSync(mainIndexDtsPath, mainIndexDts);
-      console.log('✅ Updated main index.d.ts with DA');
-    }
-  }
-
-  if (!mainIndexDts.includes("import * as Splice from './Splice'")) {
-    const fairmintImport = mainIndexDts.indexOf("import * as Fairmint from './Fairmint';");
-    if (fairmintImport !== -1) {
-      const insertPos = mainIndexDts.indexOf('\n', fairmintImport) + 1;
-      const spliceImport = "import * as Splice from './Splice';\n";
-      mainIndexDts = mainIndexDts.slice(0, insertPos) + spliceImport + mainIndexDts.slice(insertPos);
-      mainIndexDts = mainIndexDts.replace('export { Fairmint, DA } ;', 'export { Fairmint, DA, Splice } ;');
-      fs.writeFileSync(mainIndexDtsPath, mainIndexDts);
-      console.log('✅ Updated main index.d.ts with Splice');
-    }
+  const mainIndexDts = fs.readFileSync(mainIndexDtsPath, 'utf8');
+  const normalizedMainIndexDts = normalizeMainIndexDts(mainIndexDts, hasSpliceDir);
+  if (normalizedMainIndexDts !== mainIndexDts) {
+    fs.writeFileSync(mainIndexDtsPath, normalizedMainIndexDts);
+    console.log('✅ Updated main index.d.ts');
   }
 }
 
@@ -512,6 +848,19 @@ function replaceDependencyReferences(targetDir: string): void {
           /require\('daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
+      }
+    }
+
+    if (content.includes(OCP_DAML_JS_IMPORT)) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR))
+        .replace(/\\/g, '/');
+      // Package names include dots and other regex metacharacters, so escape before building the matcher.
+      const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
+      if (isDts) {
+        content = content.replace(new RegExp(`from '${escapedImport}';`, 'g'), `from '${relativePath}';`);
+      } else {
+        content = content.replace(new RegExp(`require\\('${escapedImport}'\\)`, 'g'), `require('${relativePath}')`);
       }
     }
 
@@ -576,6 +925,20 @@ function replaceDependencyReferences(targetDir: string): void {
       } else {
         content = content.replace(
           /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
+          `require('${relativePath}')`
+        );
+      }
+    }
+
+    if (content.includes('daml.js/splice-api-token-burn-mint-v1-1.0.0')) {
+      const relativePath = path
+        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'))
+        .replace(/\\/g, '/');
+      if (isDts) {
+        content = content.replace(/from 'daml.js\/splice-api-token-burn-mint-v1-1\.0\.0';/g, `from '${relativePath}';`);
+      } else {
+        content = content.replace(
+          /require\('daml.js\/splice-api-token-burn-mint-v1-1\.0\.0'\)/g,
           `require('${relativePath}')`
         );
       }
@@ -674,17 +1037,19 @@ function removeLocalDependency(targetDir: string): void {
   const packageJsonPath = path.join(targetDir, 'package.json');
   const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
   const localDependencies = [
-    'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
-    'daml.js/splice-api-featured-app-v1-1.0.0',
-    'daml.js/splice-amulet-0.1.14',
-    'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
-    'daml.js/daml-prim-DA-Types-1.0.0',
-    'daml.js/splice-api-token-metadata-v1-1.0.0',
-    'daml.js/splice-api-token-holding-v1-1.0.0',
-    'daml.js/splice-api-token-allocation-instruction-v1-1.0.0',
-    'daml.js/splice-api-token-transfer-instruction-v1-1.0.0',
-    'daml.js/splice-api-token-allocation-v1-1.0.0',
-    'daml.js/daml-stdlib-DA-Set-Types-1.0.0',
+    DA_INTERNAL_TEMPLATE_IMPORT,
+    OCP_DAML_JS_IMPORT,
+    SPLICE_FEATURED_APP_IMPORT,
+    SPLICE_AMULET_IMPORT,
+    DA_TIME_TYPES_IMPORT,
+    DA_TYPES_IMPORT,
+    TOKEN_BURN_MINT_IMPORT,
+    TOKEN_METADATA_IMPORT,
+    TOKEN_HOLDING_IMPORT,
+    TOKEN_ALLOCATION_INSTRUCTION_IMPORT,
+    TOKEN_TRANSFER_INSTRUCTION_IMPORT,
+    TOKEN_ALLOCATION_IMPORT,
+    DA_SET_TYPES_IMPORT,
   ];
   let removedCount = 0;
   for (const dep of localDependencies) {
@@ -711,16 +1076,40 @@ function main(): void {
         continue;
       }
       console.log(`📦 Processing package: ${targetDir}`);
+      clearBundledArtifacts(targetDir);
+      // Detect dependency references from the surviving generated modules after stale bundled output is removed.
+      const bundleRequirements = collectBundleRequirements(targetDir);
       createBundledFiles(targetDir);
-      createBundledSpliceFiles(targetDir);
-      // Only bundle splice-amulet and additional dependencies for Subscriptions package
-      if (targetDir.includes('CantonPayments')) {
+
+      if (bundleRequirements.hasBundledOcp) {
+        createBundledOcpFiles(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledSpliceFeaturedApp) {
+        createBundledSpliceFiles(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledSpliceAmulet) {
         createBundledSpliceAmuletFiles(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledDATimeTypes) {
         createBundledDATimeTypesFiles(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledDATypes) {
         createBundledDATypesFiles(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledSpliceApiTokenDependencies) {
         createBundledSpliceApiTokenDependencies(targetDir);
+      }
+
+      if (bundleRequirements.hasBundledDASetTypes) {
         createBundledDASetTypesFiles(targetDir);
       }
+      ensureBundledDANamespaceIndexes(targetDir);
+      ensureBundledSpliceNamespaceIndexes(targetDir);
       updateMainIndex(targetDir);
       replaceDependencyReferences(targetDir);
       removeLocalDependency(targetDir);
@@ -738,13 +1127,17 @@ if (require.main === module) {
 }
 
 export {
+  collectBundleRequirements,
   createBundledDASetTypesFiles,
   createBundledDATimeTypesFiles,
   createBundledDATypesFiles,
   createBundledFiles,
+  createBundledOcpFiles,
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
   createBundledSpliceFiles,
+  ensureBundledDANamespaceIndexes,
+  ensureBundledSpliceNamespaceIndexes,
   main,
   removeLocalDependency,
   replaceDependencyReferences,
