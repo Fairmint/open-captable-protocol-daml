@@ -9,11 +9,11 @@
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  *
- * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and version.
- * Any source change can yield a different LF package (package id / archive bytes). The validator may then reject the pair
- * as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run upgrade-package` with
- * `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against v0.0.2 instead of v0.0.1
- * against a different v0.0.1 build.
+ * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and
+ * version. Any source change can yield a different LF package (package id / archive bytes). The validator may then
+ * reject the pair as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run
+ * upgrade-package` with `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against
+ * v0.0.2 instead of v0.0.1 against a different v0.0.1 build.
  */
 
 import { execSync } from 'child_process';
@@ -167,7 +167,9 @@ function reportUpgradeFailure(packageName: string, baseName: string, output: str
     for (const line of lines.slice(-(maxLines / 2))) indent(line);
   }
   console.error('');
-  console.error('   If this was a non-breaking change, bump the patch in daml.yaml (e.g. `npm run upgrade-package -- --package ' + baseName + ' --type minor`).');
+  console.error(
+    `   If this was a non-breaking change, bump the patch in daml.yaml (e.g. \`npm run upgrade-package -- --package ${baseName} --type minor\`).`
+  );
   console.error('   To introduce breaking changes, bump the major version:');
   console.error(`   npm run upgrade-package -- --package ${baseName} --type major\n`);
 }
