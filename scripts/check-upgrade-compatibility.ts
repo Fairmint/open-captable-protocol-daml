@@ -9,18 +9,18 @@
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  *
- * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and version.
- * Any source change can yield a different LF package (package id / archive bytes). The validator may then reject the pair
- * as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run upgrade-package` with
- * `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against v0.0.2 instead of v0.0.1
- * against a different v0.0.1 build.
+ * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and
+ * version. Any source change can yield a different LF package (package id / archive bytes). The validator may then
+ * reject the pair as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run
+ * upgrade-package` with `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against
+ * v0.0.2 instead of v0.0.1 against a different v0.0.1 build.
  *
- * Every deployable package must have its **current** `daml.yaml` version recorded under `dars/` (lock entry + file on disk)
- * with a SHA256 matching the committed backup. After building, run `npx tsx scripts/backup-dar.ts --package <key> --version
- * <ver>` (see `scripts/packages.ts` keys) and commit `dars/` + `dars.lock`. CI then verifies the built DAR matches that
- * backup and runs `upgrade-check` from the latest **older semver** backup **of the same package name** when one exists.
- * (Cross-major OpenCapTable-* lines are not compared: both DARs can embed the same dependency name/version with different
- * package ids, which `upgrade-check` rejects.)
+ * Every deployable package must have its **current** `daml.yaml` version recorded under `dars/` (lock entry + file on
+ * disk) with a SHA256 matching the committed backup. After building, run `npx tsx scripts/backup-dar.ts --package <key>
+ * --version <ver>` (see `scripts/packages.ts` keys) and commit `dars/` + `dars.lock`. CI then verifies the built DAR
+ * matches that backup and runs `upgrade-check` from the latest **older semver** backup **of the same package name**
+ * when one exists. (Cross-major OpenCapTable-* lines are not compared: both DARs can embed the same dependency
+ * name/version with different package ids, which `upgrade-check` rejects.)
  */
 
 import { execSync } from 'child_process';
@@ -253,7 +253,9 @@ function main(): void {
       continue;
     }
 
-    console.log(`✅ ${currentPackageName} v${currentDar.version}: Built DAR matches committed backup (${currentLockKey})`);
+    console.log(
+      `✅ ${currentPackageName} v${currentDar.version}: Built DAR matches committed backup (${currentLockKey})`
+    );
 
     const backupsForPackage = backedUpByPackageName.get(currentPackageName) ?? [];
     const upgradeBaseline = getMostRecentOlderBackup(backupsForPackage, currentDar.version);
