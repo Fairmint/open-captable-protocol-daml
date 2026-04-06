@@ -38,9 +38,11 @@ function readVersionFromDamlYaml(sourceDir: string): string {
 
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
+  shared: { name: 'Shared', sourceDir: 'Shared' },
   ocp: { name: 'OpenCapTable-v34', sourceDir: 'OpenCapTable-v34' },
   reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
   nft: { name: 'OpenCapTableNft-v01', sourceDir: 'OpenCapTableNft-v01' },
+  proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
   paymentStreams: { name: 'CantonPayments', sourceDir: 'CantonPayments' },
   couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
 } as const;

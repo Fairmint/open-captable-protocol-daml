@@ -8,13 +8,26 @@
  * - Compatible changes are made without bumping the minor version
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
+ *
+ * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and
+ * version. Any source change can yield a different LF package (package id / archive bytes). The validator may then
+ * reject the pair as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run
+ * upgrade-package` with `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against
+ * v0.0.2 instead of v0.0.1 against a different v0.0.1 build.
+ *
+ * Every deployable package must have its **current** `daml.yaml` version recorded under `dars/` (lock entry + file on
+ * disk) with a SHA256 matching the committed backup. After building, run `npx tsx scripts/backup-dar.ts --package <key>
+ * --version <ver>` (see `scripts/packages.ts` keys) and commit `dars/` + `dars.lock`. CI then verifies the built DAR
+ * matches that backup and runs `upgrade-check` from the latest **older semver** backup **of the same package name**
+ * when one exists. (Cross-major OpenCapTable-* lines are not compared: both DARs can embed the same dependency
+ * name/version with different package ids, which `upgrade-check` rejects.)
  */
 
 import { execSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
-import { computeSha256, getDarsDir, loadDarsLock } from './dar-utils';
+import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock } from './dar-utils';
 
 const ROOT_DIR = path.join(__dirname, '..');
 
@@ -30,7 +43,19 @@ function parsePackageName(name: string): { baseName: string; majorVersion: numbe
   return { baseName: name, majorVersion: null };
 }
 
-/** Get all backed-up packages from dars.lock, grouped by exact package name. */
+/** Semver compare: negative if a < b, zero if equal, positive if a > b. */
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const da = pa[i] ?? 0;
+    const db = pb[i] ?? 0;
+    if (da !== db) return da - db;
+  }
+  return 0;
+}
+
+/** Get all backed-up packages from dars.lock, grouped by exact package name (file must exist on disk). */
 function getBackedUpPackages(): Map<string, Array<{ packageName: string; version: string; darPath: string }>> {
   const lock = loadDarsLock();
   const darsDir = getDarsDir();
@@ -57,54 +82,21 @@ function getBackedUpPackages(): Map<string, Array<{ packageName: string; version
   return byPackageName;
 }
 
-/** Find the most recent backed-up version for a package. */
-function getMostRecentBackup(
+/** Sort backups by semver descending. */
+function sortBackupsDesc(
   backups: Array<{ packageName: string; version: string; darPath: string }>
-): { packageName: string; version: string; darPath: string } | null {
-  if (backups.length === 0) return null;
-
-  // Sort by semver descending to find most recent
-  const sorted = [...backups].sort((a, b) => {
-    const aVer = a.version.split('.').map(Number);
-    const bVer = b.version.split('.').map(Number);
-    for (let i = 0; i < 3; i++) {
-      if ((aVer[i] || 0) !== (bVer[i] || 0)) {
-        return (bVer[i] || 0) - (aVer[i] || 0);
-      }
-    }
-    return 0;
-  });
-
-  return sorted[0];
+): Array<{ packageName: string; version: string; darPath: string }> {
+  return [...backups].sort((a, b) => compareSemver(b.version, a.version));
 }
 
-/** Get all backed-up packages grouped by base name (for finding previous major versions). */
-function getBackedUpPackagesByBaseName(): Map<
-  string,
-  Array<{ packageName: string; version: string; darPath: string }>
-> {
-  const lock = loadDarsLock();
-  const darsDir = getDarsDir();
-
-  const byBaseName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
-
-  for (const [lockKey, _entry] of Object.entries(lock.packages)) {
-    const parts = lockKey.split('/');
-    if (parts.length !== 3) continue;
-
-    const [packageName, version, _darFile] = parts;
-    const { baseName } = parsePackageName(packageName);
-    const darPath = path.join(darsDir, lockKey);
-
-    if (!fs.existsSync(darPath)) continue;
-
-    if (!byBaseName.has(baseName)) {
-      byBaseName.set(baseName, []);
-    }
-    byBaseName.get(baseName)!.push({ packageName, version, darPath });
-  }
-
-  return byBaseName;
+/** Latest backup strictly older than `currentVersion` (for upgrade-check baseline). */
+function getMostRecentOlderBackup(
+  backups: Array<{ packageName: string; version: string; darPath: string }>,
+  currentVersion: string
+): { packageName: string; version: string; darPath: string } | null {
+  const older = backups.filter((b) => compareSemver(currentVersion, b.version) > 0);
+  if (older.length === 0) return null;
+  return sortBackupsDesc(older)[0];
 }
 
 /** Find the current DAR for a package directory. */
@@ -148,15 +140,22 @@ function findCurrentPackages(): string[] {
 /** Report an upgrade compatibility failure with helpful output. */
 function reportUpgradeFailure(packageName: string, baseName: string, output: string): void {
   console.error(`❌ ${packageName}: NOT backwards compatible!\n`);
-  console.error('   Upgrade check output:');
-  const lines = output.split('\n').filter((line) => line.includes('ERROR') || line.includes('WARN'));
-  for (const line of lines.slice(0, 10)) {
-    console.error(`   ${line}`);
-  }
-  if (lines.length > 10) {
-    console.error(`   ... and ${lines.length - 10} more issues`);
+  console.error('   Upgrade check output (full log):');
+  const lines = output.split('\n');
+  const indent = (s: string) => console.error(`   ${s}`);
+  const maxLines = 100;
+  if (lines.length <= maxLines) {
+    for (const line of lines) indent(line);
+  } else {
+    indent(`(${lines.length} lines; showing first ${maxLines / 2} and last ${maxLines / 2})`);
+    for (const line of lines.slice(0, maxLines / 2)) indent(line);
+    indent('...');
+    for (const line of lines.slice(-(maxLines / 2))) indent(line);
   }
   console.error('');
+  console.error(
+    `   If this was a non-breaking change, bump the patch in daml.yaml (e.g. \`npm run upgrade-package -- --package ${baseName} --type minor\`).`
+  );
   console.error('   To introduce breaking changes, bump the major version:');
   console.error(`   npm run upgrade-package -- --package ${baseName} --type major\n`);
 }
@@ -184,7 +183,6 @@ function main(): void {
   console.log('🔍 Checking DAML package upgrade compatibility...\n');
 
   const backedUpByPackageName = getBackedUpPackages();
-  const backedUpByBaseName = getBackedUpPackagesByBaseName();
   const currentPackages = findCurrentPackages();
 
   let hasFailures = false;
@@ -213,75 +211,73 @@ function main(): void {
     if (!nameMatch) continue;
 
     const currentPackageName = nameMatch[1].trim();
-    const { baseName, majorVersion: currentMajor } = parsePackageName(currentPackageName);
+    const { baseName } = parsePackageName(currentPackageName);
 
-    // Find backed-up versions for this exact package name
-    const backupsForPackage = backedUpByPackageName.get(currentPackageName) ?? [];
-    const mostRecentBackup = getMostRecentBackup(backupsForPackage);
-
-    if (mostRecentBackup) {
-      // Compare against the most recent backup of the same package
-      console.log(
-        `🔄 Checking ${currentPackageName} v${currentDar.version} against backup v${mostRecentBackup.version}...`
-      );
-
-      const result = runUpgradeCheck(mostRecentBackup.darPath, currentDar.darPath);
-
-      if (result.success) {
-        // Upgrade check passed - verify version was bumped if there are actual changes
-        if (currentDar.version === mostRecentBackup.version) {
-          // Same version - check if DAR contents actually changed
-          const currentHash = computeSha256(currentDar.darPath);
-          const backupHash = computeSha256(mostRecentBackup.darPath);
-
-          if (currentHash !== backupHash) {
-            // DAR changed but version wasn't bumped - fail CI
-            console.error(`❌ ${currentPackageName}: Compatible changes detected but version not bumped!\n`);
-            console.error(`   Current DAR hash:  ${currentHash.slice(0, 16)}...`);
-            console.error(`   Backup DAR hash:   ${backupHash.slice(0, 16)}...`);
-            console.error('');
-            console.error('   To fix, bump the minor version:');
-            console.error(`   npm run upgrade-package -- --package ${baseName} --type minor\n`);
-            hasFailures = true;
-            checkedCount++;
-            continue;
-          }
-          // DAR is identical - no actual changes
-          console.log(`✅ ${currentPackageName} v${currentDar.version}: No changes from backup\n`);
-        } else {
-          // Version was bumped and upgrade-check passed - proper workflow
-          console.log(
-            `✅ ${currentPackageName}: Backwards compatible (v${mostRecentBackup.version} → v${currentDar.version})\n`
-          );
-        }
-        checkedCount++;
-        continue;
-      }
-
-      // Upgrade check failed - this is only OK if it's a new major version
-      // But since we're comparing against the same package name, a failure here means
-      // breaking changes without a major version bump
-      reportUpgradeFailure(currentPackageName, baseName, result.output);
+    const lock = loadDarsLock();
+    const darsDir = getDarsDir();
+    const currentLockKey = getDarLockKey(currentPackageName, currentDar.version, currentPackageName);
+    const committedBackupPath = path.join(darsDir, currentLockKey);
+    if (!(currentLockKey in lock.packages)) {
+      console.error(`❌ ${currentPackageName}: No dars.lock entry for the current release.\n`);
+      console.error(`   Expected key: ${currentLockKey}`);
+      console.error('   Build the package, then run:');
+      console.error(`   npx tsx scripts/backup-dar.ts --package <key> --version ${currentDar.version}`);
+      console.error('   (see scripts/packages.ts for package keys), then commit dars/ and dars.lock.\n');
       hasFailures = true;
       checkedCount++;
       continue;
     }
 
-    // No backup for this exact package name - check if there's a previous major version
-    const allBackupsForBase = backedUpByBaseName.get(baseName) ?? [];
-    const previousMajorBackup = getMostRecentBackupForPreviousMajor(allBackupsForBase, currentMajor);
+    const lockEntry = lock.packages[currentLockKey];
 
-    if (previousMajorBackup) {
-      // This is a new major version - compare against previous major to show what changed
-      console.log(
-        `✅ ${currentPackageName}: New major version (previous was ${previousMajorBackup.packageName} v${previousMajorBackup.version})`
-      );
+    if (!fs.existsSync(committedBackupPath)) {
+      console.error(`❌ ${currentPackageName}: dars.lock lists ${currentLockKey} but the file is missing on disk.\n`);
+      console.error(`   Expected file: ${committedBackupPath}`);
+      console.error('   Restore from git or re-run backup-dar and commit.\n');
+      hasFailures = true;
       checkedCount++;
       continue;
     }
 
-    // Truly new package with no backups at all
-    console.log(`✅ ${currentPackageName}: No previous backup (new package)`);
+    const builtHash = computeSha256(currentDar.darPath);
+    if (builtHash !== lockEntry.sha256) {
+      console.error(`❌ ${currentPackageName}: Built DAR does not match the committed backup in dars/.\n`);
+      console.error(`   Lock key: ${currentLockKey}`);
+      console.error(`   Expected (dars.lock): ${lockEntry.sha256}`);
+      console.error(`   Actual (build):       ${builtHash}`);
+      console.error('');
+      console.error('   The tree under dars/ must be the exact DAR for this daml.yaml version.');
+      console.error('   After `npm run build`, run backup-dar for this package and commit.\n');
+      hasFailures = true;
+      checkedCount++;
+      continue;
+    }
+
+    console.log(
+      `✅ ${currentPackageName} v${currentDar.version}: Built DAR matches committed backup (${currentLockKey})`
+    );
+
+    const backupsForPackage = backedUpByPackageName.get(currentPackageName) ?? [];
+    const upgradeBaseline = getMostRecentOlderBackup(backupsForPackage, currentDar.version);
+
+    if (upgradeBaseline) {
+      console.log(
+        `🔄 Running upgrade-check: v${upgradeBaseline.version} (backup) → v${currentDar.version} (current build)...`
+      );
+      const result = runUpgradeCheck(upgradeBaseline.darPath, currentDar.darPath);
+      if (!result.success) {
+        reportUpgradeFailure(currentPackageName, baseName, result.output);
+        hasFailures = true;
+        checkedCount++;
+        continue;
+      }
+      console.log(
+        `✅ ${currentPackageName}: upgrade-check OK (v${upgradeBaseline.version} → v${currentDar.version})\n`
+      );
+    } else {
+      console.log(`✅ ${currentPackageName}: No older backed-up version to upgrade-check (first release in dars/)\n`);
+    }
+
     checkedCount++;
   }
 
@@ -295,40 +291,6 @@ function main(): void {
   }
 
   console.log('\n✅ All packages are backwards compatible.');
-}
-
-/** Find the most recent backup for a previous major version. */
-function getMostRecentBackupForPreviousMajor(
-  backups: Array<{ packageName: string; version: string; darPath: string }>,
-  currentMajor: number | null
-): { packageName: string; version: string; darPath: string } | null {
-  if (currentMajor === null) return null;
-
-  // Filter to only previous major versions
-  const previousMajorBackups = backups.filter((b) => {
-    const { majorVersion } = parsePackageName(b.packageName);
-    return majorVersion !== null && majorVersion < currentMajor;
-  });
-
-  if (previousMajorBackups.length === 0) return null;
-
-  // Sort by major version descending, then by semver descending
-  const sorted = [...previousMajorBackups].sort((a, b) => {
-    const aMajor = parsePackageName(a.packageName).majorVersion ?? 0;
-    const bMajor = parsePackageName(b.packageName).majorVersion ?? 0;
-    if (aMajor !== bMajor) return bMajor - aMajor;
-
-    const aVer = a.version.split('.').map(Number);
-    const bVer = b.version.split('.').map(Number);
-    for (let i = 0; i < 3; i++) {
-      if ((aVer[i] || 0) !== (bVer[i] || 0)) {
-        return (bVer[i] || 0) - (aVer[i] || 0);
-      }
-    }
-    return 0;
-  });
-
-  return sorted[0];
 }
 
 try {
