@@ -8,6 +8,12 @@
  * - Compatible changes are made without bumping the minor version
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
+ *
+ * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and version.
+ * Any source change can yield a different LF package (package id / archive bytes). The validator may then reject the pair
+ * as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run upgrade-package` with
+ * `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against v0.0.2 instead of v0.0.1
+ * against a different v0.0.1 build.
  */
 
 import { execSync } from 'child_process';
@@ -148,15 +154,20 @@ function findCurrentPackages(): string[] {
 /** Report an upgrade compatibility failure with helpful output. */
 function reportUpgradeFailure(packageName: string, baseName: string, output: string): void {
   console.error(`❌ ${packageName}: NOT backwards compatible!\n`);
-  console.error('   Upgrade check output:');
-  const lines = output.split('\n').filter((line) => line.includes('ERROR') || line.includes('WARN'));
-  for (const line of lines.slice(0, 10)) {
-    console.error(`   ${line}`);
-  }
-  if (lines.length > 10) {
-    console.error(`   ... and ${lines.length - 10} more issues`);
+  console.error('   Upgrade check output (full log):');
+  const lines = output.split('\n');
+  const indent = (s: string) => console.error(`   ${s}`);
+  const maxLines = 100;
+  if (lines.length <= maxLines) {
+    for (const line of lines) indent(line);
+  } else {
+    indent(`(${lines.length} lines; showing first ${maxLines / 2} and last ${maxLines / 2})`);
+    for (const line of lines.slice(0, maxLines / 2)) indent(line);
+    indent('...');
+    for (const line of lines.slice(-(maxLines / 2))) indent(line);
   }
   console.error('');
+  console.error('   If this was a non-breaking change, bump the patch in daml.yaml (e.g. `npm run upgrade-package -- --package ' + baseName + ' --type minor`).');
   console.error('   To introduce breaking changes, bump the major version:');
   console.error(`   npm run upgrade-package -- --package ${baseName} --type major\n`);
 }
