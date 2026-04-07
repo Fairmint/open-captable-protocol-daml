@@ -7,13 +7,11 @@
  * ## Upgrading OpenCapTable (e.g. to v34) end-to-end
  *
  * 1. Build DAR: `npm run build` (from repo root).
- * 2. Upload DAR to **both** Intellect and 5N for each network:
- *    `npm run upload-dar -- --package ocp --network devnet`
- *    `npm run upload-dar -- --package ocp --network mainnet`
+ * 2. Upload DAR to **both** Intellect and 5N for each network: `npm run upload-dar -- --package ocp --network devnet` `npm
+ *    run upload-dar -- --package ocp --network mainnet`
  * 3. Regenerate JS + typings: `npm run codegen`
- * 4. Create factories (Intellect operator party, per `scripts/utils.ts`):
- *    `tsx scripts/create-ocp-factory.ts --network devnet`
- *    `tsx scripts/create-ocp-factory.ts --network mainnet`
+ * 4. Create factories (Intellect operator party, per `scripts/utils.ts`): `tsx scripts/create-ocp-factory.ts --network
+ *    devnet` `tsx scripts/create-ocp-factory.ts --network mainnet`
  * 5. Bump `package.json` version and publish `@fairmint/open-captable-protocol-daml-js`.
  *
  * Or run `npm run create-factory:ocp` after steps 1–2 (it runs codegen then both networks).
