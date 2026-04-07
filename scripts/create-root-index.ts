@@ -163,7 +163,7 @@ export { Fairmint, Nft, CantonPayments, DA, Splice } ;
 }
 
 function ensureJsonDts() {
-  // Ensure .d.ts exists next to the generated JSONs for TS consumers
+  // Ensure .d.ts exists next to generated JSONs for TS consumers (OCP uses committed types/ocp-factory-contract-id-json.d.ts)
   const ensureJson = (jsonPath: string, dtsPath: string, dtsContent: string) => {
     if (fs.existsSync(jsonPath)) {
       fs.writeFileSync(dtsPath, dtsContent);
@@ -171,12 +171,6 @@ function ensureJsonDts() {
       console.warn(`Warning: ${path.relative(ROOT_DIR, jsonPath)} not found; skipping .d.ts creation`);
     }
   };
-
-  ensureJson(
-    path.join(ROOT_DIR, 'generated', 'ocp-factory-contract-id.json'),
-    path.join(ROOT_DIR, 'generated', 'ocp-factory-contract-id.json.d.ts'),
-    `declare const data: {\n    mainnet: {\n        ocpFactoryContractId: string;\n        templateId: string;\n    };\n    devnet: {\n        ocpFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
-  );
 
   ensureJson(
     path.join(ROOT_DIR, 'generated', 'reports-factory-contract-id.json'),
