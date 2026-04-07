@@ -7,7 +7,12 @@ const ROOT_DIR = path.join(__dirname, '..');
 const nftApiPkg = requirePackageConfig('nftApi');
 const nftReferencePkg = requirePackageConfig('nftReference');
 const standaloneNftApiDir = path.join(ROOT_DIR, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`);
-const standaloneNftReferenceDir = path.join(ROOT_DIR, 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`);
+const standaloneNftReferenceDir = path.join(
+  ROOT_DIR,
+  'generated',
+  'js',
+  `${nftReferencePkg.name}-${nftReferencePkg.version}`
+);
 
 try {
   const rootPkg = require(ROOT_DIR);
@@ -30,7 +35,9 @@ try {
     throw new Error(`Standalone NFT API package missing at ${standaloneNftApiDir}. Run npm run codegen first.`);
   }
   if (!fs.existsSync(standaloneNftReferenceDir)) {
-    throw new Error(`Standalone NFT reference package missing at ${standaloneNftReferenceDir}. Run npm run codegen first.`);
+    throw new Error(
+      `Standalone NFT reference package missing at ${standaloneNftReferenceDir}. Run npm run codegen first.`
+    );
   }
 
   const standaloneNftApiPkg = require(standaloneNftApiDir);
