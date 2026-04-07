@@ -19,7 +19,6 @@ const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
 const nftApiPkg = requirePackageConfig('nftApi');
 const nftReferencePkg = requirePackageConfig('nftReference');
-const nftIfacePkg = requirePackageConfig('nftIface');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 // Paths
@@ -51,8 +50,8 @@ const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Se
 const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
 const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
 /** Scoped package name from daml codegen (iface merged into NFT v01 lib/index). */
-const NFT_IFACE_PACKAGE_IMPORT = `@daml.js/${nftIfacePkg.name}-${nftIfacePkg.version}`;
-const NFT_IFACE_DAML_JS_IMPORT = `daml.js/${nftIfacePkg.name}-${nftIfacePkg.version}`;
+const NFT_API_PACKAGE_IMPORT = `@daml.js/${nftApiPkg.name}-${nftApiPkg.version}`;
+const NFT_API_DAML_JS_IMPORT = `daml.js/${nftApiPkg.name}-${nftApiPkg.version}`;
 const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
 const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
 const SPLICE_FEATURED_APP_IMPORT = 'daml.js/splice-api-featured-app-v1-1.0.0';
@@ -807,7 +806,7 @@ function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportR
       resolveTarget: () => path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR),
     },
     {
-      importPaths: [NFT_IFACE_PACKAGE_IMPORT, NFT_IFACE_DAML_JS_IMPORT],
+      importPaths: [NFT_API_PACKAGE_IMPORT, NFT_API_DAML_JS_IMPORT],
       resolveTarget: () => path.join(targetDir, 'lib/index.js'),
     },
     {
@@ -878,7 +877,7 @@ function removeLocalDependency(targetDir: string): void {
   const localDependencies = [
     DA_INTERNAL_TEMPLATE_IMPORT,
     OCP_DAML_JS_IMPORT,
-    NFT_IFACE_PACKAGE_IMPORT,
+    NFT_API_PACKAGE_IMPORT,
     SPLICE_FEATURED_APP_IMPORT,
     SPLICE_AMULET_IMPORT,
     DA_TIME_TYPES_IMPORT,

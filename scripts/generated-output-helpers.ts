@@ -36,7 +36,14 @@ function isWithinDir(dirPath: string, candidatePath: string): boolean {
 }
 
 function normalizeRelativeImport(fromFile: string, toTarget: string): string {
-  return path.relative(path.dirname(fromFile), toTarget).replace(/\\/g, '/');
+  let relativePath = path.relative(path.dirname(fromFile), toTarget).replace(/\\/g, '/');
+  if (relativePath === '') {
+    relativePath = '.';
+  }
+  if (!relativePath.startsWith('./') && !relativePath.startsWith('../')) {
+    relativePath = `./${relativePath}`;
+  }
+  return relativePath;
 }
 
 function replaceImportPath(source: string, importPath: string, relativePath: string, isDts: boolean): string {
