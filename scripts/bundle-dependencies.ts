@@ -3,6 +3,11 @@
 import fs from 'fs';
 import path from 'path';
 import {
+  applyGeneratedImportRewrites,
+  collectGeneratedOutputFiles,
+  type GeneratedImportRewriteRule,
+} from './generated-output-helpers';
+import {
   hasNftApiPackageNamespaceBridgeAtPackageRoot,
   hasNftApiPackageNamespaceBridgeUnderLib,
   patchNftReferenceGeneratedTree,
@@ -70,10 +75,6 @@ interface BundleRequirements {
   hasBundledDATypes: boolean;
   hasBundledSpliceApiTokenDependencies: boolean;
   hasBundledDASetTypes: boolean;
-}
-
-function escapeRegExp(value: string): string {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function createDirectoryIfNotExists(dirPath: string): void {
@@ -164,12 +165,6 @@ function normalizeImportTarget(importPath: string): string {
     .replace(/[/\\]index$/, '');
 }
 
-function isWithinDir(dirPath: string, candidatePath: string): boolean {
-  const normalizedDir = path.resolve(dirPath);
-  const normalizedCandidate = path.resolve(candidatePath);
-  return normalizedCandidate === normalizedDir || normalizedCandidate.startsWith(`${normalizedDir}${path.sep}`);
-}
-
 function getBundledArtifactDirs(targetDir: string): string[] {
   const bundledDirs = [
     path.join(targetDir, 'lib', 'Splice'),
@@ -186,46 +181,13 @@ function getBundledArtifactDirs(targetDir: string): string[] {
   return bundledDirs;
 }
 
-function collectDependencyReferenceFiles(targetDir: string): string[] {
-  const libDir = path.join(targetDir, 'lib');
-  const ignoredDirs = getBundledArtifactDirs(targetDir);
-
-  if (!fs.existsSync(libDir)) {
-    return [];
-  }
-
-  const pendingDirs = [libDir];
-  const files: string[] = [];
-
-  while (pendingDirs.length > 0) {
-    const currentDir = pendingDirs.pop();
-    if (!currentDir) continue;
-
-    for (const entry of fs.readdirSync(currentDir, { withFileTypes: true })) {
-      const entryPath = path.join(currentDir, entry.name);
-
-      if (entry.isDirectory()) {
-        if (ignoredDirs.some((ignoredDir) => isWithinDir(ignoredDir, entryPath))) {
-          continue;
-        }
-        pendingDirs.push(entryPath);
-        continue;
-      }
-
-      if (entry.isFile() && (entry.name.endsWith('.js') || entry.name.endsWith('.d.ts'))) {
-        files.push(entryPath);
-      }
-    }
-  }
-
-  return files;
-}
-
 function packageHasDependencyReference(targetDir: string, rawImports: string[], bundledTargets: string[]): boolean {
   const normalizedTargets = bundledTargets.map((bundledTarget) => normalizeImportTarget(bundledTarget));
   const moduleSpecifierPatterns = [/require\(['"]([^'"]+)['"]\)/g, /from ['"]([^'"]+)['"]/g];
 
-  for (const filePath of collectDependencyReferenceFiles(targetDir)) {
+  for (const filePath of collectGeneratedOutputFiles(path.join(targetDir, 'lib'), {
+    ignoredDirs: getBundledArtifactDirs(targetDir),
+  })) {
     const fileContents = fs.readFileSync(filePath, 'utf8');
 
     if (rawImports.some((rawImport) => fileContents.includes(rawImport))) {
@@ -833,240 +795,75 @@ function replaceNftReferenceBridgeImports(targetDir: string): void {
   }
 }
 
+function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportRewriteRule[] {
+  return [
+    {
+      importPaths: [DA_INTERNAL_TEMPLATE_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/DA/Internal/Template'),
+      logLabel: 'DA',
+    },
+    {
+      importPaths: [OCP_DAML_JS_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR),
+    },
+    {
+      importPaths: [NFT_IFACE_PACKAGE_IMPORT, NFT_IFACE_DAML_JS_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/index.js'),
+    },
+    {
+      importPaths: [SPLICE_FEATURED_APP_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'),
+      logLabel: 'Splice',
+    },
+    {
+      importPaths: [SPLICE_AMULET_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib'),
+      logLabel: 'splice-amulet',
+    },
+    {
+      importPaths: [DA_TIME_TYPES_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/DA/Time/Types'),
+      logLabel: 'DA Time Types',
+    },
+    {
+      importPaths: [DA_TYPES_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/DA/Types'),
+      logLabel: 'DA Types',
+    },
+    {
+      importPaths: [TOKEN_METADATA_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'),
+    },
+    {
+      importPaths: [TOKEN_BURN_MINT_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'),
+    },
+    {
+      importPaths: [TOKEN_HOLDING_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1'),
+    },
+    {
+      importPaths: [TOKEN_ALLOCATION_INSTRUCTION_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1'),
+    },
+    {
+      importPaths: [TOKEN_TRANSFER_INSTRUCTION_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1'),
+    },
+    {
+      importPaths: [TOKEN_ALLOCATION_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1'),
+    },
+    {
+      importPaths: [DA_SET_TYPES_IMPORT],
+      resolveTarget: () => path.join(targetDir, 'lib/DA/Set/Types'),
+    },
+  ];
+}
+
 function replaceDependencyReferences(targetDir: string): void {
   console.log('🔄 Replacing dependency references in generated files...');
-
-  const filesToProcess: string[] = [];
-  const findFiles = (dir: string) => {
-    const files = fs.readdirSync(dir);
-    for (const file of files) {
-      const filePath = path.join(dir, file);
-      const stat = fs.statSync(filePath);
-      if (stat.isDirectory()) {
-        findFiles(filePath);
-      } else if (file.endsWith('.js') || file.endsWith('.d.ts')) {
-        filesToProcess.push(filePath);
-      }
-    }
-  };
-
-  findFiles(path.join(targetDir, 'lib'));
-
-  let replacedCount = 0;
-  for (const filePath of filesToProcess) {
-    let content = fs.readFileSync(filePath, 'utf8');
-    const originalContent = content;
-    const isDts = filePath.endsWith('.d.ts');
-
-    if (content.includes('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Internal/Template'))
-        .replace(/\\/g, '/');
-      console.log(`  Updating ${path.relative(targetDir, filePath)} with DA path: ${relativePath}`);
-      if (isDts) {
-        content = content.replace(
-          /from 'daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
-      } else {
-        content = content.replace(
-          /require\('daml.js\/ghc-stdlib-DA-Internal-Template-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes(OCP_DAML_JS_IMPORT)) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR))
-        .replace(/\\/g, '/');
-      // Package names include dots and other regex metacharacters, so escape before building the matcher.
-      const escapedImport = escapeRegExp(OCP_DAML_JS_IMPORT);
-      if (isDts) {
-        content = content.replace(new RegExp(`from '${escapedImport}';`, 'g'), `from '${relativePath}';`);
-      } else {
-        content = content.replace(new RegExp(`require\\('${escapedImport}'\\)`, 'g'), `require('${relativePath}')`);
-      }
-    }
-
-    if (content.includes(NFT_IFACE_PACKAGE_IMPORT) || content.includes(NFT_IFACE_DAML_JS_IMPORT)) {
-      const indexEntry = path.join(targetDir, 'lib/index.js');
-      const relativePath = path.relative(path.dirname(filePath), indexEntry).replace(/\\/g, '/');
-      const escScoped = escapeRegExp(NFT_IFACE_PACKAGE_IMPORT);
-      const escDamlJs = escapeRegExp(NFT_IFACE_DAML_JS_IMPORT);
-      if (isDts) {
-        content = content.replace(new RegExp(`from '${escScoped}';`, 'g'), `from '${relativePath}';`);
-        content = content.replace(new RegExp(`from '${escDamlJs}';`, 'g'), `from '${relativePath}';`);
-      } else {
-        content = content.replace(new RegExp(`require\\('${escScoped}'\\)`, 'g'), `require('${relativePath}')`);
-        content = content.replace(new RegExp(`require\\('${escDamlJs}'\\)`, 'g'), `require('${relativePath}')`);
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-featured-app-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'))
-        .replace(/\\/g, '/');
-      console.log(`  Updating ${path.relative(targetDir, filePath)} with Splice path: ${relativePath}`);
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/splice-api-featured-app-v1-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-featured-app-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-amulet-0.1.14')) {
-      const relativePath = path.relative(path.dirname(filePath), path.join(targetDir, 'lib')).replace(/\\/g, '/');
-      console.log(`  Updating ${path.relative(targetDir, filePath)} with splice-amulet path: ${relativePath}`);
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/splice-amulet-0\.1\.14';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(/require\('daml.js\/splice-amulet-0\.1\.14'\)/g, `require('${relativePath}')`);
-      }
-    }
-
-    if (content.includes('daml.js/daml-stdlib-DA-Time-Types-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Time/Types'))
-        .replace(/\\/g, '/');
-      console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Time Types path: ${relativePath}`);
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/daml-stdlib-DA-Time-Types-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/daml-stdlib-DA-Time-Types-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/daml-prim-DA-Types-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Types'))
-        .replace(/\\/g, '/');
-      console.log(`  Updating ${path.relative(targetDir, filePath)} with DA Types path: ${relativePath}`);
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/daml-prim-DA-Types-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(/require\('daml.js\/daml-prim-DA-Types-1\.0\.0'\)/g, `require('${relativePath}')`);
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-metadata-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/splice-api-token-metadata-v1-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-metadata-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-burn-mint-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/splice-api-token-burn-mint-v1-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-burn-mint-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-holding-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/splice-api-token-holding-v1-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-holding-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-allocation-instruction-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(
-          /from 'daml.js\/splice-api-token-allocation-instruction-v1-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-allocation-instruction-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-transfer-instruction-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(
-          /from 'daml.js\/splice-api-token-transfer-instruction-v1-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-transfer-instruction-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/splice-api-token-allocation-v1-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(
-          /from 'daml.js\/splice-api-token-allocation-v1-1\.0\.0';/g,
-          `from '${relativePath}';`
-        );
-      } else {
-        content = content.replace(
-          /require\('daml.js\/splice-api-token-allocation-v1-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content.includes('daml.js/daml-stdlib-DA-Set-Types-1.0.0')) {
-      const relativePath = path
-        .relative(path.dirname(filePath), path.join(targetDir, 'lib/DA/Set/Types'))
-        .replace(/\\/g, '/');
-      if (isDts) {
-        content = content.replace(/from 'daml.js\/daml-stdlib-DA-Set-Types-1\.0\.0';/g, `from '${relativePath}';`);
-      } else {
-        content = content.replace(
-          /require\('daml.js\/daml-stdlib-DA-Set-Types-1\.0\.0'\)/g,
-          `require('${relativePath}')`
-        );
-      }
-    }
-
-    if (content !== originalContent) {
-      fs.writeFileSync(filePath, content);
-      replacedCount++;
-    }
-  }
+  const replacedCount = applyGeneratedImportRewrites(path.join(targetDir, 'lib'), getDependencyReferenceRewriteRules(targetDir));
 
   console.log(`✅ Replaced dependency references in ${replacedCount} files`);
 }

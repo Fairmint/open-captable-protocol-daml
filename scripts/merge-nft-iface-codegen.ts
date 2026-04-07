@@ -1,11 +1,13 @@
 /**
  * After codegen, NftReference-v01 JS omits Nft.Api.* modules because they live in NftApi-v01. Copy the generated
- * Nft/Api subtree into the NftReference-v01 lib and rewrite Nft/index so the standalone reference package exports both
- * Nft.Api and Nft.Reference.
+ * Nft/Api subtree into the NftReference-v01 lib and rewrite Nft/index so the standalone reference package exports
+ * both Nft.Api and Nft.Reference.
  */
 import fs from 'fs';
 import path from 'path';
-import { patchNftReferenceGeneratedTree } from './nft-reference-bridge-rewrite';
+import {
+  prepareMergedNftNamespace,
+} from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 function copyDir(src: string, dest: string): void {
@@ -24,7 +26,14 @@ const nftApiPkg = requirePackageConfig('nftApi');
 const nftReferencePkg = requirePackageConfig('nftReference');
 
 const rootDir = path.join(__dirname, '..');
-const apiNftDir = path.join(rootDir, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`, 'lib', 'Nft');
+const apiNftDir = path.join(
+  rootDir,
+  'generated',
+  'js',
+  `${nftApiPkg.name}-${nftApiPkg.version}`,
+  'lib',
+  'Nft'
+);
 const referenceNftDir = path.join(
   rootDir,
   'generated',
@@ -44,39 +53,7 @@ if (!fs.existsSync(referenceNftDir)) {
 }
 
 copyDir(path.join(apiNftDir, 'Api'), path.join(referenceNftDir, 'Api'));
-
-const mergedIndexJs = `"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-var Api = require('./Api');
-exports.Api = Api;
-var Reference = require('./Reference');
-exports.Reference = Reference;
-`;
-
-const mergedIndexDts = `export * as Api from './Api';
-export * as Reference from './Reference';
-`;
-
-fs.writeFileSync(path.join(referenceNftDir, 'index.js'), mergedIndexJs);
-fs.writeFileSync(path.join(referenceNftDir, 'index.d.ts'), mergedIndexDts);
-fs.writeFileSync(
-  path.join(referenceNftDir, '..', 'nft-api-v01-package-namespace.js'),
-  `"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-var NftApi = require("./Nft/Api");
-exports.Nft = { Api: NftApi };
-`
-);
-fs.writeFileSync(
-  path.join(referenceNftDir, '..', 'nft-api-v01-package-namespace.d.ts'),
-  `import type * as NftApi from "./Nft/Api";
-export declare const Nft: {
-  Api: typeof NftApi;
-};
-`
-);
-
-const patched = patchNftReferenceGeneratedTree(path.join(referenceNftDir, 'Reference'));
+const patched = prepareMergedNftNamespace(referenceNftDir, path.join(referenceNftDir, '..'));
 if (patched > 0) {
   console.log(`✅ Patched ${patched} Nft/Reference files to use nft-api-v01 bridge import`);
 }

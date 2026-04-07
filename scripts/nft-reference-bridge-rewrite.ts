@@ -6,8 +6,50 @@
  * `.../V1/NftAsset/module.js` depths.
  */
 
-import fs from 'fs';
 import path from 'path';
+import {
+  findGeneratedOutputFilesContainingAny,
+  hasGeneratedOutputPair,
+  rewriteGeneratedOutputFiles,
+  writeGeneratedOutputPair,
+} from './generated-output-helpers';
+
+export const NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME = 'nft-api-v01-package-namespace';
+export const NFT_API_PACKAGE_NAMESPACE_BRIDGE_REQUIRED_RELATIVE_FILES = [
+  `${NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME}.js`,
+  `${NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME}.d.ts`,
+] as const;
+
+const NFT_API_PACKAGE_NAMESPACE_BRIDGE_JS = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var NftApi = require("./Nft/Api");
+exports.Nft = { Api: NftApi };
+`;
+
+const NFT_API_PACKAGE_NAMESPACE_BRIDGE_DTS = `import type * as NftApi from "./Nft/Api";
+export declare const Nft: {
+  Api: typeof NftApi;
+};
+`;
+
+const MERGED_NFT_INDEX_JS = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Api = require('./Api');
+exports.Api = Api;
+var Reference = require('./Reference');
+exports.Reference = Reference;
+`;
+
+const MERGED_NFT_INDEX_DTS = `export * as Api from './Api';
+export * as Reference from './Reference';
+`;
+
+const BAD_PACKAGE_ROOT_IMPORTS = [
+  "require('../../../../index.js')",
+  'require("../../../../index.js")',
+  "from '../../../../index.js'",
+  'from "../../../../index.js"',
+] as const;
 
 export function rewriteNftReferencePackageRootIndexImports(source: string): string {
   let next = source
@@ -35,45 +77,44 @@ export function rewriteNftReferencePackageRootIndexImports(source: string): stri
   return next;
 }
 
-export function patchNftReferenceGeneratedTree(referenceSubtreeRoot: string): number {
-  if (!fs.existsSync(referenceSubtreeRoot)) {
-    return 0;
-  }
-
-  let count = 0;
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
-        continue;
-      }
-      const text = fs.readFileSync(full, 'utf8');
-      const next = rewriteNftReferencePackageRootIndexImports(text);
-      if (next !== text) {
-        fs.writeFileSync(full, next);
-        count++;
-      }
-    }
-  };
-
-  walk(referenceSubtreeRoot);
-  return count;
+export function writeMergedNftNamespaceIndex(nftDir: string): void {
+  writeGeneratedOutputPair(nftDir, 'index', {
+    js: MERGED_NFT_INDEX_JS,
+    dts: MERGED_NFT_INDEX_DTS,
+  });
 }
 
 /** Bridge files live under `lib/` next to `Nft/` (standalone generated package or merged repo `lib/`). */
+export function writeNftApiPackageNamespaceBridge(libDir: string): void {
+  writeGeneratedOutputPair(libDir, NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME, {
+    js: NFT_API_PACKAGE_NAMESPACE_BRIDGE_JS,
+    dts: NFT_API_PACKAGE_NAMESPACE_BRIDGE_DTS,
+  });
+}
+
+export function prepareMergedNftNamespace(nftDir: string, libDir: string): number {
+  writeMergedNftNamespaceIndex(nftDir);
+  writeNftApiPackageNamespaceBridge(libDir);
+  return patchNftReferenceGeneratedNftDir(nftDir);
+}
+
+export function patchNftReferenceGeneratedTree(referenceSubtreeRoot: string): number {
+  return rewriteGeneratedOutputFiles(referenceSubtreeRoot, (source) => rewriteNftReferencePackageRootIndexImports(source));
+}
+
+export function patchNftReferenceGeneratedNftDir(nftDir: string): number {
+  return patchNftReferenceGeneratedTree(path.join(nftDir, 'Reference'));
+}
+
 export function hasNftApiPackageNamespaceBridgeUnderLib(packageRoot: string): boolean {
-  const js = path.join(packageRoot, 'lib', 'nft-api-v01-package-namespace.js');
-  const dts = path.join(packageRoot, 'lib', 'nft-api-v01-package-namespace.d.ts');
-  return fs.existsSync(js) && fs.existsSync(dts);
+  return hasGeneratedOutputPair(path.join(packageRoot, 'lib'), NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME);
 }
 
 /** If tooling ever emits the bridge at package root, bundle step still finds it. */
 export function hasNftApiPackageNamespaceBridgeAtPackageRoot(packageRoot: string): boolean {
-  const js = path.join(packageRoot, 'nft-api-v01-package-namespace.js');
-  const dts = path.join(packageRoot, 'nft-api-v01-package-namespace.d.ts');
-  return fs.existsSync(js) && fs.existsSync(dts);
+  return hasGeneratedOutputPair(packageRoot, NFT_API_PACKAGE_NAMESPACE_BRIDGE_BASENAME);
+}
+
+export function findNftReferenceFilesRequiringPackageRootIndex(referenceSubtreeRoot: string): string[] {
+  return findGeneratedOutputFilesContainingAny(referenceSubtreeRoot, BAD_PACKAGE_ROOT_IMPORTS);
 }

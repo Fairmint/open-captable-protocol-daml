@@ -1,42 +1,28 @@
 import fs from 'fs';
 import path from 'path';
-import { getPackage } from './packages';
+import { writeGeneratedPackageIndex } from './generated-package-index';
+import { getPublishableGeneratedPackages } from './packages';
 import type { PackageJson } from './types';
 
 // Read the root package.json
 const rootPackagePath = path.join(__dirname, '..', 'package.json');
 const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
+const rootPackageName = rootPackage.name;
 
-// Build package paths dynamically from packages.ts (which reads from daml.yaml)
-const ocpPkg = getPackage('ocp')!;
-const reportsPkg = getPackage('reports')!;
-const nftApiPkg = getPackage('nftApi')!;
-const nftReferencePkg = getPackage('nftReference')!;
+if (!rootPackageName) {
+  throw new Error(`Root package.json missing package name: ${rootPackagePath}`);
+}
 
-const packages = [
-  { dir: path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`), name: rootPackage.name },
-  {
-    dir: path.join(__dirname, '..', 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`),
-    name: `${rootPackage.name}-reports`,
-  },
-  {
-    dir: path.join(__dirname, '..', 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`),
-    name: `${rootPackage.name}-nft-api`,
-  },
-  {
-    dir: path.join(__dirname, '..', 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`),
-    name: `${rootPackage.name}-nft`,
-  },
-];
+const packages = getPublishableGeneratedPackages(rootPackageName);
 
-for (const { dir, name } of packages) {
+for (const { dir, publishedPackageName } of packages) {
   const packageJsonPath = path.join(dir, 'package.json');
   if (!fs.existsSync(packageJsonPath)) continue;
   const generatedPackage = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8')) as PackageJson;
 
   // Update the version and name
   generatedPackage.version = rootPackage.version;
-  generatedPackage.name = name;
+  generatedPackage.name = publishedPackageName;
   // Ensure the package can be published
   delete generatedPackage.private;
 
@@ -63,32 +49,7 @@ for (const { dir, name } of packages) {
   // Create index files in generated dir
   const generatedDir = dir;
 
-  // index.js that re-exports from lib/index.js
-  const indexJsContent = `"use strict";
-
-// Re-export everything from the lib directory
-const lib = require('./lib/index.js');
-
-// Export all properties from lib
-Object.keys(lib).forEach(key => {
-    exports[key] = lib[key];
-});
-
-// Also export the lib object itself for backward compatibility
-exports.lib = lib;
-`;
-
-  // index.d.ts that re-exports from lib/index.d.ts
-  const indexDtsContent = `// Re-export everything from the lib directory
-export * from './lib/index';
-
-// Also export the lib object itself for backward compatibility
-import * as lib from './lib/index';
-export { lib };
-`;
-
-  fs.writeFileSync(path.join(generatedDir, 'index.js'), indexJsContent);
-  fs.writeFileSync(path.join(generatedDir, 'index.d.ts'), indexDtsContent);
+  writeGeneratedPackageIndex(generatedDir);
 
   console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
   console.log(`Created package index files (index.js and index.d.ts) in ${generatedDir}`);
