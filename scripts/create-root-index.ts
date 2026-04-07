@@ -4,13 +4,15 @@ import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
-const nftPkg = requirePackageConfig('nft');
+const nftApiPkg = requirePackageConfig('nftApi');
+const nftReferencePkg = requirePackageConfig('nftReference');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`);
 const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`);
-const NFT_DIR = path.join(ROOT_DIR, 'generated', 'js', `${nftPkg.name}-${nftPkg.version}`);
+const NFT_API_DIR = path.join(ROOT_DIR, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`);
+const NFT_REFERENCE_DIR = path.join(ROOT_DIR, 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`);
 const SUBSCRIPTIONS_DIR = path.join(
   ROOT_DIR,
   'generated',
@@ -19,7 +21,8 @@ const SUBSCRIPTIONS_DIR = path.join(
 );
 const OCP_LIB = path.join(OCP_DIR, 'lib');
 const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
-const NFT_LIB = path.join(NFT_DIR, 'lib');
+const NFT_API_LIB = path.join(NFT_API_DIR, 'lib');
+const NFT_REFERENCE_LIB = path.join(NFT_REFERENCE_DIR, 'lib');
 const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
 const DEST_LIB = path.join(ROOT_DIR, 'lib');
 
@@ -66,14 +69,19 @@ function buildCombinedLib() {
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
   copyDir(path.join(REPORTS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
-  copyDir(path.join(NFT_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
+  copyDir(path.join(NFT_API_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
+  copyDir(path.join(NFT_REFERENCE_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
   copyDir(path.join(SUBSCRIPTIONS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
 
   // Combine Fairmint sub-namespaces
   const destFairmint = path.join(DEST_LIB, 'Fairmint');
   copyDir(path.join(OCP_LIB, 'Fairmint', 'OpenCapTable'), path.join(destFairmint, 'OpenCapTable'));
   copyDir(path.join(REPORTS_LIB, 'Fairmint', 'OpenCapTableReports'), path.join(destFairmint, 'OpenCapTableReports'));
-  copyDir(path.join(NFT_LIB, 'Fairmint', 'OpenCapTableNft'), path.join(destFairmint, 'OpenCapTableNft'));
+
+  // Combine NFT namespaces at root level
+  const destNft = path.join(DEST_LIB, 'Nft');
+  copyDir(path.join(NFT_API_LIB, 'Nft'), destNft);
+  copyDir(path.join(NFT_REFERENCE_LIB, 'Nft'), destNft);
 
   // Copy CantonPayments at root level (not under Fairmint)
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'CantonPayments'), path.join(DEST_LIB, 'CantonPayments'));
@@ -92,15 +100,29 @@ var OpenCapTable = require('./OpenCapTable');
 exports.OpenCapTable = OpenCapTable;
 var OpenCapTableReports = require('./OpenCapTableReports');
 exports.OpenCapTableReports = OpenCapTableReports;
-var OpenCapTableNft = require('./OpenCapTableNft');
-exports.OpenCapTableNft = OpenCapTableNft;
 `
   );
   ensureFile(
     path.join(destFairmint, 'index.d.ts'),
     `export * as OpenCapTable from './OpenCapTable';
 export * as OpenCapTableReports from './OpenCapTableReports';
-export * as OpenCapTableNft from './OpenCapTableNft';
+`
+  );
+
+  ensureFile(
+    path.join(destNft, 'index.js'),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Api = require('./Api');
+exports.Api = Api;
+var Reference = require('./Reference');
+exports.Reference = Reference;
+`
+  );
+  ensureFile(
+    path.join(destNft, 'index.d.ts'),
+    `export * as Api from './Api';
+export * as Reference from './Reference';
 `
   );
 
@@ -116,6 +138,8 @@ function __export(m) {
 Object.defineProperty(exports, "__esModule", { value: true });
 var Fairmint = require('./Fairmint');
 exports.Fairmint = Fairmint;
+var Nft = require('./Nft');
+exports.Nft = Nft;
 var CantonPayments = require('./CantonPayments');
 exports.CantonPayments = CantonPayments;
 var DA = require('./DA');
@@ -127,10 +151,11 @@ exports.Splice = Splice;
   ensureFile(
     path.join(DEST_LIB, 'index.d.ts'),
     `import * as Fairmint from './Fairmint';
+import * as Nft from './Nft';
 import * as CantonPayments from './CantonPayments';
 import * as Splice from './Splice';
 import * as DA from './DA';
-export { Fairmint, CantonPayments, DA, Splice } ;
+export { Fairmint, Nft, CantonPayments, DA, Splice } ;
 `
   );
 

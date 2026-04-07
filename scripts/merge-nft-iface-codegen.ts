@@ -1,7 +1,7 @@
 /**
- * After codegen, OpenCapTableNft-v01 JS omits Fairmint.OpenCapTableNft.{Nft,Types} (they live in
- * OpenCapTableNftIface-v01). Copy those modules into the v01 generated lib and rewrite OpenCapTableNft/index so
- * standalone NFT bindings stay complete.
+ * After codegen, NftReference-v01 JS omits Nft.Api.* modules because they live in NftApi-v01. Copy the generated
+ * Nft/Api subtree into the NftReference-v01 lib and rewrite Nft/index so the standalone reference package exports
+ * both Nft.Api and Nft.Reference.
  */
 import fs from 'fs';
 import path from 'path';
@@ -19,64 +19,51 @@ function copyDir(src: string, dest: string): void {
   }
 }
 
-const nftIfacePkg = requirePackageConfig('nftIface');
-const nftPkg = requirePackageConfig('nft');
+const nftApiPkg = requirePackageConfig('nftApi');
+const nftReferencePkg = requirePackageConfig('nftReference');
 
 const rootDir = path.join(__dirname, '..');
-const ifaceFairmintNft = path.join(
+const apiNftDir = path.join(
   rootDir,
   'generated',
   'js',
-  `${nftIfacePkg.name}-${nftIfacePkg.version}`,
+  `${nftApiPkg.name}-${nftApiPkg.version}`,
   'lib',
-  'Fairmint',
-  'OpenCapTableNft'
+  'Nft'
 );
-const nftFairmintNft = path.join(
+const referenceNftDir = path.join(
   rootDir,
   'generated',
   'js',
-  `${nftPkg.name}-${nftPkg.version}`,
+  `${nftReferencePkg.name}-${nftReferencePkg.version}`,
   'lib',
-  'Fairmint',
-  'OpenCapTableNft'
+  'Nft'
 );
 
-if (!fs.existsSync(ifaceFairmintNft)) {
-  console.error(`merge-nft-iface-codegen: missing ${ifaceFairmintNft}; run OpenCapTableNftIface-v01 codegen first`);
+if (!fs.existsSync(apiNftDir)) {
+  console.error(`merge-nft-iface-codegen: missing ${apiNftDir}; run NftApi-v01 codegen first`);
   process.exit(1);
 }
-if (!fs.existsSync(nftFairmintNft)) {
-  console.error(`merge-nft-iface-codegen: missing ${nftFairmintNft}; run OpenCapTableNft-v01 codegen first`);
+if (!fs.existsSync(referenceNftDir)) {
+  console.error(`merge-nft-iface-codegen: missing ${referenceNftDir}; run NftReference-v01 codegen first`);
   process.exit(1);
 }
 
-for (const sub of ['Nft', 'Types'] as const) {
-  copyDir(path.join(ifaceFairmintNft, sub), path.join(nftFairmintNft, sub));
-}
+copyDir(path.join(apiNftDir, 'Api'), path.join(referenceNftDir, 'Api'));
 
 const mergedIndexJs = `"use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-var Nft = require('./Nft');
-exports.Nft = Nft;
-var Types = require('./Types');
-exports.Types = Types;
-var NftAsset = require('./NftAsset');
-exports.NftAsset = NftAsset;
-var NftRegistry = require('./NftRegistry');
-exports.NftRegistry = NftRegistry;
-var ReceiveAuthorization = require('./ReceiveAuthorization');
-exports.ReceiveAuthorization = ReceiveAuthorization;
+var Api = require('./Api');
+exports.Api = Api;
+var Reference = require('./Reference');
+exports.Reference = Reference;
 `;
 
-const mergedIndexDts = `export * as Nft from './Nft';
-export * as Types from './Types';
-export * as NftAsset from './NftAsset';
-export * as NftRegistry from './NftRegistry';
-export * as ReceiveAuthorization from './ReceiveAuthorization';
+const mergedIndexDts = `export * as Api from './Api';
+export * as Reference from './Reference';
 `;
 
-fs.writeFileSync(path.join(nftFairmintNft, 'index.js'), mergedIndexJs);
-fs.writeFileSync(path.join(nftFairmintNft, 'index.d.ts'), mergedIndexDts);
+fs.writeFileSync(path.join(referenceNftDir, 'index.js'), mergedIndexJs);
+fs.writeFileSync(path.join(referenceNftDir, 'index.d.ts'), mergedIndexDts);
 
-console.log('✅ Merged OpenCapTableNftIface-v01 Fairmint modules into OpenCapTableNft-v01 generated lib');
+console.log('✅ Merged NftApi-v01 bindings into NftReference-v01 generated lib');

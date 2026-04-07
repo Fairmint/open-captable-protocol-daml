@@ -9,14 +9,29 @@ interface DamlConfig {
   'data-dependencies'?: string[];
 }
 
+interface NftCorePackage {
+  name: string;
+  damlYamlPath: string;
+  damlSourceDir: string;
+}
+
 const ROOT_DIR = path.join(__dirname, '..');
-const NFT_PACKAGE_DIR = path.join(ROOT_DIR, 'OpenCapTableNft-v01');
-const NFT_DAML_YAML_PATH = path.join(NFT_PACKAGE_DIR, 'daml.yaml');
-const NFT_DAML_SOURCE_DIR = path.join(NFT_PACKAGE_DIR, 'daml');
+const NFT_CORE_PACKAGES: NftCorePackage[] = [
+  {
+    name: 'NftApi-v01',
+    damlYamlPath: path.join(ROOT_DIR, 'NftApi-v01', 'daml.yaml'),
+    damlSourceDir: path.join(ROOT_DIR, 'NftApi-v01', 'daml'),
+  },
+  {
+    name: 'NftReference-v01',
+    damlYamlPath: path.join(ROOT_DIR, 'NftReference-v01', 'daml.yaml'),
+    damlSourceDir: path.join(ROOT_DIR, 'NftReference-v01', 'daml'),
+  },
+] as const;
 const SPLICE_IMPORT_PATTERN = /^\s*import\b[^\n]*\bSplice\.[A-Za-z0-9_.']+/m;
 
-function readDamlConfig(): DamlConfig {
-  const fileContents = fs.readFileSync(NFT_DAML_YAML_PATH, 'utf8');
+function readDamlConfig(corePackage: NftCorePackage): DamlConfig {
+  const fileContents = fs.readFileSync(corePackage.damlYamlPath, 'utf8');
   return yaml.parse(fileContents) as DamlConfig;
 }
 
@@ -47,22 +62,29 @@ function findSplicePackageDependencies(config: DamlConfig): string[] {
   return dependencies.filter((dependency) => dependency.includes('splice-'));
 }
 
-function findSpliceImports(): string[] {
-  return collectDamlFiles(NFT_DAML_SOURCE_DIR).flatMap((filePath) => {
+function findSpliceImports(corePackage: NftCorePackage): string[] {
+  return collectDamlFiles(corePackage.damlSourceDir).flatMap((filePath) => {
     const fileContents = fs.readFileSync(filePath, 'utf8');
     return SPLICE_IMPORT_PATTERN.test(fileContents) ? [path.relative(ROOT_DIR, filePath)] : [];
   });
 }
 
 function main(): void {
-  console.log('🔍 Checking NFT core package invariants...');
+  console.log('🔍 Checking NFT API/reference package invariants...');
 
-  const config = readDamlConfig();
-  const spliceDependencies = findSplicePackageDependencies(config);
-  const spliceImports = findSpliceImports();
+  let hasViolation = false;
 
-  if (spliceDependencies.length > 0 || spliceImports.length > 0) {
-    console.error('❌ NFT core package must remain free of Splice dependencies.');
+  for (const corePackage of NFT_CORE_PACKAGES) {
+    const config = readDamlConfig(corePackage);
+    const spliceDependencies = findSplicePackageDependencies(config);
+    const spliceImports = findSpliceImports(corePackage);
+
+    if (spliceDependencies.length === 0 && spliceImports.length === 0) {
+      continue;
+    }
+
+    hasViolation = true;
+    console.error(`❌ ${corePackage.name} must remain free of Splice dependencies.`);
 
     if (spliceDependencies.length > 0) {
       console.error('\nSplice package dependencies:');
@@ -77,15 +99,17 @@ function main(): void {
         console.error(`  - ${filePath}`);
       }
     }
+  }
 
+  if (hasViolation) {
     process.exit(1);
   }
 
-  console.log('✅ NFT core package has no Splice package dependencies or imports.');
+  console.log('✅ NFT API/reference packages have no Splice package dependencies or imports.');
 }
 
 if (require.main === module) {
   main();
 }
 
-export { collectDamlFiles, findSpliceImports, findSplicePackageDependencies, main, readDamlConfig };
+export { NFT_CORE_PACKAGES, collectDamlFiles, findSpliceImports, findSplicePackageDependencies, main, readDamlConfig };

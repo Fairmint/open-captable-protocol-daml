@@ -4,20 +4,21 @@ import { requirePackageConfig } from './packages';
 import { getErrorMessage } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
-const nftPkg = requirePackageConfig('nft');
-const standaloneNftDir = path.join(ROOT_DIR, 'generated', 'js', `${nftPkg.name}-${nftPkg.version}`);
+const nftApiPkg = requirePackageConfig('nftApi');
+const nftReferencePkg = requirePackageConfig('nftReference');
+const standaloneNftApiDir = path.join(ROOT_DIR, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`);
+const standaloneNftReferenceDir = path.join(ROOT_DIR, 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`);
 
 try {
   const rootPkg = require(ROOT_DIR);
-  if (!rootPkg?.Fairmint) {
-    throw new Error('Root export missing Fairmint');
-  }
-  const hasOcp = Boolean(rootPkg.Fairmint?.OpenCapTable);
-  const hasReports = Boolean(rootPkg.Fairmint?.OpenCapTableReports);
-  const hasNft = Boolean(rootPkg.Fairmint?.OpenCapTableNft);
+  const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
+  const hasReports = Boolean(rootPkg?.Fairmint?.OpenCapTableReports);
+  const hasNftApi = Boolean(rootPkg?.Nft?.Api?.V1);
+  const hasNftReference = Boolean(rootPkg?.Nft?.Reference?.V1);
   if (!hasOcp) console.warn('Warning: OpenCapTable namespace not detected');
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
-  if (!hasNft) throw new Error('Root export missing OpenCapTableNft namespace');
+  if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
+  if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
 
   // Verify JSON import via package subpath exports
   const ocp = require('@fairmint/open-captable-protocol-daml-js/ocp-factory-contract-id.json');
@@ -25,26 +26,43 @@ try {
   const reports = require('@fairmint/open-captable-protocol-daml-js/reports-factory-contract-id.json');
   if (!reports?.mainnet?.reportsFactoryContractId) throw new Error('Reports Factory JSON missing expected fields');
 
-  if (!fs.existsSync(standaloneNftDir)) {
-    throw new Error(`Standalone NFT package missing at ${standaloneNftDir}. Run npm run codegen first.`);
+  if (!fs.existsSync(standaloneNftApiDir)) {
+    throw new Error(`Standalone NFT API package missing at ${standaloneNftApiDir}. Run npm run codegen first.`);
+  }
+  if (!fs.existsSync(standaloneNftReferenceDir)) {
+    throw new Error(`Standalone NFT reference package missing at ${standaloneNftReferenceDir}. Run npm run codegen first.`);
   }
 
-  const standaloneNftPkg = require(standaloneNftDir);
-  if (!standaloneNftPkg?.Fairmint?.OpenCapTableNft) {
-    throw new Error('Standalone NFT package missing OpenCapTableNft namespace');
+  const standaloneNftApiPkg = require(standaloneNftApiDir);
+  if (!standaloneNftApiPkg?.Nft?.Api?.V1) {
+    throw new Error('Standalone NFT API package missing Nft.Api.V1 namespace');
   }
-  if (standaloneNftPkg?.Splice) {
-    throw new Error('Standalone NFT package must not export Splice');
+  if (standaloneNftApiPkg?.Nft?.Reference) {
+    throw new Error('Standalone NFT API package must not export Nft.Reference');
   }
-  if (fs.existsSync(path.join(standaloneNftDir, 'lib', 'Splice'))) {
-    throw new Error('Standalone NFT package must not bundle lib/Splice');
+  if (standaloneNftApiPkg?.Splice || fs.existsSync(path.join(standaloneNftApiDir, 'lib', 'Splice'))) {
+    throw new Error('Standalone NFT API package must not bundle Splice');
   }
-  if (fs.existsSync(path.join(standaloneNftDir, 'lib', 'Fairmint', 'OpenCapTable'))) {
-    throw new Error('Standalone NFT package must not bundle Fairmint/OpenCapTable');
+
+  const standaloneNftReferencePkg = require(standaloneNftReferenceDir);
+  if (!standaloneNftReferencePkg?.Nft?.Api?.V1) {
+    throw new Error('Standalone NFT reference package missing Nft.Api.V1 namespace');
+  }
+  if (!standaloneNftReferencePkg?.Nft?.Reference?.V1) {
+    throw new Error('Standalone NFT reference package missing Nft.Reference.V1 namespace');
+  }
+  if (standaloneNftReferencePkg?.Splice) {
+    throw new Error('Standalone NFT reference package must not export Splice');
+  }
+  if (fs.existsSync(path.join(standaloneNftReferenceDir, 'lib', 'Splice'))) {
+    throw new Error('Standalone NFT reference package must not bundle lib/Splice');
+  }
+  if (fs.existsSync(path.join(standaloneNftReferenceDir, 'lib', 'Fairmint'))) {
+    throw new Error('Standalone NFT reference package must not bundle Fairmint namespaces');
   }
 
   console.log(
-    'OK: Root package exports Fairmint aggregator including OpenCapTableNft, JSON subpaths are accessible, and standalone NFT package remains dependency-isolated'
+    'OK: Root package exports Nft.Api.V1 and Nft.Reference.V1, JSON subpaths are accessible, and standalone NFT packages remain correctly isolated'
   );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));
