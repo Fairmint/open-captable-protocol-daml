@@ -45,12 +45,27 @@ interface ContractIdData {
 function loadExistingData(filePath: string): ContractIdData {
   try {
     if (fs.existsSync(filePath)) {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-      // Handle legacy format
-      if (data.ocpFactoryContractId && !data.mainnet && !data.devnet) {
-        return { mainnet: { ocpFactoryContractId: data.ocpFactoryContractId, templateId: data.templateId } };
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ContractIdData & {
+        ocpFactoryContractId?: string;
+        templateId?: string;
+        staging?: unknown;
+      };
+      // Legacy flat shape (pre devnet/mainnet split)
+      if (
+        data.ocpFactoryContractId &&
+        data.templateId &&
+        !data.mainnet &&
+        !data.devnet
+      ) {
+        return {
+          mainnet: { ocpFactoryContractId: data.ocpFactoryContractId, templateId: data.templateId },
+        };
       }
-      return data;
+      // Drop obsolete keys (e.g. staging) so rewritten JSON matches ContractIdData only
+      return {
+        ...(data.mainnet ? { mainnet: data.mainnet } : {}),
+        ...(data.devnet ? { devnet: data.devnet } : {}),
+      };
     }
   } catch {
     console.warn('⚠️  Could not read existing file, starting fresh');
@@ -115,10 +130,13 @@ function finishCreate(
     throw new Error('No events in response');
   }
 
-  const firstEvent = eventsById[Object.keys(eventsById)[0]];
-  if (!('CreatedTreeEvent' in firstEvent)) {
+  const raw = eventsById[Object.keys(eventsById)[0]];
+  if (typeof raw !== 'object' || raw === null || !('CreatedTreeEvent' in raw)) {
     throw new Error('Expected CreatedTreeEvent');
   }
+  const firstEvent = raw as {
+    CreatedTreeEvent: { value: { contractId: string; templateId: string } };
+  };
 
   const { contractId } = firstEvent.CreatedTreeEvent.value;
   const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
