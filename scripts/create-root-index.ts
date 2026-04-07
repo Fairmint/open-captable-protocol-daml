@@ -63,9 +63,9 @@ function ensureFile(filePath: string, content: string) {
 }
 
 /**
- * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which
- * creates a circular dependency (root index loads Nft → Reference → NftAsset before index finishes).
- * Re-point those imports at a tiny bridge that only loads Nft/Api.
+ * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which creates a circular
+ * dependency (root index loads Nft → Reference → NftAsset before index finishes). Re-point those imports at a tiny
+ * bridge that only loads Nft/Api.
  */
 function writeNftApiPackageNamespaceBridge(destLib: string) {
   ensureFile(

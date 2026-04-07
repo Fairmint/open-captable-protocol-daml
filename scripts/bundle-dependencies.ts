@@ -822,8 +822,7 @@ function updateMainIndex(targetDir: string): void {
 function replaceNftReferenceBridgeImports(targetDir: string): void {
   const referenceRoot = path.join(targetDir, 'lib', 'Nft', 'Reference');
   const bridgeOk =
-    hasNftApiPackageNamespaceBridgeUnderLib(targetDir) ||
-    hasNftApiPackageNamespaceBridgeAtPackageRoot(targetDir);
+    hasNftApiPackageNamespaceBridgeUnderLib(targetDir) || hasNftApiPackageNamespaceBridgeAtPackageRoot(targetDir);
   if (!fs.existsSync(referenceRoot) || !bridgeOk) {
     return;
   }

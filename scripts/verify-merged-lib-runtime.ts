@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * Validates the combined `lib/` after codegen: required bundled paths exist, Nft/Reference does not
- * reintroduce a circular require on root `index.js`, and Node can load `lib/index.js` (consumer smoke test).
+ * Validates the combined `lib/` after codegen: required bundled paths exist, Nft/Reference does not reintroduce a
+ * circular require on root `index.js`, and Node can load `lib/index.js` (consumer smoke test).
  */
 
 import { spawnSync } from 'child_process';

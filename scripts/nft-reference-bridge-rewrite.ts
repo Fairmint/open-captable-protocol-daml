@@ -1,9 +1,9 @@
 /**
  * NftReference codegen imports the merged package root via `../../../../index.js` from files under
- * `lib/Nft/Reference/...` (depth matches DAML module nesting). That pulls in the full `index.js` graph
- * and creates a circular dependency. Rewrite those imports to `nft-api-v01-package-namespace.js`
- * using the **same** relative prefix as the original `index.js` import so resolution stays correct
- * for both `.../V1/Foo.js` and `.../V1/NftAsset/module.js` depths.
+ * `lib/Nft/Reference/...` (depth matches DAML module nesting). That pulls in the full `index.js` graph and creates a
+ * circular dependency. Rewrite those imports to `nft-api-v01-package-namespace.js` using the **same** relative prefix
+ * as the original `index.js` import so resolution stays correct for both `.../V1/Foo.js` and
+ * `.../V1/NftAsset/module.js` depths.
  */
 
 import fs from 'fs';
