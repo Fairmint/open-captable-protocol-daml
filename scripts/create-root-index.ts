@@ -1,5 +1,11 @@
 import fs from 'fs';
 import path from 'path';
+import {
+  createBundledDASetTypesFiles,
+  createBundledSpliceApiTokenDependencies,
+  ensureBundledDANamespaceIndexes,
+  ensureBundledSpliceNamespaceIndexes,
+} from './bundle-dependencies';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
@@ -53,6 +59,136 @@ function copyDir(src: string, dest: string) {
 function ensureFile(filePath: string, content: string) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, content);
+}
+
+/**
+ * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which
+ * creates a circular dependency (root index loads Nft → Reference → NftAsset before index finishes).
+ * Re-point those imports at a tiny bridge that only loads Nft/Api.
+ */
+function writeNftApiPackageNamespaceBridge(destLib: string) {
+  ensureFile(
+    path.join(destLib, 'nft-api-v01-package-namespace.js'),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var NftApi = require("./Nft/Api");
+exports.Nft = { Api: NftApi };
+`
+  );
+  ensureFile(
+    path.join(destLib, 'nft-api-v01-package-namespace.d.ts'),
+    `import type * as NftApi from "./Nft/Api";
+export declare const Nft: {
+  Api: typeof NftApi;
+};
+`
+  );
+}
+
+function patchNftReferenceCrossPackageImports(destLib: string) {
+  const refRoot = path.join(destLib, 'Nft', 'Reference');
+  if (!fs.existsSync(refRoot)) {
+    return;
+  }
+
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
+        continue;
+      }
+      let text = fs.readFileSync(full, 'utf8');
+      const next = text
+        .split("require('../../../../index.js')")
+        .join("require('../../../../nft-api-v01-package-namespace.js')")
+        .split('require("../../../../index.js")')
+        .join('require("../../../../nft-api-v01-package-namespace.js")')
+        .split("from '../../../../index.js'")
+        .join("from '../../../../nft-api-v01-package-namespace.js'")
+        .split('from "../../../../index.js"')
+        .join('from "../../../../nft-api-v01-package-namespace.js"');
+      if (next !== text) {
+        fs.writeFileSync(full, next);
+      }
+    }
+  };
+
+  walk(refRoot);
+}
+
+function patchCombinedBundledDependencyImports(destLib: string) {
+  const spliceRoot = path.join(destLib, 'Splice');
+  if (!fs.existsSync(spliceRoot)) {
+    return;
+  }
+
+  const replacements = [
+    {
+      from: 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
+      toDir: path.join(destLib, 'DA', 'Internal', 'Template'),
+    },
+    {
+      from: 'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
+      toDir: path.join(destLib, 'DA', 'Time', 'Types'),
+    },
+    {
+      from: 'daml.js/daml-prim-DA-Types-1.0.0',
+      toDir: path.join(destLib, 'DA', 'Types'),
+    },
+    {
+      from: 'daml.js/splice-api-token-metadata-v1-1.0.0',
+      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'MetadataV1'),
+    },
+    {
+      from: 'daml.js/splice-api-token-holding-v1-1.0.0',
+      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'HoldingV1'),
+    },
+    {
+      from: 'daml.js/splice-api-token-allocation-v1-1.0.0',
+      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'AllocationV1'),
+    },
+  ];
+
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const full = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(full);
+        continue;
+      }
+      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
+        continue;
+      }
+
+      const text = fs.readFileSync(full, 'utf8');
+      let next = text;
+      for (const replacement of replacements) {
+        if (!next.includes(replacement.from)) {
+          continue;
+        }
+        const relativePath = path.relative(path.dirname(full), replacement.toDir).replace(/\\/g, '/');
+        next = next
+          .split(`require('${replacement.from}')`)
+          .join(`require('${relativePath}')`)
+          .split(`require("${replacement.from}")`)
+          .join(`require("${relativePath}")`)
+          .split(`from '${replacement.from}'`)
+          .join(`from '${relativePath}'`)
+          .split(`from "${replacement.from}"`)
+          .join(`from "${relativePath}"`);
+      }
+
+      if (next !== text) {
+        fs.writeFileSync(full, next);
+      }
+    }
+  };
+
+  walk(spliceRoot);
 }
 
 function buildCombinedLib() {
@@ -158,6 +294,17 @@ import * as DA from './DA';
 export { Fairmint, Nft, CantonPayments, DA, Splice } ;
 `
   );
+
+  writeNftApiPackageNamespaceBridge(DEST_LIB);
+  patchNftReferenceCrossPackageImports(DEST_LIB);
+
+  // Merged `lib/Splice` can include Amulet without `Splice/Api/Token/*` (splice-amulet imports).
+  // Bundle those token modules into the combined lib/ (same as CantonPayments package build).
+  createBundledSpliceApiTokenDependencies(ROOT_DIR);
+  createBundledDASetTypesFiles(ROOT_DIR);
+  patchCombinedBundledDependencyImports(DEST_LIB);
+  ensureBundledDANamespaceIndexes(ROOT_DIR);
+  ensureBundledSpliceNamespaceIndexes(ROOT_DIR);
 
   console.log('✅ Combined lib/ created (factory JSON typings: types/*-factory-contract-id-json.d.ts)');
 }
