@@ -159,32 +159,7 @@ export { Fairmint, Nft, CantonPayments, DA, Splice } ;
 `
   );
 
-  console.log('✅ Combined lib/ created');
-}
-
-function ensureJsonDts() {
-  // Ensure .d.ts exists next to generated JSONs for TS consumers (OCP uses committed types/ocp-factory-contract-id-json.d.ts)
-  const ensureJson = (jsonPath: string, dtsPath: string, dtsContent: string) => {
-    if (fs.existsSync(jsonPath)) {
-      fs.writeFileSync(dtsPath, dtsContent);
-    } else {
-      console.warn(`Warning: ${path.relative(ROOT_DIR, jsonPath)} not found; skipping .d.ts creation`);
-    }
-  };
-
-  ensureJson(
-    path.join(ROOT_DIR, 'generated', 'reports-factory-contract-id.json'),
-    path.join(ROOT_DIR, 'generated', 'reports-factory-contract-id.json.d.ts'),
-    `declare const data: {\n    devnet: {\n        reportsFactoryContractId: string;\n        templateId: string;\n    };\n    mainnet: {\n        reportsFactoryContractId: string;\n        templateId: string;\n    };\n};\nexport default data;\n`
-  );
-
-  ensureJson(
-    path.join(ROOT_DIR, 'generated', 'paymentStreams-factory-contract-id.json'),
-    path.join(ROOT_DIR, 'generated', 'paymentStreams-factory-contract-id.json.d.ts'),
-    `declare const data: {\n    devnet: {\n        paymentStreamsFactoryContractId: string;\n        templateId: string;\n        disclosedContract: {\n            templateId: string;\n            contractId: string;\n            createdEventBlob: string;\n            synchronizerId: string;\n        };\n    };\n    mainnet: {\n        paymentStreamsFactoryContractId: string;\n        templateId: string;\n        disclosedContract: {\n            templateId: string;\n            contractId: string;\n            createdEventBlob: string;\n            synchronizerId: string;\n        };\n    };\n};\nexport default data;\n`
-  );
+  console.log('✅ Combined lib/ created (factory JSON typings: types/*-factory-contract-id-json.d.ts)');
 }
 
 buildCombinedLib();
-ensureJsonDts();
-console.log('Created combined lib and ensured JSON typings');
