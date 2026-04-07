@@ -6,7 +6,7 @@
  * uploading.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
- * purpose—see `dars/README.md`.
+ * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki
  *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
  */
