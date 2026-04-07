@@ -2,6 +2,10 @@
 /**
  * Backup a DAR file after mainnet upload. Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
  *
+ * **Retention:** When bumping a package version, add the new backup with this script but **do not remove** prior
+ * `dars/<package>/<oldVersion>/` trees that are already in the repo—keep historical DARs for audit, re-upload, and
+ * debugging. See `dars/README.md`.
+ *
  * Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]
  */
 

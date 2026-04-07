@@ -5,6 +5,9 @@
  * Requires the DAR to be backed up first. If not backed up, the script will automatically run the backup process before
  * uploading.
  *
+ * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
+ * purpose—see `dars/README.md`.
+ *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
  */
 
