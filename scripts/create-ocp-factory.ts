@@ -1,8 +1,24 @@
 #!/usr/bin/env node
 /**
- * Create the OcpFactory contract. Saves contract ID to generated/ocp-factory-contract-id.json.
+ * Create the OcpFactory contract on ledger and record IDs in generated/ocp-factory-contract-id.json.
  *
- * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet|staging>
+ * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
+ *
+ * ## Upgrading OpenCapTable (e.g. to v34) end-to-end
+ *
+ * 1. Build DAR: `npm run build` (from repo root).
+ * 2. Upload DAR to **both** Intellect and 5N for each network:
+ *    `npm run upload-dar -- --package ocp --network devnet`
+ *    `npm run upload-dar -- --package ocp --network mainnet`
+ * 3. Regenerate JS + typings: `npm run codegen`
+ * 4. Create factories (Intellect operator party, per `scripts/utils.ts`):
+ *    `tsx scripts/create-ocp-factory.ts --network devnet`
+ *    `tsx scripts/create-ocp-factory.ts --network mainnet`
+ * 5. Bump `package.json` version and publish `@fairmint/open-captable-protocol-daml-js`.
+ *
+ * Or run `npm run create-factory:ocp` after steps 1–2 (it runs codegen then both networks).
+ *
+ * Contract IDs and `templateId` in the JSON come from the ledger response; they must match the uploaded DAR.
  */
 
 import * as fs from 'fs';
@@ -13,7 +29,6 @@ import { createLedgerJsonApiClient } from './utils';
 interface ContractIdData {
   mainnet?: { ocpFactoryContractId: string; templateId: string };
   devnet?: { ocpFactoryContractId: string; templateId: string };
-  staging?: { ocpFactoryContractId: string; templateId: string };
 }
 
 function loadExistingData(filePath: string): ContractIdData {
@@ -82,7 +97,6 @@ async function main() {
 
   if (data.mainnet) console.log(`   Mainnet:  ${data.mainnet.ocpFactoryContractId}`);
   if (data.devnet) console.log(`   Devnet:   ${data.devnet.ocpFactoryContractId}`);
-  if (data.staging) console.log(`   Staging:  ${data.staging.ocpFactoryContractId}`);
   console.log('');
 }
 

@@ -5,10 +5,6 @@ import type { ContractNetwork } from './types';
 type ScriptNetwork = ContractNetwork;
 
 function toSdkNetwork(network: ScriptNetwork): NetworkType {
-  if (network === 'staging') {
-    // The installed SDK runtime supports staging config, but its published type union has not caught up yet.
-    return network as NetworkType;
-  }
   return network;
 }
 
@@ -28,7 +24,7 @@ function getMissingEnvVarFromError(error: unknown): string | null {
 /**
  * Create a LedgerJsonApiClient instance using EnvLoader for scripts
  *
- * @param network Network type ('devnet' | 'mainnet' | 'staging')
+ * @param network Network type ('devnet' | 'mainnet')
  * @param providerType Provider type
  * @returns Configured LedgerJsonApiClient instance
  */
@@ -102,7 +98,7 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
 /**
  * Create a ValidatorApiClient instance using EnvLoader for scripts
  *
- * @param network Network type ('devnet' | 'mainnet' | 'staging')
+ * @param network Network type ('devnet' | 'mainnet')
  * @param providerType Provider type
  * @returns Configured ValidatorApiClient instance
  */
