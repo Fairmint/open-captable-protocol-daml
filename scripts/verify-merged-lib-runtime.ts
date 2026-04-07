@@ -38,6 +38,8 @@ function assertNftReferenceDoesNotRequireRootIndex(): void {
 
   const badRequireSingle = "require('../../../../index.js')";
   const badRequireDouble = 'require("../../../../index.js")';
+  const badFromSingle = "from '../../../../index.js'";
+  const badFromDouble = 'from "../../../../index.js"';
 
   const walk = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -46,13 +48,18 @@ function assertNftReferenceDoesNotRequireRootIndex(): void {
         walk(full);
         continue;
       }
-      if (!entry.name.endsWith('.js')) {
+      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
         continue;
       }
       const text = fs.readFileSync(full, 'utf8');
-      if (text.includes(badRequireSingle) || text.includes(badRequireDouble)) {
+      if (
+        text.includes(badRequireSingle) ||
+        text.includes(badRequireDouble) ||
+        text.includes(badFromSingle) ||
+        text.includes(badFromDouble)
+      ) {
         throw new Error(
-          `Circular import risk: ${path.relative(LIB_DIR, full)} still requires root index.js; use nft-api-v01-package-namespace bridge`
+          `Circular import risk: ${path.relative(LIB_DIR, full)} still references root index.js; use nft-api-v01-package-namespace bridge`
         );
       }
     }
