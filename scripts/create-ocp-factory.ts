@@ -109,7 +109,9 @@ async function main() {
     } catch (err) {
       lastError = err;
       if (isPackageMissingOnParticipant(err) && provider === LEDGER_SCRIPT_PROVIDERS[0]) {
-        console.warn(`  ⚠️  ${ocpPkg.name} not on ${LEDGER_SCRIPT_PROVIDERS[0]}; trying ${LEDGER_SCRIPT_PROVIDERS[1]}…\n`);
+        console.warn(
+          `  ⚠️  ${ocpPkg.name} not on ${LEDGER_SCRIPT_PROVIDERS[0]}; trying ${LEDGER_SCRIPT_PROVIDERS[1]}…\n`
+        );
         continue;
       }
       throw err;

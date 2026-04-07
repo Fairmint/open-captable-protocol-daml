@@ -1,6 +1,7 @@
 /**
- * After codegen, OpenCapTableNft-v01 JS omits Fairmint.OpenCapTableNft.{Nft,Types} (they live in OpenCapTableNftIface-v01).
- * Copy those modules into the v01 generated lib and rewrite OpenCapTableNft/index so standalone NFT bindings stay complete.
+ * After codegen, OpenCapTableNft-v01 JS omits Fairmint.OpenCapTableNft.{Nft,Types} (they live in
+ * OpenCapTableNftIface-v01). Copy those modules into the v01 generated lib and rewrite OpenCapTableNft/index so
+ * standalone NFT bindings stay complete.
  */
 import fs from 'fs';
 import path from 'path';
