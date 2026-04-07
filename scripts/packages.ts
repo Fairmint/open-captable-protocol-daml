@@ -41,13 +41,19 @@ const PACKAGE_DEFS = {
   shared: { name: 'Shared', sourceDir: 'Shared' },
   ocp: { name: 'OpenCapTable-v34', sourceDir: 'OpenCapTable-v34' },
   reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
-  nft: { name: 'OpenCapTableNft-v01', sourceDir: 'OpenCapTableNft-v01' },
+  nftApi: { name: 'NftApi-v01', sourceDir: 'NftApi-v01' },
+  nftReference: { name: 'NftReference-v01', sourceDir: 'NftReference-v01' },
   proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
   paymentStreams: { name: 'CantonPayments', sourceDir: 'CantonPayments' },
   couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
 } as const;
 
 type PackageDefKey = keyof typeof PACKAGE_DEFS;
+const LEGACY_PACKAGE_ALIASES = {
+  nft: 'nftReference',
+  nftIface: 'nftApi',
+} as const;
+type PackageAliasKey = keyof typeof LEGACY_PACKAGE_ALIASES;
 
 /** Build full package config by reading version from daml.yaml. */
 function buildPackageConfig(def: { name: string; sourceDir: string }): PackageConfig {
@@ -72,23 +78,27 @@ function getPackages(): Record<PackageDefKey, PackageConfig> {
   return _packagesCache;
 }
 
-/** @deprecated Use getPackages() instead - exported for backward compatibility */
-export const PACKAGES = new Proxy({} as Record<PackageDefKey, PackageConfig>, {
-  get(_, prop: string) {
-    return getPackages()[prop as PackageDefKey];
-  },
-  ownKeys() {
-    return Object.keys(PACKAGE_DEFS);
-  },
-  getOwnPropertyDescriptor(_, prop: string) {
-    if (prop in PACKAGE_DEFS) {
-      return { enumerable: true, configurable: true, value: getPackages()[prop as PackageDefKey] };
-    }
-    return undefined;
-  },
-});
+/** All package configs (one entry per CLI alias). */
+export function getAllPackages(): PackageConfig[] {
+  return Object.values(getPackages());
+}
 
-export type PackageKey = PackageDefKey;
+export type PackageKey = PackageDefKey | PackageAliasKey;
+
+function resolvePackageKey(key: string): PackageDefKey | undefined {
+  const lowerKey = key.toLowerCase();
+  const packageKey = (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find(
+    (candidate) => candidate.toLowerCase() === lowerKey
+  );
+  if (packageKey) {
+    return packageKey;
+  }
+
+  const legacyAlias = (Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]).find(
+    (candidate) => candidate.toLowerCase() === lowerKey
+  );
+  return legacyAlias ? LEGACY_PACKAGE_ALIASES[legacyAlias] : undefined;
+}
 
 /**
  * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v34'). Key lookup is
@@ -96,14 +106,12 @@ export type PackageKey = PackageDefKey;
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {
   const packages = getPackages();
-  const lowerKey = keyOrName.toLowerCase();
-  // Case-insensitive key lookup
-  const matchingKey = Object.keys(packages).find((k) => k.toLowerCase() === lowerKey);
+  const matchingKey = resolvePackageKey(keyOrName);
   if (matchingKey) {
-    return packages[matchingKey as PackageKey];
+    return packages[matchingKey];
   }
   // Also support lookup by full name (case-insensitive)
-  return Object.values(packages).find((pkg) => pkg.name.toLowerCase() === lowerKey);
+  return Object.values(packages).find((pkg) => pkg.name.toLowerCase() === keyOrName.toLowerCase());
 }
 
 /**
@@ -120,7 +128,10 @@ export function requirePackageConfig(packageKey: string): PackageConfig {
 
 /** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
-  return Object.keys(PACKAGE_DEFS) as PackageKey[];
+  return [
+    ...(Object.keys(PACKAGE_DEFS) as PackageDefKey[]),
+    ...(Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]),
+  ];
 }
 
 // =============================================================================
@@ -154,7 +165,7 @@ export function requireNetwork(scriptName: string): ContractNetwork {
   const network = parseNetworkArg();
   if (!network) {
     console.error(`❌ Missing --network argument`);
-    console.error(`Usage: tsx scripts/${scriptName} --network <devnet|mainnet|staging>`);
+    console.error(`Usage: tsx scripts/${scriptName} --network <devnet|mainnet>`);
     process.exit(1);
   }
   return network;
@@ -192,8 +203,12 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
   for (const [key, pkg] of Object.entries(packages)) {
     console.error(`  ${key.padEnd(15)} → ${pkg.name} v${pkg.version}`);
   }
+  console.error(
+    `  ${'nft'.padEnd(15)} → ${packages.nftReference.name} v${packages.nftReference.version} (legacy alias)`
+  );
+  console.error(`  ${'nftIface'.padEnd(15)} → ${packages.nftApi.name} v${packages.nftApi.version} (legacy alias)`);
   console.error('');
-  console.error('Networks: devnet, mainnet, staging');
+  console.error('Networks: devnet, mainnet');
 }
 
 // =============================================================================

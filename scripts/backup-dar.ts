@@ -2,6 +2,10 @@
 /**
  * Backup a DAR file after mainnet upload. Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
  *
+ * **Retention:** When bumping a package version, add the new backup with this script but **do not remove** prior
+ * `dars/<package>/<oldVersion>/` trees that are already in the repo—keep historical DARs for audit, re-upload, and
+ * debugging. See the repo wiki: https://github.com/Fairmint/open-captable-protocol-daml/wiki
+ *
  * Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]
  */
 
@@ -9,13 +13,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
 import { computeSha256, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
-import { PACKAGES, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
+import { getAllPackages, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
 
 function printUsage(errorMessage?: string): never {
   if (errorMessage) console.error(`❌ ${errorMessage}\n`);
   console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]');
   console.error('\nPackages:');
-  for (const [, pkg] of Object.entries(PACKAGES)) {
+  for (const pkg of getAllPackages()) {
     console.error(`  ${pkg.name}`);
   }
   process.exit(1);

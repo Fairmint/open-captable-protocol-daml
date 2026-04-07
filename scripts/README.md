@@ -147,3 +147,10 @@ npm run upgrade-package -- --package OpenCapTable --type major
 **Error: "Invalid version format"**
 
 - The version in `daml.yaml` should follow semantic versioning: `X.Y.Z`
+
+## DAR backups and retention
+
+Backed-up DARs live under `dars/` with integrity recorded in `dars.lock`. After any version bump,
+**add** the new backup with `npm run backup-dar` but **keep** previous `dars/<package>/<version>/`
+trees that are already in git unless you have another archival process. Policy and layout:
+[GitHub wiki](https://github.com/Fairmint/open-captable-protocol-daml/wiki).

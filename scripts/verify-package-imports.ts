@@ -43,7 +43,7 @@ function checkForUnresolvedImports(): Array<{ file: string; matches: string[] }>
 
   // Pattern to find unresolved daml.js imports
   // These should have been replaced with relative paths
-  const unresolvedPatterns = [/require\(['"]daml\.js\/[^'"]+['"]\)/g, /from ['"]daml\.js\/[^'"]+['"]/g];
+  const unresolvedPatterns = [/require\(['"]@?daml\.js\/[^'"]+['"]\)/g, /from ['"]@?daml\.js\/[^'"]+['"]/g];
 
   for (const filePath of allFiles) {
     const content = fs.readFileSync(filePath, 'utf8');

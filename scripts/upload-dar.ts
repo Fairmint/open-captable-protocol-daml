@@ -5,12 +5,16 @@
  * Requires the DAR to be backed up first. If not backed up, the script will automatically run the backup process before
  * uploading.
  *
+ * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
+ * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki
+ *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
  */
 
 import { execSync } from 'child_process';
 import { getFreshDarPath, isDarBackedUp, recordNetworkUpload, requireBackedUpDar } from './dar-utils';
 import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
+import { LEDGER_SCRIPT_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
 
 /** Ensure the DAR is backed up before upload. If not backed up, automatically run the backup process. */
@@ -60,12 +64,35 @@ async function main() {
   // Now require the backed-up DAR (this verifies integrity)
   const darPath = requireBackedUpDar(pkg.name, pkg.version, pkg.darName);
 
-  // Upload to both providers
-  for (const provider of ['intellect', '5n'] as const) {
+  // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
+  // does not block the other.
+  const failures: Array<{ provider: string; message: string }> = [];
+
+  for (const provider of LEDGER_SCRIPT_PROVIDERS) {
     console.log(`  → ${provider}...`);
-    const client = createLedgerJsonApiClient(network, provider);
-    await client.uploadDarFile({ filePath: darPath });
-    console.log(`    ✅ Done`);
+    try {
+      const client = createLedgerJsonApiClient(network, provider);
+      await client.uploadDarFile({ filePath: darPath });
+      console.log(`    ✅ Done`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`    ⚠️  Failed: ${message}`);
+      failures.push({ provider, message });
+    }
+  }
+
+  if (failures.length === LEDGER_SCRIPT_PROVIDERS.length) {
+    console.error(`\n❌ Upload failed on all providers:\n`);
+    for (const { provider, message } of failures) {
+      console.error(`   ${provider}: ${message}\n`);
+    }
+    process.exit(1);
+  }
+
+  if (failures.length > 0) {
+    console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.`);
+    console.warn(`   Not updating dars.lock — upload must succeed on all providers first.\n`);
+    process.exit(1);
   }
 
   recordNetworkUpload(pkg.name, pkg.version, pkg.darName, network);
