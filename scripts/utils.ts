@@ -1,12 +1,6 @@
-import type { ClientConfig, NetworkType, ProviderType } from '@fairmint/canton-node-sdk';
+import type { ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
 import { EnvLoader, FileLogger, LedgerJsonApiClient, ValidatorApiClient } from '@fairmint/canton-node-sdk';
 import type { ContractNetwork } from './types';
-
-type ScriptNetwork = ContractNetwork;
-
-function toSdkNetwork(network: ScriptNetwork): NetworkType {
-  return network;
-}
 
 function getMissingEnvVarFromError(error: unknown): string | null {
   if (!(error instanceof Error)) {
@@ -28,16 +22,15 @@ function getMissingEnvVarFromError(error: unknown): string | null {
  * @param providerType Provider type
  * @returns Configured LedgerJsonApiClient instance
  */
-export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: ProviderType): LedgerJsonApiClient {
+export function createLedgerJsonApiClient(network: ContractNetwork, providerType: ProviderType): LedgerJsonApiClient {
   const envLoader = EnvLoader.getInstance();
-  const sdkNetwork = toSdkNetwork(network);
-  const envPrefix = `CANTON_${sdkNetwork.toUpperCase()}_${providerType.toUpperCase()}`;
+  const envPrefix = `CANTON_${network.toUpperCase()}_${providerType.toUpperCase()}`;
   const apiUrlEnvVar = `${envPrefix}_LEDGER_JSON_API_URI`;
   const clientIdEnvVar = `${envPrefix}_LEDGER_JSON_API_CLIENT_ID`;
   const clientSecretEnvVar = `${envPrefix}_LEDGER_JSON_API_CLIENT_SECRET`;
-  const apiUrl = envLoader.getApiUri('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
-  const clientId = envLoader.getApiClientId('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
-  const clientSecret = envLoader.getApiClientSecret('LEDGER_JSON_API', sdkNetwork, providerType) ?? '';
+  const apiUrl = envLoader.getApiUri('LEDGER_JSON_API', network, providerType) ?? '';
+  const clientId = envLoader.getApiClientId('LEDGER_JSON_API', network, providerType) ?? '';
+  const clientSecret = envLoader.getApiClientSecret('LEDGER_JSON_API', network, providerType) ?? '';
   const missingEnvVars: string[] = [];
   let authUrl = '';
   let partyId = '';
@@ -53,7 +46,7 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
   }
 
   try {
-    authUrl = envLoader.getAuthUrl(sdkNetwork, providerType);
+    authUrl = envLoader.getAuthUrl(network, providerType);
   } catch (error) {
     const missingEnvVar = getMissingEnvVarFromError(error);
     if (!missingEnvVar) {
@@ -63,7 +56,7 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
   }
 
   try {
-    partyId = envLoader.getPartyId(sdkNetwork, providerType);
+    partyId = envLoader.getPartyId(network, providerType);
   } catch (error) {
     const missingEnvVar = getMissingEnvVarFromError(error);
     if (!missingEnvVar) {
@@ -77,7 +70,7 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
   }
 
   return new LedgerJsonApiClient({
-    network: sdkNetwork,
+    network,
     provider: providerType,
     authUrl,
     apis: {
@@ -102,24 +95,23 @@ export function createLedgerJsonApiClient(network: ScriptNetwork, providerType: 
  * @param providerType Provider type
  * @returns Configured ValidatorApiClient instance
  */
-export function createValidatorApiClient(network: ScriptNetwork, providerType: ProviderType): ValidatorApiClient {
+export function createValidatorApiClient(network: ContractNetwork, providerType: ProviderType): ValidatorApiClient {
   const envLoader = EnvLoader.getInstance();
-  const sdkNetwork = toSdkNetwork(network);
-  const apiUrl = envLoader.getApiUri('VALIDATOR_API', sdkNetwork, providerType);
-  const clientId = envLoader.getApiClientId('VALIDATOR_API', sdkNetwork, providerType);
-  const clientSecret = envLoader.getApiClientSecret('VALIDATOR_API', sdkNetwork, providerType);
-  const authUrl = envLoader.getAuthUrl(sdkNetwork, providerType);
-  const partyId = envLoader.getPartyId(sdkNetwork, providerType);
-  const userId = envLoader.getUserId(sdkNetwork, providerType);
-  const username = envLoader.getApiUsername('VALIDATOR_API', sdkNetwork, providerType);
-  const password = envLoader.getApiPassword('VALIDATOR_API', sdkNetwork, providerType);
+  const apiUrl = envLoader.getApiUri('VALIDATOR_API', network, providerType);
+  const clientId = envLoader.getApiClientId('VALIDATOR_API', network, providerType);
+  const clientSecret = envLoader.getApiClientSecret('VALIDATOR_API', network, providerType);
+  const authUrl = envLoader.getAuthUrl(network, providerType);
+  const partyId = envLoader.getPartyId(network, providerType);
+  const userId = envLoader.getUserId(network, providerType);
+  const username = envLoader.getApiUsername('VALIDATOR_API', network, providerType);
+  const password = envLoader.getApiPassword('VALIDATOR_API', network, providerType);
 
   if (!apiUrl || !clientId || (!clientSecret && !(username && password)) || !authUrl) {
     throw new Error('Missing required environment configuration for ValidatorApiClient');
   }
 
   const clientConfig: ClientConfig = {
-    network: sdkNetwork,
+    network,
     provider: providerType,
     authUrl,
     apis: {
