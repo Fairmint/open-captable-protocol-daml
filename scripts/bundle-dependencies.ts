@@ -7,7 +7,8 @@ import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
-const nftPkg = requirePackageConfig('nft');
+const nftApiPkg = requirePackageConfig('nftApi');
+const nftReferencePkg = requirePackageConfig('nftReference');
 const nftIfacePkg = requirePackageConfig('nftIface');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
@@ -15,7 +16,8 @@ const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 const PACKAGE_DIRS = [
   path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`),
   path.join(__dirname, '../generated/js', `${reportsPkg.name}-${reportsPkg.version}`),
-  path.join(__dirname, '../generated/js', `${nftPkg.name}-${nftPkg.version}`),
+  path.join(__dirname, '../generated/js', `${nftApiPkg.name}-${nftApiPkg.version}`),
+  path.join(__dirname, '../generated/js', `${nftReferencePkg.name}-${nftReferencePkg.version}`),
   path.join(__dirname, '../generated/js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
 ];
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
@@ -812,6 +814,49 @@ function updateMainIndex(targetDir: string): void {
   }
 }
 
+function replaceNftReferenceBridgeImports(targetDir: string): void {
+  const referenceRoot = path.join(targetDir, 'lib', 'Nft', 'Reference');
+  const bridgePath = path.join(targetDir, 'lib', 'nft-api-v01-package-namespace.js');
+  if (!fs.existsSync(referenceRoot) || !fs.existsSync(bridgePath)) {
+    return;
+  }
+
+  let replacedCount = 0;
+  const walk = (dir: string) => {
+    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+      const entryPath = path.join(dir, entry.name);
+      if (entry.isDirectory()) {
+        walk(entryPath);
+        continue;
+      }
+      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
+        continue;
+      }
+
+      const originalContent = fs.readFileSync(entryPath, 'utf8');
+      const nextContent = originalContent
+        .split("require('../../../../index.js')")
+        .join("require('../../../../nft-api-v01-package-namespace.js')")
+        .split('require("../../../../index.js")')
+        .join('require("../../../../nft-api-v01-package-namespace.js")')
+        .split("from '../../../../index.js'")
+        .join("from '../../../../nft-api-v01-package-namespace.js'")
+        .split('from "../../../../index.js"')
+        .join('from "../../../../nft-api-v01-package-namespace.js"');
+
+      if (nextContent !== originalContent) {
+        fs.writeFileSync(entryPath, nextContent);
+        replacedCount++;
+      }
+    }
+  };
+
+  walk(referenceRoot);
+  if (replacedCount > 0) {
+    console.log(`✅ Replaced NFT reference bridge imports in ${replacedCount} files`);
+  }
+}
+
 function replaceDependencyReferences(targetDir: string): void {
   console.log('🔄 Replacing dependency references in generated files...');
 
@@ -1131,6 +1176,7 @@ function main(): void {
       ensureBundledSpliceNamespaceIndexes(targetDir);
       updateMainIndex(targetDir);
       replaceDependencyReferences(targetDir);
+      replaceNftReferenceBridgeImports(targetDir);
       removeLocalDependency(targetDir);
     }
     console.log('✅ Dependency bundling completed successfully (TS)!');
