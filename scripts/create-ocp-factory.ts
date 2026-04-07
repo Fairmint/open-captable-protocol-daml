@@ -46,7 +46,12 @@ function isNetworkEntry(value: unknown): value is { ocpFactoryContractId: string
     return false;
   }
   const o = value as Record<string, unknown>;
-  return typeof o.ocpFactoryContractId === 'string' && typeof o.templateId === 'string';
+  const cid = o.ocpFactoryContractId;
+  const tid = o.templateId;
+  if (typeof cid !== 'string' || typeof tid !== 'string') {
+    return false;
+  }
+  return cid.trim().length > 0 && tid.trim().length > 0;
 }
 
 interface CreatedTreeEventNode {
