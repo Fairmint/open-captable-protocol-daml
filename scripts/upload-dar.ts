@@ -60,12 +60,34 @@ async function main() {
   // Now require the backed-up DAR (this verifies integrity)
   const darPath = requireBackedUpDar(pkg.name, pkg.version, pkg.darName);
 
-  // Upload to both providers
-  for (const provider of ['intellect', '5n'] as const) {
+  // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
+  // does not block the other.
+  const providers = ['intellect', '5n'] as const;
+  const failures: { provider: string; message: string }[] = [];
+
+  for (const provider of providers) {
     console.log(`  → ${provider}...`);
-    const client = createLedgerJsonApiClient(network, provider);
-    await client.uploadDarFile({ filePath: darPath });
-    console.log(`    ✅ Done`);
+    try {
+      const client = createLedgerJsonApiClient(network, provider);
+      await client.uploadDarFile({ filePath: darPath });
+      console.log(`    ✅ Done`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`    ⚠️  Failed: ${message}`);
+      failures.push({ provider, message });
+    }
+  }
+
+  if (failures.length === providers.length) {
+    console.error(`\n❌ Upload failed on all providers:\n`);
+    for (const { provider, message } of failures) {
+      console.error(`   ${provider}: ${message}\n`);
+    }
+    process.exit(1);
+  }
+
+  if (failures.length > 0) {
+    console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.\n`);
   }
 
   recordNetworkUpload(pkg.name, pkg.version, pkg.darName, network);

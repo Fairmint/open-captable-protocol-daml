@@ -42,7 +42,6 @@ const PACKAGE_DEFS = {
   ocp: { name: 'OpenCapTable-v34', sourceDir: 'OpenCapTable-v34' },
   reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
   nft: { name: 'OpenCapTableNft-v01', sourceDir: 'OpenCapTableNft-v01' },
-  proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
   paymentStreams: { name: 'CantonPayments', sourceDir: 'CantonPayments' },
   couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
 } as const;
