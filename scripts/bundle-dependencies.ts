@@ -8,6 +8,7 @@ import { getErrorMessage, type PackageJson } from './types';
 const ocpPkg = requirePackageConfig('ocp');
 const reportsPkg = requirePackageConfig('reports');
 const nftPkg = requirePackageConfig('nft');
+const nftIfacePkg = requirePackageConfig('nftIface');
 const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 // Paths
@@ -37,6 +38,9 @@ const TOKEN_ALLOCATION_DIR = path.join(__dirname, '../generated/js/splice-api-to
 const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Set-Types-1.0.0');
 const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
 const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
+/** Scoped package name from daml codegen (iface merged into NFT v01 lib/index). */
+const NFT_IFACE_PACKAGE_IMPORT = `@daml.js/${nftIfacePkg.name}-${nftIfacePkg.version}`;
+const NFT_IFACE_DAML_JS_IMPORT = `daml.js/${nftIfacePkg.name}-${nftIfacePkg.version}`;
 const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
 const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
 const SPLICE_FEATURED_APP_IMPORT = 'daml.js/splice-api-featured-app-v1-1.0.0';
@@ -864,6 +868,20 @@ function replaceDependencyReferences(targetDir: string): void {
       }
     }
 
+    if (content.includes(NFT_IFACE_PACKAGE_IMPORT) || content.includes(NFT_IFACE_DAML_JS_IMPORT)) {
+      const indexEntry = path.join(targetDir, 'lib/index.js');
+      const relativePath = path.relative(path.dirname(filePath), indexEntry).replace(/\\/g, '/');
+      const escScoped = escapeRegExp(NFT_IFACE_PACKAGE_IMPORT);
+      const escDamlJs = escapeRegExp(NFT_IFACE_DAML_JS_IMPORT);
+      if (isDts) {
+        content = content.replace(new RegExp(`from '${escScoped}';`, 'g'), `from '${relativePath}';`);
+        content = content.replace(new RegExp(`from '${escDamlJs}';`, 'g'), `from '${relativePath}';`);
+      } else {
+        content = content.replace(new RegExp(`require\\('${escScoped}'\\)`, 'g'), `require('${relativePath}')`);
+        content = content.replace(new RegExp(`require\\('${escDamlJs}'\\)`, 'g'), `require('${relativePath}')`);
+      }
+    }
+
     if (content.includes('daml.js/splice-api-featured-app-v1-1.0.0')) {
       const relativePath = path
         .relative(path.dirname(filePath), path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'))
@@ -1039,6 +1057,7 @@ function removeLocalDependency(targetDir: string): void {
   const localDependencies = [
     DA_INTERNAL_TEMPLATE_IMPORT,
     OCP_DAML_JS_IMPORT,
+    NFT_IFACE_PACKAGE_IMPORT,
     SPLICE_FEATURED_APP_IMPORT,
     SPLICE_AMULET_IMPORT,
     DA_TIME_TYPES_IMPORT,
