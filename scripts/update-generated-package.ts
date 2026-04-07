@@ -10,7 +10,8 @@ const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as Pack
 // Build package paths dynamically from packages.ts (which reads from daml.yaml)
 const ocpPkg = getPackage('ocp')!;
 const reportsPkg = getPackage('reports')!;
-const nftPkg = getPackage('nft')!;
+const nftApiPkg = getPackage('nftApi')!;
+const nftReferencePkg = getPackage('nftReference')!;
 
 const packages = [
   { dir: path.join(__dirname, '..', 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`), name: rootPackage.name },
@@ -19,7 +20,11 @@ const packages = [
     name: `${rootPackage.name}-reports`,
   },
   {
-    dir: path.join(__dirname, '..', 'generated', 'js', `${nftPkg.name}-${nftPkg.version}`),
+    dir: path.join(__dirname, '..', 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`),
+    name: `${rootPackage.name}-nft-api`,
+  },
+  {
+    dir: path.join(__dirname, '..', 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`),
     name: `${rootPackage.name}-nft`,
   },
 ];

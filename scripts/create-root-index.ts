@@ -6,6 +6,7 @@ import {
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
 } from './bundle-dependencies';
+import { patchNftReferenceGeneratedTree } from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
@@ -62,9 +63,9 @@ function ensureFile(filePath: string, content: string) {
 }
 
 /**
- * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which creates a circular
- * dependency (root index loads Nft → Reference → NftAsset before index finishes). Re-point those imports at a tiny
- * bridge that only loads Nft/Api.
+ * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which
+ * creates a circular dependency (root index loads Nft → Reference → NftAsset before index finishes).
+ * Re-point those imports at a tiny bridge that only loads Nft/Api.
  */
 function writeNftApiPackageNamespaceBridge(destLib: string) {
   ensureFile(
@@ -85,39 +86,11 @@ export declare const Nft: {
   );
 }
 
-function patchNftReferenceCrossPackageImports(destLib: string) {
-  const refRoot = path.join(destLib, 'Nft', 'Reference');
-  if (!fs.existsSync(refRoot)) {
-    return;
+function patchNftReferenceCrossPackageImports(destLib: string): void {
+  const n = patchNftReferenceGeneratedTree(path.join(destLib, 'Nft', 'Reference'));
+  if (n > 0) {
+    console.log(`✅ Patched ${n} merged lib Nft/Reference files to use nft-api-v01 bridge import`);
   }
-
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
-        continue;
-      }
-      const text = fs.readFileSync(full, 'utf8');
-      const next = text
-        .split("require('../../../../index.js')")
-        .join("require('../../../../nft-api-v01-package-namespace.js')")
-        .split('require("../../../../index.js")')
-        .join('require("../../../../nft-api-v01-package-namespace.js")')
-        .split("from '../../../../index.js'")
-        .join("from '../../../../nft-api-v01-package-namespace.js'")
-        .split('from "../../../../index.js"')
-        .join('from "../../../../nft-api-v01-package-namespace.js"');
-      if (next !== text) {
-        fs.writeFileSync(full, next);
-      }
-    }
-  };
-
-  walk(refRoot);
 }
 
 function patchCombinedBundledDependencyImports(destLib: string) {

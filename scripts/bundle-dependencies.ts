@@ -2,6 +2,11 @@
 
 import fs from 'fs';
 import path from 'path';
+import {
+  hasNftApiPackageNamespaceBridgeAtPackageRoot,
+  hasNftApiPackageNamespaceBridgeUnderLib,
+  patchNftReferenceGeneratedTree,
+} from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 import { getErrorMessage, type PackageJson } from './types';
 
@@ -816,42 +821,14 @@ function updateMainIndex(targetDir: string): void {
 
 function replaceNftReferenceBridgeImports(targetDir: string): void {
   const referenceRoot = path.join(targetDir, 'lib', 'Nft', 'Reference');
-  const bridgePath = path.join(targetDir, 'lib', 'nft-api-v01-package-namespace.js');
-  if (!fs.existsSync(referenceRoot) || !fs.existsSync(bridgePath)) {
+  const bridgeOk =
+    hasNftApiPackageNamespaceBridgeUnderLib(targetDir) ||
+    hasNftApiPackageNamespaceBridgeAtPackageRoot(targetDir);
+  if (!fs.existsSync(referenceRoot) || !bridgeOk) {
     return;
   }
 
-  let replacedCount = 0;
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const entryPath = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(entryPath);
-        continue;
-      }
-      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
-        continue;
-      }
-
-      const originalContent = fs.readFileSync(entryPath, 'utf8');
-      const nextContent = originalContent
-        .split("require('../../../../index.js')")
-        .join("require('../../../../nft-api-v01-package-namespace.js')")
-        .split('require("../../../../index.js")')
-        .join('require("../../../../nft-api-v01-package-namespace.js")')
-        .split("from '../../../../index.js'")
-        .join("from '../../../../nft-api-v01-package-namespace.js'")
-        .split('from "../../../../index.js"')
-        .join('from "../../../../nft-api-v01-package-namespace.js"');
-
-      if (nextContent !== originalContent) {
-        fs.writeFileSync(entryPath, nextContent);
-        replacedCount++;
-      }
-    }
-  };
-
-  walk(referenceRoot);
+  const replacedCount = patchNftReferenceGeneratedTree(referenceRoot);
   if (replacedCount > 0) {
     console.log(`✅ Replaced NFT reference bridge imports in ${replacedCount} files`);
   }

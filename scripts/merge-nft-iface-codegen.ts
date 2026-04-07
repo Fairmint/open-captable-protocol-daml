@@ -5,6 +5,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { patchNftReferenceGeneratedTree } from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 function copyDir(src: string, dest: string): void {
@@ -17,43 +18,6 @@ function copyDir(src: string, dest: string): void {
     if (stat.isDirectory()) copyDir(from, to);
     else fs.copyFileSync(from, to);
   }
-}
-
-function patchReferenceImports(referenceNftDir: string): void {
-  const refRoot = path.join(referenceNftDir, 'Reference');
-  if (!fs.existsSync(refRoot)) {
-    return;
-  }
-
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
-        continue;
-      }
-
-      const text = fs.readFileSync(full, 'utf8');
-      const next = text
-        .split("require('../../../../index.js')")
-        .join("require('../../../../nft-api-v01-package-namespace.js')")
-        .split('require("../../../../index.js")')
-        .join('require("../../../../nft-api-v01-package-namespace.js")')
-        .split("from '../../../../index.js'")
-        .join("from '../../../../nft-api-v01-package-namespace.js'")
-        .split('from "../../../../index.js"')
-        .join('from "../../../../nft-api-v01-package-namespace.js"');
-
-      if (next !== text) {
-        fs.writeFileSync(full, next);
-      }
-    }
-  };
-
-  walk(refRoot);
 }
 
 const nftApiPkg = requirePackageConfig('nftApi');
@@ -111,6 +75,10 @@ export declare const Nft: {
 };
 `
 );
-patchReferenceImports(referenceNftDir);
+
+const patched = patchNftReferenceGeneratedTree(path.join(referenceNftDir, 'Reference'));
+if (patched > 0) {
+  console.log(`✅ Patched ${patched} Nft/Reference files to use nft-api-v01 bridge import`);
+}
 
 console.log('✅ Merged NftApi-v01 bindings into NftReference-v01 generated lib');
