@@ -3,23 +3,6 @@
  * Create the OcpFactory contract on ledger and record IDs in generated/ocp-factory-contract-id.json.
  *
  * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
- *
- * ## Upgrading OpenCapTable (e.g. to v34) end-to-end
- *
- * 1. Build DAR: `npm run build` (from repo root).
- * 2. Upload DAR to **both** Intellect and 5N for each network:
- *    `npm run upload-dar -- --package ocp --network devnet`
- *    `npm run upload-dar -- --package ocp --network mainnet`
- * 3. Regenerate JS + typings: `npm run codegen`
- * 4. Create factories (Intellect first; falls back to 5n if the package is missing on Intellect, e.g. partial devnet
- *    upload):
- *    `tsx scripts/create-ocp-factory.ts --network devnet`
- *    `tsx scripts/create-ocp-factory.ts --network mainnet`
- * 5. Bump `package.json` version and publish `@fairmint/open-captable-protocol-daml-js`.
- *
- * Or run `npm run create-factory:ocp` after steps 1–2 (it runs codegen then both networks).
- *
- * Contract IDs and `templateId` in the JSON come from the ledger response; they must match the uploaded DAR.
  */
 
 import * as fs from 'fs';
@@ -45,32 +28,26 @@ interface ContractIdData {
 function loadExistingData(filePath: string): ContractIdData {
   try {
     if (fs.existsSync(filePath)) {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as ContractIdData & {
-        ocpFactoryContractId?: string;
-        templateId?: string;
-        staging?: unknown;
-      };
-      // Legacy flat shape (pre devnet/mainnet split)
-      if (
-        data.ocpFactoryContractId &&
-        data.templateId &&
-        !data.mainnet &&
-        !data.devnet
-      ) {
-        return {
-          mainnet: { ocpFactoryContractId: data.ocpFactoryContractId, templateId: data.templateId },
-        };
-      }
-      // Drop obsolete keys (e.g. staging) so rewritten JSON matches ContractIdData only
+      const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
+      const mainnet = data.mainnet;
+      const devnet = data.devnet;
       return {
-        ...(data.mainnet ? { mainnet: data.mainnet } : {}),
-        ...(data.devnet ? { devnet: data.devnet } : {}),
+        ...(isNetworkEntry(mainnet) ? { mainnet } : {}),
+        ...(isNetworkEntry(devnet) ? { devnet } : {}),
       };
     }
   } catch {
     console.warn('⚠️  Could not read existing file, starting fresh');
   }
   return {};
+}
+
+function isNetworkEntry(value: unknown): value is { ocpFactoryContractId: string; templateId: string } {
+  if (value === null || typeof value !== 'object') {
+    return false;
+  }
+  const o = value as Record<string, unknown>;
+  return typeof o.ocpFactoryContractId === 'string' && typeof o.templateId === 'string';
 }
 
 async function main() {
