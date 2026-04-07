@@ -4,8 +4,8 @@
 export type { ApiConfig, AuthConfig, ClientConfig, NetworkType, ProviderType } from '@fairmint/canton-node-sdk';
 import type { NetworkType } from '@fairmint/canton-node-sdk';
 
-/** Valid network values accepted by the SDK. */
-export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet'] as const;
+/** Mirrors @fairmint/canton-node-sdk NetworkType for isValidNetwork (includes legacy staging until consumers upgrade SDK). */
+export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet', 'staging'] as const;
 
 /** Type guard to check if a string is a valid NetworkType. */
 export function isValidNetwork(value: string): value is NetworkType {
