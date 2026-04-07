@@ -2,18 +2,19 @@
 
 // Re-export SDK types for convenience
 export type { ApiConfig, AuthConfig, ClientConfig, NetworkType, ProviderType } from '@fairmint/canton-node-sdk';
-import type { NetworkType } from '@fairmint/canton-node-sdk';
 
-/** Mirrors @fairmint/canton-node-sdk NetworkType for isValidNetwork (includes legacy staging until consumers upgrade SDK). */
-export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet', 'staging'] as const;
+/** Networks this repo’s scripts treat as valid (no staging). */
+export const VALID_NETWORKS = ['devnet', 'testnet', 'mainnet', 'localnet'] as const;
 
-/** Type guard to check if a string is a valid NetworkType. */
-export function isValidNetwork(value: string): value is NetworkType {
-  return VALID_NETWORKS.includes(value as NetworkType);
+export type FairmintScriptNetwork = (typeof VALID_NETWORKS)[number];
+
+/** Type guard for script-level network strings (subset of Canton SDK networks). */
+export function isValidNetwork(value: string): value is FairmintScriptNetwork {
+  return (VALID_NETWORKS as readonly string[]).includes(value);
 }
 
-/** Asserts that a string is a valid NetworkType, throwing if not. Returns the value cast to NetworkType for convenience. */
-export function assertValidNetwork(value: string): NetworkType {
+/** Asserts a script-level network string; throws if not in {@link VALID_NETWORKS}. */
+export function assertValidNetwork(value: string): FairmintScriptNetwork {
   if (!isValidNetwork(value)) {
     throw new Error(`Invalid network: "${value}". Must be one of: ${VALID_NETWORKS.join(', ')}`);
   }
