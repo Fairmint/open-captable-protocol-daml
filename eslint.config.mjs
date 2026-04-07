@@ -1,7 +1,7 @@
 import typescriptEslintPlugin from '@typescript-eslint/eslint-plugin';
 import typescriptEslintParser from '@typescript-eslint/parser';
 import eslintConfigPrettier from 'eslint-config-prettier';
-import importPlugin from 'eslint-plugin-import';
+import { importX } from 'eslint-plugin-import-x';
 import unusedImportsPlugin from 'eslint-plugin-unused-imports';
 
 const eslintConfig = [
@@ -39,10 +39,10 @@ const eslintConfig = [
     plugins: {
       '@typescript-eslint': typescriptEslintPlugin,
       'unused-imports': unusedImportsPlugin,
-      import: importPlugin,
+      'import-x': importX,
     },
     settings: {
-      'import/resolver': {
+      'import-x/resolver': {
         typescript: {
           alwaysTryTypes: true,
           project: './tsconfig.json',
@@ -130,11 +130,11 @@ const eslintConfig = [
         },
       ],
 
-      // Import plugin rules
-      'import/order': 'off',
-      'import/no-duplicates': 'warn',
-      'import/no-unresolved': 'off',
-      'import/no-named-as-default': 'off',
+      // Import plugin rules (import-x: ESLint 10–compatible fork)
+      'import-x/order': 'off',
+      'import-x/no-duplicates': 'warn',
+      'import-x/no-unresolved': 'off',
+      'import-x/no-named-as-default': 'off',
 
       // General JavaScript/TypeScript rules
       'no-console': 'warn',

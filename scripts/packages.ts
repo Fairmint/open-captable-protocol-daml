@@ -73,21 +73,10 @@ function getPackages(): Record<PackageDefKey, PackageConfig> {
   return _packagesCache;
 }
 
-/** @deprecated Use getPackages() instead - exported for backward compatibility */
-export const PACKAGES = new Proxy({} as Record<PackageDefKey, PackageConfig>, {
-  get(_, prop: string) {
-    return getPackages()[prop as PackageDefKey];
-  },
-  ownKeys() {
-    return Object.keys(PACKAGE_DEFS);
-  },
-  getOwnPropertyDescriptor(_, prop: string) {
-    if (prop in PACKAGE_DEFS) {
-      return { enumerable: true, configurable: true, value: getPackages()[prop as PackageDefKey] };
-    }
-    return undefined;
-  },
-});
+/** All package configs (one entry per CLI alias). */
+export function getAllPackages(): PackageConfig[] {
+  return Object.values(getPackages());
+}
 
 export type PackageKey = PackageDefKey;
 

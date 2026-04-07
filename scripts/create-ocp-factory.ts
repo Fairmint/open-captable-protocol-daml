@@ -7,8 +7,8 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import type { ProviderType } from '@fairmint/canton-node-sdk';
-import { buildTemplateId, requireNetwork } from './packages';
+import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
+import { LEDGER_SCRIPT_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
 
 /** True when the participant does not have the DAR vetted (e.g. upload only reached the other provider). */
@@ -29,8 +29,7 @@ function loadExistingData(filePath: string): ContractIdData {
   try {
     if (fs.existsSync(filePath)) {
       const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
-      const mainnet = data.mainnet;
-      const devnet = data.devnet;
+      const { mainnet, devnet } = data;
       return {
         ...(isNetworkEntry(mainnet) ? { mainnet } : {}),
         ...(isNetworkEntry(devnet) ? { devnet } : {}),
@@ -50,8 +49,29 @@ function isNetworkEntry(value: unknown): value is { ocpFactoryContractId: string
   return typeof o.ocpFactoryContractId === 'string' && typeof o.templateId === 'string';
 }
 
+interface CreatedTreeEventNode {
+  CreatedTreeEvent: { value: { contractId: string; templateId: string } };
+}
+
+function isCreatedTreeEventNode(event: unknown): event is CreatedTreeEventNode {
+  if (event === null || typeof event !== 'object' || !('CreatedTreeEvent' in event)) {
+    return false;
+  }
+  const wrapped = (event as { CreatedTreeEvent: unknown }).CreatedTreeEvent;
+  if (wrapped === null || typeof wrapped !== 'object' || !('value' in wrapped)) {
+    return false;
+  }
+  const val = (wrapped as { value: unknown }).value;
+  if (val === null || typeof val !== 'object') {
+    return false;
+  }
+  const v = val as Record<string, unknown>;
+  return typeof v.contractId === 'string' && typeof v.templateId === 'string';
+}
+
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
+  const ocpPkg = requirePackageConfig('ocp');
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
@@ -59,10 +79,9 @@ async function main() {
   const templateId = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
   console.log(`  Template: ${templateId}`);
 
-  const providers: ProviderType[] = ['intellect', '5n'];
   let lastError: unknown;
 
-  for (const provider of providers) {
+  for (const provider of LEDGER_SCRIPT_PROVIDERS) {
     const client = createLedgerJsonApiClient(network, provider);
     const operatorPartyId = client.getPartyId();
     console.log(`  Provider: ${provider}`);
@@ -84,8 +103,8 @@ async function main() {
       return;
     } catch (err) {
       lastError = err;
-      if (isPackageMissingOnParticipant(err) && provider === 'intellect') {
-        console.warn(`  ⚠️  OpenCapTable-v34 not on Intellect; trying 5n…\n`);
+      if (isPackageMissingOnParticipant(err) && provider === LEDGER_SCRIPT_PROVIDERS[0]) {
+        console.warn(`  ⚠️  ${ocpPkg.name} not on ${LEDGER_SCRIPT_PROVIDERS[0]}; trying ${LEDGER_SCRIPT_PROVIDERS[1]}…\n`);
         continue;
       }
       throw err;
@@ -103,20 +122,12 @@ function finishCreate(
   outputPath: string
 ): void {
   const { eventsById } = response.transactionTree;
-  if (Object.keys(eventsById).length === 0) {
-    throw new Error('No events in response');
+  const created = Object.values(eventsById).filter(isCreatedTreeEventNode);
+  if (created.length !== 1) {
+    throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
   }
 
-  const raw = eventsById[Object.keys(eventsById)[0]];
-  if (typeof raw !== 'object' || raw === null || !('CreatedTreeEvent' in raw)) {
-    throw new Error('Expected CreatedTreeEvent');
-  }
-  const firstEvent = raw as {
-    CreatedTreeEvent: { value: { contractId: string; templateId: string } };
-  };
-
-  const { contractId } = firstEvent.CreatedTreeEvent.value;
-  const resultTemplateId = firstEvent.CreatedTreeEvent.value.templateId;
+  const { contractId, templateId: resultTemplateId } = created[0].CreatedTreeEvent.value;
 
   const data = loadExistingData(outputPath);
   data[network] = { ocpFactoryContractId: contractId, templateId: resultTemplateId };

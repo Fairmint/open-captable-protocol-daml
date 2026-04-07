@@ -13,13 +13,13 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
 import { computeSha256, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
-import { PACKAGES, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
+import { getAllPackages, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
 
 function printUsage(errorMessage?: string): never {
   if (errorMessage) console.error(`❌ ${errorMessage}\n`);
   console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]');
   console.error('\nPackages:');
-  for (const [, pkg] of Object.entries(PACKAGES)) {
+  for (const pkg of getAllPackages()) {
     console.error(`  ${pkg.name}`);
   }
   process.exit(1);

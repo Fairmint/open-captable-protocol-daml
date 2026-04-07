@@ -14,6 +14,7 @@
 import { execSync } from 'child_process';
 import { getFreshDarPath, isDarBackedUp, recordNetworkUpload, requireBackedUpDar } from './dar-utils';
 import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
+import { LEDGER_SCRIPT_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
 
 /** Ensure the DAR is backed up before upload. If not backed up, automatically run the backup process. */
@@ -65,10 +66,9 @@ async function main() {
 
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
   // does not block the other.
-  const providers = ['intellect', '5n'] as const;
-  const failures: { provider: string; message: string }[] = [];
+  const failures: Array<{ provider: string; message: string }> = [];
 
-  for (const provider of providers) {
+  for (const provider of LEDGER_SCRIPT_PROVIDERS) {
     console.log(`  → ${provider}...`);
     try {
       const client = createLedgerJsonApiClient(network, provider);
@@ -81,7 +81,7 @@ async function main() {
     }
   }
 
-  if (failures.length === providers.length) {
+  if (failures.length === LEDGER_SCRIPT_PROVIDERS.length) {
     console.error(`\n❌ Upload failed on all providers:\n`);
     for (const { provider, message } of failures) {
       console.error(`   ${provider}: ${message}\n`);
@@ -90,7 +90,9 @@ async function main() {
   }
 
   if (failures.length > 0) {
-    console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.\n`);
+    console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.`);
+    console.warn(`   Not updating dars.lock — upload must succeed on all providers first.\n`);
+    process.exit(1);
   }
 
   recordNetworkUpload(pkg.name, pkg.version, pkg.darName, network);
