@@ -155,7 +155,7 @@ export function requireNetwork(scriptName: string): ContractNetwork {
   const network = parseNetworkArg();
   if (!network) {
     console.error(`❌ Missing --network argument`);
-    console.error(`Usage: tsx scripts/${scriptName} --network <devnet|mainnet|staging>`);
+    console.error(`Usage: tsx scripts/${scriptName} --network <devnet|mainnet>`);
     process.exit(1);
   }
   return network;
@@ -194,7 +194,7 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
     console.error(`  ${key.padEnd(15)} → ${pkg.name} v${pkg.version}`);
   }
   console.error('');
-  console.error('Networks: devnet, mainnet, staging');
+  console.error('Networks: devnet, mainnet');
 }
 
 // =============================================================================
