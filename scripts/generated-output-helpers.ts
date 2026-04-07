@@ -152,7 +152,9 @@ export function applyGeneratedImportRewrites(
         );
 
         if (updated !== next && rule.logLabel) {
-          console.log(`  Updating ${path.relative(rootDir, context.filePath)} with ${rule.logLabel} path: ${relativePath}`);
+          console.log(
+            `  Updating ${path.relative(rootDir, context.filePath)} with ${rule.logLabel} path: ${relativePath}`
+          );
         }
 
         next = updated;

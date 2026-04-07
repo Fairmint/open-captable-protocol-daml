@@ -99,7 +99,9 @@ export function prepareMergedNftNamespace(nftDir: string, libDir: string): numbe
 }
 
 export function patchNftReferenceGeneratedTree(referenceSubtreeRoot: string): number {
-  return rewriteGeneratedOutputFiles(referenceSubtreeRoot, (source) => rewriteNftReferencePackageRootIndexImports(source));
+  return rewriteGeneratedOutputFiles(referenceSubtreeRoot, (source) =>
+    rewriteNftReferencePackageRootIndexImports(source)
+  );
 }
 
 export function patchNftReferenceGeneratedNftDir(nftDir: string): number {

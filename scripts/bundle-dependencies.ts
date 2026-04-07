@@ -863,7 +863,10 @@ function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportR
 
 function replaceDependencyReferences(targetDir: string): void {
   console.log('🔄 Replacing dependency references in generated files...');
-  const replacedCount = applyGeneratedImportRewrites(path.join(targetDir, 'lib'), getDependencyReferenceRewriteRules(targetDir));
+  const replacedCount = applyGeneratedImportRewrites(
+    path.join(targetDir, 'lib'),
+    getDependencyReferenceRewriteRules(targetDir)
+  );
 
   console.log(`✅ Replaced dependency references in ${replacedCount} files`);
 }
