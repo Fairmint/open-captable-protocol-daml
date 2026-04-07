@@ -62,9 +62,9 @@ function ensureFile(filePath: string, content: string) {
 }
 
 /**
- * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which
- * creates a circular dependency (root index loads Nft → Reference → NftAsset before index finishes).
- * Re-point those imports at a tiny bridge that only loads Nft/Api.
+ * NftReference codegen imports the merged iface package as `require('../../../../index.js')`, which creates a circular
+ * dependency (root index loads Nft → Reference → NftAsset before index finishes). Re-point those imports at a tiny
+ * bridge that only loads Nft/Api.
  */
 function writeNftApiPackageNamespaceBridge(destLib: string) {
   ensureFile(
@@ -101,7 +101,7 @@ function patchNftReferenceCrossPackageImports(destLib: string) {
       if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
         continue;
       }
-      let text = fs.readFileSync(full, 'utf8');
+      const text = fs.readFileSync(full, 'utf8');
       const next = text
         .split("require('../../../../index.js')")
         .join("require('../../../../nft-api-v01-package-namespace.js')")
