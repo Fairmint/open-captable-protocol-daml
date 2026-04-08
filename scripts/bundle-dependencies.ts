@@ -12,23 +12,14 @@ import {
   hasNftApiPackageNamespaceBridgeUnderLib,
   patchNftReferenceGeneratedTree,
 } from './nft-reference-bridge-rewrite';
-import { requirePackageConfig } from './packages';
+import { getGeneratedPackages, requirePackageConfig } from './packages';
 import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
-const reportsPkg = requirePackageConfig('reports');
 const nftApiPkg = requirePackageConfig('nftApi');
-const nftReferencePkg = requirePackageConfig('nftReference');
-const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
-// Paths
-const PACKAGE_DIRS = [
-  path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`),
-  path.join(__dirname, '../generated/js', `${reportsPkg.name}-${reportsPkg.version}`),
-  path.join(__dirname, '../generated/js', `${nftApiPkg.name}-${nftApiPkg.version}`),
-  path.join(__dirname, '../generated/js', `${nftReferencePkg.name}-${nftReferencePkg.version}`),
-  path.join(__dirname, '../generated/js', `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`),
-];
+// Paths — keep in sync with packages that have generated.createIndex (see getGeneratedPackages).
+const PACKAGE_DIRS = getGeneratedPackages().map(({ dir }) => dir);
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
@@ -878,6 +869,7 @@ function removeLocalDependency(targetDir: string): void {
     DA_INTERNAL_TEMPLATE_IMPORT,
     OCP_DAML_JS_IMPORT,
     NFT_API_PACKAGE_IMPORT,
+    NFT_API_DAML_JS_IMPORT,
     SPLICE_FEATURED_APP_IMPORT,
     SPLICE_AMULET_IMPORT,
     DA_TIME_TYPES_IMPORT,
