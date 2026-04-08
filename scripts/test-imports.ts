@@ -32,10 +32,7 @@ try {
   if (ocpTemplates.capTable !== openCapTableNamespace.CapTable.CapTable.templateId) {
     throw new Error('OCP_TEMPLATES.capTable does not match generated CapTable templateId');
   }
-  if (
-    ocpTemplates.issuerAuthorization !==
-    openCapTableNamespace.IssuerAuthorization.IssuerAuthorization.templateId
-  ) {
+  if (ocpTemplates.issuerAuthorization !== openCapTableNamespace.IssuerAuthorization.IssuerAuthorization.templateId) {
     throw new Error('OCP_TEMPLATES.issuerAuthorization does not match generated IssuerAuthorization templateId');
   }
   if (ocpTemplates.ocpFactory !== openCapTableNamespace.OcpFactory.OcpFactory.templateId) {
