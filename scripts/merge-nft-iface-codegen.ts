@@ -5,6 +5,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { prepareMergedNftNamespace } from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 function copyDir(src: string, dest: string): void {
@@ -43,20 +44,9 @@ if (!fs.existsSync(referenceNftDir)) {
 }
 
 copyDir(path.join(apiNftDir, 'Api'), path.join(referenceNftDir, 'Api'));
-
-const mergedIndexJs = `"use strict";
-Object.defineProperty(exports, "__esModule", { value: true });
-var Api = require('./Api');
-exports.Api = Api;
-var Reference = require('./Reference');
-exports.Reference = Reference;
-`;
-
-const mergedIndexDts = `export * as Api from './Api';
-export * as Reference from './Reference';
-`;
-
-fs.writeFileSync(path.join(referenceNftDir, 'index.js'), mergedIndexJs);
-fs.writeFileSync(path.join(referenceNftDir, 'index.d.ts'), mergedIndexDts);
+const patched = prepareMergedNftNamespace(referenceNftDir, path.join(referenceNftDir, '..'));
+if (patched > 0) {
+  console.log(`✅ Patched ${patched} Nft/Reference files to use nft-api-v01 bridge import`);
+}
 
 console.log('✅ Merged NftApi-v01 bindings into NftReference-v01 generated lib');

@@ -21,6 +21,21 @@ export interface PackageConfig {
   version: string;
   /** Source directory relative to repo root */
   sourceDir: string;
+  /** Generated JS package metadata, if this package produces a generated package. */
+  generated?: GeneratedPackageMetadata;
+}
+
+export interface GeneratedPackageMetadata {
+  /** Whether scripts should create standalone package index files for this generated package. */
+  createIndex: boolean;
+  /**
+   * Published npm package suffix for generated packages.
+   *
+   * - `null` means publish as the root package name
+   * - `string` means append `-${suffix}` to the root package name
+   * - `undefined` means this generated package is not published standalone
+   */
+  publishNameSuffix?: string | null;
 }
 
 const ROOT_DIR = path.join(__dirname, '..');
@@ -36,17 +51,43 @@ function readVersionFromDamlYaml(sourceDir: string): string {
   return parsed.version;
 }
 
+interface PackageDef {
+  name: string;
+  sourceDir: string;
+  generated?: GeneratedPackageMetadata;
+}
+
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
   shared: { name: 'Shared', sourceDir: 'Shared' },
-  ocp: { name: 'OpenCapTable-v34', sourceDir: 'OpenCapTable-v34' },
-  reports: { name: 'OpenCapTableReports-v01', sourceDir: 'OpenCapTableReports-v01' },
-  nftApi: { name: 'NftApi-v01', sourceDir: 'NftApi-v01' },
-  nftReference: { name: 'NftReference-v01', sourceDir: 'NftReference-v01' },
+  ocp: {
+    name: 'OpenCapTable-v34',
+    sourceDir: 'OpenCapTable-v34',
+    generated: { createIndex: true, publishNameSuffix: null },
+  },
+  reports: {
+    name: 'OpenCapTableReports-v01',
+    sourceDir: 'OpenCapTableReports-v01',
+    generated: { createIndex: true, publishNameSuffix: 'reports' },
+  },
+  nftApi: {
+    name: 'NftApi-v01',
+    sourceDir: 'NftApi-v01',
+    generated: { createIndex: true, publishNameSuffix: 'nft-api' },
+  },
+  nftReference: {
+    name: 'NftReference-v01',
+    sourceDir: 'NftReference-v01',
+    generated: { createIndex: true, publishNameSuffix: 'nft' },
+  },
   proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
-  paymentStreams: { name: 'CantonPayments', sourceDir: 'CantonPayments' },
+  paymentStreams: {
+    name: 'CantonPayments',
+    sourceDir: 'CantonPayments',
+    generated: { createIndex: true },
+  },
   couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
-} as const;
+} as const satisfies Record<string, PackageDef>;
 
 type PackageDefKey = keyof typeof PACKAGE_DEFS;
 const LEGACY_PACKAGE_ALIASES = {
@@ -56,12 +97,13 @@ const LEGACY_PACKAGE_ALIASES = {
 type PackageAliasKey = keyof typeof LEGACY_PACKAGE_ALIASES;
 
 /** Build full package config by reading version from daml.yaml. */
-function buildPackageConfig(def: { name: string; sourceDir: string }): PackageConfig {
+function buildPackageConfig(def: PackageDef): PackageConfig {
   return {
     name: def.name,
     darName: def.name,
     version: readVersionFromDamlYaml(def.sourceDir),
     sourceDir: def.sourceDir,
+    generated: def.generated ? { ...def.generated } : undefined,
   };
 }
 
@@ -132,6 +174,59 @@ export function getPackageKeys(): PackageKey[] {
     ...(Object.keys(PACKAGE_DEFS) as PackageDefKey[]),
     ...(Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]),
   ];
+}
+
+export interface GeneratedPackageConfig {
+  key: PackageDefKey;
+  package: PackageConfig;
+  dir: string;
+  publishedPackageName?: string;
+}
+
+export interface PublishableGeneratedPackageConfig extends GeneratedPackageConfig {
+  publishedPackageName: string;
+}
+
+function buildPublishedPackageName(rootPackageName: string, suffix?: string | null): string | undefined {
+  if (suffix === undefined) {
+    return undefined;
+  }
+  return suffix === null ? rootPackageName : `${rootPackageName}-${suffix}`;
+}
+
+/** Resolve the generated JS output directory for a package. */
+export function getGeneratedPackageDir(packageKey: string): string {
+  const pkg = requirePackageConfig(packageKey);
+  return path.join(ROOT_DIR, 'generated', 'js', `${pkg.name}-${pkg.version}`);
+}
+
+/** Generated packages that should receive standalone index files. */
+export function getGeneratedPackages(rootPackageName?: string): GeneratedPackageConfig[] {
+  const packages = getPackages();
+
+  return (Object.keys(PACKAGE_DEFS) as PackageDefKey[])
+    .map((key): GeneratedPackageConfig | null => {
+      const pkg = packages[key];
+      if (!pkg.generated?.createIndex) {
+        return null;
+      }
+      return {
+        key,
+        package: pkg,
+        dir: getGeneratedPackageDir(key),
+        publishedPackageName: rootPackageName
+          ? buildPublishedPackageName(rootPackageName, pkg.generated.publishNameSuffix)
+          : undefined,
+      };
+    })
+    .filter((pkg): pkg is GeneratedPackageConfig => pkg !== null);
+}
+
+/** Generated packages that are published as standalone npm packages. */
+export function getPublishableGeneratedPackages(rootPackageName: string): PublishableGeneratedPackageConfig[] {
+  return getGeneratedPackages(rootPackageName).filter(
+    (pkg): pkg is PublishableGeneratedPackageConfig => pkg.publishedPackageName !== undefined
+  );
 }
 
 // =============================================================================

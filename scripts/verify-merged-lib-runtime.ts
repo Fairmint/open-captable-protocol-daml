@@ -7,6 +7,10 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
+import {
+  findNftReferenceFilesRequiringPackageRootIndex,
+  NFT_API_PACKAGE_NAMESPACE_BRIDGE_REQUIRED_RELATIVE_FILES,
+} from './nft-reference-bridge-rewrite';
 import { getErrorMessage } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
@@ -14,8 +18,7 @@ const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
 /** Paths that merged lib must include for Splice/Amulet + Nft bridge (regression: npm 0.2.146). */
 const REQUIRED_RELATIVE_FILES = [
-  'nft-api-v01-package-namespace.js',
-  'nft-api-v01-package-namespace.d.ts',
+  ...NFT_API_PACKAGE_NAMESPACE_BRIDGE_REQUIRED_RELATIVE_FILES,
   'Splice/Api/Token/MetadataV1/module.js',
   'Splice/Api/Token/HoldingV1/module.js',
   'DA/Set/Types/module.js',
@@ -32,40 +35,13 @@ function assertRequiredFiles(): void {
 
 function assertNftReferenceDoesNotRequireRootIndex(): void {
   const refRoot = path.join(LIB_DIR, 'Nft', 'Reference');
-  if (!fs.existsSync(refRoot)) {
-    return;
+  const filesRequiringRootIndex = findNftReferenceFilesRequiringPackageRootIndex(refRoot);
+  const firstBadFile = filesRequiringRootIndex[0];
+  if (firstBadFile) {
+    throw new Error(
+      `Circular import risk: ${path.relative(LIB_DIR, firstBadFile)} still references root index.js; use nft-api-v01-package-namespace bridge`
+    );
   }
-
-  const badRequireSingle = "require('../../../../index.js')";
-  const badRequireDouble = 'require("../../../../index.js")';
-  const badFromSingle = "from '../../../../index.js'";
-  const badFromDouble = 'from "../../../../index.js"';
-
-  const walk = (dir: string): void => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) {
-        walk(full);
-        continue;
-      }
-      if (!entry.name.endsWith('.js') && !entry.name.endsWith('.d.ts')) {
-        continue;
-      }
-      const text = fs.readFileSync(full, 'utf8');
-      if (
-        text.includes(badRequireSingle) ||
-        text.includes(badRequireDouble) ||
-        text.includes(badFromSingle) ||
-        text.includes(badFromDouble)
-      ) {
-        throw new Error(
-          `Circular import risk: ${path.relative(LIB_DIR, full)} still references root index.js; use nft-api-v01-package-namespace bridge`
-        );
-      }
-    }
-  };
-
-  walk(refRoot);
 }
 
 function assertNodeLoadsLibIndex(): void {

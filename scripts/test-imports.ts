@@ -1,18 +1,13 @@
 import fs from 'fs';
 import path from 'path';
-import { requirePackageConfig } from './packages';
-import { getErrorMessage } from './types';
+import { getGeneratedPackageDir } from './packages';
+import { getErrorMessage, type PackageJson } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
-const nftApiPkg = requirePackageConfig('nftApi');
-const nftReferencePkg = requirePackageConfig('nftReference');
-const standaloneNftApiDir = path.join(ROOT_DIR, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`);
-const standaloneNftReferenceDir = path.join(
-  ROOT_DIR,
-  'generated',
-  'js',
-  `${nftReferencePkg.name}-${nftReferencePkg.version}`
-);
+const rootPackagePath = path.join(ROOT_DIR, 'package.json');
+const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
+const standaloneNftApiDir = getGeneratedPackageDir('nftApi');
+const standaloneNftReferenceDir = getGeneratedPackageDir('nftReference');
 
 try {
   const rootPkg = require(ROOT_DIR);
@@ -26,9 +21,9 @@ try {
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
 
   // Verify JSON import via package subpath exports
-  const ocp = require('@fairmint/open-captable-protocol-daml-js/ocp-factory-contract-id.json');
+  const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
   if (!ocp?.mainnet?.ocpFactoryContractId) throw new Error('OCP Factory JSON missing expected fields');
-  const reports = require('@fairmint/open-captable-protocol-daml-js/reports-factory-contract-id.json');
+  const reports = require(`${rootPackage.name}/reports-factory-contract-id.json`);
   if (!reports?.mainnet?.reportsFactoryContractId) throw new Error('Reports Factory JSON missing expected fields');
 
   if (!fs.existsSync(standaloneNftApiDir)) {
