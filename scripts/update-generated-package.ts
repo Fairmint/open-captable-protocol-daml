@@ -46,11 +46,8 @@ for (const { dir, publishedPackageName } of packages) {
   // Write back the generated package.json
   fs.writeFileSync(packageJsonPath, `${JSON.stringify(generatedPackage, null, 4)}\n`);
 
-  // Create index files in generated dir
-  const generatedDir = dir;
-
-  writeGeneratedPackageIndex(generatedDir);
+  writeGeneratedPackageIndex(dir);
 
   console.log(`Updated generated package.json: name=${generatedPackage.name}, version=${generatedPackage.version}`);
-  console.log(`Created package index files (index.js and index.d.ts) in ${generatedDir}`);
+  console.log(`Created package index files (index.js and index.d.ts) in ${dir}`);
 }
