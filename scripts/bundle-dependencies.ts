@@ -19,7 +19,7 @@ const ocpPkg = requirePackageConfig('ocp');
 const nftApiPkg = requirePackageConfig('nftApi');
 
 // Paths — keep in sync with packages that have generated.createIndex (see getGeneratedPackages).
-const PACKAGE_DIRS = getGeneratedPackages().map(({ dir }) => dir);
+const PACKAGE_DIRS = getGeneratedPackages().map(({ dir }) => dir)
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
 const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');

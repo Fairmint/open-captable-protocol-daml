@@ -11,14 +11,33 @@ const standaloneNftReferenceDir = getGeneratedPackageDir('nftReference');
 
 try {
   const rootPkg = require(ROOT_DIR);
-  const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
   const hasReports = Boolean(rootPkg?.Fairmint?.OpenCapTableReports);
   const hasNftApi = Boolean(rootPkg?.Nft?.Api?.V1);
   const hasNftReference = Boolean(rootPkg?.Nft?.Reference?.V1);
-  if (!hasOcp) console.warn('Warning: OpenCapTable namespace not detected');
+  const ocpTemplates = rootPkg?.OCP_TEMPLATES;
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
   if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
+  if (!ocpTemplates?.capTable) throw new Error('Root export missing OCP_TEMPLATES.capTable');
+  if (!ocpTemplates?.issuerAuthorization) {
+    throw new Error('Root export missing OCP_TEMPLATES.issuerAuthorization');
+  }
+  if (!ocpTemplates?.ocpFactory) throw new Error('Root export missing OCP_TEMPLATES.ocpFactory');
+  const fairmintNamespace = rootPkg?.Fairmint;
+  if (!fairmintNamespace) throw new Error('Root export missing Fairmint namespace');
+
+  const openCapTableNamespace = fairmintNamespace?.OpenCapTable;
+  if (!openCapTableNamespace) throw new Error('Root export missing Fairmint.OpenCapTable namespace');
+
+  if (ocpTemplates.capTable !== openCapTableNamespace.CapTable.CapTable.templateId) {
+    throw new Error('OCP_TEMPLATES.capTable does not match generated CapTable templateId');
+  }
+  if (ocpTemplates.issuerAuthorization !== openCapTableNamespace.IssuerAuthorization.IssuerAuthorization.templateId) {
+    throw new Error('OCP_TEMPLATES.issuerAuthorization does not match generated IssuerAuthorization templateId');
+  }
+  if (ocpTemplates.ocpFactory !== openCapTableNamespace.OcpFactory.OcpFactory.templateId) {
+    throw new Error('OCP_TEMPLATES.ocpFactory does not match generated OcpFactory templateId');
+  }
 
   // Verify JSON import via package subpath exports
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
@@ -64,7 +83,7 @@ try {
   }
 
   console.log(
-    'OK: Root package exports Nft.Api.V1 and Nft.Reference.V1, JSON subpaths are accessible, and standalone NFT packages remain correctly isolated'
+    'OK: Root package exports OCP_TEMPLATES alongside Nft.Api.V1 and Nft.Reference.V1, JSON subpaths are accessible, and standalone NFT packages remain correctly isolated'
   );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));
