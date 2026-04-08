@@ -11,12 +11,10 @@ const standaloneNftReferenceDir = getGeneratedPackageDir('nftReference');
 
 try {
   const rootPkg = require(ROOT_DIR);
-  const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
   const hasReports = Boolean(rootPkg?.Fairmint?.OpenCapTableReports);
   const hasNftApi = Boolean(rootPkg?.Nft?.Api?.V1);
   const hasNftReference = Boolean(rootPkg?.Nft?.Reference?.V1);
   const ocpTemplates = rootPkg?.OCP_TEMPLATES;
-  if (!hasOcp) console.warn('Warning: OpenCapTable namespace not detected');
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
   if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
@@ -25,16 +23,22 @@ try {
     throw new Error('Root export missing OCP_TEMPLATES.issuerAuthorization');
   }
   if (!ocpTemplates?.ocpFactory) throw new Error('Root export missing OCP_TEMPLATES.ocpFactory');
-  if (ocpTemplates.capTable !== rootPkg.Fairmint.OpenCapTable.CapTable.CapTable.templateId) {
+  const fairmintNamespace = rootPkg?.Fairmint;
+  if (!fairmintNamespace) throw new Error('Root export missing Fairmint namespace');
+
+  const openCapTableNamespace = fairmintNamespace?.OpenCapTable;
+  if (!openCapTableNamespace) throw new Error('Root export missing Fairmint.OpenCapTable namespace');
+
+  if (ocpTemplates.capTable !== openCapTableNamespace.CapTable.CapTable.templateId) {
     throw new Error('OCP_TEMPLATES.capTable does not match generated CapTable templateId');
   }
   if (
     ocpTemplates.issuerAuthorization !==
-    rootPkg.Fairmint.OpenCapTable.IssuerAuthorization.IssuerAuthorization.templateId
+    openCapTableNamespace.IssuerAuthorization.IssuerAuthorization.templateId
   ) {
     throw new Error('OCP_TEMPLATES.issuerAuthorization does not match generated IssuerAuthorization templateId');
   }
-  if (ocpTemplates.ocpFactory !== rootPkg.Fairmint.OpenCapTable.OcpFactory.OcpFactory.templateId) {
+  if (ocpTemplates.ocpFactory !== openCapTableNamespace.OcpFactory.OcpFactory.templateId) {
     throw new Error('OCP_TEMPLATES.ocpFactory does not match generated OcpFactory templateId');
   }
 
