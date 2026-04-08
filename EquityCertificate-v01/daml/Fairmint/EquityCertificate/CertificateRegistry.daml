@@ -1,0 +1,147 @@
+-- Issuer-scoped registry: rolling @EquityCertificateIssuer@ with @minted_positions@ map; mint/burn/revoke archive the prior issuer and create a successor.
+module Fairmint.EquityCertificate.CertificateRegistry where
+
+import DA.Map qualified as Map
+
+import Fairmint.EquityCertificate.Certificate (EquityCertificate (..))
+import Fairmint.EquityCertificate.Shared.Validation
+import Fairmint.EquityCertificate.Types
+
+import Nft.Api.V1.Types qualified as NftTypes
+import Nft.Reference.V1.Metadata (validateNftRegistration)
+
+data MintEquityCertificateResult = MintEquityCertificateResult with
+    issuer_cid : ContractId EquityCertificateIssuer
+    certificate_cid : ContractId EquityCertificate
+  deriving (Eq, Show)
+
+template EquityCertificateIssuer
+  with
+    registry_authority : Party
+    nft_operator : Party
+    registry : NftTypes.RegistryIdentity
+    collection : NftTypes.CollectionIdentity
+    minted_positions : Map.Map Text ()
+  where
+    signatory registry_authority, nft_operator
+
+    ensure
+      NftTypes.validateRegistryIdentity registry
+        && NftTypes.validateCollectionIdentity collection
+        && collection.registry_id == registry.registry_id
+        && all
+          (\(k, ()) -> NftTypes.validateRequiredText k)
+          (Map.toList minted_positions)
+
+    choice MintEquityCertificate : MintEquityCertificateResult
+      with
+        holder : Party
+        position_identity : PositionIdentity
+        registration : NftTypes.NftRegistration
+      controller registry_authority, nft_operator
+      do
+        assertMsg "NFT registration must be valid" $
+          validateNftRegistration registration
+        assertMsg "position identity must be valid" $
+          validatePositionIdentity position_identity
+        assertMsg "NFT must belong to this issuer collection" $
+          registration.nft_id.collection == collection
+        assertMsg "NFT token_id must match canonical position key" $
+          validateRegistrationTokenMatchesPosition registration.nft_id.token_id position_identity
+
+        let position_key = positionIdentityKey position_identity
+
+        assertMsg "position already has a live certificate" $
+          case Map.lookup position_key minted_positions of
+            None -> True
+            Some _ -> False
+
+        let ra = registry_authority
+        let op = nft_operator
+        let reg = registry
+        let coll = collection
+
+        certificate_cid <- create EquityCertificate with
+          registry_authority = ra
+          nft_operator = op
+          holder
+          position_identity
+          position_key
+          registration
+
+        issuer_cid <- create EquityCertificateIssuer with
+          registry_authority = ra
+          nft_operator = op
+          registry = reg
+          collection = coll
+          minted_positions = Map.insert position_key () minted_positions
+
+        pure MintEquityCertificateResult with issuer_cid, certificate_cid
+
+    -- Holder self-burn (mirrors Ethereum @burn@); requires operator/registry cosignature like other archive paths.
+    choice BurnEquityCertificate : ContractId EquityCertificateIssuer
+      with
+        certificate_cid : ContractId EquityCertificate
+        holder : Party
+      controller registry_authority, nft_operator, holder
+      do
+        cert <- fetch certificate_cid
+        assertMsg "wrong certificate issuer parties" $
+          cert.registry_authority == registry_authority && cert.nft_operator == nft_operator
+        assertMsg "holder mismatch" $ cert.holder == holder
+        assertMsg "certificate collection mismatch" $
+          cert.registration.nft_id.collection == collection
+        assertMsg "unknown position for this issuer" $
+          case Map.lookup cert.position_key minted_positions of
+            None -> False
+            Some _ -> True
+
+        let ra = registry_authority
+        let op = nft_operator
+        let reg = registry
+        let coll = collection
+        let mp = Map.delete cert.position_key minted_positions
+
+        new_issuer <- create EquityCertificateIssuer with
+          registry_authority = ra
+          nft_operator = op
+          registry = reg
+          collection = coll
+          minted_positions = mp
+
+        archive certificate_cid
+
+        pure new_issuer
+
+    -- Forced revocation (mirrors Ethereum @burnFrom@).
+    choice RevokeEquityCertificate : ContractId EquityCertificateIssuer
+      with
+        certificate_cid : ContractId EquityCertificate
+      controller registry_authority, nft_operator
+      do
+        cert <- fetch certificate_cid
+        assertMsg "wrong certificate issuer parties" $
+          cert.registry_authority == registry_authority && cert.nft_operator == nft_operator
+        assertMsg "certificate collection mismatch" $
+          cert.registration.nft_id.collection == collection
+        assertMsg "unknown position for this issuer" $
+          case Map.lookup cert.position_key minted_positions of
+            None -> False
+            Some _ -> True
+
+        let ra = registry_authority
+        let op = nft_operator
+        let reg = registry
+        let coll = collection
+        let mp = Map.delete cert.position_key minted_positions
+
+        new_issuer <- create EquityCertificateIssuer with
+          registry_authority = ra
+          nft_operator = op
+          registry = reg
+          collection = coll
+          minted_positions = mp
+
+        archive certificate_cid
+
+        pure new_issuer

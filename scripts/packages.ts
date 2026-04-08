@@ -80,6 +80,14 @@ const PACKAGE_DEFS = {
     sourceDir: 'NftReference-v01',
     generated: { createIndex: true, publishNameSuffix: 'nft' },
   },
+  equityCertificateShared: {
+    name: 'EquityCertificateShared',
+    sourceDir: 'EquityCertificateShared',
+  },
+  equityCertificate: {
+    name: 'EquityCertificate',
+    sourceDir: 'EquityCertificate-v01',
+  },
   proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
   paymentStreams: {
     name: 'CantonPayments',
