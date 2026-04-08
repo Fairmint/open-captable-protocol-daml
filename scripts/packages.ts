@@ -30,7 +30,6 @@ export interface GeneratedPackageMetadata {
   createIndex: boolean;
   /**
    * Published npm package suffix for generated packages.
-   *
    * - `null` means publish as the root package name
    * - `string` means append `-${suffix}` to the root package name
    * - `undefined` means this generated package is not published standalone
@@ -79,6 +78,14 @@ const PACKAGE_DEFS = {
     name: 'NftReference-v01',
     sourceDir: 'NftReference-v01',
     generated: { createIndex: true, publishNameSuffix: 'nft' },
+  },
+  equityCertificateShared: {
+    name: 'EquityCertificateShared',
+    sourceDir: 'EquityCertificateShared',
+  },
+  equityCertificate: {
+    name: 'EquityCertificate',
+    sourceDir: 'EquityCertificate-v01',
   },
   proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
   paymentStreams: {
@@ -129,9 +136,7 @@ export type PackageKey = PackageDefKey | PackageAliasKey;
 
 function resolvePackageKey(key: string): PackageDefKey | undefined {
   const lowerKey = key.toLowerCase();
-  const packageKey = (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find(
-    (candidate) => candidate.toLowerCase() === lowerKey
-  );
+  const packageKey = (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find((candidate) => candidate.toLowerCase() === lowerKey);
   if (packageKey) {
     return packageKey;
   }
@@ -170,10 +175,7 @@ export function requirePackageConfig(packageKey: string): PackageConfig {
 
 /** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
-  return [
-    ...(Object.keys(PACKAGE_DEFS) as PackageDefKey[]),
-    ...(Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]),
-  ];
+  return [...(Object.keys(PACKAGE_DEFS) as PackageDefKey[]), ...(Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[])];
 }
 
 export interface GeneratedPackageConfig {
@@ -298,9 +300,7 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
   for (const [key, pkg] of Object.entries(packages)) {
     console.error(`  ${key.padEnd(15)} → ${pkg.name} v${pkg.version}`);
   }
-  console.error(
-    `  ${'nft'.padEnd(15)} → ${packages.nftReference.name} v${packages.nftReference.version} (legacy alias)`
-  );
+  console.error(`  ${'nft'.padEnd(15)} → ${packages.nftReference.name} v${packages.nftReference.version} (legacy alias)`);
   console.error(`  ${'nftIface'.padEnd(15)} → ${packages.nftApi.name} v${packages.nftApi.version} (legacy alias)`);
   console.error('');
   console.error('Networks: devnet, mainnet');

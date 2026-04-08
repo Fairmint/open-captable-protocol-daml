@@ -1,0 +1,176 @@
+module Fairmint.EquityCertificate.TestCertificate where
+
+import Daml.Script
+
+import Fairmint.EquityCertificate.CertificateRegistry qualified as Reg
+import Fairmint.EquityCertificate.TestHelpers
+import Fairmint.EquityCertificate.Types
+import Nft.Api.V1.Nft qualified as Nft
+import Nft.Api.V1.Types
+
+testMintAndNftView = script do
+  parties <- allocateCertificateParties "MintView"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let registration = registrationForPosition samplePosition
+  Reg.MintEquityCertificateResult{issuer_cid = issuer_after_mint, certificate_cid} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd issuer_cid Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  let nft_cid = toInterfaceContractId @Nft.Nft certificate_cid
+  Some view <- queryInterfaceContractId @Nft.Nft parties.holder nft_cid
+  assertMsg "holder in view" (view.holder == parties.holder)
+  assertMsg "operator in view" (view.operator == parties.operator)
+  assertMsg "active lifecycle" (view.state == NftLifecycleState_Active)
+  assertMsg "no transfer offer" (view.transfer_offer == None)
+  assertMsg "token id is position key" (view.nft_id.token_id == positionIdentityKey samplePosition)
+
+  Some _ <- queryContractId parties.registry_authority issuer_after_mint
+  pure ()
+
+testDuplicatePositionRejected = script do
+  parties <- allocateCertificateParties "Dup"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let registration = registrationForPosition samplePosition
+  Reg.MintEquityCertificateResult{issuer_cid = issuer1, certificate_cid = first_cid} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd issuer_cid Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
+    exerciseCmd issuer1 Reg.MintEquityCertificate with
+      holder = parties.holder
+      position_identity = samplePosition
+      registration
+
+  Some _ <- queryContractId parties.registry_authority first_cid
+  pure ()
+
+testRemintAfterBurn = script do
+  parties <- allocateCertificateParties "Remint"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let registration = registrationForPosition samplePosition
+  Reg.MintEquityCertificateResult{issuer_cid = i1, certificate_cid = cid1} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd issuer_cid Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  i2 <-
+    submit (actAs [parties.registry_authority, parties.operator, parties.holder]) do
+      exerciseCmd i1 Reg.BurnEquityCertificate with
+        certificate_cid = cid1
+        holder = parties.holder
+
+  Reg.MintEquityCertificateResult{certificate_cid = cid2} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd i2 Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  assertMsg "new contract id after remint" (cid1 /= cid2)
+  pure ()
+
+testRevokeEquityCertificate = script do
+  parties <- allocateCertificateParties "Revoke"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let registration = registrationForPosition samplePosition
+  Reg.MintEquityCertificateResult{issuer_cid = i1, certificate_cid} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd issuer_cid Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  _ <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd i1 Reg.RevokeEquityCertificate with certificate_cid
+
+  None <- queryContractId parties.registry_authority certificate_cid
+  pure ()
+
+testRevokeRejectsUnauthorized = script do
+  parties <- allocateCertificateParties "RevokeAuth"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let registration = registrationForPosition samplePosition
+  Reg.MintEquityCertificateResult{issuer_cid = i1, certificate_cid} <-
+    submit (actAs [parties.registry_authority, parties.operator]) do
+      exerciseCmd issuer_cid Reg.MintEquityCertificate with
+        holder = parties.holder
+        position_identity = samplePosition
+        registration
+
+  submitMustFail (actAs [parties.other]) do
+    exerciseCmd i1 Reg.RevokeEquityCertificate with certificate_cid
+
+  pure ()
+
+testMintRejectsTokenIdMismatch = script do
+  parties <- allocateCertificateParties "TokenMismatch"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let bad_registration =
+        (registrationForPosition samplePosition) with
+          nft_id =
+            NftId with
+              collection = defaultCollection
+              token_id = "wrong-token-id"
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
+    exerciseCmd issuer_cid Reg.MintEquityCertificate with
+      holder = parties.holder
+      position_identity = samplePosition
+      registration = bad_registration
+
+  pure ()
+
+testMintRejectsWrongCollection = script do
+  parties <- allocateCertificateParties "WrongColl"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let otherCollection = CollectionIdentity with
+        registry_id = defaultRegistry.registry_id
+        collection_id = "OTHER"
+  let registration =
+        (registrationForPosition samplePosition) with
+          nft_id =
+            NftId with
+              collection = otherCollection
+              token_id = positionIdentityKey samplePosition
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
+    exerciseCmd issuer_cid Reg.MintEquityCertificate with
+      holder = parties.holder
+      position_identity = samplePosition
+      registration
+
+  pure ()
+
+testMintRejectsColonInPositionIdentity = script do
+  parties <- allocateCertificateParties "Colon"
+  issuer_cid <- createIssuerWithEmptyMap parties
+
+  let ambiguousPosition =
+        PositionIdentity with
+          stakeholder_id = "a:b"
+          security_id = "c"
+  let ambiguousRegistration = registrationForPosition ambiguousPosition
+
+  submitMustFail (actAs [parties.registry_authority, parties.operator]) do
+    exerciseCmd issuer_cid Reg.MintEquityCertificate with
+      holder = parties.holder
+      position_identity = ambiguousPosition
+      registration = ambiguousRegistration
+
+  pure ()
