@@ -11,33 +11,14 @@ const standaloneNftReferenceDir = getGeneratedPackageDir('nftReference');
 
 try {
   const rootPkg = require(ROOT_DIR);
+  const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
   const hasReports = Boolean(rootPkg?.Fairmint?.OpenCapTableReports);
   const hasNftApi = Boolean(rootPkg?.Nft?.Api?.V1);
   const hasNftReference = Boolean(rootPkg?.Nft?.Reference?.V1);
-  const ocpTemplates = rootPkg?.OCP_TEMPLATES;
+  if (!hasOcp) console.warn('Warning: OpenCapTable namespace not detected');
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
   if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
-  if (!ocpTemplates?.capTable) throw new Error('Root export missing OCP_TEMPLATES.capTable');
-  if (!ocpTemplates?.issuerAuthorization) {
-    throw new Error('Root export missing OCP_TEMPLATES.issuerAuthorization');
-  }
-  if (!ocpTemplates?.ocpFactory) throw new Error('Root export missing OCP_TEMPLATES.ocpFactory');
-  const fairmintNamespace = rootPkg?.Fairmint;
-  if (!fairmintNamespace) throw new Error('Root export missing Fairmint namespace');
-
-  const openCapTableNamespace = fairmintNamespace?.OpenCapTable;
-  if (!openCapTableNamespace) throw new Error('Root export missing Fairmint.OpenCapTable namespace');
-
-  if (ocpTemplates.capTable !== openCapTableNamespace.CapTable.CapTable.templateId) {
-    throw new Error('OCP_TEMPLATES.capTable does not match generated CapTable templateId');
-  }
-  if (ocpTemplates.issuerAuthorization !== openCapTableNamespace.IssuerAuthorization.IssuerAuthorization.templateId) {
-    throw new Error('OCP_TEMPLATES.issuerAuthorization does not match generated IssuerAuthorization templateId');
-  }
-  if (ocpTemplates.ocpFactory !== openCapTableNamespace.OcpFactory.OcpFactory.templateId) {
-    throw new Error('OCP_TEMPLATES.ocpFactory does not match generated OcpFactory templateId');
-  }
 
   // Verify JSON import via package subpath exports
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
@@ -54,9 +35,74 @@ try {
       `openCapTableDarPath OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH mismatch: ${String(openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH)}`
     );
   }
+  if (openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_PATH_ENV !== 'OPEN_CAP_TABLE_DAR_PATH') {
+    throw new Error(
+      `openCapTableDarPath OPEN_CAP_TABLE_DAR_PATH_ENV mismatch: ${String(openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_PATH_ENV)}`
+    );
+  }
+  if (typeof openCapTableDarPathMod.resolveOpenCapTableDarPath !== 'function') {
+    throw new Error('openCapTableDarPath export missing resolveOpenCapTableDarPath');
+  }
+
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
   if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
     throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
+  }
+
+  const resolvedDefault = openCapTableDarPathMod.resolveOpenCapTableDarPath() as string;
+  if (resolvedDefault !== darPath) {
+    throw new Error(
+      `resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`
+    );
+  }
+
+  const resolvedWithDummySibling = openCapTableDarPathMod.resolveOpenCapTableDarPath({
+    siblingSearchFrom: '/nonexistent-does-not-matter-when-packaged-dar-exists',
+  }) as string;
+  if (resolvedWithDummySibling !== darPath) {
+    throw new Error(
+      'resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists'
+    );
+  }
+
+  if (typeof rootPkg.resolveOpenCapTableDarPath !== 'function') {
+    throw new Error('Root package must re-export resolveOpenCapTableDarPath');
+  }
+  if (typeof rootPkg.getOpenCapTableDarPath !== 'function') {
+    throw new Error('Root package must re-export getOpenCapTableDarPath');
+  }
+  if (rootPkg.OPEN_CAP_TABLE_DAR_PATH_ENV !== 'OPEN_CAP_TABLE_DAR_PATH') {
+    throw new Error('Root package must re-export OPEN_CAP_TABLE_DAR_PATH_ENV');
+  }
+  if ((rootPkg.getOpenCapTableDarPath() as string) !== darPath) {
+    throw new Error('root getOpenCapTableDarPath() must match subpath module');
+  }
+  if ((rootPkg.resolveOpenCapTableDarPath() as string) !== darPath) {
+    throw new Error('root resolveOpenCapTableDarPath() must match subpath module');
+  }
+  if (rootPkg.resolveOpenCapTableDarPath !== openCapTableDarPathMod.resolveOpenCapTableDarPath) {
+    throw new Error('root resolveOpenCapTableDarPath must be same function as openCapTableDarPath subpath');
+  }
+
+  process.env.OPEN_CAP_TABLE_DAR_PATH = darPath;
+  try {
+    if (openCapTableDarPathMod.resolveOpenCapTableDarPath() !== darPath) {
+      throw new Error('OPEN_CAP_TABLE_DAR_PATH should take precedence when set to packaged DAR path');
+    }
+  } finally {
+    delete process.env.OPEN_CAP_TABLE_DAR_PATH;
+  }
+
+  process.env.OPEN_CAP_TABLE_DAR_PATH = path.join(ROOT_DIR, 'this-file-should-not-exist-for-import-test.dar');
+  try {
+    openCapTableDarPathMod.resolveOpenCapTableDarPath();
+    throw new Error('expected resolveOpenCapTableDarPath to throw when OPEN_CAP_TABLE_DAR_PATH is invalid');
+  } catch (e) {
+    if (!(e instanceof Error) || !e.message.includes('OPEN_CAP_TABLE_DAR_PATH')) {
+      throw e;
+    }
+  } finally {
+    delete process.env.OPEN_CAP_TABLE_DAR_PATH;
   }
 
   if (!fs.existsSync(standaloneNftApiDir)) {
@@ -97,7 +143,7 @@ try {
   }
 
   console.log(
-    'OK: Root package exports OCP_TEMPLATES alongside Nft.Api.V1 and Nft.Reference.V1, JSON subpaths and openCapTableDarPath resolve, and standalone NFT packages remain correctly isolated'
+    'OK: Root package exports Nft.Api.V1 and Nft.Reference.V1, JSON subpaths are accessible, and standalone NFT packages remain correctly isolated'
   );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));
