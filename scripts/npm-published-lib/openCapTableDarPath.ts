@@ -144,7 +144,9 @@ export function resolveOpenCapTableDarPath(options?: ResolveOpenCapTableDarPathO
 
     const msg = [base, hints.length ? ` ${hints.join(' ')}` : ''].join('');
     if (packagedCause instanceof Error) {
-      throw new Error(msg, { cause: packagedCause });
+      const err = new Error(msg) as Error & { cause: Error };
+      err.cause = packagedCause;
+      throw err;
     }
     throw new Error(msg);
   }
