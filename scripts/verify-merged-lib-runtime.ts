@@ -69,6 +69,7 @@ function assertOpenCapTableDarRootReexports(): void {
     if (typeof idx.resolveOpenCapTableDarPath !== 'function') process.exit(5);
     if (idx.resolveOpenCapTableDarPath !== m.resolveOpenCapTableDarPath) process.exit(6);
     if (idx.getOpenCapTableDarPath !== m.getOpenCapTableDarPath) process.exit(7);
+    if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(8);
   `;
   const result = spawnSync(process.execPath, ['-e', snippet], {
     cwd: ROOT_DIR,

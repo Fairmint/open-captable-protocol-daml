@@ -19,6 +19,13 @@ try {
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
   if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
+  if (
+    !rootPkg.OCP_TEMPLATES?.capTable ||
+    !rootPkg.OCP_TEMPLATES?.issuerAuthorization ||
+    !rootPkg.OCP_TEMPLATES?.ocpFactory
+  ) {
+    throw new Error('Root package missing OCP_TEMPLATES (capTable, issuerAuthorization, ocpFactory)');
+  }
 
   // Verify JSON import via package subpath exports
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
