@@ -45,6 +45,20 @@ try {
   const reports = require(`${rootPackage.name}/reports-factory-contract-id.json`);
   if (!reports?.mainnet?.reportsFactoryContractId) throw new Error('Reports Factory JSON missing expected fields');
 
+  const openCapTableDarPathMod = require(`${rootPackage.name}/openCapTableDarPath`);
+  if (typeof openCapTableDarPathMod.getOpenCapTableDarPath !== 'function') {
+    throw new Error('openCapTableDarPath export missing getOpenCapTableDarPath');
+  }
+  if (openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH !== './opencaptable.dar') {
+    throw new Error(
+      `openCapTableDarPath OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH mismatch: ${String(openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH)}`
+    );
+  }
+  const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
+  if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
+    throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
+  }
+
   if (!fs.existsSync(standaloneNftApiDir)) {
     throw new Error(`Standalone NFT API package missing at ${standaloneNftApiDir}. Run npm run codegen first.`);
   }
@@ -83,7 +97,7 @@ try {
   }
 
   console.log(
-    'OK: Root package exports OCP_TEMPLATES alongside Nft.Api.V1 and Nft.Reference.V1, JSON subpaths are accessible, and standalone NFT packages remain correctly isolated'
+    'OK: Root package exports OCP_TEMPLATES alongside Nft.Api.V1 and Nft.Reference.V1, JSON subpaths and openCapTableDarPath resolve, and standalone NFT packages remain correctly isolated'
   );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));
