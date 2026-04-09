@@ -49,9 +49,16 @@ try {
   if (typeof openCapTableDarPathMod.getOpenCapTableDarPath !== 'function') {
     throw new Error('openCapTableDarPath export missing getOpenCapTableDarPath');
   }
+  if (openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH !== './opencaptable.dar') {
+    throw new Error(
+      `openCapTableDarPath OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH mismatch: ${String(openCapTableDarPathMod.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH)}`
+    );
+  }
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
-  if (!darPath || !fs.existsSync(darPath)) {
-    throw new Error(`getOpenCapTableDarPath() invalid or missing file: ${darPath}`);
+  if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
+    throw new Error(
+      `getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`
+    );
   }
 
   if (!fs.existsSync(standaloneNftApiDir)) {
