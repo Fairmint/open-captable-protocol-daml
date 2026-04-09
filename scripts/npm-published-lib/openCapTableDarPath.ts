@@ -9,7 +9,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 /**
- * npm `exports` subpath for the raw DAR file (for tools that need `require.resolve` / bundler parity).
+ * Npm `exports` subpath for the raw DAR file (for tools that need `require.resolve` / bundler parity).
  *
  * @see package.json `exports["./opencaptable.dar"]`
  */
