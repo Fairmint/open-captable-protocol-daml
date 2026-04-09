@@ -51,14 +51,18 @@ try {
 
   const resolvedDefault = openCapTableDarPathMod.resolveOpenCapTableDarPath() as string;
   if (resolvedDefault !== darPath) {
-    throw new Error(`resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`);
+    throw new Error(
+      `resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`
+    );
   }
 
   const resolvedWithDummySibling = openCapTableDarPathMod.resolveOpenCapTableDarPath({
     siblingSearchFrom: '/nonexistent-does-not-matter-when-packaged-dar-exists',
   }) as string;
   if (resolvedWithDummySibling !== darPath) {
-    throw new Error('resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists');
+    throw new Error(
+      'resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists'
+    );
   }
 
   if (typeof rootPkg.resolveOpenCapTableDarPath !== 'function') {
