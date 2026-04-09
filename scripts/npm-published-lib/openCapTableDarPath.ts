@@ -1,9 +1,10 @@
 /**
- * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` only
- * (uses Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
+ * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` only (uses
+ * Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
  *
- * @remarks User-facing documentation for `OPEN_CAP_TABLE_DAR_PATH`, monorepo layout, and options lives in this
- * repository’s **GitHub Wiki** — not in markdown files inside the repo.
+ * @remarks
+ *   User-facing documentation for `OPEN_CAP_TABLE_DAR_PATH`, monorepo layout, and options lives in this repository’s
+ *   **GitHub Wiki** — not in markdown files inside the repo.
  */
 
 import * as fs from 'fs';
@@ -13,7 +14,7 @@ import * as path from 'path';
 export const OPEN_CAP_TABLE_DAR_PATH_ENV = 'OPEN_CAP_TABLE_DAR_PATH' as const;
 
 /**
- * npm `exports` subpath for the raw DAR file (for tools that need `require.resolve` / bundler parity).
+ * Npm `exports` subpath for the raw DAR file (for tools that need `require.resolve` / bundler parity).
  *
  * @see package.json `exports["./opencaptable.dar"]`
  */
@@ -23,17 +24,22 @@ export const OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH = './opencaptable.dar' as const;
  * From a dependent repo root: sibling `open-captable-protocol-daml` staged DAR
  * (`../open-captable-protocol-daml/published-dars/OpenCapTable.dar`).
  */
-const DEFAULT_SIBLING_DAR_SEGMENTS = ['..', 'open-captable-protocol-daml', 'published-dars', 'OpenCapTable.dar'] as const;
+const DEFAULT_SIBLING_DAR_SEGMENTS = [
+  '..',
+  'open-captable-protocol-daml',
+  'published-dars',
+  'OpenCapTable.dar',
+] as const;
 
 export interface ResolveOpenCapTableDarPathOptions {
   /**
-   * Root of the consuming repository (e.g. SDK or app checkout). The parent directory should
-   * contain `open-captable-protocol-daml` when using the default sibling layout.
+   * Root of the consuming repository (e.g. SDK or app checkout). The parent directory should contain
+   * `open-captable-protocol-daml` when using the default sibling layout.
    */
   siblingSearchFrom?: string;
   /**
-   * Custom DAR path: absolute, or relative to `siblingSearchFrom` (required when relative).
-   * Use when the daml checkout is not at the default sibling path.
+   * Custom DAR path: absolute, or relative to `siblingSearchFrom` (required when relative). Use when the daml checkout
+   * is not at the default sibling path.
    */
   siblingDarPath?: string;
 }

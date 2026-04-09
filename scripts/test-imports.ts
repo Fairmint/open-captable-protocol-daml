@@ -53,21 +53,23 @@ try {
 
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
   if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
-    throw new Error(
-      `getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`
-    );
+    throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
   }
 
   const resolvedDefault = openCapTableDarPathMod.resolveOpenCapTableDarPath() as string;
   if (resolvedDefault !== darPath) {
-    throw new Error(`resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`);
+    throw new Error(
+      `resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`
+    );
   }
 
   const resolvedWithDummySibling = openCapTableDarPathMod.resolveOpenCapTableDarPath({
     siblingSearchFrom: '/nonexistent-does-not-matter-when-packaged-dar-exists',
   }) as string;
   if (resolvedWithDummySibling !== darPath) {
-    throw new Error('resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists');
+    throw new Error(
+      'resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists'
+    );
   }
 
   // DAR path helpers use Node `fs` — they must NOT be re-exported from the package root (breaks browser/Next bundles).
