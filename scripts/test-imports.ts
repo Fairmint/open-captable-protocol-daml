@@ -19,6 +19,13 @@ try {
   if (!hasReports) console.warn('Warning: OpenCapTableReports namespace not detected');
   if (!hasNftApi) throw new Error('Root export missing Nft.Api.V1 namespace');
   if (!hasNftReference) throw new Error('Root export missing Nft.Reference.V1 namespace');
+  if (
+    !rootPkg.OCP_TEMPLATES?.capTable ||
+    !rootPkg.OCP_TEMPLATES?.issuerAuthorization ||
+    !rootPkg.OCP_TEMPLATES?.ocpFactory
+  ) {
+    throw new Error('Root package missing OCP_TEMPLATES (capTable, issuerAuthorization, ocpFactory)');
+  }
 
   // Verify JSON import via package subpath exports
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
@@ -46,23 +53,21 @@ try {
 
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
   if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
-    throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
+    throw new Error(
+      `getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`
+    );
   }
 
   const resolvedDefault = openCapTableDarPathMod.resolveOpenCapTableDarPath() as string;
   if (resolvedDefault !== darPath) {
-    throw new Error(
-      `resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`
-    );
+    throw new Error(`resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`);
   }
 
   const resolvedWithDummySibling = openCapTableDarPathMod.resolveOpenCapTableDarPath({
     siblingSearchFrom: '/nonexistent-does-not-matter-when-packaged-dar-exists',
   }) as string;
   if (resolvedWithDummySibling !== darPath) {
-    throw new Error(
-      'resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists'
-    );
+    throw new Error('resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists');
   }
 
   if (typeof rootPkg.resolveOpenCapTableDarPath !== 'function') {
