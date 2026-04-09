@@ -53,42 +53,29 @@ try {
 
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
   if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
-    throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
+    throw new Error(
+      `getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`
+    );
   }
 
   const resolvedDefault = openCapTableDarPathMod.resolveOpenCapTableDarPath() as string;
   if (resolvedDefault !== darPath) {
-    throw new Error(
-      `resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`
-    );
+    throw new Error(`resolveOpenCapTableDarPath() should match getOpenCapTableDarPath(); ${resolvedDefault} vs ${darPath}`);
   }
 
   const resolvedWithDummySibling = openCapTableDarPathMod.resolveOpenCapTableDarPath({
     siblingSearchFrom: '/nonexistent-does-not-matter-when-packaged-dar-exists',
   }) as string;
   if (resolvedWithDummySibling !== darPath) {
-    throw new Error(
-      'resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists'
-    );
+    throw new Error('resolveOpenCapTableDarPath({ siblingSearchFrom }) must not change result when packaged DAR exists');
   }
 
-  if (typeof rootPkg.resolveOpenCapTableDarPath !== 'function') {
-    throw new Error('Root package must re-export resolveOpenCapTableDarPath');
+  // DAR path helpers use Node `fs` — they must NOT be re-exported from the package root (breaks browser/Next bundles).
+  if (typeof rootPkg.resolveOpenCapTableDarPath !== 'undefined') {
+    throw new Error('Root package must not export resolveOpenCapTableDarPath (use openCapTableDarPath subpath)');
   }
-  if (typeof rootPkg.getOpenCapTableDarPath !== 'function') {
-    throw new Error('Root package must re-export getOpenCapTableDarPath');
-  }
-  if (rootPkg.OPEN_CAP_TABLE_DAR_PATH_ENV !== 'OPEN_CAP_TABLE_DAR_PATH') {
-    throw new Error('Root package must re-export OPEN_CAP_TABLE_DAR_PATH_ENV');
-  }
-  if ((rootPkg.getOpenCapTableDarPath() as string) !== darPath) {
-    throw new Error('root getOpenCapTableDarPath() must match subpath module');
-  }
-  if ((rootPkg.resolveOpenCapTableDarPath() as string) !== darPath) {
-    throw new Error('root resolveOpenCapTableDarPath() must match subpath module');
-  }
-  if (rootPkg.resolveOpenCapTableDarPath !== openCapTableDarPathMod.resolveOpenCapTableDarPath) {
-    throw new Error('root resolveOpenCapTableDarPath must be same function as openCapTableDarPath subpath');
+  if (typeof rootPkg.getOpenCapTableDarPath !== 'undefined') {
+    throw new Error('Root package must not export getOpenCapTableDarPath (use openCapTableDarPath subpath)');
   }
 
   process.env.OPEN_CAP_TABLE_DAR_PATH = darPath;

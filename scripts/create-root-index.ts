@@ -6,7 +6,9 @@ import {
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
 } from './bundle-dependencies';
-import { prepareMergedNftNamespace } from './nft-reference-bridge-rewrite';
+import {
+  prepareMergedNftNamespace,
+} from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
@@ -216,11 +218,6 @@ exports.OCP_TEMPLATES = Object.freeze({
     issuerAuthorization: Fairmint_OpenCapTable_IssuerAuthorization.IssuerAuthorization.templateId,
     ocpFactory: Fairmint_OpenCapTable_OcpFactory.OcpFactory.templateId,
 });
-var _openCapTableDarPath = require('./openCapTableDarPath');
-exports.getOpenCapTableDarPath = _openCapTableDarPath.getOpenCapTableDarPath;
-exports.resolveOpenCapTableDarPath = _openCapTableDarPath.resolveOpenCapTableDarPath;
-exports.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH = _openCapTableDarPath.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH;
-exports.OPEN_CAP_TABLE_DAR_PATH_ENV = _openCapTableDarPath.OPEN_CAP_TABLE_DAR_PATH_ENV;
 `
   );
   ensureFile(
@@ -239,13 +236,6 @@ export declare const OCP_TEMPLATES: {
   readonly issuerAuthorization: typeof Fairmint_OpenCapTable_IssuerAuthorization.IssuerAuthorization.templateId;
   readonly ocpFactory: typeof Fairmint_OpenCapTable_OcpFactory.OcpFactory.templateId;
 };
-export {
-  getOpenCapTableDarPath,
-  resolveOpenCapTableDarPath,
-  OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH,
-  OPEN_CAP_TABLE_DAR_PATH_ENV,
-} from './openCapTableDarPath';
-export type { ResolveOpenCapTableDarPathOptions } from './openCapTableDarPath';
 `
   );
 

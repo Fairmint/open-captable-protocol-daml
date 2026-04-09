@@ -58,18 +58,17 @@ function assertNodeLoadsLibIndex(): void {
   }
 }
 
-/** Ensures `openCapTableDarPath` exists and root `index.js` re-exports the same resolver (API guard). */
-function assertOpenCapTableDarRootReexports(): void {
+/** Ensures `openCapTableDarPath` exists and root `index.js` does not pull `fs` (browser-safe entry). */
+function assertOpenCapTableDarSubpathAndRootSeparation(): void {
   const snippet = `
     const m = require('./lib/openCapTableDarPath');
     if (typeof m.resolveOpenCapTableDarPath !== 'function') process.exit(2);
     if (typeof m.getOpenCapTableDarPath !== 'function') process.exit(3);
     if (m.OPEN_CAP_TABLE_DAR_PATH_ENV !== 'OPEN_CAP_TABLE_DAR_PATH') process.exit(4);
     const idx = require('./lib/index.js');
-    if (typeof idx.resolveOpenCapTableDarPath !== 'function') process.exit(5);
-    if (idx.resolveOpenCapTableDarPath !== m.resolveOpenCapTableDarPath) process.exit(6);
-    if (idx.getOpenCapTableDarPath !== m.getOpenCapTableDarPath) process.exit(7);
-    if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(8);
+    if (typeof idx.resolveOpenCapTableDarPath !== 'undefined') process.exit(5);
+    if (typeof idx.getOpenCapTableDarPath !== 'undefined') process.exit(6);
+    if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(7);
   `;
   const result = spawnSync(process.execPath, ['-e', snippet], {
     cwd: ROOT_DIR,
@@ -80,7 +79,7 @@ function assertOpenCapTableDarRootReexports(): void {
   if (result.status !== 0) {
     const detail = [result.stderr, result.stdout].filter(Boolean).join('\n').trim();
     throw new Error(
-      `openCapTableDarPath root re-export check failed (exit ${result.status})\nExpected lib/openCapTableDarPath.js and matching exports on lib/index.js.\n${detail}`
+      `openCapTableDarPath / root index separation check failed (exit ${result.status})\nExpected lib/openCapTableDarPath.js; root index must omit DAR helpers (no fs in browser bundles).\n${detail}`
     );
   }
 }
@@ -96,10 +95,10 @@ function main(): void {
   try {
     assertRequiredFiles();
     assertNftReferenceDoesNotRequireRootIndex();
-    assertOpenCapTableDarRootReexports();
+    assertOpenCapTableDarSubpathAndRootSeparation();
     assertNodeLoadsLibIndex();
     console.log(
-      '✅ Merged lib/ checks passed (files, no Nft/Reference→index cycle, DAR path re-exports, Node require).'
+      '✅ Merged lib/ checks passed (files, no Nft/Reference→index cycle, DAR subpath vs root separation, Node require).'
     );
   } catch (error) {
     console.error('❌ verify-merged-lib-runtime failed:', getErrorMessage(error));
