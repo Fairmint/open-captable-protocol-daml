@@ -6,7 +6,9 @@ import {
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
 } from './bundle-dependencies';
-import { prepareMergedNftNamespace } from './nft-reference-bridge-rewrite';
+import {
+  prepareMergedNftNamespace,
+} from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
@@ -208,14 +210,11 @@ var DA = require('./DA');
 exports.DA = DA;
 var Splice = require('./Splice');
 exports.Splice = Splice;
-var Fairmint_OpenCapTable_CapTable = require('./Fairmint/OpenCapTable/CapTable/module');
-var Fairmint_OpenCapTable_IssuerAuthorization = require('./Fairmint/OpenCapTable/IssuerAuthorization/module');
-var Fairmint_OpenCapTable_OcpFactory = require('./Fairmint/OpenCapTable/OcpFactory/module');
-exports.OCP_TEMPLATES = Object.freeze({
-    capTable: Fairmint_OpenCapTable_CapTable.CapTable.templateId,
-    issuerAuthorization: Fairmint_OpenCapTable_IssuerAuthorization.IssuerAuthorization.templateId,
-    ocpFactory: Fairmint_OpenCapTable_OcpFactory.OcpFactory.templateId,
-});
+var _openCapTableDarPath = require('./openCapTableDarPath');
+exports.getOpenCapTableDarPath = _openCapTableDarPath.getOpenCapTableDarPath;
+exports.resolveOpenCapTableDarPath = _openCapTableDarPath.resolveOpenCapTableDarPath;
+exports.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH = _openCapTableDarPath.OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH;
+exports.OPEN_CAP_TABLE_DAR_PATH_ENV = _openCapTableDarPath.OPEN_CAP_TABLE_DAR_PATH_ENV;
 `
   );
   ensureFile(
@@ -225,15 +224,14 @@ import * as Nft from './Nft';
 import * as CantonPayments from './CantonPayments';
 import * as Splice from './Splice';
 import * as DA from './DA';
-import * as Fairmint_OpenCapTable_CapTable from './Fairmint/OpenCapTable/CapTable/module';
-import * as Fairmint_OpenCapTable_IssuerAuthorization from './Fairmint/OpenCapTable/IssuerAuthorization/module';
-import * as Fairmint_OpenCapTable_OcpFactory from './Fairmint/OpenCapTable/OcpFactory/module';
 export { Fairmint, Nft, CantonPayments, DA, Splice } ;
-export declare const OCP_TEMPLATES: {
-  readonly capTable: typeof Fairmint_OpenCapTable_CapTable.CapTable.templateId;
-  readonly issuerAuthorization: typeof Fairmint_OpenCapTable_IssuerAuthorization.IssuerAuthorization.templateId;
-  readonly ocpFactory: typeof Fairmint_OpenCapTable_OcpFactory.OcpFactory.templateId;
-};
+export {
+  getOpenCapTableDarPath,
+  resolveOpenCapTableDarPath,
+  OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH,
+  OPEN_CAP_TABLE_DAR_PATH_ENV,
+} from './openCapTableDarPath';
+export type { ResolveOpenCapTableDarPathOptions } from './openCapTableDarPath';
 `
   );
 

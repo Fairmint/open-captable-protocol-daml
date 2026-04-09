@@ -22,6 +22,7 @@ const REQUIRED_RELATIVE_FILES = [
   'Splice/Api/Token/MetadataV1/module.js',
   'Splice/Api/Token/HoldingV1/module.js',
   'DA/Set/Types/module.js',
+  'openCapTableDarPath.js',
 ];
 
 function assertRequiredFiles(): void {
@@ -57,6 +58,32 @@ function assertNodeLoadsLibIndex(): void {
   }
 }
 
+/** Ensures `openCapTableDarPath` exists and root `index.js` re-exports the same resolver (API guard). */
+function assertOpenCapTableDarRootReexports(): void {
+  const snippet = `
+    const m = require('./lib/openCapTableDarPath');
+    if (typeof m.resolveOpenCapTableDarPath !== 'function') process.exit(2);
+    if (typeof m.getOpenCapTableDarPath !== 'function') process.exit(3);
+    if (m.OPEN_CAP_TABLE_DAR_PATH_ENV !== 'OPEN_CAP_TABLE_DAR_PATH') process.exit(4);
+    const idx = require('./lib/index.js');
+    if (typeof idx.resolveOpenCapTableDarPath !== 'function') process.exit(5);
+    if (idx.resolveOpenCapTableDarPath !== m.resolveOpenCapTableDarPath) process.exit(6);
+    if (idx.getOpenCapTableDarPath !== m.getOpenCapTableDarPath) process.exit(7);
+  `;
+  const result = spawnSync(process.execPath, ['-e', snippet], {
+    cwd: ROOT_DIR,
+    encoding: 'utf8',
+    maxBuffer: 20 * 1024 * 1024,
+  });
+
+  if (result.status !== 0) {
+    const detail = [result.stderr, result.stdout].filter(Boolean).join('\n').trim();
+    throw new Error(
+      `openCapTableDarPath root re-export check failed (exit ${result.status})\nExpected lib/openCapTableDarPath.js and matching exports on lib/index.js.\n${detail}`
+    );
+  }
+}
+
 function main(): void {
   console.log('🔍 Verifying merged lib/ layout and Node load...\n');
 
@@ -68,8 +95,11 @@ function main(): void {
   try {
     assertRequiredFiles();
     assertNftReferenceDoesNotRequireRootIndex();
+    assertOpenCapTableDarRootReexports();
     assertNodeLoadsLibIndex();
-    console.log('✅ Merged lib/ checks passed (files, no Nft/Reference→index cycle, Node require).');
+    console.log(
+      '✅ Merged lib/ checks passed (files, no Nft/Reference→index cycle, DAR path re-exports, Node require).'
+    );
   } catch (error) {
     console.error('❌ verify-merged-lib-runtime failed:', getErrorMessage(error));
     process.exit(1);
