@@ -1,6 +1,6 @@
 /**
- * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` (and
- * re-exported from the package root).
+ * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` only (uses
+ * Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
  *
  * @remarks
  *   User-facing documentation for `OPEN_CAP_TABLE_DAR_PATH`, monorepo layout, and options lives in this repository’s
