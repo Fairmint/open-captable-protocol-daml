@@ -6,9 +6,7 @@ import {
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
 } from './bundle-dependencies';
-import {
-  prepareMergedNftNamespace,
-} from './nft-reference-bridge-rewrite';
+import { prepareMergedNftNamespace } from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
