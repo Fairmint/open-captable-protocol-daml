@@ -56,9 +56,7 @@ try {
   }
   const darPath = openCapTableDarPathMod.getOpenCapTableDarPath() as string;
   if (!darPath || !path.isAbsolute(darPath) || !fs.existsSync(darPath)) {
-    throw new Error(
-      `getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`
-    );
+    throw new Error(`getOpenCapTableDarPath() must return an absolute path to an existing file; got: ${darPath}`);
   }
 
   if (!fs.existsSync(standaloneNftApiDir)) {
