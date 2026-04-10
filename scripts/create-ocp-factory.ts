@@ -8,17 +8,8 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
-import { LEDGER_SCRIPT_PROVIDERS } from './providers';
+import { OCP_FACTORY_LEDGER_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
-
-/** True when the participant does not have the DAR vetted (e.g. upload only reached the other provider). */
-function isPackageMissingOnParticipant(err: unknown): boolean {
-  if (!err || typeof err !== 'object' || !('context' in err)) {
-    return false;
-  }
-  const ctx = (err as { context?: { code?: unknown } }).context;
-  return ctx?.code === 'PACKAGE_NAMES_NOT_FOUND';
-}
 
 interface ContractIdData {
   mainnet?: { ocpFactoryContractId: string; templateId: string };
@@ -76,7 +67,7 @@ function isCreatedTreeEventNode(event: unknown): event is CreatedTreeEventNode {
 
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
-  const ocpPkg = requirePackageConfig('ocp');
+  requirePackageConfig('ocp');
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
@@ -84,41 +75,24 @@ async function main() {
   const templateId = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
   console.log(`  Template: ${templateId}`);
 
-  let lastError: unknown;
+  const [provider] = OCP_FACTORY_LEDGER_PROVIDERS;
+  const client = createLedgerJsonApiClient(network, provider);
+  const operatorPartyId = client.getPartyId();
+  console.log(`  Provider: ${provider}`);
+  console.log(`  Operator: ${operatorPartyId}`);
 
-  for (const provider of LEDGER_SCRIPT_PROVIDERS) {
-    const client = createLedgerJsonApiClient(network, provider);
-    const operatorPartyId = client.getPartyId();
-    console.log(`  Provider: ${provider}`);
-    console.log(`  Operator: ${operatorPartyId}`);
+  const response = await client.submitAndWaitForTransactionTree({
+    commands: [
+      {
+        CreateCommand: {
+          templateId,
+          createArguments: { system_operator: operatorPartyId },
+        },
+      },
+    ],
+  });
 
-    try {
-      const response = await client.submitAndWaitForTransactionTree({
-        commands: [
-          {
-            CreateCommand: {
-              templateId,
-              createArguments: { system_operator: operatorPartyId },
-            },
-          },
-        ],
-      });
-
-      finishCreate(network, response, outputPathForJson());
-      return;
-    } catch (err) {
-      lastError = err;
-      if (isPackageMissingOnParticipant(err) && provider === LEDGER_SCRIPT_PROVIDERS[0]) {
-        console.warn(
-          `  ⚠️  ${ocpPkg.name} not on ${LEDGER_SCRIPT_PROVIDERS[0]}; trying ${LEDGER_SCRIPT_PROVIDERS[1]}…\n`
-        );
-        continue;
-      }
-      throw err;
-    }
-  }
-
-  throw lastError ?? new Error('No provider succeeded');
+  finishCreate(network, response, outputPathForJson());
 }
 
 const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
