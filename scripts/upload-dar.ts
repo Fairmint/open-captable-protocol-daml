@@ -8,10 +8,17 @@
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
  * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki
  *
- * Usage: tsx scripts/upload-dar.ts --package <package> --network <network>
+ * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet]
+ *
+ * **`--no-vet`:** pass `vetAllPackages=false` to `POST /v2/packages` so the DAR is stored without
+ * immediately vetting packages. That **skips** the upgrade-compatibility step that rejects
+ * `NOT_VALID_UPGRADE_PACKAGE` for incompatible lineages. Then run:
+ * `npx tsx scripts/vet-package-allow-incompatible-upgrade.ts --network … --provider … --package-id <main-dalf-id>`
+ * (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
  */
 
 import { execSync } from 'child_process';
+import * as fs from 'fs';
 import { getFreshDarPath, isDarBackedUp, recordNetworkUpload, requireBackedUpDar } from './dar-utils';
 import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
 import { LEDGER_SCRIPT_PROVIDERS } from './providers';
@@ -67,12 +74,28 @@ async function main() {
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
   // does not block the other.
   const failures: Array<{ provider: string; message: string }> = [];
+  const noVet = process.argv.includes('--no-vet');
+  if (noVet) {
+    console.log(
+      '  ℹ️  --no-vet: uploading without auto-vet (avoids upgrade check at upload). Vet manually with scripts/vet-package-allow-incompatible-upgrade.ts if needed.\n',
+    );
+  }
 
   for (const provider of LEDGER_SCRIPT_PROVIDERS) {
     console.log(`  → ${provider}...`);
     try {
       const client = createLedgerJsonApiClient(network, provider);
-      await client.uploadDarFile({ filePath: darPath });
+      if (noVet) {
+        // Published @fairmint/canton-node-sdk may not yet parse `vetAllPackages` on uploadDarFile (Zod strips unknown
+        // keys). POST the octet-stream body ourselves with the query flag Canton documents for JSON API uploads.
+        const url = `${client.getApiUrl()}/v2/packages?vetAllPackages=false`;
+        await client.makePostRequest(url, fs.readFileSync(darPath), {
+          contentType: 'application/octet-stream',
+          includeBearerToken: true,
+        });
+      } else {
+        await client.uploadDarFile({ filePath: darPath });
+      }
       console.log(`    ✅ Done`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -85,6 +108,11 @@ async function main() {
     console.error(`\n❌ Upload failed on all providers:\n`);
     for (const { provider, message } of failures) {
       console.error(`   ${provider}: ${message}\n`);
+    }
+    if (failures.some((f) => f.message.includes('NOT_VALID_UPGRADE_PACKAGE')) && !noVet) {
+      console.error(
+        'Tip: incompatible package lineage vetting at upload — retry with --no-vet, then vet the new main package id (see script header).\n',
+      );
     }
     process.exit(1);
   }
