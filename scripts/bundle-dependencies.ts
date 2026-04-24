@@ -22,7 +22,8 @@ const nftApiPkg = requirePackageConfig('nftApi');
 const PACKAGE_DIRS = getGeneratedPackages().map(({ dir }) => dir);
 const DEPENDENCY_DIR = path.join(__dirname, '../generated/js/ghc-stdlib-DA-Internal-Template-1.0.0');
 const SPLICE_DEPENDENCY_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v1-1.0.0');
-const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.14');
+const SPLICE_DEPENDENCY_V2_DIR = path.join(__dirname, '../generated/js/splice-api-featured-app-v2-1.0.0');
+const SPLICE_AMULET_DIR = path.join(__dirname, '../generated/js/splice-amulet-0.1.16');
 const DA_TIME_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Time-Types-1.0.0');
 const DA_TYPES_DIR = path.join(__dirname, '../generated/js/daml-prim-DA-Types-1.0.0');
 const TOKEN_BURN_MINT_DIR = path.join(__dirname, '../generated/js/splice-api-token-burn-mint-v1-1.0.0');
@@ -45,21 +46,36 @@ const NFT_API_PACKAGE_IMPORT = `@daml.js/${nftApiPkg.name}-${nftApiPkg.version}`
 const NFT_API_DAML_JS_IMPORT = `daml.js/${nftApiPkg.name}-${nftApiPkg.version}`;
 const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
 const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
+const DA_INTERNAL_TEMPLATE_IMPORT_SCOPED = '@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
 const SPLICE_FEATURED_APP_IMPORT = 'daml.js/splice-api-featured-app-v1-1.0.0';
-const SPLICE_AMULET_IMPORT = 'daml.js/splice-amulet-0.1.14';
+const SPLICE_FEATURED_APP_IMPORT_SCOPED = '@daml.js/splice-api-featured-app-v1-1.0.0';
+const SPLICE_FEATURED_APP_V2_IMPORT = 'daml.js/splice-api-featured-app-v2-1.0.0';
+const SPLICE_FEATURED_APP_V2_IMPORT_SCOPED = '@daml.js/splice-api-featured-app-v2-1.0.0';
+const SPLICE_AMULET_IMPORT = 'daml.js/splice-amulet-0.1.16';
+const SPLICE_AMULET_IMPORT_SCOPED = '@daml.js/splice-amulet-0.1.16';
 const DA_TIME_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Time-Types-1.0.0';
+const DA_TIME_TYPES_IMPORT_SCOPED = '@daml.js/daml-stdlib-DA-Time-Types-1.0.0';
 const DA_TYPES_IMPORT = 'daml.js/daml-prim-DA-Types-1.0.0';
+const DA_TYPES_IMPORT_SCOPED = '@daml.js/daml-prim-DA-Types-1.0.0';
 const TOKEN_BURN_MINT_IMPORT = 'daml.js/splice-api-token-burn-mint-v1-1.0.0';
+const TOKEN_BURN_MINT_IMPORT_SCOPED = '@daml.js/splice-api-token-burn-mint-v1-1.0.0';
 const TOKEN_METADATA_IMPORT = 'daml.js/splice-api-token-metadata-v1-1.0.0';
+const TOKEN_METADATA_IMPORT_SCOPED = '@daml.js/splice-api-token-metadata-v1-1.0.0';
 const TOKEN_HOLDING_IMPORT = 'daml.js/splice-api-token-holding-v1-1.0.0';
+const TOKEN_HOLDING_IMPORT_SCOPED = '@daml.js/splice-api-token-holding-v1-1.0.0';
 const TOKEN_ALLOCATION_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-allocation-instruction-v1-1.0.0';
+const TOKEN_ALLOCATION_INSTRUCTION_IMPORT_SCOPED = '@daml.js/splice-api-token-allocation-instruction-v1-1.0.0';
 const TOKEN_TRANSFER_INSTRUCTION_IMPORT = 'daml.js/splice-api-token-transfer-instruction-v1-1.0.0';
+const TOKEN_TRANSFER_INSTRUCTION_IMPORT_SCOPED = '@daml.js/splice-api-token-transfer-instruction-v1-1.0.0';
 const TOKEN_ALLOCATION_IMPORT = 'daml.js/splice-api-token-allocation-v1-1.0.0';
+const TOKEN_ALLOCATION_IMPORT_SCOPED = '@daml.js/splice-api-token-allocation-v1-1.0.0';
 const DA_SET_TYPES_IMPORT = 'daml.js/daml-stdlib-DA-Set-Types-1.0.0';
+const DA_SET_TYPES_IMPORT_SCOPED = '@daml.js/daml-stdlib-DA-Set-Types-1.0.0';
 
 interface BundleRequirements {
   hasBundledOcp: boolean;
   hasBundledSpliceFeaturedApp: boolean;
+  hasBundledSpliceFeaturedAppV2: boolean;
   hasBundledSpliceAmulet: boolean;
   hasBundledDATimeTypes: boolean;
   hasBundledDATypes: boolean;
@@ -205,7 +221,35 @@ function packageHasDependencyReference(targetDir: string, rawImports: string[], 
   return false;
 }
 
+function amuletModuleReferencesFeaturedAppV2(content: string): boolean {
+  return content.includes(SPLICE_FEATURED_APP_V2_IMPORT) || content.includes(SPLICE_FEATURED_APP_V2_IMPORT_SCOPED);
+}
+
+/** When `willBundleSpliceAmulet` is true, may read `SPLICE_AMULET_DIR` after clear (embedded Amulet absent). */
+function packageNeedsFeaturedAppV2Bundle(targetDir: string, willBundleSpliceAmulet: boolean): boolean {
+  // Only packages that embed or will copy splice-amulet Amulet may need the v2 shim (rewrites in that tree).
+  // Do not read `SPLICE_AMULET_DIR` when we are not bundling amulet: its template always contains the v2 string
+  // and would incorrectly enable this bundle for standalone NFT packages (breaks `test-imports` invariants).
+  const embeddedAmulet = path.join(targetDir, 'lib/Splice/Amulet/module.js');
+  if (fs.existsSync(embeddedAmulet)) {
+    return amuletModuleReferencesFeaturedAppV2(fs.readFileSync(embeddedAmulet, 'utf8'));
+  }
+  if (willBundleSpliceAmulet) {
+    const templateAmulet = path.join(SPLICE_AMULET_DIR, 'lib/Splice/Amulet/module.js');
+    return (
+      fs.existsSync(templateAmulet) && amuletModuleReferencesFeaturedAppV2(fs.readFileSync(templateAmulet, 'utf8'))
+    );
+  }
+  return false;
+}
+
 function collectBundleRequirements(targetDir: string): BundleRequirements {
+  const hasBundledSpliceAmulet = packageHasDependencyReference(
+    targetDir,
+    [SPLICE_AMULET_IMPORT],
+    [path.join(targetDir, 'lib')]
+  );
+
   return {
     hasBundledOcp: packageHasDependencyReference(
       targetDir,
@@ -215,22 +259,25 @@ function collectBundleRequirements(targetDir: string): BundleRequirements {
     hasBundledSpliceFeaturedApp: packageHasDependencyReference(
       targetDir,
       [SPLICE_FEATURED_APP_IMPORT],
-      [path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1')]
+      [
+        path.join(targetDir, 'lib', 'Splice', 'Api', 'FeaturedAppRightV1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-featured-app-v1'),
+      ]
     ),
-    hasBundledSpliceAmulet: packageHasDependencyReference(
-      targetDir,
-      [SPLICE_AMULET_IMPORT],
-      [path.join(targetDir, 'lib')]
-    ),
+    hasBundledSpliceFeaturedAppV2: packageNeedsFeaturedAppV2Bundle(targetDir, hasBundledSpliceAmulet),
+    hasBundledSpliceAmulet,
     hasBundledDATimeTypes: packageHasDependencyReference(
       targetDir,
       [DA_TIME_TYPES_IMPORT],
-      [path.join(targetDir, 'lib', 'DA', 'Time', 'Types')]
+      [
+        path.join(targetDir, 'lib', 'DA', 'Time', 'Types'),
+        path.join(targetDir, 'lib', '__bundled__', 'daml-stdlib-DA-Time-Types'),
+      ]
     ),
     hasBundledDATypes: packageHasDependencyReference(
       targetDir,
       [DA_TYPES_IMPORT],
-      [path.join(targetDir, 'lib', 'DA', 'Types')]
+      [path.join(targetDir, 'lib', 'DA', 'Types'), path.join(targetDir, 'lib', '__bundled__', 'daml-prim-DA-Types')]
     ),
     hasBundledSpliceApiTokenDependencies: packageHasDependencyReference(
       targetDir,
@@ -249,12 +296,21 @@ function collectBundleRequirements(targetDir: string): BundleRequirements {
         path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
         path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
         path.join(targetDir, 'lib', 'Splice', 'Api', 'Token', 'AllocationV1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-burn-mint-v1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-metadata-v1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-holding-v1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-allocation-instruction-v1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-transfer-instruction-v1'),
+        path.join(targetDir, 'lib', '__bundled__', 'splice-api-token-allocation-v1'),
       ]
     ),
     hasBundledDASetTypes: packageHasDependencyReference(
       targetDir,
       [DA_SET_TYPES_IMPORT],
-      [path.join(targetDir, 'lib', 'DA', 'Set', 'Types')]
+      [
+        path.join(targetDir, 'lib', 'DA', 'Set', 'Types'),
+        path.join(targetDir, 'lib', '__bundled__', 'daml-stdlib-DA-Set-Types'),
+      ]
     ),
   };
 }
@@ -380,6 +436,20 @@ exports.Internal = Internal;
   const daIndexDts = createNamespaceIndexDts(['Internal']);
   fs.writeFileSync(path.join(daDir, 'index.d.ts'), daIndexDts);
 
+  // Package-level wrapper: require('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0') => { DA: { Internal: { Template: ... } } }
+  const daWrapperDir = path.join(targetDir, 'lib/__bundled__/ghc-stdlib-DA-Internal-Template');
+  createDirectoryIfNotExists(daWrapperDir);
+  const daWrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Template = require('../../DA/Internal/Template');
+exports.DA = { Internal: { Template: Template } };
+`;
+  fs.writeFileSync(path.join(daWrapperDir, 'index.js'), daWrapperIndex);
+  const daWrapperIndexDts = `import * as Template from '../../DA/Internal/Template';
+export declare const DA: { Internal: { Template: typeof Template } };
+`;
+  fs.writeFileSync(path.join(daWrapperDir, 'index.d.ts'), daWrapperIndexDts);
+
   console.log('✅ Created bundled DA.Internal.Template structure');
 }
 
@@ -498,7 +568,53 @@ exports.Api = Api;
   const spliceMainIndexDts = createNamespaceIndexDts(['Api']);
   fs.writeFileSync(path.join(spliceMainDir, 'index.d.ts'), spliceMainIndexDts);
 
+  // Create a package-level wrapper that mirrors the original package's export shape:
+  // require('daml.js/splice-api-featured-app-v1-1.0.0') => { Splice: { Api: { FeaturedAppRightV1: ... } } }
+  const wrapperDir = path.join(targetDir, 'lib/__bundled__/splice-api-featured-app-v1');
+  createDirectoryIfNotExists(wrapperDir);
+  const wrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var FeaturedAppRightV1 = require('../../Splice/Api/FeaturedAppRightV1');
+exports.Splice = { Api: { FeaturedAppRightV1: FeaturedAppRightV1 } };
+`;
+  fs.writeFileSync(path.join(wrapperDir, 'index.js'), wrapperIndex);
+  const wrapperIndexDts = `import * as FeaturedAppRightV1 from '../../Splice/Api/FeaturedAppRightV1';
+export declare const Splice: { Api: { FeaturedAppRightV1: typeof FeaturedAppRightV1 } };
+`;
+  fs.writeFileSync(path.join(wrapperDir, 'index.d.ts'), wrapperIndexDts);
+
   console.log('✅ Created bundled splice-api-featured-app-v1 structure');
+}
+
+function createBundledSpliceFeaturedAppV2Files(targetDir: string): void {
+  console.log('📦 Bundling splice-api-featured-app-v2 dependency...');
+  const sourceDir = path.join(SPLICE_DEPENDENCY_V2_DIR, 'lib/Splice/Api/FeaturedAppRightV2');
+
+  if (!fs.existsSync(sourceDir)) {
+    console.log('⚠️  splice-api-featured-app-v2 FeaturedAppRightV2 directory not found');
+    return;
+  }
+
+  createDirectoryIfNotExists(path.join(targetDir, 'lib/Splice/Api'));
+  const destDir = path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV2');
+  copyDirectory(sourceDir, destDir);
+
+  // Create a package-level wrapper that mirrors the original package's export shape:
+  // require('daml.js/splice-api-featured-app-v2-1.0.0') => { Splice: { Api: { FeaturedAppRightV2: ... } } }
+  const wrapperDir = path.join(targetDir, 'lib/__bundled__/splice-api-featured-app-v2');
+  createDirectoryIfNotExists(wrapperDir);
+  const wrapperIndex = `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var FeaturedAppRightV2 = require('../../Splice/Api/FeaturedAppRightV2');
+exports.Splice = { Api: { FeaturedAppRightV2: FeaturedAppRightV2 } };
+`;
+  fs.writeFileSync(path.join(wrapperDir, 'index.js'), wrapperIndex);
+  const wrapperIndexDts = `import * as FeaturedAppRightV2 from '../../Splice/Api/FeaturedAppRightV2';
+export declare const Splice: { Api: { FeaturedAppRightV2: typeof FeaturedAppRightV2 } };
+`;
+  fs.writeFileSync(path.join(wrapperDir, 'index.d.ts'), wrapperIndexDts);
+
+  console.log('✅ Copied splice-api-featured-app-v2 FeaturedAppRightV2 modules');
 }
 
 function createBundledSpliceAmuletFiles(targetDir: string): void {
@@ -526,8 +642,26 @@ function createBundledDATimeTypesFiles(targetDir: string): void {
     return;
   }
 
-  // Copy the DA/Time directory
   copyDirectory(daSourceDir, daDestDir);
+
+  // Package-level wrapper: require('daml.js/daml-stdlib-DA-Time-Types-1.0.0') => { DA: { Time: { Types: ... } } }
+  const wrapperDir = path.join(targetDir, 'lib/__bundled__/daml-stdlib-DA-Time-Types');
+  createDirectoryIfNotExists(wrapperDir);
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.js'),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Types = require('../../DA/Time/Types');
+exports.DA = { Time: { Types: Types } };
+`
+  );
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.d.ts'),
+    `import * as Types from '../../DA/Time/Types';
+export declare const DA: { Time: { Types: typeof Types } };
+`
+  );
+
   console.log('✅ Copied DA Time Types modules');
 }
 
@@ -541,8 +675,26 @@ function createBundledDATypesFiles(targetDir: string): void {
     return;
   }
 
-  // Copy the DA/Types directory
   copyDirectory(daSourceDir, daDestDir);
+
+  // Package-level wrapper: require('daml.js/daml-prim-DA-Types-1.0.0') => { DA: { Types: ... } }
+  const wrapperDir = path.join(targetDir, 'lib/__bundled__/daml-prim-DA-Types');
+  createDirectoryIfNotExists(wrapperDir);
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.js'),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Types = require('../../DA/Types');
+exports.DA = { Types: Types };
+`
+  );
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.d.ts'),
+    `import * as Types from '../../DA/Types';
+export declare const DA: { Types: typeof Types };
+`
+  );
+
   console.log('✅ Copied DA Types modules');
 }
 
@@ -608,6 +760,47 @@ function createBundledSpliceApiTokenDependencies(targetDir: string): void {
       console.log('✅ Copied token-allocation-v1');
     }
   }
+
+  // Create package-level wrappers for all token packages so that
+  // require('daml.js/splice-api-token-*') => { Splice: { Api: { Token: { *V1: ... } } } }
+  const tokenWrappers: Array<{ name: string; wrapperKey: string; relPath: string }> = [
+    { name: 'splice-api-token-burn-mint-v1', wrapperKey: 'BurnMintV1', relPath: '../../Splice/Api/Token/BurnMintV1' },
+    { name: 'splice-api-token-metadata-v1', wrapperKey: 'MetadataV1', relPath: '../../Splice/Api/Token/MetadataV1' },
+    { name: 'splice-api-token-holding-v1', wrapperKey: 'HoldingV1', relPath: '../../Splice/Api/Token/HoldingV1' },
+    {
+      name: 'splice-api-token-allocation-instruction-v1',
+      wrapperKey: 'AllocationInstructionV1',
+      relPath: '../../Splice/Api/Token/AllocationInstructionV1',
+    },
+    {
+      name: 'splice-api-token-transfer-instruction-v1',
+      wrapperKey: 'TransferInstructionV1',
+      relPath: '../../Splice/Api/Token/TransferInstructionV1',
+    },
+    {
+      name: 'splice-api-token-allocation-v1',
+      wrapperKey: 'AllocationV1',
+      relPath: '../../Splice/Api/Token/AllocationV1',
+    },
+  ];
+  for (const { name, wrapperKey, relPath } of tokenWrappers) {
+    const wrapperDir = path.join(targetDir, `lib/__bundled__/${name}`);
+    createDirectoryIfNotExists(wrapperDir);
+    fs.writeFileSync(
+      path.join(wrapperDir, 'index.js'),
+      `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var mod = require('${relPath}');
+exports.Splice = { Api: { Token: { ${wrapperKey}: mod } } };
+`
+    );
+    fs.writeFileSync(
+      path.join(wrapperDir, 'index.d.ts'),
+      `import * as mod from '${relPath}';
+export declare const Splice: { Api: { Token: { ${wrapperKey}: typeof mod } } };
+`
+    );
+  }
 }
 
 function ensureBundledSpliceNamespaceIndexes(targetDir: string): void {
@@ -650,8 +843,26 @@ function createBundledDASetTypesFiles(targetDir: string): void {
     return;
   }
 
-  // Copy the DA/Set directory
   copyDirectory(daSourceDir, daDestDir);
+
+  // Package-level wrapper: require('daml.js/daml-stdlib-DA-Set-Types-1.0.0') => { DA: { Set: { Types: ... } } }
+  const wrapperDir = path.join(targetDir, 'lib/__bundled__/daml-stdlib-DA-Set-Types');
+  createDirectoryIfNotExists(wrapperDir);
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.js'),
+    `"use strict";
+Object.defineProperty(exports, "__esModule", { value: true });
+var Types = require('../../DA/Set/Types');
+exports.DA = { Set: { Types: Types } };
+`
+  );
+  fs.writeFileSync(
+    path.join(wrapperDir, 'index.d.ts'),
+    `import * as Types from '../../DA/Set/Types';
+export declare const DA: { Set: { Types: typeof Types } };
+`
+  );
+
   console.log('✅ Copied DA Set Types modules');
 }
 
@@ -788,8 +999,8 @@ function replaceNftReferenceBridgeImports(targetDir: string): void {
 function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportRewriteRule[] {
   return [
     {
-      importPaths: [DA_INTERNAL_TEMPLATE_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/DA/Internal/Template'),
+      importPaths: [DA_INTERNAL_TEMPLATE_IMPORT, DA_INTERNAL_TEMPLATE_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/ghc-stdlib-DA-Internal-Template'),
       logLabel: 'DA',
     },
     {
@@ -801,52 +1012,57 @@ function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportR
       resolveTarget: () => path.join(targetDir, 'lib/index.js'),
     },
     {
-      importPaths: [SPLICE_FEATURED_APP_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/FeaturedAppRightV1'),
+      importPaths: [SPLICE_FEATURED_APP_IMPORT, SPLICE_FEATURED_APP_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-featured-app-v1'),
       logLabel: 'Splice',
     },
     {
-      importPaths: [SPLICE_AMULET_IMPORT],
+      importPaths: [SPLICE_FEATURED_APP_V2_IMPORT, SPLICE_FEATURED_APP_V2_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-featured-app-v2'),
+      logLabel: 'Splice v2',
+    },
+    {
+      importPaths: [SPLICE_AMULET_IMPORT, SPLICE_AMULET_IMPORT_SCOPED],
       resolveTarget: () => path.join(targetDir, 'lib'),
       logLabel: 'splice-amulet',
     },
     {
-      importPaths: [DA_TIME_TYPES_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/DA/Time/Types'),
+      importPaths: [DA_TIME_TYPES_IMPORT, DA_TIME_TYPES_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/daml-stdlib-DA-Time-Types'),
       logLabel: 'DA Time Types',
     },
     {
-      importPaths: [DA_TYPES_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/DA/Types'),
+      importPaths: [DA_TYPES_IMPORT, DA_TYPES_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/daml-prim-DA-Types'),
       logLabel: 'DA Types',
     },
     {
-      importPaths: [TOKEN_METADATA_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/MetadataV1'),
+      importPaths: [TOKEN_METADATA_IMPORT, TOKEN_METADATA_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-metadata-v1'),
     },
     {
-      importPaths: [TOKEN_BURN_MINT_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/BurnMintV1'),
+      importPaths: [TOKEN_BURN_MINT_IMPORT, TOKEN_BURN_MINT_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-burn-mint-v1'),
     },
     {
-      importPaths: [TOKEN_HOLDING_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/HoldingV1'),
+      importPaths: [TOKEN_HOLDING_IMPORT, TOKEN_HOLDING_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-holding-v1'),
     },
     {
-      importPaths: [TOKEN_ALLOCATION_INSTRUCTION_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/AllocationInstructionV1'),
+      importPaths: [TOKEN_ALLOCATION_INSTRUCTION_IMPORT, TOKEN_ALLOCATION_INSTRUCTION_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-allocation-instruction-v1'),
     },
     {
-      importPaths: [TOKEN_TRANSFER_INSTRUCTION_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/TransferInstructionV1'),
+      importPaths: [TOKEN_TRANSFER_INSTRUCTION_IMPORT, TOKEN_TRANSFER_INSTRUCTION_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-transfer-instruction-v1'),
     },
     {
-      importPaths: [TOKEN_ALLOCATION_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/Splice/Api/Token/AllocationV1'),
+      importPaths: [TOKEN_ALLOCATION_IMPORT, TOKEN_ALLOCATION_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-token-allocation-v1'),
     },
     {
-      importPaths: [DA_SET_TYPES_IMPORT],
-      resolveTarget: () => path.join(targetDir, 'lib/DA/Set/Types'),
+      importPaths: [DA_SET_TYPES_IMPORT, DA_SET_TYPES_IMPORT_SCOPED],
+      resolveTarget: () => path.join(targetDir, 'lib/__bundled__/daml-stdlib-DA-Set-Types'),
     },
   ];
 }
@@ -871,6 +1087,7 @@ function removeLocalDependency(targetDir: string): void {
     NFT_API_PACKAGE_IMPORT,
     NFT_API_DAML_JS_IMPORT,
     SPLICE_FEATURED_APP_IMPORT,
+    SPLICE_FEATURED_APP_V2_IMPORT,
     SPLICE_AMULET_IMPORT,
     DA_TIME_TYPES_IMPORT,
     DA_TYPES_IMPORT,
@@ -924,6 +1141,10 @@ function main(): void {
         createBundledSpliceAmuletFiles(targetDir);
       }
 
+      if (bundleRequirements.hasBundledSpliceFeaturedAppV2) {
+        createBundledSpliceFeaturedAppV2Files(targetDir);
+      }
+
       if (bundleRequirements.hasBundledDATimeTypes) {
         createBundledDATimeTypesFiles(targetDir);
       }
@@ -967,6 +1188,7 @@ export {
   createBundledOcpFiles,
   createBundledSpliceAmuletFiles,
   createBundledSpliceApiTokenDependencies,
+  createBundledSpliceFeaturedAppV2Files,
   createBundledSpliceFiles,
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,

@@ -92,6 +92,14 @@ function patchCombinedBundledDependencyImports(destLib: string) {
       from: 'daml.js/splice-api-token-allocation-v1-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'AllocationV1'),
     },
+    {
+      from: 'daml.js/splice-api-featured-app-v1-1.0.0',
+      toDir: path.join(destLib, 'Splice', 'Api', 'FeaturedAppRightV1'),
+    },
+    {
+      from: 'daml.js/splice-api-featured-app-v2-1.0.0',
+      toDir: path.join(destLib, 'Splice', 'Api', 'FeaturedAppRightV2'),
+    },
   ];
 
   const walk = (dir: string) => {
@@ -145,6 +153,17 @@ function buildCombinedLib() {
   // This will merge with what was already copied from OCP
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
   copyDir(path.join(SUBSCRIPTIONS_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
+
+  // Ensure FeaturedAppRightV2 is present in combined lib if not already copied via Splice merge
+  const featuredAppV2Dest = path.join(DEST_LIB, 'Splice', 'Api', 'FeaturedAppRightV2');
+  const featuredAppV2Src = path.join(
+    ROOT_DIR,
+    'generated/js/splice-api-featured-app-v2-1.0.0/lib/Splice/Api/FeaturedAppRightV2'
+  );
+  if (!fs.existsSync(featuredAppV2Dest) && fs.existsSync(featuredAppV2Src)) {
+    copyDir(featuredAppV2Src, featuredAppV2Dest);
+  }
+
   copyDir(path.join(REPORTS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
   copyDir(path.join(NFT_API_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
   copyDir(path.join(NFT_REFERENCE_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
