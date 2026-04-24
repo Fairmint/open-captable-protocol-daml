@@ -1,6 +1,6 @@
 /**
- * Public Catalyst / Transfer Agent topology for scripts (URLs, OAuth client ids, party ids).
- * Keep aligned with `canton/src/config/cantonPublic.ts`. Secrets stay in env only.
+ * Public Catalyst / Transfer Agent topology for scripts (URLs, OAuth client ids, party ids). Keep aligned with
+ * `canton/src/config/cantonPublic.ts`. Secrets stay in env only.
  */
 import type { ContractNetwork } from '../types';
 

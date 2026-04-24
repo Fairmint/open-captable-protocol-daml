@@ -156,7 +156,10 @@ function buildCombinedLib() {
 
   // Ensure FeaturedAppRightV2 is present in combined lib if not already copied via Splice merge
   const featuredAppV2Dest = path.join(DEST_LIB, 'Splice', 'Api', 'FeaturedAppRightV2');
-  const featuredAppV2Src = path.join(ROOT_DIR, 'generated/js/splice-api-featured-app-v2-1.0.0/lib/Splice/Api/FeaturedAppRightV2');
+  const featuredAppV2Src = path.join(
+    ROOT_DIR,
+    'generated/js/splice-api-featured-app-v2-1.0.0/lib/Splice/Api/FeaturedAppRightV2'
+  );
   if (!fs.existsSync(featuredAppV2Dest) && fs.existsSync(featuredAppV2Src)) {
     copyDir(featuredAppV2Src, featuredAppV2Dest);
   }

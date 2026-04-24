@@ -10,11 +10,10 @@
  *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet]
  *
- * **`--no-vet`:** pass `vetAllPackages=false` to `POST /v2/packages` so the DAR is stored without
- * immediately vetting packages. That **skips** the upgrade-compatibility step that rejects
- * `NOT_VALID_UPGRADE_PACKAGE` for incompatible lineages. Then run:
- * `npx tsx scripts/vet-package-allow-incompatible-upgrade.ts --network … --provider … --package-id <main-dalf-id>`
- * (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
+ * **`--no-vet`:** pass `vetAllPackages=false` to `POST /v2/packages` so the DAR is stored without immediately vetting
+ * packages. That **skips** the upgrade-compatibility step that rejects `NOT_VALID_UPGRADE_PACKAGE` for incompatible
+ * lineages. Then run: `npx tsx scripts/vet-package-allow-incompatible-upgrade.ts --network … --provider … --package-id
+ * <main-dalf-id>` (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
  */
 
 import { execSync } from 'child_process';
@@ -77,7 +76,7 @@ async function main() {
   const noVet = process.argv.includes('--no-vet');
   if (noVet) {
     console.log(
-      '  ℹ️  --no-vet: uploading without auto-vet (avoids upgrade check at upload). Vet manually with scripts/vet-package-allow-incompatible-upgrade.ts if needed.\n',
+      '  ℹ️  --no-vet: uploading without auto-vet (avoids upgrade check at upload). Vet manually with scripts/vet-package-allow-incompatible-upgrade.ts if needed.\n'
     );
   }
 
@@ -111,7 +110,7 @@ async function main() {
     }
     if (failures.some((f) => f.message.includes('NOT_VALID_UPGRADE_PACKAGE')) && !noVet) {
       console.error(
-        'Tip: incompatible package lineage vetting at upload — retry with --no-vet, then vet the new main package id (see script header).\n',
+        'Tip: incompatible package lineage vetting at upload — retry with --no-vet, then vet the new main package id (see script header).\n'
       );
     }
     process.exit(1);
