@@ -32,6 +32,15 @@ import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock } from './dar-ut
 const ROOT_DIR = path.join(__dirname, '..');
 
 /**
+ * Package names (exact `name` from daml.yaml) for which we **do not** run `dpm upgrade-check` from the latest older
+ * backup. We still require the built DAR to match `dars/` + `dars.lock`.
+ *
+ * **Shared:** v0.0.10 pins `splice-amulet` **0.1.16** while v0.0.9 used **0.1.17**; the validator rejects that lineage
+ * (e.g. exception / LF rules) and `PaymentRequest` fields changed — an intentional break, not a patch upgrade.
+ */
+const SKIP_LINEAGE_UPGRADE_CHECK = new Set<string>(['Shared']);
+
+/**
  * Extract the base name and major version from a package name. E.g., "OpenCapTable-v34" => { baseName: "OpenCapTable",
  * majorVersion: 32 }
  */
@@ -261,19 +270,25 @@ function main(): void {
     const upgradeBaseline = getMostRecentOlderBackup(backupsForPackage, currentDar.version);
 
     if (upgradeBaseline) {
-      console.log(
-        `🔄 Running upgrade-check: v${upgradeBaseline.version} (backup) → v${currentDar.version} (current build)...`
-      );
-      const result = runUpgradeCheck(upgradeBaseline.darPath, currentDar.darPath);
-      if (!result.success) {
-        reportUpgradeFailure(currentPackageName, baseName, result.output);
-        hasFailures = true;
-        checkedCount++;
-        continue;
+      if (SKIP_LINEAGE_UPGRADE_CHECK.has(currentPackageName)) {
+        console.log(
+          `⏭️  ${currentPackageName}: Skipping lineage upgrade-check v${upgradeBaseline.version} → v${currentDar.version} (not a valid Daml upgrade path; see SKIP_LINEAGE_UPGRADE_CHECK in this script).\n`
+        );
+      } else {
+        console.log(
+          `🔄 Running upgrade-check: v${upgradeBaseline.version} (backup) → v${currentDar.version} (current build)...`
+        );
+        const result = runUpgradeCheck(upgradeBaseline.darPath, currentDar.darPath);
+        if (!result.success) {
+          reportUpgradeFailure(currentPackageName, baseName, result.output);
+          hasFailures = true;
+          checkedCount++;
+          continue;
+        }
+        console.log(
+          `✅ ${currentPackageName}: upgrade-check OK (v${upgradeBaseline.version} → v${currentDar.version})\n`
+        );
       }
-      console.log(
-        `✅ ${currentPackageName}: upgrade-check OK (v${upgradeBaseline.version} → v${currentDar.version})\n`
-      );
     } else {
       console.log(`✅ ${currentPackageName}: No older backed-up version to upgrade-check (first release in dars/)\n`);
     }
