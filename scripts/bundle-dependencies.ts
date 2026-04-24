@@ -222,14 +222,13 @@ function packageHasDependencyReference(targetDir: string, rawImports: string[], 
 }
 
 function packageNeedsFeaturedAppV2Bundle(targetDir: string): boolean {
-  // Check the generated Amulet module — either in the surviving lib (not yet cleared) or
-  // in the splice-amulet source (for packages where lib/Splice comes entirely from that bundle).
-  const candidates = [
-    path.join(targetDir, 'lib/Splice/Amulet/module.js'),
-    path.join(SPLICE_AMULET_DIR, 'lib/Splice/Amulet/module.js'),
-  ];
-  return candidates.some(
-    (f) => fs.existsSync(f) && fs.readFileSync(f, 'utf8').includes(SPLICE_FEATURED_APP_V2_IMPORT)
+  // Only packages whose **own** codegen embeds `lib/Splice/Amulet` (CantonPayments, etc.) may need the v2 shim.
+  // Do **not** consult `SPLICE_AMULET_DIR` here: splice-amulet's Amulet module always contains the v2 import string,
+  // which would incorrectly enable this bundle for standalone NFT packages and break `test-imports` invariants.
+  const embeddedAmulet = path.join(targetDir, 'lib/Splice/Amulet/module.js');
+  return (
+    fs.existsSync(embeddedAmulet) &&
+    fs.readFileSync(embeddedAmulet, 'utf8').includes(SPLICE_FEATURED_APP_V2_IMPORT)
   );
 }
 
