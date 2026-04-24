@@ -221,18 +221,38 @@ function packageHasDependencyReference(targetDir: string, rawImports: string[], 
   return false;
 }
 
-function packageNeedsFeaturedAppV2Bundle(targetDir: string): boolean {
-  // Only packages whose **own** codegen embeds `lib/Splice/Amulet` (CantonPayments, etc.) may need the v2 shim.
-  // Do **not** consult `SPLICE_AMULET_DIR` here: splice-amulet's Amulet module always contains the v2 import string,
-  // which would incorrectly enable this bundle for standalone NFT packages and break `test-imports` invariants.
-  const embeddedAmulet = path.join(targetDir, 'lib/Splice/Amulet/module.js');
+function amuletModuleReferencesFeaturedAppV2(content: string): boolean {
   return (
-    fs.existsSync(embeddedAmulet) &&
-    fs.readFileSync(embeddedAmulet, 'utf8').includes(SPLICE_FEATURED_APP_V2_IMPORT)
+    content.includes(SPLICE_FEATURED_APP_V2_IMPORT) || content.includes(SPLICE_FEATURED_APP_V2_IMPORT_SCOPED)
   );
 }
 
+/** When `willBundleSpliceAmulet` is true, may read `SPLICE_AMULET_DIR` after clear (embedded Amulet absent). */
+function packageNeedsFeaturedAppV2Bundle(targetDir: string, willBundleSpliceAmulet: boolean): boolean {
+  // Only packages that embed or will copy splice-amulet Amulet may need the v2 shim (rewrites in that tree).
+  // Do not read `SPLICE_AMULET_DIR` when we are not bundling amulet: its template always contains the v2 string
+  // and would incorrectly enable this bundle for standalone NFT packages (breaks `test-imports` invariants).
+  const embeddedAmulet = path.join(targetDir, 'lib/Splice/Amulet/module.js');
+  if (fs.existsSync(embeddedAmulet)) {
+    return amuletModuleReferencesFeaturedAppV2(fs.readFileSync(embeddedAmulet, 'utf8'));
+  }
+  if (willBundleSpliceAmulet) {
+    const templateAmulet = path.join(SPLICE_AMULET_DIR, 'lib/Splice/Amulet/module.js');
+    return (
+      fs.existsSync(templateAmulet) &&
+      amuletModuleReferencesFeaturedAppV2(fs.readFileSync(templateAmulet, 'utf8'))
+    );
+  }
+  return false;
+}
+
 function collectBundleRequirements(targetDir: string): BundleRequirements {
+  const hasBundledSpliceAmulet = packageHasDependencyReference(
+    targetDir,
+    [SPLICE_AMULET_IMPORT],
+    [path.join(targetDir, 'lib')]
+  );
+
   return {
     hasBundledOcp: packageHasDependencyReference(
       targetDir,
@@ -247,12 +267,8 @@ function collectBundleRequirements(targetDir: string): BundleRequirements {
         path.join(targetDir, 'lib', '__bundled__', 'splice-api-featured-app-v1'),
       ]
     ),
-    hasBundledSpliceFeaturedAppV2: packageNeedsFeaturedAppV2Bundle(targetDir),
-    hasBundledSpliceAmulet: packageHasDependencyReference(
-      targetDir,
-      [SPLICE_AMULET_IMPORT],
-      [path.join(targetDir, 'lib')]
-    ),
+    hasBundledSpliceFeaturedAppV2: packageNeedsFeaturedAppV2Bundle(targetDir, hasBundledSpliceAmulet),
+    hasBundledSpliceAmulet,
     hasBundledDATimeTypes: packageHasDependencyReference(
       targetDir,
       [DA_TIME_TYPES_IMPORT],
