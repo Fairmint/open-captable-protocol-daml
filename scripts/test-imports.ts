@@ -11,13 +11,17 @@ try {
   const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
   if (!hasOcp) throw new Error('Root export missing Fairmint.OpenCapTable');
   if (rootPkg?.Fairmint?.OpenCapTableReports) {
-    throw new Error('This package must not export Fairmint.OpenCapTableReports (use @fairmint/daml-js)');
+    throw new Error(
+      'This package must not export Fairmint.OpenCapTableReports (not part of this package — see https://github.com/Fairmint/daml)'
+    );
   }
   if (typeof rootPkg.Nft !== 'undefined') {
-    throw new Error('This package must not export Nft (use @fairmint/daml-js)');
+    throw new Error('This package must not export Nft (not part of this package — see https://github.com/Fairmint/daml)');
   }
   if (typeof rootPkg.CantonPayments !== 'undefined') {
-    throw new Error('This package must not export CantonPayments (use @fairmint/daml-js)');
+    throw new Error(
+      'This package must not export CantonPayments (not part of this package — see https://github.com/Fairmint/daml)'
+    );
   }
   if (
     !rootPkg.OCP_TEMPLATES?.capTable ||
