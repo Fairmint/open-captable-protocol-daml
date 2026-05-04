@@ -16,7 +16,9 @@ try {
     );
   }
   if (typeof rootPkg.Nft !== 'undefined') {
-    throw new Error('This package must not export Nft (not part of this package — see https://github.com/Fairmint/daml)');
+    throw new Error(
+      'This package must not export Nft (not part of this package — see https://github.com/Fairmint/daml)'
+    );
   }
   if (typeof rootPkg.CantonPayments !== 'undefined') {
     throw new Error(
