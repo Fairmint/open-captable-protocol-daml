@@ -1,4 +1,4 @@
-/** Typings for `generated/ocp-factory-contract-id.json` (JSON is committed; this stub is the stable TS surface). */
+/** Typings for `ocp-factory-contract-id.json` (committed snapshot; updated by `create-factory:ocp`). */
 declare const data: {
   mainnet: {
     ocpFactoryContractId: string;
