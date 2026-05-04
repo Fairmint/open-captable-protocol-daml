@@ -9,16 +9,14 @@ import fs from 'fs';
 import path from 'path';
 import {
   findNftReferenceFilesRequiringPackageRootIndex,
-  NFT_API_PACKAGE_NAMESPACE_BRIDGE_REQUIRED_RELATIVE_FILES,
 } from './nft-reference-bridge-rewrite';
 import { getErrorMessage } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
-/** Paths that merged lib must include for Splice/Amulet + Nft bridge (regression: npm 0.2.146). */
+/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v34 + inlined Shared). */
 const REQUIRED_RELATIVE_FILES = [
-  ...NFT_API_PACKAGE_NAMESPACE_BRIDGE_REQUIRED_RELATIVE_FILES,
   'Splice/Api/Token/MetadataV1/module.js',
   'Splice/Api/Token/HoldingV1/module.js',
   'DA/Set/Types/module.js',
@@ -36,6 +34,9 @@ function assertRequiredFiles(): void {
 
 function assertNftReferenceDoesNotRequireRootIndex(): void {
   const refRoot = path.join(LIB_DIR, 'Nft', 'Reference');
+  if (!fs.existsSync(refRoot)) {
+    return;
+  }
   const filesRequiringRootIndex = findNftReferenceFilesRequiringPackageRootIndex(refRoot);
   const firstBadFile = filesRequiringRootIndex[0];
   if (firstBadFile) {
@@ -69,6 +70,8 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (typeof idx.resolveOpenCapTableDarPath !== 'undefined') process.exit(5);
     if (typeof idx.getOpenCapTableDarPath !== 'undefined') process.exit(6);
     if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(7);
+    if (typeof idx.Nft !== 'undefined') process.exit(8);
+    if (typeof idx.CantonPayments !== 'undefined') process.exit(9);
   `;
   const result = spawnSync(process.execPath, ['-e', snippet], {
     cwd: ROOT_DIR,
