@@ -7,9 +7,7 @@
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import {
-  findNftReferenceFilesRequiringPackageRootIndex,
-} from './nft-reference-bridge-rewrite';
+import { findNftReferenceFilesRequiringPackageRootIndex } from './nft-reference-bridge-rewrite';
 import { getErrorMessage } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');

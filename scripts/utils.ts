@@ -2,7 +2,10 @@ import type { ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
 import { EnvLoader, FileLogger, LedgerJsonApiClient, ValidatorApiClient } from '@fairmint/canton-node-sdk';
 import type { ContractNetwork } from './types';
 
-/** Populate `CANTON_*` URL / client-id / party env from committed public config when unset (see `scripts/config/cantonPublic.ts`). */
+/**
+ * Populate `CANTON_*` URL / client-id / party env from committed public config when unset (see
+ * `scripts/config/cantonPublic.ts`).
+ */
 import './cantonSdkEnvCompat';
 
 function getMissingEnvVarFromError(error: unknown): string | null {

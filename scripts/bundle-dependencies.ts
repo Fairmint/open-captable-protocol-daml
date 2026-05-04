@@ -222,9 +222,7 @@ function packageHasDependencyReference(targetDir: string, rawImports: string[], 
 }
 
 function amuletModuleReferencesFeaturedAppV2(content: string): boolean {
-  return (
-    content.includes(SPLICE_FEATURED_APP_V2_IMPORT) || content.includes(SPLICE_FEATURED_APP_V2_IMPORT_SCOPED)
-  );
+  return content.includes(SPLICE_FEATURED_APP_V2_IMPORT) || content.includes(SPLICE_FEATURED_APP_V2_IMPORT_SCOPED);
 }
 
 /** When `willBundleSpliceAmulet` is true, may read `SPLICE_AMULET_DIR` after clear (embedded Amulet absent). */
@@ -239,8 +237,7 @@ function packageNeedsFeaturedAppV2Bundle(targetDir: string, willBundleSpliceAmul
   if (willBundleSpliceAmulet) {
     const templateAmulet = path.join(SPLICE_AMULET_DIR, 'lib/Splice/Amulet/module.js');
     return (
-      fs.existsSync(templateAmulet) &&
-      amuletModuleReferencesFeaturedAppV2(fs.readFileSync(templateAmulet, 'utf8'))
+      fs.existsSync(templateAmulet) && amuletModuleReferencesFeaturedAppV2(fs.readFileSync(templateAmulet, 'utf8'))
     );
   }
   return false;
@@ -280,10 +277,7 @@ function collectBundleRequirements(targetDir: string): BundleRequirements {
     hasBundledDATypes: packageHasDependencyReference(
       targetDir,
       [DA_TYPES_IMPORT],
-      [
-        path.join(targetDir, 'lib', 'DA', 'Types'),
-        path.join(targetDir, 'lib', '__bundled__', 'daml-prim-DA-Types'),
-      ]
+      [path.join(targetDir, 'lib', 'DA', 'Types'), path.join(targetDir, 'lib', '__bundled__', 'daml-prim-DA-Types')]
     ),
     hasBundledSpliceApiTokenDependencies: packageHasDependencyReference(
       targetDir,
@@ -783,7 +777,11 @@ function createBundledSpliceApiTokenDependencies(targetDir: string): void {
       wrapperKey: 'TransferInstructionV1',
       relPath: '../../Splice/Api/Token/TransferInstructionV1',
     },
-    { name: 'splice-api-token-allocation-v1', wrapperKey: 'AllocationV1', relPath: '../../Splice/Api/Token/AllocationV1' },
+    {
+      name: 'splice-api-token-allocation-v1',
+      wrapperKey: 'AllocationV1',
+      relPath: '../../Splice/Api/Token/AllocationV1',
+    },
   ];
   for (const { name, wrapperKey, relPath } of tokenWrappers) {
     const wrapperDir = path.join(targetDir, `lib/__bundled__/${name}`);

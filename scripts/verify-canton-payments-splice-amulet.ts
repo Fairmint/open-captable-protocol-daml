@@ -4,9 +4,8 @@
  *
  * Uses `dpm damlc inspect-dar --json` from CantonPayments/ (correct SDK from daml.yaml).
  *
- * Usage:
- *   npx tsx scripts/verify-canton-payments-splice-amulet.ts
- *   npx tsx scripts/verify-canton-payments-splice-amulet.ts --dar CantonPayments/.daml/dist/CantonPayments-0.0.42.dar
+ * Usage: npx tsx scripts/verify-canton-payments-splice-amulet.ts npx tsx
+ * scripts/verify-canton-payments-splice-amulet.ts --dar CantonPayments/.daml/dist/CantonPayments-0.0.42.dar
  */
 
 import { execFileSync } from 'child_process';
@@ -17,8 +16,7 @@ const ROOT = path.join(__dirname, '..');
 const CANTON_PAYMENTS_DIR = path.join(ROOT, 'CantonPayments');
 
 /** Main package id of standalone `libs/splice/daml/dars/splice-amulet-0.1.16.dar` (canonical). */
-export const SPLICE_AMULET_0_1_16_PACKAGE_ID =
-  'c208d7ead1e4e9b610fc2054d0bf00716144ad444011bce0b02dcd6cd0cb8a23';
+export const SPLICE_AMULET_0_1_16_PACKAGE_ID = 'c208d7ead1e4e9b610fc2054d0bf00716144ad444011bce0b02dcd6cd0cb8a23';
 
 function main(): void {
   const argv = process.argv.slice(2);
@@ -42,11 +40,11 @@ function main(): void {
     process.exit(1);
   }
 
-  const raw = execFileSync(
-    'dpm',
-    ['damlc', 'inspect-dar', path.relative(CANTON_PAYMENTS_DIR, darPath), '--json'],
-    { cwd: CANTON_PAYMENTS_DIR, encoding: 'utf8', maxBuffer: 32 * 1024 * 1024 },
-  );
+  const raw = execFileSync('dpm', ['damlc', 'inspect-dar', path.relative(CANTON_PAYMENTS_DIR, darPath), '--json'], {
+    cwd: CANTON_PAYMENTS_DIR,
+    encoding: 'utf8',
+    maxBuffer: 32 * 1024 * 1024,
+  });
   const j = JSON.parse(raw) as {
     main_package_id: string;
     packages: Record<string, { name?: string; path?: string }>;
@@ -70,11 +68,13 @@ function main(): void {
   const ok = spliceId.toLowerCase() === SPLICE_AMULET_0_1_16_PACKAGE_ID.toLowerCase();
   console.log(`CantonPayments main: ${j.main_package_id}`);
   console.log(`Embedded splice-amulet package_id: ${spliceId}`);
-  console.log(`Path fragment: ${splicePath?.includes('splice-amulet-0.1.16') ? 'contains 0.1.16' : splicePath ?? '(none)'}`);
+  console.log(
+    `Path fragment: ${splicePath?.includes('splice-amulet-0.1.16') ? 'contains 0.1.16' : (splicePath ?? '(none)')}`
+  );
   if (!ok) {
     console.error(
       `\nExpected splice-amulet package id ${SPLICE_AMULET_0_1_16_PACKAGE_ID} (0.1.16).\n` +
-        `Daml code may still call LockedAmulet_Unlock, but this DAR is not linked against 0.1.16 LF.\n`,
+        `Daml code may still call LockedAmulet_Unlock, but this DAR is not linked against 0.1.16 LF.\n`
     );
     process.exit(1);
   }
@@ -97,7 +97,7 @@ function main(): void {
       console.error(
         '\nPublished lib/CantonPayments still references splice-amulet-0.1.17 in JS/typings.\n' +
           'Regenerate and bundle: `cd CantonPayments && dpm codegen-js && cd .. && npx tsx scripts/bundle-dependencies.ts && npx tsx scripts/create-package-index.ts && npx tsx scripts/create-root-index.ts && npx tsx scripts/fix-splice-refs.ts && npm run build:ts`\n' +
-          `Offending files (${bad.length}):\n  ${bad.slice(0, 12).join('\n  ')}${bad.length > 12 ? '\n  …' : ''}\n`,
+          `Offending files (${bad.length}):\n  ${bad.slice(0, 12).join('\n  ')}${bad.length > 12 ? '\n  …' : ''}\n`
       );
       process.exit(1);
     }
@@ -106,4 +106,4 @@ function main(): void {
   console.log('\nOK — CantonPayments DAR is built against splice-amulet 0.1.16.');
 }
 
-void main();
+main();

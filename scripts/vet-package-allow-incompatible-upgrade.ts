@@ -1,25 +1,22 @@
 #!/usr/bin/env node
 /**
- * Vet a package id on a participant using Canton's **force** flag that skips upgrade-compatibility
- * checks between vetted package lineages (`UPDATE_VETTED_PACKAGES_FORCE_FLAG_ALLOW_VET_INCOMPATIBLE_UPGRADES`).
+ * Vet a package id on a participant using Canton's **force** flag that skips upgrade-compatibility checks between
+ * vetted package lineages (`UPDATE_VETTED_PACKAGES_FORCE_FLAG_ALLOW_VET_INCOMPATIBLE_UPGRADES`).
  *
- * Use after `npm run upload-dar -- ... --no-vet` when the DAR is valid LF but not a valid upgrade
- * of an already-vetted package (e.g. CantonPayments built against splice-amulet 0.1.16 while
- * `aca762f1…` was built against 0.1.17).
+ * Use after `npm run upload-dar -- ... --no-vet` when the DAR is valid LF but not a valid upgrade of an already-vetted
+ * package (e.g. CantonPayments built against splice-amulet 0.1.16 while `aca762f1…` was built against 0.1.17).
  *
- * **Warning:** This is an operator-level escape hatch. Only use when you understand the topology
- * consequences (simultaneously vetted, upgrade-incompatible package lineages).
+ * **Warning:** This is an operator-level escape hatch. Only use when you understand the topology consequences
+ * (simultaneously vetted, upgrade-incompatible package lineages).
  *
- * Usage:
- *   npx tsx scripts/vet-package-allow-incompatible-upgrade.ts \
- *     --network mainnet --provider intellect \
- *     --package-id 6b6a969fa6a621479a29fcf7fb2d9596317545eabc088ed4c62c43c0c0ac2173
+ * Usage: npx tsx scripts/vet-package-allow-incompatible-upgrade.ts\
+ * --network mainnet --provider intellect\
+ * --package-id 6b6a969fa6a621479a29fcf7fb2d9596317545eabc088ed4c62c43c0c0ac2173
  *
- * Dry run (validate request without applying):
- *   ... --dry-run
+ * Dry run (validate request without applying): ... --dry-run
  *
- * Override synchronizer (default: global-domain for mainnet Catalyst / TA):
- *   ... --synchronizer-id 'global-domain::1220...'
+ * Override synchronizer (default: global-domain for mainnet Catalyst / TA): ... --synchronizer-id
+ * 'global-domain::1220...'
  */
 
 import type { ProviderType } from '@fairmint/canton-node-sdk';
@@ -70,7 +67,7 @@ function parseArgs(): {
 function buildUpdateVettedPackagesBody(
   packageId: string,
   dryRun: boolean,
-  synchronizerId: string,
+  synchronizerId: string
 ): Record<string, unknown> {
   return {
     changes: [

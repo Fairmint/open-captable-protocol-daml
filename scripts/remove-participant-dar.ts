@@ -3,37 +3,34 @@
  * Remove uploaded DARs from a Canton **participant admin** gRPC endpoint using
  * `com.digitalasset.canton.admin.participant.v30.PackageService/RemoveDar`.
  *
- * This is NOT the Ledger JSON API (`POST /v2/packages` has no delete). You need
- * participant-admin gRPC (host:port + TLS material your infra exposes), e.g. Canton console
- * or internal ops tooling — same API the proto documents as potentially unsafe if packages
- * are still in use (#17635 in upstream Canton).
+ * This is NOT the Ledger JSON API (`POST /v2/packages` has no delete). You need participant-admin gRPC (host:port + TLS
+ * material your infra exposes), e.g. Canton console or internal ops tooling — same API the proto documents as
+ * potentially unsafe if packages are still in use (#17635 in upstream Canton).
  *
  * Does **not** touch splice-amulet or any package not explicitly listed.
  *
- * Usage (print grpcurl commands — default, safe):
- *   npx tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23
+ * Usage (print grpcurl commands — default, safe): npx tsx scripts/remove-participant-dar.ts --preset
+ * mainnet-canton-payments-2026-04-23
  *
- * Print commands for **both** mainnet participants (uses env for host:port, or placeholders):
- *   npx tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --mainnet-both
+ * Print commands for **both** mainnet participants (uses env for host:port, or placeholders): npx tsx
+ * scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --mainnet-both
  *
- * Optional: also remove CantonPayments 0.0.38 (also uploaded mainnet that calendar day):
- *   npx tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --include-0-0-38
+ * Optional: also remove CantonPayments 0.0.38 (also uploaded mainnet that calendar day): npx tsx
+ * scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --include-0-0-38
  *
- * Execute one participant:
- *   export CANTON_PARTICIPANT_ADMIN_ADDR='participant-admin.internal:5002'
- *   export CANTON_PARTICIPANT_ADMIN_CACERT=/path/to/ca.pem   # optional
- *   export CANTON_PARTICIPANT_ADMIN_CERT=/path/to/client.pem # optional
- *   export CANTON_PARTICIPANT_ADMIN_KEY=/path/to/client.key   # optional
- *   export CANTON_PARTICIPANT_ADMIN_INSECURE=1                # optional; grpcurl -insecure
- *   npx tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --execute
+ * Execute one participant: export CANTON_PARTICIPANT_ADMIN_ADDR='participant-admin.internal:5002' export
+ * CANTON_PARTICIPANT_ADMIN_CACERT=/path/to/ca.pem # optional export CANTON_PARTICIPANT_ADMIN_CERT=/path/to/client.pem #
+ * optional export CANTON_PARTICIPANT_ADMIN_KEY=/path/to/client.key # optional export
+ * CANTON_PARTICIPANT_ADMIN_INSECURE=1 # optional; grpcurl -insecure npx tsx scripts/remove-participant-dar.ts --preset
+ * mainnet-canton-payments-2026-04-23 --execute
  *
- * Execute Intellect + 5n mainnet (separate admin gRPC addresses — NOT the public ledger JSON URLs):
- *   export CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR='intellect-admin:5002'
- *   export CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR='5n-admin:5002'
- *   npx tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 --execute-mainnet-both
+ * Execute Intellect + 5n mainnet (separate admin gRPC addresses — NOT the public ledger JSON URLs): export
+ * CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR='intellect-admin:5002' export
+ * CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR='5n-admin:5002' npx tsx scripts/remove-participant-dar.ts --preset
+ * mainnet-canton-payments-2026-04-23 --execute-mainnet-both
  *
- * Custom main package id (64-char hex, no prefix):
- *   npx tsx scripts/remove-participant-dar.ts --main-package-id aca762f1ca25b960f4016d00c2eef4263a860e7663e3bb76f4ecf56375508a6a
+ * Custom main package id (64-char hex, no prefix): npx tsx scripts/remove-participant-dar.ts --main-package-id
+ * aca762f1ca25b960f4016d00c2eef4263a860e7663e3bb76f4ecf56375508a6a
  */
 
 import { execFileSync } from 'child_process';
@@ -41,10 +38,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const ROOT = path.join(__dirname, '..');
-const ADMIN_PROTO_ROOT = path.join(
-  ROOT,
-  'libs/splice/canton/community/admin-api/src/main/protobuf',
-);
+const ADMIN_PROTO_ROOT = path.join(ROOT, 'libs/splice/canton/community/admin-api/src/main/protobuf');
 const ADMIN_PROTO_REL = 'com/digitalasset/canton/admin/participant/v30/package_service.proto';
 const REMOVE_RPC = 'com.digitalasset.canton.admin.participant.v30.PackageService/RemoveDar';
 
@@ -73,9 +67,7 @@ function assertHex64(id: string, label: string): void {
 
 function grpcImportArgs(): string[] {
   if (!fs.existsSync(path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL))) {
-    throw new Error(
-      `Admin proto not found at ${path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL)} — wrong repo layout?`,
-    );
+    throw new Error(`Admin proto not found at ${path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL)} — wrong repo layout?`);
   }
   return ['-import-path', ADMIN_PROTO_ROOT, '-proto', ADMIN_PROTO_REL];
 }
@@ -110,8 +102,9 @@ function removeDarOne(mainPackageId: string, execute: boolean, addr: string, lab
     tls.push('-cert', process.env.CANTON_PARTICIPANT_ADMIN_CERT.trim());
     tls.push('-key', process.env.CANTON_PARTICIPANT_ADMIN_KEY.trim());
   }
-  const printable =
-    `grpcurl ${imp.join(' ')} ${tls.join(' ')} -d '${body}' ${addr} ${REMOVE_RPC}`.replace(/\s+/g, ' ').trim();
+  const printable = `grpcurl ${imp.join(' ')} ${tls.join(' ')} -d '${body}' ${addr} ${REMOVE_RPC}`
+    .replace(/\s+/g, ' ')
+    .trim();
   console.log(`\n# [${label}] RemoveDar ${mainPackageId}\n${printable}\n`);
 
   if (!execute) return;
@@ -128,24 +121,20 @@ function removeDarOne(mainPackageId: string, execute: boolean, addr: string, lab
   });
 }
 
-function resolveTargets(
-  argv: string[],
-): Array<{ label: string; addr: string; envHint: string }> {
+function resolveTargets(argv: string[]): Array<{ label: string; addr: string; envHint: string }> {
   const mainnetBoth = argv.includes('--mainnet-both') || argv.includes('--execute-mainnet-both');
   if (mainnetBoth) {
     const intellect =
       process.env.CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR?.trim() ??
       '<set CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR>';
     const fiveN =
-      process.env.CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR?.trim() ??
-      '<set CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR>';
+      process.env.CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR?.trim() ?? '<set CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR>';
     return [
       { label: 'mainnet-intellect', addr: intellect, envHint: 'CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR' },
       { label: 'mainnet-5n', addr: fiveN, envHint: 'CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR' },
     ];
   }
-  const single =
-    process.env.CANTON_PARTICIPANT_ADMIN_ADDR?.trim() ?? '<set CANTON_PARTICIPANT_ADMIN_ADDR>';
+  const single = process.env.CANTON_PARTICIPANT_ADMIN_ADDR?.trim() ?? '<set CANTON_PARTICIPANT_ADMIN_ADDR>';
   return [{ label: 'participant', addr: single, envHint: 'CANTON_PARTICIPANT_ADMIN_ADDR' }];
 }
 
@@ -181,7 +170,7 @@ function main(): void {
   } else {
     console.error(
       'Usage: tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 [--mainnet-both] [--include-0-0-38] [--execute|--execute-mainnet-both]\n' +
-        '   or: tsx scripts/remove-participant-dar.ts --main-package-id <64-hex> [--execute]',
+        '   or: tsx scripts/remove-participant-dar.ts --main-package-id <64-hex> [--execute]'
     );
     process.exit(1);
   }
@@ -199,7 +188,7 @@ function main(): void {
           `\nCannot --execute: missing ${t.envHint}.\n\n` +
             `${MAINNET_LEDGER_JSON_HINT}\n\n` +
             'Those hosts serve Ledger JSON / v2 REST, not participant admin PackageService; grpcurl gets 404.\n' +
-            'Use your internal participant admin gRPC host:port (often :5002 behind kubectl port-forward or VPN).\n',
+            'Use your internal participant admin gRPC host:port (often :5002 behind kubectl port-forward or VPN).\n'
         );
         process.exit(1);
       }
@@ -208,7 +197,7 @@ function main(): void {
 
   console.log(
     '\nParticipant admin RemoveDar — Canton participant only. Does not unvet topology.\n' +
-      'Order: newer CantonPayments builds first (preset default), then 0.0.38 only with --include-0-0-38.\n',
+      'Order: newer CantonPayments builds first (preset default), then 0.0.38 only with --include-0-0-38.\n'
   );
   console.log(`${MAINNET_LEDGER_JSON_HINT}\n`);
 
@@ -228,9 +217,9 @@ function main(): void {
     console.log(
       'Dry-run only (printed commands). To run:\n' +
         '  Single participant: set CANTON_PARTICIPANT_ADMIN_ADDR (+ optional TLS envs), add --execute\n' +
-        '  Both mainnet: set CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR and CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR, add --execute-mainnet-both\n',
+        '  Both mainnet: set CANTON_MAINNET_INTELLECT_PARTICIPANT_ADMIN_ADDR and CANTON_MAINNET_5N_PARTICIPANT_ADMIN_ADDR, add --execute-mainnet-both\n'
     );
   }
 }
 
-void main();
+main();

@@ -101,9 +101,7 @@ export type PackageKey = PackageDefKey;
 
 function resolvePackageKey(key: string): PackageDefKey | undefined {
   const lowerKey = key.toLowerCase();
-  return (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find(
-    (candidate) => candidate.toLowerCase() === lowerKey
-  );
+  return (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find((candidate) => candidate.toLowerCase() === lowerKey);
 }
 
 /**
