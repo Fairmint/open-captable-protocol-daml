@@ -59,50 +59,14 @@ interface PackageDef {
 
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
-  shared: { name: 'Shared', sourceDir: 'Shared' },
   ocp: {
     name: 'OpenCapTable-v34',
     sourceDir: 'OpenCapTable-v34',
     generated: { createIndex: true, publishNameSuffix: null },
   },
-  reports: {
-    name: 'OpenCapTableReports-v01',
-    sourceDir: 'OpenCapTableReports-v01',
-    generated: { createIndex: true, publishNameSuffix: 'reports' },
-  },
-  nftApi: {
-    name: 'NftApi-v01',
-    sourceDir: 'NftApi-v01',
-    generated: { createIndex: true, publishNameSuffix: 'nft-api' },
-  },
-  nftReference: {
-    name: 'NftReference-v01',
-    sourceDir: 'NftReference-v01',
-    generated: { createIndex: true, publishNameSuffix: 'nft' },
-  },
-  equityCertificateShared: {
-    name: 'EquityCertificateShared',
-    sourceDir: 'EquityCertificateShared',
-  },
-  equityCertificate: {
-    name: 'EquityCertificate',
-    sourceDir: 'EquityCertificate-v01',
-  },
-  proof: { name: 'OpenCapTableProofOfOwnership-v01', sourceDir: 'OpenCapTableProofOfOwnership-v01' },
-  paymentStreams: {
-    name: 'CantonPayments',
-    sourceDir: 'CantonPayments',
-    generated: { createIndex: true },
-  },
-  couponMinter: { name: 'CouponMinter', sourceDir: 'CouponMinter' },
 } as const satisfies Record<string, PackageDef>;
 
 type PackageDefKey = keyof typeof PACKAGE_DEFS;
-const LEGACY_PACKAGE_ALIASES = {
-  nft: 'nftReference',
-  nftIface: 'nftApi',
-} as const;
-type PackageAliasKey = keyof typeof LEGACY_PACKAGE_ALIASES;
 
 /** Build full package config by reading version from daml.yaml. */
 function buildPackageConfig(def: PackageDef): PackageConfig {
@@ -133,21 +97,11 @@ export function getAllPackages(): PackageConfig[] {
   return Object.values(getPackages());
 }
 
-export type PackageKey = PackageDefKey | PackageAliasKey;
+export type PackageKey = PackageDefKey;
 
 function resolvePackageKey(key: string): PackageDefKey | undefined {
   const lowerKey = key.toLowerCase();
-  const packageKey = (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find(
-    (candidate) => candidate.toLowerCase() === lowerKey
-  );
-  if (packageKey) {
-    return packageKey;
-  }
-
-  const legacyAlias = (Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]).find(
-    (candidate) => candidate.toLowerCase() === lowerKey
-  );
-  return legacyAlias ? LEGACY_PACKAGE_ALIASES[legacyAlias] : undefined;
+  return (Object.keys(PACKAGE_DEFS) as PackageDefKey[]).find((candidate) => candidate.toLowerCase() === lowerKey);
 }
 
 /**
@@ -178,10 +132,7 @@ export function requirePackageConfig(packageKey: string): PackageConfig {
 
 /** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
-  return [
-    ...(Object.keys(PACKAGE_DEFS) as PackageDefKey[]),
-    ...(Object.keys(LEGACY_PACKAGE_ALIASES) as PackageAliasKey[]),
-  ];
+  return [...(Object.keys(PACKAGE_DEFS) as PackageDefKey[])];
 }
 
 export interface GeneratedPackageConfig {
@@ -306,10 +257,6 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
   for (const [key, pkg] of Object.entries(packages)) {
     console.error(`  ${key.padEnd(15)} → ${pkg.name} v${pkg.version}`);
   }
-  console.error(
-    `  ${'nft'.padEnd(15)} → ${packages.nftReference.name} v${packages.nftReference.version} (legacy alias)`
-  );
-  console.error(`  ${'nftIface'.padEnd(15)} → ${packages.nftApi.name} v${packages.nftApi.version} (legacy alias)`);
   console.error('');
   console.error('Networks: devnet, mainnet');
 }

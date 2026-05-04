@@ -2,35 +2,19 @@ import fs from 'fs';
 import path from 'path';
 import {
   createBundledDASetTypesFiles,
+  createBundledDATimeTypesFiles,
+  createBundledDATypesFiles,
   createBundledSpliceApiTokenDependencies,
   ensureBundledDANamespaceIndexes,
   ensureBundledSpliceNamespaceIndexes,
 } from './bundle-dependencies';
-import { prepareMergedNftNamespace } from './nft-reference-bridge-rewrite';
 import { requirePackageConfig } from './packages';
 
 const ocpPkg = requirePackageConfig('ocp');
-const reportsPkg = requirePackageConfig('reports');
-const nftApiPkg = requirePackageConfig('nftApi');
-const nftReferencePkg = requirePackageConfig('nftReference');
-const paymentStreamsPkg = requirePackageConfig('paymentStreams');
 
 const ROOT_DIR = path.join(__dirname, '..');
 const OCP_DIR = path.join(ROOT_DIR, 'generated', 'js', `${ocpPkg.name}-${ocpPkg.version}`);
-const REPORTS_DIR = path.join(ROOT_DIR, 'generated', 'js', `${reportsPkg.name}-${reportsPkg.version}`);
-const NFT_API_DIR = path.join(ROOT_DIR, 'generated', 'js', `${nftApiPkg.name}-${nftApiPkg.version}`);
-const NFT_REFERENCE_DIR = path.join(ROOT_DIR, 'generated', 'js', `${nftReferencePkg.name}-${nftReferencePkg.version}`);
-const SUBSCRIPTIONS_DIR = path.join(
-  ROOT_DIR,
-  'generated',
-  'js',
-  `${paymentStreamsPkg.name}-${paymentStreamsPkg.version}`
-);
 const OCP_LIB = path.join(OCP_DIR, 'lib');
-const REPORTS_LIB = path.join(REPORTS_DIR, 'lib');
-const NFT_API_LIB = path.join(NFT_API_DIR, 'lib');
-const NFT_REFERENCE_LIB = path.join(NFT_REFERENCE_DIR, 'lib');
-const SUBSCRIPTIONS_LIB = path.join(SUBSCRIPTIONS_DIR, 'lib');
 const DEST_LIB = path.join(ROOT_DIR, 'lib');
 
 function rimraf(dir: string) {
@@ -141,20 +125,13 @@ function patchCombinedBundledDependencyImports(destLib: string) {
 }
 
 function buildCombinedLib() {
-  console.log('🧩 Building combined lib/ from generated packages...');
+  console.log('🧩 Building combined lib/ from OpenCapTable-v34 codegen only...');
   rimraf(DEST_LIB);
   fs.mkdirSync(DEST_LIB, { recursive: true });
 
-  // Copy DA and Splice from OCP first
   copyDir(path.join(OCP_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
   copyDir(path.join(OCP_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
 
-  // Copy additional DA and Splice modules from Subscriptions (DA/Types, DA/Time/Types, etc.)
-  // This will merge with what was already copied from OCP
-  copyDir(path.join(SUBSCRIPTIONS_LIB, 'DA'), path.join(DEST_LIB, 'DA'));
-  copyDir(path.join(SUBSCRIPTIONS_LIB, 'Splice'), path.join(DEST_LIB, 'Splice'));
-
-  // Ensure FeaturedAppRightV2 is present in combined lib if not already copied via Splice merge
   const featuredAppV2Dest = path.join(DEST_LIB, 'Splice', 'Api', 'FeaturedAppRightV2');
   const featuredAppV2Src = path.join(
     ROOT_DIR,
@@ -164,25 +141,11 @@ function buildCombinedLib() {
     copyDir(featuredAppV2Src, featuredAppV2Dest);
   }
 
-  copyDir(path.join(REPORTS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
-  copyDir(path.join(NFT_API_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
-  copyDir(path.join(NFT_REFERENCE_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
-  copyDir(path.join(SUBSCRIPTIONS_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
+  copyDir(path.join(OCP_LIB, '__bundled__'), path.join(DEST_LIB, '__bundled__'));
 
-  // Combine Fairmint sub-namespaces
   const destFairmint = path.join(DEST_LIB, 'Fairmint');
   copyDir(path.join(OCP_LIB, 'Fairmint', 'OpenCapTable'), path.join(destFairmint, 'OpenCapTable'));
-  copyDir(path.join(REPORTS_LIB, 'Fairmint', 'OpenCapTableReports'), path.join(destFairmint, 'OpenCapTableReports'));
 
-  // Combine NFT namespaces at root level
-  const destNft = path.join(DEST_LIB, 'Nft');
-  copyDir(path.join(NFT_API_LIB, 'Nft'), destNft);
-  copyDir(path.join(NFT_REFERENCE_LIB, 'Nft'), destNft);
-
-  // Copy CantonPayments at root level (not under Fairmint)
-  copyDir(path.join(SUBSCRIPTIONS_LIB, 'CantonPayments'), path.join(DEST_LIB, 'CantonPayments'));
-
-  // Write Fairmint index.js and index.d.ts
   ensureFile(
     path.join(destFairmint, 'index.js'),
     `"use strict";
@@ -194,20 +157,14 @@ function __export(m) {
 Object.defineProperty(exports, "__esModule", { value: true });
 var OpenCapTable = require('./OpenCapTable');
 exports.OpenCapTable = OpenCapTable;
-var OpenCapTableReports = require('./OpenCapTableReports');
-exports.OpenCapTableReports = OpenCapTableReports;
 `
   );
   ensureFile(
     path.join(destFairmint, 'index.d.ts'),
     `export * as OpenCapTable from './OpenCapTable';
-export * as OpenCapTableReports from './OpenCapTableReports';
 `
   );
 
-  const patchedNftReferenceFiles = prepareMergedNftNamespace(destNft, DEST_LIB);
-
-  // Write root lib index.js and index.d.ts
   ensureFile(
     path.join(DEST_LIB, 'index.js'),
     `"use strict";
@@ -219,10 +176,6 @@ function __export(m) {
 Object.defineProperty(exports, "__esModule", { value: true });
 var Fairmint = require('./Fairmint');
 exports.Fairmint = Fairmint;
-var Nft = require('./Nft');
-exports.Nft = Nft;
-var CantonPayments = require('./CantonPayments');
-exports.CantonPayments = CantonPayments;
 var DA = require('./DA');
 exports.DA = DA;
 var Splice = require('./Splice');
@@ -240,14 +193,12 @@ exports.OCP_TEMPLATES = Object.freeze({
   ensureFile(
     path.join(DEST_LIB, 'index.d.ts'),
     `import * as Fairmint from './Fairmint';
-import * as Nft from './Nft';
-import * as CantonPayments from './CantonPayments';
 import * as Splice from './Splice';
 import * as DA from './DA';
 import * as Fairmint_OpenCapTable_CapTable from './Fairmint/OpenCapTable/CapTable/module';
 import * as Fairmint_OpenCapTable_IssuerAuthorization from './Fairmint/OpenCapTable/IssuerAuthorization/module';
 import * as Fairmint_OpenCapTable_OcpFactory from './Fairmint/OpenCapTable/OcpFactory/module';
-export { Fairmint, Nft, CantonPayments, DA, Splice } ;
+export { Fairmint, DA, Splice } ;
 export declare const OCP_TEMPLATES: {
   readonly capTable: typeof Fairmint_OpenCapTable_CapTable.CapTable.templateId;
   readonly issuerAuthorization: typeof Fairmint_OpenCapTable_IssuerAuthorization.IssuerAuthorization.templateId;
@@ -256,21 +207,15 @@ export declare const OCP_TEMPLATES: {
 `
   );
 
-  if (patchedNftReferenceFiles > 0) {
-    console.log(
-      `✅ Patched ${patchedNftReferenceFiles} merged lib Nft/Reference files to use nft-api-v01 bridge import`
-    );
-  }
-
-  // Merged `lib/Splice` can include Amulet without `Splice/Api/Token/*` (splice-amulet imports).
-  // Bundle those token modules into the combined lib/ (same as CantonPayments package build).
+  createBundledDATimeTypesFiles(ROOT_DIR);
+  createBundledDATypesFiles(ROOT_DIR);
   createBundledSpliceApiTokenDependencies(ROOT_DIR);
   createBundledDASetTypesFiles(ROOT_DIR);
   patchCombinedBundledDependencyImports(DEST_LIB);
   ensureBundledDANamespaceIndexes(ROOT_DIR);
   ensureBundledSpliceNamespaceIndexes(ROOT_DIR);
 
-  console.log('✅ Combined lib/ created (factory JSON typings: types/*-factory-contract-id-json.d.ts)');
+  console.log('✅ Combined lib/ created (OpenCapTable-v34 + OCP_TEMPLATES)');
 }
 
 buildCombinedLib();

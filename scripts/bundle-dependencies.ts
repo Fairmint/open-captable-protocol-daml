@@ -12,11 +12,11 @@ import {
   hasNftApiPackageNamespaceBridgeUnderLib,
   patchNftReferenceGeneratedTree,
 } from './nft-reference-bridge-rewrite';
-import { getGeneratedPackages, requirePackageConfig } from './packages';
+import { getGeneratedPackages, getPackage, requirePackageConfig } from './packages';
 import { getErrorMessage, type PackageJson } from './types';
 
 const ocpPkg = requirePackageConfig('ocp');
-const nftApiPkg = requirePackageConfig('nftApi');
+const nftApiPkg = getPackage('nftApi');
 
 // Paths — keep in sync with packages that have generated.createIndex (see getGeneratedPackages).
 const PACKAGE_DIRS = getGeneratedPackages().map(({ dir }) => dir);
@@ -42,8 +42,8 @@ const DA_SET_TYPES_DIR = path.join(__dirname, '../generated/js/daml-stdlib-DA-Se
 const OCP_PACKAGE_DIR = path.join(__dirname, '../generated/js', `${ocpPkg.name}-${ocpPkg.version}`);
 const OCP_DAML_JS_IMPORT = `daml.js/${ocpPkg.name}-${ocpPkg.version}`;
 /** Scoped package name from daml codegen (iface merged into NFT v01 lib/index). */
-const NFT_API_PACKAGE_IMPORT = `@daml.js/${nftApiPkg.name}-${nftApiPkg.version}`;
-const NFT_API_DAML_JS_IMPORT = `daml.js/${nftApiPkg.name}-${nftApiPkg.version}`;
+const NFT_API_PACKAGE_IMPORT = nftApiPkg ? `@daml.js/${nftApiPkg.name}-${nftApiPkg.version}` : '';
+const NFT_API_DAML_JS_IMPORT = nftApiPkg ? `daml.js/${nftApiPkg.name}-${nftApiPkg.version}` : '';
 const OCP_BUNDLED_WRAPPER_DIR = path.join('__bundled__', 'OpenCapTable');
 const DA_INTERNAL_TEMPLATE_IMPORT = 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
 const DA_INTERNAL_TEMPLATE_IMPORT_SCOPED = '@daml.js/ghc-stdlib-DA-Internal-Template-1.0.0';
@@ -997,7 +997,7 @@ function replaceNftReferenceBridgeImports(targetDir: string): void {
 }
 
 function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportRewriteRule[] {
-  return [
+  const rules: GeneratedImportRewriteRule[] = [
     {
       importPaths: [DA_INTERNAL_TEMPLATE_IMPORT, DA_INTERNAL_TEMPLATE_IMPORT_SCOPED],
       resolveTarget: () => path.join(targetDir, 'lib/__bundled__/ghc-stdlib-DA-Internal-Template'),
@@ -1007,10 +1007,14 @@ function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportR
       importPaths: [OCP_DAML_JS_IMPORT],
       resolveTarget: () => path.join(targetDir, 'lib', OCP_BUNDLED_WRAPPER_DIR),
     },
-    {
+  ];
+  if (NFT_API_DAML_JS_IMPORT) {
+    rules.push({
       importPaths: [NFT_API_PACKAGE_IMPORT, NFT_API_DAML_JS_IMPORT],
       resolveTarget: () => path.join(targetDir, 'lib/index.js'),
-    },
+    });
+  }
+  rules.push(
     {
       importPaths: [SPLICE_FEATURED_APP_IMPORT, SPLICE_FEATURED_APP_IMPORT_SCOPED],
       resolveTarget: () => path.join(targetDir, 'lib/__bundled__/splice-api-featured-app-v1'),
@@ -1063,8 +1067,9 @@ function getDependencyReferenceRewriteRules(targetDir: string): GeneratedImportR
     {
       importPaths: [DA_SET_TYPES_IMPORT, DA_SET_TYPES_IMPORT_SCOPED],
       resolveTarget: () => path.join(targetDir, 'lib/__bundled__/daml-stdlib-DA-Set-Types'),
-    },
-  ];
+    }
+  );
+  return rules;
 }
 
 function replaceDependencyReferences(targetDir: string): void {
@@ -1084,8 +1089,7 @@ function removeLocalDependency(targetDir: string): void {
   const localDependencies = [
     DA_INTERNAL_TEMPLATE_IMPORT,
     OCP_DAML_JS_IMPORT,
-    NFT_API_PACKAGE_IMPORT,
-    NFT_API_DAML_JS_IMPORT,
+    ...(NFT_API_DAML_JS_IMPORT ? [NFT_API_PACKAGE_IMPORT, NFT_API_DAML_JS_IMPORT] : []),
     SPLICE_FEATURED_APP_IMPORT,
     SPLICE_FEATURED_APP_V2_IMPORT,
     SPLICE_AMULET_IMPORT,
