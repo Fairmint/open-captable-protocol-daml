@@ -60,6 +60,39 @@ function readStringField(value: Record<string, unknown>, keys: string[]): string
   return undefined;
 }
 
+function packageMetadataMatches(value: Record<string, unknown>, packageName: string, version: string): boolean {
+  const name = readStringField(value, ['name', 'packageName', 'package_name']);
+  const packageVersion = readStringField(value, ['version', 'packageVersion', 'package_version']);
+  return name === packageName && (!packageVersion || packageVersion === version);
+}
+
+function findPackageIdInPackageMap(
+  value: Record<string, unknown>,
+  packageName: string,
+  version: string
+): string | null {
+  const { packages } = value;
+  if (!isObject(packages)) {
+    return null;
+  }
+
+  const mainPackageId = readStringField(value, ['main_package_id', 'mainPackageId']);
+  if (mainPackageId) {
+    const mainPackage = packages[mainPackageId];
+    if (isObject(mainPackage) && packageMetadataMatches(mainPackage, packageName, version)) {
+      return mainPackageId;
+    }
+  }
+
+  for (const [packageId, metadata] of Object.entries(packages)) {
+    if (isObject(metadata) && packageMetadataMatches(metadata, packageName, version)) {
+      return packageId;
+    }
+  }
+
+  return null;
+}
+
 function findPackageIdInInspectJson(value: unknown, packageName: string, version: string): string | null {
   if (Array.isArray(value)) {
     for (const item of value) {
@@ -73,10 +106,13 @@ function findPackageIdInInspectJson(value: unknown, packageName: string, version
     return null;
   }
 
-  const name = readStringField(value, ['name', 'packageName', 'package_name']);
+  const packageMapMatch = findPackageIdInPackageMap(value, packageName, version);
+  if (packageMapMatch) {
+    return packageMapMatch;
+  }
+
   const packageId = readStringField(value, ['packageId', 'package_id']);
-  const packageVersion = readStringField(value, ['version', 'packageVersion', 'package_version']);
-  if (name === packageName && packageId && (!packageVersion || packageVersion === version)) {
+  if (packageId && packageMetadataMatches(value, packageName, version)) {
     return packageId;
   }
 

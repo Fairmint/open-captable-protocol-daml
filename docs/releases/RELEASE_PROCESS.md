@@ -16,15 +16,16 @@ Pushing a matching tag runs `.github/workflows/release.yml`.
 The workflow:
 
 1. Parses the tag with `scripts/parse-release-tag.ts`.
-2. Fails early if the current root `package.json` version is already published to npm.
-3. Runs the same build, lint, codegen, package, and DAML test checks used by CI.
-4. Uploads the DAR to devnet and mainnet with `npm run upload-dar`.
-5. Detects which networks (devnet/mainnet) already have factories for the current DAR package ID.
-6. Creates factories on networks where they are missing with `scripts/create-ocp-factory.ts`.
-7. Verifies `dars/dars.lock`.
-8. Prepares npm package artifacts and commits changed release artifacts back to `main` when the tag points at the
-   current `origin/main`.
-9. Publishes the npm package.
+2. Fails early if the release tag is not the current `origin/main` commit.
+3. Fails early if the current root `package.json` version is already published to npm.
+4. Builds the package, backs up the current DAR, and runs the same lint, codegen, package, and DAML test checks used by
+   CI.
+5. Uploads the DAR to devnet and mainnet with `npm run upload-dar`.
+6. Detects which networks (devnet/mainnet) already have factories for the current DAR package ID.
+7. Creates factories on networks where they are missing with `scripts/create-ocp-factory.ts`.
+8. Verifies `dars/dars.lock`.
+9. Prepares npm package artifacts and publishes the npm package.
+10. Commits changed release artifacts back to `main` when the tag still points at the current `origin/main`.
 
 The tag version is the DAML package version from `OpenCapTable-v34/daml.yaml`. The npm version is the root
 `package.json` version and must be bumped before tagging when a new npm publication is expected.
