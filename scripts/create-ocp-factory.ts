@@ -12,8 +12,17 @@ import { OCP_FACTORY_LEDGER_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
 
 interface ContractIdData {
-  mainnet?: { ocpFactoryContractId: string; templateId: string };
-  devnet?: { ocpFactoryContractId: string; templateId: string };
+  mainnet?: ContractIdEntry;
+  devnet?: ContractIdEntry;
+}
+
+interface ContractIdEntry {
+  ocpFactoryContractId: string;
+  templateId: string;
+  packageName?: string;
+  packageVersion?: string;
+  sourceDir?: string;
+  updatedAt?: string;
 }
 
 function loadExistingData(filePath: string): ContractIdData {
@@ -32,7 +41,7 @@ function loadExistingData(filePath: string): ContractIdData {
   return {};
 }
 
-function isNetworkEntry(value: unknown): value is { ocpFactoryContractId: string; templateId: string } {
+function isNetworkEntry(value: unknown): value is ContractIdEntry {
   if (value === null || typeof value !== 'object') {
     return false;
   }
@@ -67,7 +76,7 @@ function isCreatedTreeEventNode(event: unknown): event is CreatedTreeEventNode {
 
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
-  requirePackageConfig('ocp');
+  const pkg = requirePackageConfig('ocp');
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
@@ -92,7 +101,7 @@ async function main() {
     ],
   });
 
-  finishCreate(network, response, outputPathForJson());
+  finishCreate(network, response, outputPathForJson(), pkg);
 }
 
 const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
@@ -100,7 +109,8 @@ const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 
 function finishCreate(
   network: 'devnet' | 'mainnet',
   response: { transactionTree: { eventsById: Record<string, unknown> } },
-  outputPath: string
+  outputPath: string,
+  pkg: { name: string; version: string; sourceDir: string }
 ): void {
   const { eventsById } = response.transactionTree;
   const created = Object.values(eventsById).filter(isCreatedTreeEventNode);
@@ -111,7 +121,14 @@ function finishCreate(
   const { contractId, templateId: resultTemplateId } = created[0].CreatedTreeEvent.value;
 
   const data = loadExistingData(outputPath);
-  data[network] = { ocpFactoryContractId: contractId, templateId: resultTemplateId };
+  data[network] = {
+    ocpFactoryContractId: contractId,
+    templateId: resultTemplateId,
+    packageName: pkg.name,
+    packageVersion: pkg.version,
+    sourceDir: pkg.sourceDir,
+    updatedAt: new Date().toISOString(),
+  };
   fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
 
   console.log(`\n✅ Created: ${contractId}`);
