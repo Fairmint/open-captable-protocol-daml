@@ -27,6 +27,13 @@ export interface DamlYamlReleaseInfo {
   version?: string;
 }
 
+interface ParsedReleaseVersion {
+  major: number;
+  minor: number;
+  patch: number;
+  prerelease: string | null;
+}
+
 export function parseReleaseTagName(tag: string): ReleaseTagParts {
   const trimmed = tag.trim();
   const match = /^(?<packageName>.+)-v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(trimmed);
@@ -81,7 +88,7 @@ export function readDamlYamlInfo(sourceDir: string): DamlYamlReleaseInfo {
 export function getPreviousPackageTags(baseName: string, currentTag: string): ReleaseTagParts[] {
   let tags: string[] = [];
   try {
-    tags = execFileSync('git', ['tag', '--list', `${baseName}-v*-v*`], {
+    tags = execFileSync('git', ['tag', '--list', '--', `${baseName}-v*-v*`], {
       cwd: ROOT_DIR,
       encoding: 'utf8',
     })
@@ -101,25 +108,56 @@ export function getPreviousPackageTags(baseName: string, currentTag: string): Re
   });
 }
 
+function parseReleaseVersion(version: string): ParsedReleaseVersion {
+  const match = /^(\d+)\.(\d+)\.(\d+)(?:-(.+))?$/.exec(version);
+  if (!match) {
+    return { major: 0, minor: 0, patch: 0, prerelease: null };
+  }
+
+  const prereleaseIndex = version.indexOf('-');
+
+  return {
+    major: Number(match[1]),
+    minor: Number(match[2]),
+    patch: Number(match[3]),
+    prerelease: prereleaseIndex === -1 ? null : version.slice(prereleaseIndex + 1),
+  };
+}
+
 export function getLatestPreviousPackageTag(previousTags: ReleaseTagParts[]): ReleaseTagParts | null {
   return (
     previousTags
-      .map((tag) => ({ tag, packageMajor: parsePackageMajor(tag.packageName), versionParts: tag.version.split('.') }))
-      .filter((entry): entry is { tag: ReleaseTagParts; packageMajor: PackageMajor; versionParts: string[] } =>
+      .map((tag) => ({
+        tag,
+        packageMajor: parsePackageMajor(tag.packageName),
+        version: parseReleaseVersion(tag.version),
+      }))
+      .filter((entry): entry is { tag: ReleaseTagParts; packageMajor: PackageMajor; version: ParsedReleaseVersion } =>
         Boolean(entry.packageMajor)
       )
       .sort((a, b) => {
         if (a.packageMajor.major !== b.packageMajor.major) {
           return b.packageMajor.major - a.packageMajor.major;
         }
-        for (let i = 0; i < 3; i++) {
-          const aPart = Number(a.versionParts[i] ?? 0);
-          const bPart = Number(b.versionParts[i] ?? 0);
-          if (aPart !== bPart) {
-            return bPart - aPart;
-          }
+        if (a.version.major !== b.version.major) {
+          return b.version.major - a.version.major;
         }
-        return 0;
+        if (a.version.minor !== b.version.minor) {
+          return b.version.minor - a.version.minor;
+        }
+        if (a.version.patch !== b.version.patch) {
+          return b.version.patch - a.version.patch;
+        }
+        if (a.version.prerelease === b.version.prerelease) {
+          return 0;
+        }
+        if (a.version.prerelease === null) {
+          return -1;
+        }
+        if (b.version.prerelease === null) {
+          return 1;
+        }
+        return b.version.prerelease.localeCompare(a.version.prerelease);
       })[0]?.tag ?? null
   );
 }

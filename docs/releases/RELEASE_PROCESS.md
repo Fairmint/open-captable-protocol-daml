@@ -19,8 +19,8 @@ The workflow:
 2. Fails early if the current root `package.json` version is already published to npm.
 3. Runs the same build, lint, codegen, package, and DAML test checks used by CI.
 4. Uploads the DAR to devnet and mainnet with `npm run upload-dar`.
-5. Detects whether devnet/mainnet already have factories for the current DAR package ID.
-6. Creates only missing factories with `scripts/create-ocp-factory.ts`.
+5. Detects which networks (devnet/mainnet) already have factories for the current DAR package ID.
+6. Creates factories on networks where they are missing with `scripts/create-ocp-factory.ts`.
 7. Verifies `dars/dars.lock`.
 8. Prepares npm package artifacts and commits changed release artifacts back to `main` when the tag points at the
    current `origin/main`.
@@ -49,7 +49,10 @@ configuration because the upload script targets both Intellect and 5n provider c
 
 Before pushing a release tag:
 
+Use Node.js 20, matching `.github/workflows/release.yml`, when running these checks locally.
+
 ```bash
+node --version
 npx tsx scripts/parse-release-tag.ts OpenCapTable-v34-v0.0.2
 npm run build
 npm run test
