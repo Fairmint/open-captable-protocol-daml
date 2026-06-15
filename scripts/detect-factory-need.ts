@@ -32,7 +32,7 @@ interface FactoryJson {
 
 interface NetworkResult {
   exists: boolean;
-  match_reason: 'metadata' | 'template_package_id' | null;
+  match_reason: 'metadata_and_template_package_id' | 'template_package_id' | null;
   ocp_factory_contract_id?: string;
   template_id?: string;
   package_name?: string;
@@ -132,7 +132,11 @@ function analyzeNetwork(
 
   const metadataMatches = entry.packageName === packageName && entry.packageVersion === version;
   const templateMatches = entry.templateId.startsWith(`${packageId}:`);
-  const matchReason = metadataMatches ? 'metadata' : templateMatches ? 'template_package_id' : null;
+  const matchReason = templateMatches
+    ? metadataMatches
+      ? 'metadata_and_template_package_id'
+      : 'template_package_id'
+    : null;
 
   return {
     exists: matchReason !== null,
