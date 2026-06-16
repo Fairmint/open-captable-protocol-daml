@@ -5,6 +5,7 @@
  * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
  */
 
+import { extractEventsFromTransaction } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
@@ -54,26 +55,6 @@ function isNetworkEntry(value: unknown): value is ContractIdEntry {
   return cid.trim().length > 0 && tid.trim().length > 0;
 }
 
-interface CreatedTreeEventNode {
-  CreatedTreeEvent: { value: { contractId: string; templateId: string } };
-}
-
-function isCreatedTreeEventNode(event: unknown): event is CreatedTreeEventNode {
-  if (event === null || typeof event !== 'object' || !('CreatedTreeEvent' in event)) {
-    return false;
-  }
-  const wrapped = (event as { CreatedTreeEvent: unknown }).CreatedTreeEvent;
-  if (wrapped === null || typeof wrapped !== 'object' || !('value' in wrapped)) {
-    return false;
-  }
-  const val = (wrapped as { value: unknown }).value;
-  if (val === null || typeof val !== 'object') {
-    return false;
-  }
-  const v = val as Record<string, unknown>;
-  return typeof v.contractId === 'string' && typeof v.templateId === 'string';
-}
-
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
   const pkg = requirePackageConfig('ocp');
@@ -112,13 +93,12 @@ function finishCreate(
   outputPath: string,
   pkg: { name: string; version: string; sourceDir: string }
 ): void {
-  const { eventsById } = response.transactionTree;
-  const created = Object.values(eventsById).filter(isCreatedTreeEventNode);
+  const created = extractEventsFromTransaction(response).created;
   if (created.length !== 1) {
     throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
   }
 
-  const { contractId, templateId: resultTemplateId } = created[0].CreatedTreeEvent.value;
+  const { contractId, templateId: resultTemplateId } = created[0];
 
   const data = loadExistingData(outputPath);
   data[network] = {
