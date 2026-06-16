@@ -93,7 +93,7 @@ function finishCreate(
   outputPath: string,
   pkg: { name: string; version: string; sourceDir: string }
 ): void {
-  const created = extractEventsFromTransaction(response).created;
+  const { created } = extractEventsFromTransaction(response);
   if (created.length !== 1) {
     throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
   }

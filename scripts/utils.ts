@@ -1,5 +1,11 @@
 import type { ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
-import { CantonRuntime, EnvLoader, FileLogger, LedgerJsonApiClient, ValidatorApiClient } from '@fairmint/canton-node-sdk';
+import {
+  CantonRuntime,
+  EnvLoader,
+  FileLogger,
+  LedgerJsonApiClient,
+  ValidatorApiClient,
+} from '@fairmint/canton-node-sdk';
 import type { ContractNetwork } from './types';
 
 /**
