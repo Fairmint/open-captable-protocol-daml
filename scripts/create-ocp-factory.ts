@@ -84,7 +84,9 @@ function isCreatedTreeEventWrapper(value: unknown): value is CreatedTreeEventWra
   return typeof created.contractId === 'string' && typeof created.templateId === 'string';
 }
 
-function getCreatedEvents(response: { transactionTree: { eventsById: Record<string, unknown> } }): CreatedTreeEventValue[] {
+function getCreatedEvents(response: {
+  transactionTree: { eventsById: Record<string, unknown> };
+}): CreatedTreeEventValue[] {
   return Object.values(response.transactionTree.eventsById)
     .filter(isCreatedTreeEventWrapper)
     .map((event) => event.CreatedTreeEvent.value);
