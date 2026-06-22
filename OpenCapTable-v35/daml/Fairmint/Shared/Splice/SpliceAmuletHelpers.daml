@@ -1,0 +1,64 @@
+-- Splice Amulet helpers for transfers, balances, and reward splits; used by payment and airdrop flows so protocol code does not duplicate low-level Amulet rules.
+module Fairmint.Shared.Splice.SpliceAmuletHelpers where
+
+import qualified DA.Map as Map
+import Splice.Amulet qualified as Amulet
+import Splice.AmuletRules (AmuletRules, AmuletRules_Transfer(..), Transfer(..), TransferOutput(..), TransferInput(..), TransferContext(..), TransferResult(..))
+import Splice.Round (OpenMiningRound)
+import Splice.Api.FeaturedAppRightV1 (AppRewardBeneficiary)
+import Splice.Fees (ExpiringAmount, chargeRatePerRound)
+import Splice.Types (Round)
+import Splice.RelRound (subRound)
+
+-- | Complete payment request with all necessary context
+data PaymentRequest = PaymentRequest
+  with
+    sender : Party
+    receiver : Party
+    provider : Party
+      -- ^ Party that receives the AppRewardCoupon
+    amount : Decimal
+    featuredAppRight : Optional (ContractId Amulet.FeaturedAppRight)
+    beneficiaries : Optional [AppRewardBeneficiary]
+      -- ^ Optional beneficiaries for app rewards
+    expectedDso : Party
+    amuletInputs : [ContractId Amulet.Amulet]
+    amuletRulesCid : ContractId AmuletRules
+    openMiningRoundCid : ContractId OpenMiningRound
+  deriving (Eq, Show)
+
+-- | Execute a payment transfer
+paymentTo : PaymentRequest -> Update TransferResult
+paymentTo req = do
+  let transfer = Transfer with
+        sender = req.sender
+        provider = req.provider
+        inputs = map InputAmulet req.amuletInputs
+        outputs = [TransferOutput with
+          receiver = req.receiver
+          -- Receiver pays fees so payer is charged exact amount (no surprises)
+          receiverFeeRatio = 1.0
+          amount = req.amount
+          lock = None]
+        beneficiaries = req.beneficiaries
+  
+  let context = TransferContext with
+        openMiningRound = req.openMiningRoundCid
+        featuredAppRight = req.featuredAppRight
+        issuingMiningRounds = Map.empty
+        validatorRights = Map.empty
+  
+  exercise req.amuletRulesCid AmuletRules_Transfer with
+    transfer = transfer
+    context = context
+    expectedDso = Some req.expectedDso
+
+-- | Calculate the actual (current) amount of an expiring amount at a given round,
+-- accounting for holding fees that have accumulated since creation.
+actualAmount : Round -> ExpiringAmount -> Decimal
+actualAmount t e
+  | e.ratePerRound.rate < 0.0 = error $ "Round rate cannot be negative: " <> show e.ratePerRound.rate
+  | t <= e.createdAt = e.initialAmount
+  | otherwise =
+      let roundsPassed = t `subRound` e.createdAt
+      in max 0.0 (e.initialAmount - chargeRatePerRound e.ratePerRound roundsPassed)
