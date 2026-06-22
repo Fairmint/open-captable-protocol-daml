@@ -30,6 +30,18 @@ interface CreatedTreeEventValue {
   templateId: string;
 }
 
+interface ActiveFactoryContract {
+  contractEntry?: {
+    JsActiveContract?: {
+      createdEvent: {
+        contractId: string;
+        templateId: string;
+        createArgument: Record<string, unknown>;
+      };
+    };
+  };
+}
+
 interface CreatedTreeEventWrapper {
   CreatedTreeEvent: {
     value: CreatedTreeEventValue;
@@ -92,6 +104,29 @@ function getCreatedEvents(response: {
     .map((event) => event.CreatedTreeEvent.value);
 }
 
+async function findExistingFactoryContract(
+  client: ReturnType<typeof createLedgerJsonApiClient>,
+  templateId: string,
+  operatorPartyId: string
+): Promise<CreatedTreeEventValue | null> {
+  const activeContracts = (await client.getActiveContracts({
+    parties: [operatorPartyId],
+    templateIds: [templateId],
+  })) as ActiveFactoryContract[];
+
+  for (const item of activeContracts) {
+    const createdEvent = item.contractEntry?.JsActiveContract?.createdEvent;
+    if (createdEvent?.templateId === templateId && createdEvent.createArgument.system_operator === operatorPartyId) {
+      return {
+        contractId: createdEvent.contractId,
+        templateId: createdEvent.templateId,
+      };
+    }
+  }
+
+  return null;
+}
+
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
   const pkg = requirePackageConfig('ocp');
@@ -108,6 +143,12 @@ async function main() {
   console.log(`  Provider: ${provider}`);
   console.log(`  Operator: ${operatorPartyId}`);
 
+  const existing = await findExistingFactoryContract(client, templateId, operatorPartyId);
+  if (existing) {
+    finishCreate(network, existing, outputPathForJson(), pkg, false);
+    return;
+  }
+
   const response = await client.submitAndWaitForTransactionTree({
     commands: [
       {
@@ -119,23 +160,24 @@ async function main() {
     ],
   });
 
-  finishCreate(network, response, outputPathForJson(), pkg);
+  const created = getCreatedEvents(response);
+  if (created.length !== 1) {
+    throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
+  }
+
+  finishCreate(network, created[0], outputPathForJson(), pkg, true);
 }
 
 const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
 
 function finishCreate(
   network: 'devnet' | 'mainnet',
-  response: { transactionTree: { eventsById: Record<string, unknown> } },
+  created: CreatedTreeEventValue,
   outputPath: string,
-  pkg: { name: string; version: string; sourceDir: string }
+  pkg: { name: string; version: string; sourceDir: string },
+  createdNew: boolean
 ): void {
-  const created = getCreatedEvents(response);
-  if (created.length !== 1) {
-    throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
-  }
-
-  const { contractId, templateId: resultTemplateId } = created[0];
+  const { contractId, templateId: resultTemplateId } = created;
 
   const data = loadExistingData(outputPath);
   data[network] = {
@@ -148,7 +190,7 @@ function finishCreate(
   };
   fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
 
-  console.log(`\n✅ Created: ${contractId}`);
+  console.log(`\n✅ ${createdNew ? 'Created' : 'Reused'}: ${contractId}`);
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}`);
 
   if (data.mainnet) console.log(`   Mainnet:  ${data.mainnet.ocpFactoryContractId}`);
