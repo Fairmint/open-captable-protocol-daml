@@ -1,0 +1,496 @@
+module OpenCapTable.TestConversionMechanisms where
+
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfInitialSharesAuthorized(..), OcfQuantitySourceType(..), OcfRatio(..), OcfStockClassType(..))
+import OpenCapTable.HelpersTriggers (ocfTriggerElectiveAtWill)
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers (addDefaultStakeholder)
+
+testTime : Time
+testTime = DT.time (DA.date 2024 Jan 1) 0 0 0
+
+usd : Decimal -> OcfMonetary
+usd amount = OcfMonetary with amount = amount; currency = "USD"
+
+invalidCurrency : OcfMonetary
+invalidCurrency = OcfMonetary with amount = 1.0; currency = ""
+
+validRatio : OcfRatio
+validRatio = OcfRatio with numerator = 1.0; denominator = 1.0
+
+invalidRatio : OcfRatio
+invalidRatio = OcfRatio with numerator = 0.0; denominator = 1.0
+
+validInterestRate : OcfInterestRate
+validInterestRate = OcfInterestRate with
+  accrual_start_date = testTime
+  accrual_end_date = None
+  rate = 0.08
+
+validRatioMechanism : OcfRatioConversionMechanism
+validRatioMechanism = OcfRatioConversionMechanism with
+  conversion_price = usd 1.0
+  ratio = validRatio
+  rounding_type = OcfRoundingNormal
+
+invalidRatioMechanism : OcfRatioConversionMechanism
+invalidRatioMechanism = validRatioMechanism with ratio = invalidRatio
+
+validCustomMechanism : OcfCustomConversionMechanism
+validCustomMechanism = OcfCustomConversionMechanism with custom_conversion_description = "Custom conversion"
+
+invalidCustomMechanism : OcfCustomConversionMechanism
+invalidCustomMechanism = OcfCustomConversionMechanism with custom_conversion_description = ""
+
+validFixedMechanism : OcfFixedAmountConversionMechanism
+validFixedMechanism = OcfFixedAmountConversionMechanism with converts_to_quantity = 100.0
+
+invalidFixedMechanism : OcfFixedAmountConversionMechanism
+invalidFixedMechanism = OcfFixedAmountConversionMechanism with converts_to_quantity = 0.0
+
+validPercentMechanism : OcfPercentCapitalizationConversionMechanism
+validPercentMechanism = OcfPercentCapitalizationConversionMechanism with
+  capitalization_definition = Some "fully-diluted"
+  capitalization_definition_rules = None
+  converts_to_percent = 0.10
+
+invalidPercentMechanism : OcfPercentCapitalizationConversionMechanism
+invalidPercentMechanism = validPercentMechanism with converts_to_percent = 1.10
+
+validPpsMechanism : OcfSharePriceBasedConversionMechanism
+validPpsMechanism = OcfSharePriceBasedConversionMechanism with
+  description = "20% discount to share price"
+  discount = True
+  discount_amount = None
+  discount_percentage = Some 0.20
+
+invalidPpsMechanism : OcfSharePriceBasedConversionMechanism
+invalidPpsMechanism = validPpsMechanism with discount_amount = Some (usd 1.0)
+
+validValuationMechanism : OcfValuationBasedConversionMechanism
+validValuationMechanism = OcfValuationBasedConversionMechanism with
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  valuation_amount = Some (usd 10_000_000.0)
+  valuation_type = OcfValuationCap
+
+invalidValuationMechanism : OcfValuationBasedConversionMechanism
+invalidValuationMechanism = validValuationMechanism with valuation_amount = Some invalidCurrency
+
+validSafeMechanism : OcfSAFEConversionMechanism
+validSafeMechanism = OcfSAFEConversionMechanism with
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  conversion_discount = Some 0.20
+  conversion_mfn = False
+  conversion_timing = None
+  conversion_valuation_cap = None
+  exit_multiple = None
+
+invalidSafeMechanism : OcfSAFEConversionMechanism
+invalidSafeMechanism = validSafeMechanism with conversion_discount = Some 1.0
+
+validNoteMechanism : OcfNoteConversionMechanism
+validNoteMechanism = OcfNoteConversionMechanism with
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  compounding_type = OcfSimple
+  conversion_discount = Some 0.20
+  conversion_mfn = None
+  conversion_valuation_cap = None
+  day_count_convention = OcfDayCountActual365
+  exit_multiple = None
+  interest_accrual_period = OcfAccrualAnnual
+  interest_payout = OcfInterestPayoutDeferred
+  interest_rates = [validInterestRate]
+
+invalidNoteMechanism : OcfNoteConversionMechanism
+invalidNoteMechanism = validNoteMechanism with interest_rates = []
+
+validConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)]
+validConvertibleMechanisms =
+  [ ("SAFE", OcfConvMechSAFE validSafeMechanism)
+  , ("NOTE", OcfConvMechNote validNoteMechanism)
+  , ("CUSTOM", OcfConvMechCustom validCustomMechanism)
+  , ("PERCENT", OcfConvMechPercentCapitalization validPercentMechanism)
+  , ("FIXED", OcfConvMechFixedAmount validFixedMechanism)
+  , ("PPS", OcfConvMechPpsBased validPpsMechanism)
+  , ("VALUATION", OcfConvMechValuationBased validValuationMechanism)
+  , ("RATIO", OcfConvMechRatio validRatio)
+  ]
+
+invalidConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)]
+invalidConvertibleMechanisms =
+  [ ("SAFE", OcfConvMechSAFE invalidSafeMechanism)
+  , ("NOTE", OcfConvMechNote invalidNoteMechanism)
+  , ("CUSTOM", OcfConvMechCustom invalidCustomMechanism)
+  , ("PERCENT", OcfConvMechPercentCapitalization invalidPercentMechanism)
+  , ("FIXED", OcfConvMechFixedAmount invalidFixedMechanism)
+  , ("PPS", OcfConvMechPpsBased invalidPpsMechanism)
+  , ("VALUATION", OcfConvMechValuationBased invalidValuationMechanism)
+  , ("RATIO", OcfConvMechRatio invalidRatio)
+  ]
+
+validWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)]
+validWarrantMechanisms =
+  [ ("CUSTOM", OcfWarrantMechanismCustom with custom_conversion_description = "Custom warrant conversion")
+  , ("PERCENT", OcfWarrantMechanismPercentCapitalization with
+      capitalization_definition = Some "fully-diluted"
+      capitalization_definition_rules = None
+      converts_to_percent = 0.05)
+  , ("FIXED", OcfWarrantMechanismFixedAmount with converts_to_quantity = 1000.0)
+  , ("VALUATION", OcfWarrantMechanismValuationBased with
+      capitalization_definition = None
+      capitalization_definition_rules = None
+      valuation_amount = Some (usd 5_000_000.0)
+      valuation_type = "valuation_cap")
+  , ("PPS", OcfWarrantMechanismPpsBased with
+      description = "10% warrant discount"
+      discount = True
+      discount_amount = None
+      discount_percentage = Some 0.10)
+  ]
+
+invalidWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)]
+invalidWarrantMechanisms =
+  [ ("CUSTOM", OcfWarrantMechanismCustom with custom_conversion_description = "")
+  , ("PERCENT", OcfWarrantMechanismPercentCapitalization with
+      capitalization_definition = None
+      capitalization_definition_rules = None
+      converts_to_percent = 0.0)
+  , ("FIXED", OcfWarrantMechanismFixedAmount with converts_to_quantity = 0.0)
+  , ("VALUATION", OcfWarrantMechanismValuationBased with
+      capitalization_definition = None
+      capitalization_definition_rules = None
+      valuation_amount = Some (usd 5_000_000.0)
+      valuation_type = "")
+  , ("PPS", OcfWarrantMechanismPpsBased with
+      description = "Conflicting discounts"
+      discount = True
+      discount_amount = Some (usd 1.0)
+      discount_percentage = Some 0.10)
+  ]
+
+stockClassRightWith :
+  OcfConversionMechanism ->
+  Optional OcfMonetary ->
+  Optional Decimal ->
+  Optional OcfRatio ->
+  Optional OcfMonetary ->
+  Optional OcfMonetary ->
+  Optional Decimal ->
+  Optional OcfMonetary ->
+  Optional Text ->
+  OcfStockClassConversionRight
+stockClassRightWith mechanism conversionPrice percentOfCapitalization ratioValue referenceSharePrice referenceValuationPrice discountRate valuationCapValue customDescription = OcfStockClassConversionRight with
+  ceiling_price_per_share = None
+  conversion_mechanism = mechanism
+  conversion_price = conversionPrice
+  conversion_trigger = ocfTriggerElectiveAtWill
+  converts_to_future_round = None
+  converts_to_stock_class_id = "SC_COMMON"
+  custom_description = customDescription
+  discount_rate = discountRate
+  expires_at = None
+  floor_price_per_share = None
+  percent_of_capitalization = percentOfCapitalization
+  ratio = ratioValue
+  reference_share_price = referenceSharePrice
+  reference_valuation_price_per_share = referenceValuationPrice
+  type_ = "STOCK_CLASS_CONVERSION_RIGHT"
+  valuation_cap = valuationCapValue
+
+stockClassRight : OcfConversionMechanism -> OcfStockClassConversionRight
+stockClassRight mechanism =
+  stockClassRightWith mechanism None None None None None None None None
+
+validStockClassRights : [OcfStockClassConversionRight]
+validStockClassRights =
+  [ stockClassRightWith OcfConversionMechanismRatioConversion None None (Some validRatio) None None None None None
+  , stockClassRightWith OcfConversionMechanismPercentCapitalizationConversion None (Some 0.10) None None None None None None
+  , stockClassRightWith OcfConversionMechanismFixedAmountConversion (Some (usd 1.0)) None None None None None None None
+  , stockClassRightWith OcfConversionMechanismValuationBasedConversion None None None None (Some (usd 1.0)) None None None
+  , stockClassRightWith OcfConversionMechanismPpsBasedConversion None None None (Some (usd 1.0)) None None None None
+  , stockClassRightWith OcfConversionMechanismSAFEConversion None None None None None (Some 0.20) None None
+  , stockClassRightWith OcfConversionMechanismNoteConversion None None None None None None (Some (usd 10_000_000.0)) None
+  , stockClassRightWith OcfConversionMechanismCustomConversion None None None None None None None (Some "Custom stock class conversion")
+  ]
+
+invalidStockClassRights : [(Text, OcfStockClassConversionRight)]
+invalidStockClassRights =
+  [ ("RATIO", stockClassRight OcfConversionMechanismRatioConversion)
+  , ("PERCENT", stockClassRightWith OcfConversionMechanismPercentCapitalizationConversion None (Some 1.10) None None None None None None)
+  , ("FIXED", stockClassRight OcfConversionMechanismFixedAmountConversion)
+  , ("VALUATION", stockClassRight OcfConversionMechanismValuationBasedConversion)
+  , ("PPS", stockClassRight OcfConversionMechanismPpsBasedConversion)
+  , ("SAFE", stockClassRight OcfConversionMechanismSAFEConversion)
+  , ("NOTE", stockClassRight OcfConversionMechanismNoteConversion)
+  , ("CUSTOM", stockClassRightWith OcfConversionMechanismCustomConversion None None None None None None None (Some ""))
+  ]
+
+convertibleRight : OcfConvertibleConversionMechanism -> OcfConvertibleConversionRight
+convertibleRight mechanism = OcfConvertibleConversionRight with
+  conversion_mechanism = mechanism
+  converts_to_future_round = Some True
+  converts_to_stock_class_id = None
+  type_ = "CONVERTIBLE_CONVERSION_RIGHT"
+
+convertibleTrigger : (Text, OcfConvertibleConversionMechanism) -> OcfConvertibleConversionTrigger
+convertibleTrigger (suffix, mechanism) = OcfConvertibleConversionTrigger with
+  conversion_right = convertibleRight mechanism
+  end_date = None
+  nickname = Some suffix
+  start_date = None
+  trigger_condition = None
+  trigger_date = None
+  trigger_description = Some ("Convertible " <> suffix <> " conversion")
+  trigger_id = "CONV-" <> suffix
+  type_ = OcfTriggerTypeTypeElectiveAtWill
+
+warrantRight : OcfWarrantConversionMechanism -> OcfWarrantConversionRight
+warrantRight mechanism = OcfWarrantConversionRight with
+  conversion_mechanism = mechanism
+  converts_to_future_round = None
+  converts_to_stock_class_id = Some "SC_COMMON"
+  type_ = "WARRANT_CONVERSION_RIGHT"
+
+warrantTrigger : (Text, OcfWarrantConversionMechanism) -> OcfConversionTrigger
+warrantTrigger (suffix, mechanism) = OcfConversionTrigger with
+  conversion_right = OcfRightWarrant (warrantRight mechanism)
+  end_date = None
+  nickname = Some suffix
+  start_date = None
+  trigger_condition = None
+  trigger_date = None
+  trigger_description = Some ("Warrant " <> suffix <> " conversion")
+  trigger_id = "WARRANT-" <> suffix
+  type_ = OcfTriggerTypeTypeElectiveAtWill
+
+assertValid : Text -> Bool -> Script ()
+assertValid label result =
+  assertMsg (label <> " should validate") result
+
+assertInvalid : Text -> Bool -> Script ()
+assertInvalid label result =
+  assertMsg (label <> " should not validate") (not result)
+
+assertValidConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)] -> Script ()
+assertValidConvertibleMechanisms cases =
+  case cases of
+    [] -> pure ()
+    (label, mechanism) :: rest -> do
+      assertValid ("convertible " <> label) (validateOcfConvertibleConversionMechanism mechanism)
+      assertValid ("convertible right " <> label) (validateOcfConvertibleConversionRight (convertibleRight mechanism))
+      assertValidConvertibleMechanisms rest
+
+assertInvalidConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)] -> Script ()
+assertInvalidConvertibleMechanisms cases =
+  case cases of
+    [] -> pure ()
+    (label, mechanism) :: rest -> do
+      assertInvalid ("convertible " <> label) (validateOcfConvertibleConversionMechanism mechanism)
+      assertInvalid ("convertible right " <> label) (validateOcfConvertibleConversionRight (convertibleRight mechanism))
+      assertInvalidConvertibleMechanisms rest
+
+assertValidWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)] -> Script ()
+assertValidWarrantMechanisms cases =
+  case cases of
+    [] -> pure ()
+    (label, mechanism) :: rest -> do
+      assertValid ("warrant " <> label) (validateOcfWarrantConversionMechanism mechanism)
+      assertValid ("warrant right " <> label) (validateOcfWarrantConversionRight (warrantRight mechanism))
+      assertValidWarrantMechanisms rest
+
+assertInvalidWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)] -> Script ()
+assertInvalidWarrantMechanisms cases =
+  case cases of
+    [] -> pure ()
+    (label, mechanism) :: rest -> do
+      assertInvalid ("warrant " <> label) (validateOcfWarrantConversionMechanism mechanism)
+      assertInvalid ("warrant right " <> label) (validateOcfWarrantConversionRight (warrantRight mechanism))
+      assertInvalidWarrantMechanisms rest
+
+assertValidStockClassRights : [OcfStockClassConversionRight] -> Script ()
+assertValidStockClassRights rights =
+  case rights of
+    [] -> pure ()
+    right :: rest -> do
+      assertValid "stock class conversion right" (validateOcfStockClassConversionRight right)
+      assertValidStockClassRights rest
+
+assertInvalidStockClassRights : [(Text, OcfStockClassConversionRight)] -> Script ()
+assertInvalidStockClassRights rights =
+  case rights of
+    [] -> pure ()
+    (label, right) :: rest -> do
+      assertInvalid ("stock class " <> label) (validateOcfStockClassConversionRight right)
+      assertInvalidStockClassRights rest
+
+testConversionMechanismValidators_AllVariants = script do
+  assertValid "ratio mechanism" (validateOcfRatioConversionMechanism validRatioMechanism)
+  assertInvalid "ratio mechanism" (validateOcfRatioConversionMechanism invalidRatioMechanism)
+  assertValid "custom mechanism" (validateOcfCustomConversionMechanism validCustomMechanism)
+  assertInvalid "custom mechanism" (validateOcfCustomConversionMechanism invalidCustomMechanism)
+  assertValid "fixed mechanism" (validateOcfFixedAmountConversionMechanism validFixedMechanism)
+  assertInvalid "fixed mechanism" (validateOcfFixedAmountConversionMechanism invalidFixedMechanism)
+  assertValid "percent capitalization mechanism" (validateOcfPercentCapitalizationConversionMechanism validPercentMechanism)
+  assertInvalid "percent capitalization mechanism" (validateOcfPercentCapitalizationConversionMechanism invalidPercentMechanism)
+  assertValid "pps mechanism" (validateOcfSharePriceBasedConversionMechanism validPpsMechanism)
+  assertInvalid "pps mechanism" (validateOcfSharePriceBasedConversionMechanism invalidPpsMechanism)
+  assertValid "valuation mechanism" (validateOcfValuationBasedConversionMechanism validValuationMechanism)
+  assertInvalid "valuation mechanism" (validateOcfValuationBasedConversionMechanism invalidValuationMechanism)
+  assertValid "SAFE mechanism" (validateOcfSAFEConversionMechanism validSafeMechanism)
+  assertInvalid "SAFE mechanism" (validateOcfSAFEConversionMechanism invalidSafeMechanism)
+  assertValid "note mechanism" (validateOcfNoteConversionMechanism validNoteMechanism)
+  assertInvalid "note mechanism" (validateOcfNoteConversionMechanism invalidNoteMechanism)
+  assertValidConvertibleMechanisms validConvertibleMechanisms
+  assertInvalidConvertibleMechanisms invalidConvertibleMechanisms
+  assertValidWarrantMechanisms validWarrantMechanisms
+  assertInvalidWarrantMechanisms invalidWarrantMechanisms
+  assertValidStockClassRights validStockClassRights
+  assertInvalidStockClassRights invalidStockClassRights
+
+testConversionMechanismRights_AllValidVariantsCreate = script do
+  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
+  capTableCid <- addDefaultStakeholder issuer cap_table
+  result1 <- submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass StockClassOcfData with
+        id = "SC_PREFERRED_ALL_CONVERSION_MECHANISMS"
+        name = "Preferred All Conversion Mechanisms"
+        class_type = OcfStockClassTypePreferred
+        default_id_prefix = "PAM-"
+        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
+        votes_per_share = 1.0
+        seniority = 2.0
+        board_approval_date = None
+        stockholder_approval_date = None
+        par_value = None
+        price_per_share = None
+        liquidation_preference_multiple = None
+        participation_cap_multiple = None
+        conversion_rights = validStockClassRights
+        comments = []]
+      edits = []
+      deletes = []
+  result2 <- submit issuer do
+    exerciseCmd result1.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
+        id = "TX_CONVERTIBLE_ALL_CONVERSION_MECHANISMS"
+        date = testTime
+        security_id = "CONV-ALL-MECHANISMS"
+        custom_id = "CN-ALL"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        investment_amount = usd 100_000.0
+        convertible_type = OcfConvertibleSecurity
+        conversion_triggers = map convertibleTrigger validConvertibleMechanisms
+        pro_rata = None
+        seniority = 1
+        comments = []]
+      edits = []
+      deletes = []
+  _ <- submit issuer do
+    exerciseCmd result2.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
+        id = "TX_WARRANT_ALL_CONVERSION_MECHANISMS"
+        date = testTime
+        security_id = "WARRANT-ALL-MECHANISMS"
+        custom_id = "W-ALL"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        quantity = Some 100.0
+        quantity_source = Some OcfQuantityInstrumentFixed
+        exercise_price = Some (usd 1.0)
+        purchase_price = usd 0.0
+        exercise_triggers = map warrantTrigger validWarrantMechanisms
+        warrant_expiration_date = None
+        vesting_terms_id = None
+        vestings = []
+        comments = []]
+      edits = []
+      deletes = []
+  pure ()
+
+testConversionMechanismRights_InvalidVariantsReject = script do
+  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
+  capTableCid <- addDefaultStakeholder issuer cap_table
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass StockClassOcfData with
+        id = "SC_INVALID_CONVERSION_MECHANISM"
+        name = "Invalid Conversion Mechanism"
+        class_type = OcfStockClassTypePreferred
+        default_id_prefix = "ICM-"
+        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
+        votes_per_share = 1.0
+        seniority = 2.0
+        board_approval_date = None
+        stockholder_approval_date = None
+        par_value = None
+        price_per_share = None
+        liquidation_preference_multiple = None
+        participation_cap_multiple = None
+        conversion_rights = [stockClassRight OcfConversionMechanismRatioConversion]
+        comments = []]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
+        id = "TX_INVALID_CONVERTIBLE_CONVERSION_MECHANISM"
+        date = testTime
+        security_id = "CONV-INVALID-MECHANISM"
+        custom_id = "CN-INVALID"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        investment_amount = usd 100_000.0
+        convertible_type = OcfConvertibleSecurity
+        conversion_triggers = [convertibleTrigger ("CUSTOM-INVALID", OcfConvMechCustom invalidCustomMechanism)]
+        pro_rata = None
+        seniority = 1
+        comments = []]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
+        id = "TX_INVALID_WARRANT_CONVERSION_MECHANISM"
+        date = testTime
+        security_id = "WARRANT-INVALID-MECHANISM"
+        custom_id = "W-INVALID"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        quantity = Some 100.0
+        quantity_source = Some OcfQuantityInstrumentFixed
+        exercise_price = Some (usd 1.0)
+        purchase_price = usd 0.0
+        exercise_triggers = [warrantTrigger ("CUSTOM-INVALID", OcfWarrantMechanismCustom with custom_conversion_description = "")]
+        warrant_expiration_date = None
+        vesting_terms_id = None
+        vestings = []
+        comments = []]
+      edits = []
+      deletes = []
+  pure ()
