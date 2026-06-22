@@ -36,6 +36,9 @@ validInterestRate = OcfInterestRate with
   accrual_end_date = None
   rate = 0.08
 
+invalidInterestRate : OcfInterestRate
+invalidInterestRate = validInterestRate with rate = 1.10
+
 validRatioMechanism : OcfRatioConversionMechanism
 validRatioMechanism = OcfRatioConversionMechanism with
   conversion_price = usd 1.0
@@ -76,6 +79,12 @@ validPpsMechanism = OcfSharePriceBasedConversionMechanism with
 invalidPpsMechanism : OcfSharePriceBasedConversionMechanism
 invalidPpsMechanism = validPpsMechanism with discount_amount = Some (usd 1.0)
 
+invalidPpsMechanismDiscountDisabled : OcfSharePriceBasedConversionMechanism
+invalidPpsMechanismDiscountDisabled = validPpsMechanism with
+  discount = False
+  discount_amount = Some (usd 1.0)
+  discount_percentage = Some 0.20
+
 validValuationMechanism : OcfValuationBasedConversionMechanism
 validValuationMechanism = OcfValuationBasedConversionMechanism with
   capitalization_definition = None
@@ -99,6 +108,9 @@ validSafeMechanism = OcfSAFEConversionMechanism with
 invalidSafeMechanism : OcfSAFEConversionMechanism
 invalidSafeMechanism = validSafeMechanism with conversion_discount = Some 1.0
 
+invalidSafeMechanismCap : OcfSAFEConversionMechanism
+invalidSafeMechanismCap = validSafeMechanism with conversion_valuation_cap = Some invalidCurrency
+
 validNoteMechanism : OcfNoteConversionMechanism
 validNoteMechanism = OcfNoteConversionMechanism with
   capitalization_definition = None
@@ -114,7 +126,13 @@ validNoteMechanism = OcfNoteConversionMechanism with
   interest_rates = [validInterestRate]
 
 invalidNoteMechanism : OcfNoteConversionMechanism
-invalidNoteMechanism = validNoteMechanism with interest_rates = []
+invalidNoteMechanism = validNoteMechanism with interest_rates = [invalidInterestRate]
+
+validNoteMechanismWithoutInterest : OcfNoteConversionMechanism
+validNoteMechanismWithoutInterest = validNoteMechanism with interest_rates = []
+
+invalidNoteMechanismCap : OcfNoteConversionMechanism
+invalidNoteMechanismCap = validNoteMechanism with conversion_valuation_cap = Some invalidCurrency
 
 validConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)]
 validConvertibleMechanisms =
@@ -171,11 +189,11 @@ invalidWarrantMechanisms =
   , ("VALUATION", OcfWarrantMechanismValuationBased with
       capitalization_definition = None
       capitalization_definition_rules = None
-      valuation_amount = Some (usd 5_000_000.0)
-      valuation_type = "")
+      valuation_amount = None
+      valuation_type = "valuation_cap")
   , ("PPS", OcfWarrantMechanismPpsBased with
       description = "Conflicting discounts"
-      discount = True
+      discount = False
       discount_amount = Some (usd 1.0)
       discount_percentage = Some 0.10)
   ]
@@ -350,14 +368,24 @@ testConversionMechanismValidators_AllVariants = script do
   assertInvalid "valuation mechanism" (validateOcfValuationBasedConversionMechanism invalidValuationMechanism)
   assertValid "SAFE mechanism" (validateOcfSAFEConversionMechanism validSafeMechanism)
   assertInvalid "SAFE mechanism" (validateOcfSAFEConversionMechanism invalidSafeMechanism)
+  assertInvalid "SAFE mechanism invalid cap" (validateOcfSAFEConversionMechanism invalidSafeMechanismCap)
   assertValid "note mechanism" (validateOcfNoteConversionMechanism validNoteMechanism)
+  assertValid "note mechanism without interest rates" (validateOcfNoteConversionMechanism validNoteMechanismWithoutInterest)
   assertInvalid "note mechanism" (validateOcfNoteConversionMechanism invalidNoteMechanism)
+  assertInvalid "note mechanism invalid cap" (validateOcfNoteConversionMechanism invalidNoteMechanismCap)
+  assertInvalid "pps mechanism disabled conflicting discounts" (validateOcfSharePriceBasedConversionMechanism invalidPpsMechanismDiscountDisabled)
   assertValidConvertibleMechanisms validConvertibleMechanisms
   assertInvalidConvertibleMechanisms invalidConvertibleMechanisms
   assertValidWarrantMechanisms validWarrantMechanisms
   assertInvalidWarrantMechanisms invalidWarrantMechanisms
   assertValidStockClassRights validStockClassRights
   assertInvalidStockClassRights invalidStockClassRights
+  assertValid "any right convertible SAFE" (validateOcfAnyConversionRight (OcfRightConvertible (convertibleRight (OcfConvMechSAFE validSafeMechanism))))
+  assertInvalid "any right convertible CUSTOM" (validateOcfAnyConversionRight (OcfRightConvertible (convertibleRight (OcfConvMechCustom invalidCustomMechanism))))
+  assertValid "any right warrant CUSTOM" (validateOcfAnyConversionRight (OcfRightWarrant (warrantRight (OcfWarrantMechanismCustom with custom_conversion_description = "Custom warrant"))))
+  assertInvalid "any right warrant VALUATION" (validateOcfAnyConversionRight (OcfRightWarrant (warrantRight (OcfWarrantMechanismValuationBased with capitalization_definition = None, capitalization_definition_rules = None, valuation_amount = None, valuation_type = "valuation_cap"))))
+  assertValid "any right stock class RATIO" (validateOcfAnyConversionRight (OcfRightStockClass (stockClassRightWith OcfConversionMechanismRatioConversion None None (Some validRatio) None None None None None)))
+  assertInvalid "any right stock class RATIO" (validateOcfAnyConversionRight (OcfRightStockClass (stockClassRight OcfConversionMechanismRatioConversion)))
 
 testConversionMechanismRights_AllValidVariantsCreate = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
@@ -430,8 +458,28 @@ testConversionMechanismRights_AllValidVariantsCreate = script do
 testConversionMechanismRights_InvalidVariantsReject = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
   capTableCid <- addDefaultStakeholder issuer cap_table
-  submitMustFail issuer do
+  stockControl <- submit issuer do
     exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass StockClassOcfData with
+        id = "SC_VALID_CONVERSION_MECHANISM_CONTROL"
+        name = "Valid Conversion Mechanism Control"
+        class_type = OcfStockClassTypePreferred
+        default_id_prefix = "VCM-"
+        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
+        votes_per_share = 1.0
+        seniority = 2.0
+        board_approval_date = None
+        stockholder_approval_date = None
+        par_value = None
+        price_per_share = None
+        liquidation_preference_multiple = None
+        participation_cap_multiple = None
+        conversion_rights = [stockClassRightWith OcfConversionMechanismRatioConversion None None (Some validRatio) None None None None None]
+        comments = []]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd stockControl.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateStockClass StockClassOcfData with
         id = "SC_INVALID_CONVERSION_MECHANISM"
         name = "Invalid Conversion Mechanism"
@@ -450,8 +498,28 @@ testConversionMechanismRights_InvalidVariantsReject = script do
         comments = []]
       edits = []
       deletes = []
+  convertibleControl <- submit issuer do
+    exerciseCmd stockControl.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
+        id = "TX_VALID_CONVERTIBLE_CONVERSION_MECHANISM_CONTROL"
+        date = testTime
+        security_id = "CONV-VALID-MECHANISM-CONTROL"
+        custom_id = "CN-VALID-CONTROL"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        investment_amount = usd 100_000.0
+        convertible_type = OcfConvertibleSecurity
+        conversion_triggers = [convertibleTrigger ("CUSTOM-VALID-CONTROL", OcfConvMechCustom validCustomMechanism)]
+        pro_rata = None
+        seniority = 1
+        comments = []]
+      edits = []
+      deletes = []
   submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
+    exerciseCmd convertibleControl.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
         id = "TX_INVALID_CONVERTIBLE_CONVERSION_MECHANISM"
         date = testTime
@@ -470,8 +538,31 @@ testConversionMechanismRights_InvalidVariantsReject = script do
         comments = []]
       edits = []
       deletes = []
+  warrantControl <- submit issuer do
+    exerciseCmd convertibleControl.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
+        id = "TX_VALID_WARRANT_CONVERSION_MECHANISM_CONTROL"
+        date = testTime
+        security_id = "WARRANT-VALID-MECHANISM-CONTROL"
+        custom_id = "W-VALID-CONTROL"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        quantity = Some 100.0
+        quantity_source = Some OcfQuantityInstrumentFixed
+        exercise_price = Some (usd 1.0)
+        purchase_price = usd 0.0
+        exercise_triggers = [warrantTrigger ("CUSTOM-VALID-CONTROL", OcfWarrantMechanismCustom with custom_conversion_description = "Valid warrant")]
+        warrant_expiration_date = None
+        vesting_terms_id = None
+        vestings = []
+        comments = []]
+      edits = []
+      deletes = []
   submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
+    exerciseCmd warrantControl.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
         id = "TX_INVALID_WARRANT_CONVERSION_MECHANISM"
         date = testTime
