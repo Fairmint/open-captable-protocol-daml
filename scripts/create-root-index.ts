@@ -145,7 +145,7 @@ function patchCombinedBundledDependencyImports(destLib: string) {
 }
 
 function buildCombinedLib() {
-  console.log('🧩 Building combined lib/ from OpenCapTable-v35 codegen only...');
+  console.log('🧩 Building combined lib/ from OpenCapTable-v36 codegen only...');
   rimraf(DEST_LIB);
   fs.mkdirSync(DEST_LIB, { recursive: true });
 
@@ -235,7 +235,7 @@ export declare const OCP_TEMPLATES: {
   ensureBundledDANamespaceIndexes(ROOT_DIR);
   ensureBundledSpliceNamespaceIndexes(ROOT_DIR);
 
-  console.log('✅ Combined lib/ created (OpenCapTable-v35 + OCP_TEMPLATES)');
+  console.log('✅ Combined lib/ created (OpenCapTable-v36 + OCP_TEMPLATES)');
 }
 
 buildCombinedLib();

@@ -39,7 +39,7 @@ export function parseReleaseTagName(tag: string): ReleaseTagParts {
   const match = /^(?<packageName>.+)-v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(trimmed);
   if (!match?.groups) {
     throw new Error(
-      `Invalid release tag "${tag}". Expected <package-name>-v<major>.<minor>.<patch>, for example OpenCapTable-v35-v0.0.2.`
+      `Invalid release tag "${tag}". Expected <package-name>-v<major>.<minor>.<patch>, for example OpenCapTable-v36-v0.0.2.`
     );
   }
 
