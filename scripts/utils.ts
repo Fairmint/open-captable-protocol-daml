@@ -1,5 +1,6 @@
 import type { ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
 import {
+  Canton,
   EnvLoader,
   FileLogger,
   LedgerJsonApiClient,
@@ -80,7 +81,7 @@ export function createLedgerJsonApiClient(network: ContractNetwork, providerType
     throw new Error(`Missing required LedgerJsonApiClient environment variables: ${missingEnvVars.join(', ')}`);
   }
 
-  return new LedgerJsonApiClient({
+  const canton = new Canton({
     network,
     provider: providerType,
     authUrl,
@@ -97,6 +98,7 @@ export function createLedgerJsonApiClient(network: ContractNetwork, providerType
     },
     logger: new FileLogger(),
   });
+  return canton.ledger;
 }
 
 /**
@@ -142,5 +144,6 @@ export function createValidatorApiClient(network: ContractNetwork, providerType:
     logger: new FileLogger(),
   };
 
-  return new ValidatorApiClient(clientConfig);
+  const canton = new Canton(clientConfig);
+  return canton.validator;
 }
