@@ -104,11 +104,17 @@ function getCreatedEvents(response: {
     .map((event) => event.CreatedTreeEvent.value);
 }
 
+function templateTypeName(templateId: string): string {
+  const separatorIndex = templateId.indexOf(':');
+  return separatorIndex === -1 ? templateId : templateId.slice(separatorIndex + 1);
+}
+
 async function findExistingFactoryContract(
   client: ReturnType<typeof createLedgerJsonApiClient>,
   templateId: string,
   operatorPartyId: string
 ): Promise<CreatedTreeEventValue | null> {
+  const expectedTemplateType = templateTypeName(templateId);
   const activeContracts = (await client.getActiveContracts({
     parties: [operatorPartyId],
     templateIds: [templateId],
@@ -116,7 +122,11 @@ async function findExistingFactoryContract(
 
   for (const item of activeContracts) {
     const createdEvent = item.contractEntry?.JsActiveContract?.createdEvent;
-    if (createdEvent?.templateId === templateId && createdEvent.createArgument.system_operator === operatorPartyId) {
+    if (
+      createdEvent &&
+      templateTypeName(createdEvent.templateId) === expectedTemplateType &&
+      createdEvent.createArgument.system_operator === operatorPartyId
+    ) {
       return {
         contractId: createdEvent.contractId,
         templateId: createdEvent.templateId,
