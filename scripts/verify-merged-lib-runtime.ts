@@ -13,7 +13,7 @@ import { getErrorMessage } from './types';
 const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
-/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v36 + inlined Shared). */
+/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v35 + inlined Shared). */
 const REQUIRED_RELATIVE_FILES = [
   'Splice/Api/Token/MetadataV1/module.js',
   'Splice/Api/Token/HoldingV1/module.js',

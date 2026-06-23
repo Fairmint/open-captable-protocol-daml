@@ -38,7 +38,7 @@ const ROOT_DIR = path.join(__dirname, '..');
 const SKIP_LINEAGE_UPGRADE_CHECK = new Set<string>([]);
 
 /**
- * Extract the base name and major version from a package name. E.g., "OpenCapTable-v36" => { baseName: "OpenCapTable",
+ * Extract the base name and major version from a package name. E.g., "OpenCapTable-v35" => { baseName: "OpenCapTable",
  * majorVersion: 35 }
  */
 function parsePackageName(name: string): { baseName: string; majorVersion: number | null } {
@@ -66,11 +66,11 @@ function getBackedUpPackages(): Map<string, Array<{ packageName: string; version
   const lock = loadDarsLock();
   const darsDir = getDarsDir();
 
-  // Group by exact package name (e.g., "OpenCapTable-v36")
+  // Group by exact package name (e.g., "OpenCapTable-v35")
   const byPackageName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
 
   for (const [lockKey, _entry] of Object.entries(lock.packages)) {
-    // lockKey format: "OpenCapTable-v36/0.0.1/OpenCapTable-v36.dar"
+    // lockKey format: "OpenCapTable-v35/0.0.1/OpenCapTable-v35.dar"
     const parts = lockKey.split('/');
     if (parts.length !== 3) continue;
 
