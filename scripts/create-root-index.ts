@@ -51,60 +51,40 @@ function patchCombinedBundledDependencyImports(destLib: string) {
     return;
   }
 
-  const dependencyTargets = [
+  const replacements = [
     {
-      packageName: 'ghc-stdlib-DA-Internal-Template-1.0.0',
+      from: 'daml.js/ghc-stdlib-DA-Internal-Template-1.0.0',
       toDir: path.join(destLib, 'DA', 'Internal', 'Template'),
     },
     {
-      packageName: 'daml-stdlib-DA-Time-Types-1.0.0',
+      from: 'daml.js/daml-stdlib-DA-Time-Types-1.0.0',
       toDir: path.join(destLib, 'DA', 'Time', 'Types'),
     },
     {
-      packageName: 'daml-prim-DA-Types-1.0.0',
+      from: 'daml.js/daml-prim-DA-Types-1.0.0',
       toDir: path.join(destLib, 'DA', 'Types'),
     },
     {
-      packageName: 'daml-stdlib-DA-Set-Types-1.0.0',
-      toDir: path.join(destLib, 'DA', 'Set', 'Types'),
-    },
-    {
-      packageName: 'splice-api-token-burn-mint-v1-1.0.0',
-      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'BurnMintV1'),
-    },
-    {
-      packageName: 'splice-api-token-metadata-v1-1.0.0',
+      from: 'daml.js/splice-api-token-metadata-v1-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'MetadataV1'),
     },
     {
-      packageName: 'splice-api-token-holding-v1-1.0.0',
+      from: 'daml.js/splice-api-token-holding-v1-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'HoldingV1'),
     },
     {
-      packageName: 'splice-api-token-allocation-instruction-v1-1.0.0',
-      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'AllocationInstructionV1'),
-    },
-    {
-      packageName: 'splice-api-token-transfer-instruction-v1-1.0.0',
-      toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'TransferInstructionV1'),
-    },
-    {
-      packageName: 'splice-api-token-allocation-v1-1.0.0',
+      from: 'daml.js/splice-api-token-allocation-v1-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'Token', 'AllocationV1'),
     },
     {
-      packageName: 'splice-api-featured-app-v1-1.0.0',
+      from: 'daml.js/splice-api-featured-app-v1-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'FeaturedAppRightV1'),
     },
     {
-      packageName: 'splice-api-featured-app-v2-1.0.0',
+      from: 'daml.js/splice-api-featured-app-v2-1.0.0',
       toDir: path.join(destLib, 'Splice', 'Api', 'FeaturedAppRightV2'),
     },
   ];
-  const replacements = dependencyTargets.flatMap(({ packageName, toDir }) => [
-    { from: `daml.js/${packageName}`, toDir },
-    { from: `@daml.js/${packageName}`, toDir },
-  ]);
 
   const walk = (dir: string) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
@@ -145,7 +125,7 @@ function patchCombinedBundledDependencyImports(destLib: string) {
 }
 
 function buildCombinedLib() {
-  console.log('🧩 Building combined lib/ from OpenCapTable-v35 codegen only...');
+  console.log('🧩 Building combined lib/ from OpenCapTable-v34 codegen only...');
   rimraf(DEST_LIB);
   fs.mkdirSync(DEST_LIB, { recursive: true });
 
@@ -235,7 +215,7 @@ export declare const OCP_TEMPLATES: {
   ensureBundledDANamespaceIndexes(ROOT_DIR);
   ensureBundledSpliceNamespaceIndexes(ROOT_DIR);
 
-  console.log('✅ Combined lib/ created (OpenCapTable-v35 + OCP_TEMPLATES)');
+  console.log('✅ Combined lib/ created (OpenCapTable-v34 + OCP_TEMPLATES)');
 }
 
 buildCombinedLib();
