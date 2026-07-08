@@ -45,6 +45,11 @@ const SECURITY_ID_INDEX_MAPS: Record<string, string> = {
   WarrantIssuance: 'warrant_issuances_by_security_id',
 };
 
+const OBJECT_TYPE_CONSTRUCTOR_OVERRIDES: Record<string, string> = {
+  StakeholderRelationshipChangeEvent: 'OcfObjCeStakeholderRelationship',
+  StakeholderStatusChangeEvent: 'OcfObjCeStakeholderStatus',
+};
+
 interface TypeDef {
   name: string;
   module: string;
@@ -57,6 +62,7 @@ interface TypeDef {
   validates_stock_class_authorized_adjustment: boolean;
   validates_stock_issuance_authorized_shares: boolean;
   validates_issuer_id_reference: boolean;
+  object_type_constructor: string;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
 }
@@ -100,6 +106,27 @@ function pluralize(str: string): string {
   // Words ending in s (like stock_class) get "es"
   if (str.endsWith('s')) return `${str}es`;
   return `${str}s`;
+}
+
+function objectTypeConstructor(name: string): string {
+  if (OBJECT_TYPE_CONSTRUCTOR_OVERRIDES[name]) return OBJECT_TYPE_CONSTRUCTOR_OVERRIDES[name];
+  if (
+    /^(Convertible|EquityCompensation|Stock|Warrant).*(Acceptance|Cancellation|Conversion|Exercise|Issuance|Release|Repricing|Retraction|Transfer|Consolidation|Repurchase|Reissuance)$/.test(
+      name
+    ) ||
+    name.startsWith('IssuerAuthorizedSharesAdjustment') ||
+    name.startsWith('StockClassAuthorizedSharesAdjustment') ||
+    name.startsWith('StockClassConversionRatioAdjustment') ||
+    name.startsWith('StockClassSplit') ||
+    name.startsWith('StockPlanPoolAdjustment') ||
+    name.startsWith('StockPlanReturnToPool') ||
+    name === 'VestingAcceleration' ||
+    name === 'VestingEvent' ||
+    name === 'VestingStart'
+  ) {
+    return `OcfObjTx${name}`;
+  }
+  return `OcfObj${name}`;
 }
 
 /** Parse a DAML file to find its main data type and field name */
@@ -238,6 +265,7 @@ function discoverTypes(config: Config): TypeDef[] {
       validates_stock_class_authorized_adjustment: name === 'StockClassAuthorizedSharesAdjustment',
       validates_stock_issuance_authorized_shares: name === 'StockIssuance',
       validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
+      object_type_constructor: objectTypeConstructor(name),
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
