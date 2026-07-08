@@ -64,7 +64,7 @@ function findPackageFolder(packageName: string): string {
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "OpenCapTable-v35", "Subscriptions-v05", etc.
+      // Match patterns like "OpenCapTable-v34", "Subscriptions-v05", etc.
       const match = entry.name.match(new RegExp(`^${packageName}-(v(\\d+))$`, 'i'));
       if (match) {
         const version = parseInt(match[2], 10);

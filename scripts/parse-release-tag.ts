@@ -2,7 +2,7 @@
 /**
  * Parse and validate package-scoped release tags.
  *
- * Usage: tsx scripts/parse-release-tag.ts OpenCapTable-v35-v0.0.2
+ * Usage: tsx scripts/parse-release-tag.ts OpenCapTable-v34-v0.0.2
  */
 
 import {

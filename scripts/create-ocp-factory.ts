@@ -5,6 +5,7 @@
  * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
  */
 
+import { extractEventsFromTransaction } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
 import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
@@ -23,17 +24,6 @@ interface ContractIdEntry {
   packageVersion?: string;
   sourceDir?: string;
   updatedAt?: string;
-}
-
-interface CreatedTreeEventValue {
-  contractId: string;
-  templateId: string;
-}
-
-interface CreatedTreeEventWrapper {
-  CreatedTreeEvent: {
-    value: CreatedTreeEventValue;
-  };
 }
 
 function loadExistingData(filePath: string): ContractIdData {
@@ -63,33 +53,6 @@ function isNetworkEntry(value: unknown): value is ContractIdEntry {
     return false;
   }
   return cid.trim().length > 0 && tid.trim().length > 0;
-}
-
-function isCreatedTreeEventWrapper(value: unknown): value is CreatedTreeEventWrapper {
-  if (value === null || typeof value !== 'object' || !('CreatedTreeEvent' in value)) {
-    return false;
-  }
-
-  const wrapper = value as { CreatedTreeEvent?: unknown };
-  if (wrapper.CreatedTreeEvent === null || typeof wrapper.CreatedTreeEvent !== 'object') {
-    return false;
-  }
-
-  const event = wrapper.CreatedTreeEvent as { value?: unknown };
-  if (event.value === null || typeof event.value !== 'object') {
-    return false;
-  }
-
-  const created = event.value as Record<string, unknown>;
-  return typeof created.contractId === 'string' && typeof created.templateId === 'string';
-}
-
-function getCreatedEvents(response: {
-  transactionTree: { eventsById: Record<string, unknown> };
-}): CreatedTreeEventValue[] {
-  return Object.values(response.transactionTree.eventsById)
-    .filter(isCreatedTreeEventWrapper)
-    .map((event) => event.CreatedTreeEvent.value);
 }
 
 async function main() {
@@ -130,7 +93,7 @@ function finishCreate(
   outputPath: string,
   pkg: { name: string; version: string; sourceDir: string }
 ): void {
-  const created = getCreatedEvents(response);
+  const { created } = extractEventsFromTransaction(response);
   if (created.length !== 1) {
     throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
   }

@@ -13,7 +13,7 @@ import { isContractNetwork, type ContractNetwork } from './types';
 // =============================================================================
 
 export interface PackageConfig {
-  /** Display name (e.g., 'OpenCapTable-v35') */
+  /** Display name (e.g., 'OpenCapTable-v34') */
   name: string;
   /** DAR file name without extension (usually same as name) */
   darName: string;
@@ -60,8 +60,8 @@ interface PackageDef {
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
   ocp: {
-    name: 'OpenCapTable-v35',
-    sourceDir: 'OpenCapTable-v35',
+    name: 'OpenCapTable-v34',
+    sourceDir: 'OpenCapTable-v34',
     generated: { createIndex: true, publishNameSuffix: null },
   },
 } as const satisfies Record<string, PackageDef>;
@@ -105,7 +105,7 @@ function resolvePackageKey(key: string): PackageDefKey | undefined {
 }
 
 /**
- * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35'). Key lookup is
+ * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v34'). Key lookup is
  * case-insensitive.
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {
@@ -271,7 +271,7 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
  * This ensures we always use the correct package version from daml.yaml (single source of truth), avoiding hardcoded
  * version references that become stale after upgrades.
  *
- * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35')
+ * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v34')
  * @param module - Full module path (e.g., 'Fairmint.OpenCapTable.OcpFactory')
  * @param template - Template name (e.g., 'OcpFactory')
  */
