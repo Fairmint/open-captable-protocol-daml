@@ -62,6 +62,7 @@ interface TypeDef {
   validates_stock_class_authorized_adjustment: boolean;
   validates_stock_issuance_authorized_shares: boolean;
   validates_issuer_id_reference: boolean;
+  is_document: boolean;
   object_type_constructor: string;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
@@ -265,6 +266,7 @@ function discoverTypes(config: Config): TypeDef[] {
       validates_stock_class_authorized_adjustment: name === 'StockClassAuthorizedSharesAdjustment',
       validates_stock_issuance_authorized_shares: name === 'StockIssuance',
       validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
+      is_document: name === 'Document',
       object_type_constructor: objectTypeConstructor(name),
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
