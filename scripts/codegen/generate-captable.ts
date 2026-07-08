@@ -51,6 +51,9 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  validates_stock_class_initial_authorized_shares: boolean;
+  validates_stock_class_authorized_adjustment: boolean;
+  validates_stock_issuance_authorized_shares: boolean;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
 }
@@ -219,6 +222,9 @@ function discoverTypes(config: Config): TypeDef[] {
           error: `${toTitleCase(fieldSpec)} not found`,
         };
       }),
+      validates_stock_class_initial_authorized_shares: name === 'StockClass',
+      validates_stock_class_authorized_adjustment: name === 'StockClassAuthorizedSharesAdjustment',
+      validates_stock_issuance_authorized_shares: name === 'StockIssuance',
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 

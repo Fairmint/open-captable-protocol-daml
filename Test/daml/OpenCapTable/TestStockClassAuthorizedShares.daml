@@ -1,0 +1,110 @@
+module OpenCapTable.TestStockClassAuthorizedShares where
+
+import Fairmint.OpenCapTable.OCF.StockClass
+import Fairmint.OpenCapTable.OCF.StockClassAuthorizedSharesAdjustment
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+import Daml.Script
+
+limitedStockClass : Text -> Decimal -> StockClassOcfData
+limitedStockClass classId authorizedShares =
+  (defaultStockClass classId) with
+    initial_shares_authorized = OcfInitialSharesNumeric authorizedShares
+
+stockClassAuthorizedSharesAdjustment : Text -> Text -> Decimal -> StockClassAuthorizedSharesAdjustmentOcfData
+stockClassAuthorizedSharesAdjustment adjustmentId stockClassId authorizedShares =
+  StockClassAuthorizedSharesAdjustmentOcfData with
+    id = adjustmentId
+    date = defaultTestDate
+    stock_class_id = stockClassId
+    new_shares_authorized = authorizedShares
+    board_approval_date = None
+    stockholder_approval_date = None
+    comments = []
+
+testStockIssuanceCannotExceedStockClassInitialAuthorizedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_LIMITED" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_LIMITED" "Limited Holder"
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_TOO_MANY" "SEC_TOO_MANY" stakeholderId stockClassId) with quantity = 101.0)]
+      edits = []
+      deletes = []
+
+testStockClassAuthorizedSharesAdjustmentAllowsAdditionalIssuance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_ADJUSTABLE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_ADJUSTABLE" "Adjustable Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_INITIAL" "SEC_INITIAL" stakeholderId stockClassId) with quantity = 100.0)
+
+  result <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_RAISE" stockClassId 150.0)]
+      edits = []
+      deletes = []
+
+  _ <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_EXTRA" "SEC_EXTRA" stakeholderId stockClassId) with quantity = 50.0)
+  pure ()
+
+testStockClassAuthorizedSharesAdjustmentCannotDropBelowIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_NO_DROP" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_NO_DROP" "No Drop Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_ISSUED" "SEC_ISSUED" stakeholderId stockClassId) with quantity = 75.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_DROP" stockClassId 50.0)]
+      edits = []
+      deletes = []
+
+testStockClassEditCannotDropInitialAuthorizedSharesBelowIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_EDIT" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_EDIT" "Edit Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_EDIT_ISSUED" "SEC_EDIT_ISSUED" stakeholderId stockClassId) with quantity = 75.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditStockClass (limitedStockClass stockClassId 50.0)]
+      deletes = []
+
+testStockClassAuthorizedSharesAdjustmentDeleteCannotInvalidateIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_DELETE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_DELETE" "Delete Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_DELETE" stockClassId 150.0)]
+      edits = []
+      deletes = []
+
+  capTableIssued <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_DELETE_ISSUED" "SEC_DELETE_ISSUED" stakeholderId stockClassId) with quantity = 125.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockClassAuthorizedSharesAdjustment "TX_AUTH_DELETE"]
+
+testUnlimitedStockClassAuthorizedSharesAllowsLargeIssuance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  let unlimitedClass = (defaultStockClass "SC_UNLIMITED") with
+        initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesUnlimited
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table unlimitedClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_UNLIMITED" "Unlimited Holder"
+
+  _ <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_UNLIMITED" "SEC_UNLIMITED" stakeholderId stockClassId) with quantity = 2_000_000.0)
+  pure ()
+
