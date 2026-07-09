@@ -271,8 +271,17 @@ applyStockClassShareEvent current event = case event of
   StockClassShareMultiplier with ratio -> current * ratio.numerator / ratio.denominator
   StockClassShareRetraction _ _ -> 0.0
 
-stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
-stockSecurityShareEvents maps issuanceData = do
+balanceSecurityTerminalEvents : Time -> Optional Text -> [StockClassShareEvent]
+balanceSecurityTerminalEvents eventDate balanceSecurityId = case balanceSecurityId of
+  Some _ ->
+    [ StockClassShareRetraction with
+        event_date = eventDate
+        event_priority = 3
+    ]
+  None -> []
+
+stockIssuedShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
+stockIssuedShareEvents maps issuanceData = do
   cancellationEvents <- foldlA
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -299,19 +308,6 @@ stockSecurityShareEvents maps issuanceData = do
     []
     (Map.values maps.stock_repurchases)
 
-  transferEvents <- foldlA
-    (\events transferCid -> do
-      transfer <- fetch transferCid
-      if transfer.transfer_data.security_id == issuanceData.security_id
-        then pure ((StockClassShareDelta with
-            event_date = transfer.transfer_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - transfer.transfer_data.quantity)
-          :: events)
-        else pure events)
-    []
-    (Map.values maps.stock_transfers)
-
   conversionEvents <- foldlA
     (\events conversionCid -> do
       conversion <- fetch conversionCid
@@ -321,6 +317,95 @@ stockSecurityShareEvents maps issuanceData = do
             event_priority = 1
             quantity_delta = 0.0 - conversion.conversion_data.quantity_converted)
           :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_conversions)
+
+  retractionEvents <- foldlA
+    (\events retractionCid -> do
+      retraction <- fetch retractionCid
+      if retraction.retraction_data.security_id == issuanceData.security_id
+        then pure ((StockClassShareRetraction with
+            event_date = retraction.retraction_data.date
+            event_priority = 3)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_retractions)
+
+  splitEvents <- foldlA
+    (\events splitCid -> do
+      split <- fetch splitCid
+      if split.split_data.stock_class_id == issuanceData.stock_class_id && split.split_data.date >= issuanceData.date
+        then pure ((StockClassShareMultiplier with
+            event_date = split.split_data.date
+            event_priority = 2
+            ratio = split.split_data.split_ratio)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_class_splits)
+
+  pure ((StockClassShareDelta with
+      event_date = issuanceData.date
+      event_priority = 0
+      quantity_delta = issuanceData.quantity)
+    :: (cancellationEvents ++ repurchaseEvents ++ conversionEvents ++ retractionEvents ++ splitEvents))
+
+stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
+stockSecurityShareEvents maps issuanceData = do
+  cancellationEvents <- foldlA
+    (\events cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      if cancellation.cancellation_data.security_id == issuanceData.security_id
+        then
+          let delta = StockClassShareDelta with
+                event_date = cancellation.cancellation_data.date
+                event_priority = 1
+                quantity_delta = 0.0 - cancellation.cancellation_data.quantity
+          in pure (delta :: (balanceSecurityTerminalEvents cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id ++ events))
+        else pure events)
+    []
+    (Map.values maps.stock_cancellations)
+
+  repurchaseEvents <- foldlA
+    (\events repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      if repurchase.repurchase_data.security_id == issuanceData.security_id
+        then
+          let delta = StockClassShareDelta with
+                event_date = repurchase.repurchase_data.date
+                event_priority = 1
+                quantity_delta = 0.0 - repurchase.repurchase_data.quantity
+          in pure (delta :: (balanceSecurityTerminalEvents repurchase.repurchase_data.date repurchase.repurchase_data.balance_security_id ++ events))
+        else pure events)
+    []
+    (Map.values maps.stock_repurchases)
+
+  transferEvents <- foldlA
+    (\events transferCid -> do
+      transfer <- fetch transferCid
+      if transfer.transfer_data.security_id == issuanceData.security_id
+        then
+          let delta = StockClassShareDelta with
+                event_date = transfer.transfer_data.date
+                event_priority = 1
+                quantity_delta = 0.0 - transfer.transfer_data.quantity
+          in pure (delta :: (balanceSecurityTerminalEvents transfer.transfer_data.date transfer.transfer_data.balance_security_id ++ events))
+        else pure events)
+    []
+    (Map.values maps.stock_transfers)
+
+  conversionEvents <- foldlA
+    (\events conversionCid -> do
+      conversion <- fetch conversionCid
+      if conversion.conversion_data.security_id == issuanceData.security_id
+        then
+          let delta = StockClassShareDelta with
+                event_date = conversion.conversion_data.date
+                event_priority = 1
+                quantity_delta = 0.0 - conversion.conversion_data.quantity_converted
+          in pure (delta :: (balanceSecurityTerminalEvents conversion.conversion_data.date conversion.conversion_data.balance_security_id ++ events))
         else pure events)
     []
     (Map.values maps.stock_conversions)
@@ -382,7 +467,7 @@ stockSecurityShareEvents maps issuanceData = do
 
 stockIssuanceCurrentQuantity : CapTableMaps -> StockIssuanceOcfData -> Update Decimal
 stockIssuanceCurrentQuantity maps issuanceData = do
-  events <- stockSecurityShareEvents maps issuanceData
+  events <- stockIssuedShareEvents maps issuanceData
   pure $ foldl applyStockClassShareEvent 0.0 (sortOn stockClassShareEventSortKey events)
 
 validateStockSecurityBalanceEvent : Text -> Decimal -> StockClassShareEvent -> Update Decimal
@@ -395,7 +480,10 @@ validateStockSecurityBalanceEvent securityId current event = case event of
     pure next
   StockClassShareMultiplier with ratio ->
     pure (current * ratio.numerator / ratio.denominator)
-  StockClassShareRetraction _ _ ->
+  StockClassShareRetraction _ _ -> do
+    assertMsg
+      ("Stock security balance cannot be retired for " <> securityId <> " because it has no remaining balance")
+      (current > 0.0)
     pure 0.0
 
 validateStockSecurityBalance : CapTableMaps -> StockIssuanceOcfData -> Update ()
