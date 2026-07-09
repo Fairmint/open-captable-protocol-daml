@@ -814,9 +814,17 @@ stockClassShareLotEvents eventIndex lot =
       quantity_delta = lot.quantity)
     :: (securityEvents ++ splitEvents)
 
-stockClassShareLotSplitAdjustedEvents : StockClassShareEventIndex -> StockClassShareLot -> [StockClassShareEvent]
-stockClassShareLotSplitAdjustedEvents eventIndex lot =
-  let splitEvents =
+stockClassShareLotPlanAllocationEvents : StockClassShareEventIndex -> StockClassShareLot -> [StockClassShareEvent]
+stockClassShareLotPlanAllocationEvents eventIndex lot =
+  let retractionEvents = case lot.security_id of
+        Some securityId ->
+          filter
+            (\event -> case event of
+              StockClassShareRetraction _ _ -> True
+              _ -> False)
+            (fromOptional [] (Map.lookup securityId eventIndex.stock_security_events_by_security_id))
+        None -> []
+      splitEvents =
         filter
           (stockClassShareEventOnOrAfter lot.event_date)
           (fromOptional [] (Map.lookup lot.stock_class_id eventIndex.stock_class_split_events_by_stock_class_id))
@@ -824,17 +832,17 @@ stockClassShareLotSplitAdjustedEvents eventIndex lot =
       event_date = lot.event_date
       event_priority = 0
       quantity_delta = lot.quantity)
-    :: splitEvents
+    :: (retractionEvents ++ splitEvents)
 
-stockClassShareLotSplitAdjustedQuantity : StockClassShareEventIndex -> StockClassShareLot -> Optional Decimal
-stockClassShareLotSplitAdjustedQuantity eventIndex lot =
+stockClassShareLotPlanAllocatedQuantity : StockClassShareEventIndex -> StockClassShareLot -> Optional Decimal
+stockClassShareLotPlanAllocatedQuantity eventIndex lot =
   foldl
     applyStockClassShareEventOptional
     (Some 0.0)
-    (sortOn stockClassShareEventSortKey (stockClassShareLotSplitAdjustedEvents eventIndex lot))
+    (sortOn stockClassShareEventSortKey (stockClassShareLotPlanAllocationEvents eventIndex lot))
 
-stockClassShareLotSplitAdjustedQuantityAt : StockClassShareEventIndex -> StockClassShareLot -> Time -> Optional Decimal
-stockClassShareLotSplitAdjustedQuantityAt eventIndex lot asOf =
+stockClassShareLotPlanAllocatedQuantityAt : StockClassShareEventIndex -> StockClassShareLot -> Time -> Optional Decimal
+stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf =
   if lot.event_date <= asOf
     then
       foldl
@@ -842,7 +850,7 @@ stockClassShareLotSplitAdjustedQuantityAt eventIndex lot asOf =
         (Some 0.0)
         (sortOn
           stockClassShareEventSortKey
-          (filter (stockClassShareEventOnOrBefore asOf) (stockClassShareLotSplitAdjustedEvents eventIndex lot)))
+          (filter (stockClassShareEventOnOrBefore asOf) (stockClassShareLotPlanAllocationEvents eventIndex lot)))
     else Some 0.0
 
 stockClassShareLotCurrentQuantity : StockClassShareEventIndex -> StockClassShareLot -> Optional Decimal
@@ -1275,7 +1283,7 @@ stockIssuancePlanAllocationIndex eventIndex maps =
       case issuance.issuance_data.stock_plan_id of
         Some stockPlanId -> do
           let lot = stockIssuanceShareLot issuance.issuance_data
-          case stockClassShareLotSplitAdjustedQuantity eventIndex lot of
+          case stockClassShareLotPlanAllocatedQuantity eventIndex lot of
             Some allocationQuantity -> do
               assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
               pure (addQuantityById stockPlanId allocationQuantity totals)
@@ -1309,14 +1317,17 @@ stockPlanReturnedQuantityIndex maps =
     Map.empty
     (Map.values maps.stock_plan_return_to_pools)
 
-stockPlanReturnedQuantityBySecurityIndex : CapTableMaps -> Update (Map Text Decimal)
-stockPlanReturnedQuantityBySecurityIndex maps =
+stockPlanReturnedQuantityBySecurityAt : CapTableMaps -> Text -> Time -> Update Decimal
+stockPlanReturnedQuantityBySecurityAt maps securityId asOf =
   foldlA
-    (\totals returnCid -> do
+    (\total returnCid -> do
       returnToPool <- fetch returnCid
-      assertNonNegativeQuantity ("Stock plan return-to-pool quantity for " <> returnToPool.return_data.id) returnToPool.return_data.quantity
-      pure (addQuantityById returnToPool.return_data.security_id returnToPool.return_data.quantity totals))
-    Map.empty
+      if returnToPool.return_data.security_id == securityId && returnToPool.return_data.date <= asOf
+        then do
+          assertNonNegativeQuantity ("Stock plan return-to-pool quantity for " <> returnToPool.return_data.id <> " on " <> show asOf) returnToPool.return_data.quantity
+          pure (total + returnToPool.return_data.quantity)
+        else pure total)
+    0.0
     (Map.values maps.stock_plan_return_to_pools)
 
 equityCompensationSecurityEvents : CapTableMaps -> Text -> Update [StockClassShareEvent]
@@ -1376,8 +1387,19 @@ equityCompensationCurrentQuantity maps issuanceData = do
     (Some issuanceData.quantity)
     (sortOn stockClassShareEventSortKey events))
 
-stockPlanSecurityReturnableQuantity : StockClassShareEventIndex -> CapTableMaps -> StockPlanReturnToPoolOcfData -> Update Decimal
-stockPlanSecurityReturnableQuantity eventIndex maps returnData = do
+equityCompensationQuantityAt : CapTableMaps -> EquityCompensationIssuanceOcfData -> Time -> Update (Optional Decimal)
+equityCompensationQuantityAt maps issuanceData asOf = do
+  if issuanceData.date <= asOf
+    then do
+      events <- equityCompensationSecurityEvents maps issuanceData.security_id
+      pure (foldl
+        applyStockClassShareEventOptional
+        (Some issuanceData.quantity)
+        (sortOn stockClassShareEventSortKey (filter (stockClassShareEventOnOrBefore asOf) events)))
+    else pure (Some 0.0)
+
+stockPlanSecurityReturnableQuantityAt : StockClassShareEventIndex -> CapTableMaps -> StockPlanReturnToPoolOcfData -> Time -> Update Decimal
+stockPlanSecurityReturnableQuantityAt eventIndex maps returnData asOf = do
   let stockCidOpt = Map.lookup returnData.security_id maps.stock_issuances_by_security_id
   let equityCompensationCidOpt = Map.lookup returnData.security_id maps.equity_compensation_issuances_by_security_id
   case (stockCidOpt, equityCompensationCidOpt) of
@@ -1389,7 +1411,7 @@ stockPlanSecurityReturnableQuantity eventIndex maps returnData = do
             ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
             (stockPlanId == returnData.stock_plan_id)
           let lot = stockIssuanceShareLot issuance.issuance_data
-          case (stockClassShareLotSplitAdjustedQuantity eventIndex lot, stockClassShareLotCurrentQuantity eventIndex lot) of
+          case (stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf, stockClassShareLotQuantityAt eventIndex lot asOf) of
             (Some allocationQuantity, Some outstandingQuantity) -> do
               assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
               assertNonNegativeQuantity ("Stock issuance outstanding quantity for " <> issuance.issuance_data.id) outstandingQuantity
@@ -1411,7 +1433,7 @@ stockPlanSecurityReturnableQuantity eventIndex maps returnData = do
           assertMsg
             ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
             (stockPlanId == returnData.stock_plan_id)
-          outstandingQuantityOpt <- equityCompensationCurrentQuantity maps issuance.issuance_data
+          outstandingQuantityOpt <- equityCompensationQuantityAt maps issuance.issuance_data asOf
           case outstandingQuantityOpt of
             Some outstandingQuantity -> do
               assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) issuance.issuance_data.quantity
@@ -1436,12 +1458,11 @@ stockPlanSecurityReturnableQuantity eventIndex maps returnData = do
 
 validateStockPlanReturnToPoolQuantities : StockClassShareEventIndex -> CapTableMaps -> Update ()
 validateStockPlanReturnToPoolQuantities eventIndex maps = do
-  returnedQuantityBySecurity <- stockPlanReturnedQuantityBySecurityIndex maps
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
-      securityAllocation <- stockPlanSecurityReturnableQuantity eventIndex maps returnToPool.return_data
-      let returnedQuantity = fromOptional 0.0 (Map.lookup returnToPool.return_data.security_id returnedQuantityBySecurity)
+      securityAllocation <- stockPlanSecurityReturnableQuantityAt eventIndex maps returnToPool.return_data returnToPool.return_data.date
+      returnedQuantity <- stockPlanReturnedQuantityBySecurityAt maps returnToPool.return_data.security_id returnToPool.return_data.date
       assertMsg
         ("Stock plan return to pool exceeds returnable quantity for " <> returnToPool.return_data.security_id <> ": returned " <> show returnedQuantity <> " exceeds returnable " <> show securityAllocation)
         (returnedQuantity <= securityAllocation))
@@ -1466,7 +1487,7 @@ stockIssuancePlanAllocationIndexAt eventIndex maps asOf =
           if issuance.issuance_data.date <= asOf
             then do
               let lot = stockIssuanceShareLot issuance.issuance_data
-              case stockClassShareLotSplitAdjustedQuantityAt eventIndex lot asOf of
+              case stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf of
                 Some allocationQuantity -> do
                   assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
                   pure (addQuantityById stockPlanId allocationQuantity totals)
