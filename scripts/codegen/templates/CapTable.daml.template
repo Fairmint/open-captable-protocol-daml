@@ -1251,19 +1251,28 @@ data StockIssuanceShareNumberLot = StockIssuanceShareNumberLot with
     share_number_range: OcfShareNumberRange
   deriving (Eq, Show)
 
-stockIssuanceShareNumberLots : CapTableMaps -> Update [StockIssuanceShareNumberLot]
-stockIssuanceShareNumberLots maps =
+stockIssuanceShareNumberLots : StockClassShareEventIndex -> CapTableMaps -> Update [StockIssuanceShareNumberLot]
+stockIssuanceShareNumberLots eventIndex maps =
   foldlA
     (\lots issuanceCid -> do
       issuance <- fetch issuanceCid
-      let issuanceLots =
-            map
-              (\shareNumberRange -> StockIssuanceShareNumberLot with
-                stock_class_id = issuance.issuance_data.stock_class_id
-                issuance_id = issuance.issuance_data.id
-                share_number_range = shareNumberRange)
-              issuance.issuance_data.share_numbers_issued
-      pure (issuanceLots ++ lots))
+      let shareLot = stockIssuanceShareLot issuance.issuance_data
+      case stockClassShareLotCurrentQuantity eventIndex shareLot of
+        Some currentQuantity ->
+          if currentQuantity > 0.0
+            then do
+              let issuanceLots =
+                    map
+                      (\shareNumberRange -> StockIssuanceShareNumberLot with
+                        stock_class_id = issuance.issuance_data.stock_class_id
+                        issuance_id = issuance.issuance_data.id
+                        share_number_range = shareNumberRange)
+                      issuance.issuance_data.share_numbers_issued
+              pure (issuanceLots ++ lots)
+            else pure lots
+        None -> do
+          assertMsg ("Stock issuance share number ranges cannot be validated because stock quantity history is invalid for " <> issuance.issuance_data.id) False
+          pure lots)
     []
     (Map.values maps.stock_issuances)
 
@@ -1292,11 +1301,20 @@ stockIssuanceShareNumberLotSortKey lot =
   , lot.issuance_id
   )
 
+stockIssuanceShareNumberLotWithLaterEnd :
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot
+stockIssuanceShareNumberLotWithLaterEnd active candidate =
+  if candidate.share_number_range.ending_share_number > active.share_number_range.ending_share_number
+    then candidate
+    else active
+
 validateSortedStockIssuanceShareNumberLotsDoNotOverlap : [StockIssuanceShareNumberLot] -> Update ()
 validateSortedStockIssuanceShareNumberLotsDoNotOverlap lots = case lots of
-  lot :: other :: rest -> do
-    validateStockIssuanceShareNumberLotDoesNotOverlap lot other
-    validateSortedStockIssuanceShareNumberLotsDoNotOverlap (other :: rest)
+  active :: candidate :: rest -> do
+    validateStockIssuanceShareNumberLotDoesNotOverlap active candidate
+    validateSortedStockIssuanceShareNumberLotsDoNotOverlap (stockIssuanceShareNumberLotWithLaterEnd active candidate :: rest)
   _ -> pure ()
 
 validateStockIssuanceShareNumberLotsDoNotOverlap : [StockIssuanceShareNumberLot] -> Update ()
@@ -1308,7 +1326,8 @@ validateStockIssuanceShareNumberLotsDoNotOverlap lots =
 
 validateStockIssuanceShareNumberRanges : CapTableMaps -> Update ()
 validateStockIssuanceShareNumberRanges maps = do
-  lots <- stockIssuanceShareNumberLots maps
+  eventIndex <- stockClassShareEventIndex maps
+  lots <- stockIssuanceShareNumberLots eventIndex maps
   validateStockIssuanceShareNumberLotsDoNotOverlap lots
 
 validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
