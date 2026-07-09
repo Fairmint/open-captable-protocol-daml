@@ -59,7 +59,6 @@ interface TypeDef {
   tier: number;
   validations: Validation[];
   has_validations: boolean;
-  validates_stock_class_initial_authorized_shares: boolean;
   validates_issuer_id_reference: boolean;
   is_document: boolean;
   object_type_constructor: string;
@@ -262,7 +261,6 @@ function discoverTypes(config: Config): TypeDef[] {
         };
       }),
       has_validations: validationFields.length > 0,
-      validates_stock_class_initial_authorized_shares: name === 'StockClass',
       validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
       is_document: name === 'Document',
       object_type_constructor: objectTypeConstructor(name),
