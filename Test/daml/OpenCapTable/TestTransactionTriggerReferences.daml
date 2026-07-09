@@ -1,0 +1,188 @@
+module OpenCapTable.TestTransactionTriggerReferences where
+
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfConvertibleType(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import OpenCapTable.HelpersTriggers (ocfConvTriggerAutomaticOnDate, ocfTriggerElectiveAtWill)
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+testDate : Time
+testDate = DT.time (DA.date 2024 Jan 15) 0 0 0
+
+convertibleIssuance : Text -> Text -> [Text] -> ConvertibleIssuanceOcfData
+convertibleIssuance issuanceId securityId triggerIds = ConvertibleIssuanceOcfData with
+  id = issuanceId
+  date = testDate
+  security_id = securityId
+  custom_id = "CV-" <> issuanceId
+  stakeholder_id = defaultStakeholderId
+  board_approval_date = None
+  stockholder_approval_date = None
+  consideration_text = None
+  security_law_exemptions = []
+  convertible_type = OcfConvertibleSafe
+  investment_amount = OcfMonetary with amount = 100_000.0, currency = "USD"
+  conversion_triggers = map (\triggerId -> ocfConvTriggerAutomaticOnDate with trigger_id = triggerId, trigger_date = Some testDate) triggerIds
+  pro_rata = None
+  seniority = 1
+  comments = []
+
+convertibleConversion : Text -> Text -> Text -> ConvertibleConversionOcfData
+convertibleConversion conversionId securityId triggerId = ConvertibleConversionOcfData with
+  id = conversionId
+  date = DT.time (DA.date 2025 Jan 15) 0 0 0
+  security_id = securityId
+  trigger_id = triggerId
+  reason_text = "Conversion trigger occurred"
+  resulting_security_ids = [conversionId <> "-RESULT"]
+  comments = []
+  balance_security_id = None
+  capitalization_definition = None
+  quantity_converted = Some 10_000.0
+
+warrantIssuance : Text -> Text -> [Text] -> WarrantIssuanceOcfData
+warrantIssuance issuanceId securityId triggerIds = WarrantIssuanceOcfData with
+  id = issuanceId
+  date = testDate
+  security_id = securityId
+  custom_id = "WR-" <> issuanceId
+  stakeholder_id = defaultStakeholderId
+  purchase_price = OcfMonetary with amount = 1.0, currency = "USD"
+  quantity = Some 100.0
+  quantity_source = None
+  exercise_price = Some (OcfMonetary with amount = 0.01, currency = "USD")
+  exercise_triggers = map (\triggerId -> ocfTriggerElectiveAtWill with trigger_id = triggerId) triggerIds
+  security_law_exemptions = []
+  vestings = []
+  board_approval_date = None
+  consideration_text = None
+  stockholder_approval_date = None
+  vesting_terms_id = None
+  warrant_expiration_date = None
+  comments = []
+
+warrantExercise : Text -> Text -> Text -> WarrantExerciseOcfData
+warrantExercise exerciseId securityId triggerId = WarrantExerciseOcfData with
+  id = exerciseId
+  date = DT.time (DA.date 2025 Jan 15) 0 0 0
+  security_id = securityId
+  trigger_id = triggerId
+  quantity = Some 25.0
+  resulting_security_ids = [exerciseId <> "-RESULT"]
+  consideration_text = None
+  comments = []
+
+testConvertibleConversionTriggerReferenceSameBatchSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleIssuance (convertibleIssuance "TX_CONV_TRIGGER_OK" "CONV-TRIGGER-OK" ["TRIGGER-OK"])
+        , CT.OcfCreateConvertibleConversion (convertibleConversion "TX_CONV_CONVERSION_OK" "CONV-TRIGGER-OK" "TRIGGER-OK")
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testConvertibleConversionMissingTriggerFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleIssuance (convertibleIssuance "TX_CONV_TRIGGER_MISSING" "CONV-TRIGGER-MISSING" ["TRIGGER-OK"])
+        , CT.OcfCreateConvertibleConversion (convertibleConversion "TX_CONV_CONVERSION_MISSING" "CONV-TRIGGER-MISSING" "TRIGGER-MISSING")
+        ]
+      edits = []
+      deletes = []
+
+testConvertibleIssuanceDuplicateTriggerIdsFail = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [CT.OcfCreateConvertibleIssuance (convertibleIssuance "TX_CONV_DUP_TRIGGER" "CONV-DUP-TRIGGER" ["TRIGGER-DUP", "TRIGGER-DUP"])]
+      edits = []
+      deletes = []
+
+testConvertibleIssuanceEditCannotRemoveReferencedTrigger = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleIssuance (convertibleIssuance "TX_CONV_EDIT_TRIGGER" "CONV-EDIT-TRIGGER" ["TRIGGER-OLD"])
+        , CT.OcfCreateConvertibleConversion (convertibleConversion "TX_CONV_EDIT_TRIGGER_CONVERSION" "CONV-EDIT-TRIGGER" "TRIGGER-OLD")
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditConvertibleIssuance (convertibleIssuance "TX_CONV_EDIT_TRIGGER" "CONV-EDIT-TRIGGER" ["TRIGGER-NEW"])]
+      deletes = []
+
+testWarrantExerciseTriggerReferenceSameBatchSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance (warrantIssuance "TX_WARRANT_TRIGGER_OK" "WARRANT-TRIGGER-OK" ["TRIGGER-OK"])
+        , CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_EXERCISE_OK" "WARRANT-TRIGGER-OK" "TRIGGER-OK")
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantExerciseMissingTriggerFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance (warrantIssuance "TX_WARRANT_TRIGGER_MISSING" "WARRANT-TRIGGER-MISSING" ["TRIGGER-OK"])
+        , CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_EXERCISE_MISSING" "WARRANT-TRIGGER-MISSING" "TRIGGER-MISSING")
+        ]
+      edits = []
+      deletes = []
+
+testWarrantIssuanceDuplicateTriggerIdsFail = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [CT.OcfCreateWarrantIssuance (warrantIssuance "TX_WARRANT_DUP_TRIGGER" "WARRANT-DUP-TRIGGER" ["TRIGGER-DUP", "TRIGGER-DUP"])]
+      edits = []
+      deletes = []
+
+testWarrantIssuanceEditCannotRemoveReferencedTrigger = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance (warrantIssuance "TX_WARRANT_EDIT_TRIGGER" "WARRANT-EDIT-TRIGGER" ["TRIGGER-OLD"])
+        , CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_EDIT_TRIGGER_EXERCISE" "WARRANT-EDIT-TRIGGER" "TRIGGER-OLD")
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditWarrantIssuance (warrantIssuance "TX_WARRANT_EDIT_TRIGGER" "WARRANT-EDIT-TRIGGER" ["TRIGGER-NEW"])]
+      deletes = []
