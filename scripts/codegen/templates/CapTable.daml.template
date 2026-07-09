@@ -154,6 +154,14 @@ issuerAuthorizedAdjustmentTakesPrecedence candidate current =
   candidate.date > current.date ||
     (candidate.date == current.date && candidate.new_shares_authorized < current.new_shares_authorized)
 
+stockPlanPoolAdjustmentTakesPrecedence :
+  StockPlanPoolAdjustmentOcfData ->
+  StockPlanPoolAdjustmentOcfData ->
+  Bool
+stockPlanPoolAdjustmentTakesPrecedence candidate current =
+  candidate.date > current.date ||
+    (candidate.date == current.date && candidate.shares_reserved < current.shares_reserved)
+
 stockClassAuthorizedAdjustmentIndex : CapTableMaps -> Update (Map Text StockClassAuthorizedSharesAdjustmentOcfData)
 stockClassAuthorizedAdjustmentIndex maps =
   foldlA
@@ -211,6 +219,31 @@ currentIssuerAuthorizedLimit maps issuerCid = do
   pure $ case latestAdjustment of
     Some adjustment -> Some adjustment.new_shares_authorized
     None -> issuerAuthorizedSharesLimit issuerContract.issuer_data.initial_shares_authorized
+
+stockPlanPoolAdjustmentIndex : CapTableMaps -> Update (Map Text StockPlanPoolAdjustmentOcfData)
+stockPlanPoolAdjustmentIndex maps =
+  foldlA
+    (\index adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let stockPlanId = adjustment.adjustment_data.stock_plan_id
+      let nextIndex = case Map.lookup stockPlanId index of
+            Some current ->
+              if stockPlanPoolAdjustmentTakesPrecedence adjustment.adjustment_data current
+                then Map.insert stockPlanId adjustment.adjustment_data index
+                else index
+            None -> Map.insert stockPlanId adjustment.adjustment_data index
+      pure nextIndex)
+    Map.empty
+    (Map.values maps.stock_plan_pool_adjustments)
+
+currentStockPlanReservedShares :
+  Map Text StockPlanPoolAdjustmentOcfData ->
+  StockPlanOcfData ->
+  Decimal
+currentStockPlanReservedShares adjustmentIndex stockPlanData =
+  case Map.lookup stockPlanData.id adjustmentIndex of
+    Some adjustment -> adjustment.shares_reserved
+    None -> stockPlanData.initial_shares_reserved
 
 nonNegativeDecimal : Decimal -> Decimal
 nonNegativeDecimal n =
@@ -371,6 +404,130 @@ validateAuthorizedShareCeilings maps issuerCid = do
   adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
   validateAllStockClassAuthorizedShares maps adjustmentIndex
   validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
+
+stockIssuancePlanAllocation : CapTableMaps -> Text -> Update Decimal
+stockIssuancePlanAllocation maps stockPlanId =
+  foldlA
+    (\total issuanceCid -> do
+      issuance <- fetch issuanceCid
+      case issuance.issuance_data.stock_plan_id of
+        Some planId ->
+          if planId == stockPlanId
+            then pure (total + issuance.issuance_data.quantity)
+            else pure total
+        None -> pure total)
+    0.0
+    (Map.values maps.stock_issuances)
+
+equityCompensationPlanAllocation : CapTableMaps -> Text -> Update Decimal
+equityCompensationPlanAllocation maps stockPlanId =
+  foldlA
+    (\total issuanceCid -> do
+      issuance <- fetch issuanceCid
+      case issuance.issuance_data.stock_plan_id of
+        Some planId ->
+          if planId == stockPlanId
+            then pure (total + issuance.issuance_data.quantity)
+            else pure total
+        None -> pure total)
+    0.0
+    (Map.values maps.equity_compensation_issuances)
+
+stockPlanReturnedQuantity : CapTableMaps -> Text -> Update Decimal
+stockPlanReturnedQuantity maps stockPlanId =
+  foldlA
+    (\total returnCid -> do
+      returnToPool <- fetch returnCid
+      if returnToPool.return_data.stock_plan_id == stockPlanId
+        then pure (total + returnToPool.return_data.quantity)
+        else pure total)
+    0.0
+    (Map.values maps.stock_plan_return_to_pools)
+
+stockPlanReturnedQuantityForSecurity : CapTableMaps -> Text -> Update Decimal
+stockPlanReturnedQuantityForSecurity maps securityId =
+  foldlA
+    (\total returnCid -> do
+      returnToPool <- fetch returnCid
+      if returnToPool.return_data.security_id == securityId
+        then pure (total + returnToPool.return_data.quantity)
+        else pure total)
+    0.0
+    (Map.values maps.stock_plan_return_to_pools)
+
+stockPlanSecurityAllocation : CapTableMaps -> StockPlanReturnToPoolOcfData -> Update Decimal
+stockPlanSecurityAllocation maps returnData = do
+  let stockCidOpt = Map.lookup returnData.security_id maps.stock_issuances_by_security_id
+  let equityCompensationCidOpt = Map.lookup returnData.security_id maps.equity_compensation_issuances_by_security_id
+  case (stockCidOpt, equityCompensationCidOpt) of
+    (Some stockCid, None) -> do
+      issuance <- fetch stockCid
+      case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> do
+          assertMsg
+            ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
+            (stockPlanId == returnData.stock_plan_id)
+          pure issuance.issuance_data.quantity
+        None -> do
+          assertMsg ("Stock plan return to pool references non-plan stock security: " <> returnData.security_id) False
+          pure 0.0
+    (None, Some equityCompensationCid) -> do
+      issuance <- fetch equityCompensationCid
+      case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> do
+          assertMsg
+            ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
+            (stockPlanId == returnData.stock_plan_id)
+          pure issuance.issuance_data.quantity
+        None -> do
+          assertMsg ("Stock plan return to pool references non-plan equity compensation security: " <> returnData.security_id) False
+          pure 0.0
+    (Some _, Some _) -> do
+      assertMsg ("Stock plan return to pool security id is ambiguous: " <> returnData.security_id) False
+      pure 0.0
+    (None, None) -> do
+      assertMsg ("Stock plan return to pool security not found: " <> returnData.security_id) False
+      pure 0.0
+
+validateStockPlanReturnToPoolQuantities : CapTableMaps -> Update ()
+validateStockPlanReturnToPoolQuantities maps =
+  mapA_
+    (\returnCid -> do
+      returnToPool <- fetch returnCid
+      securityAllocation <- stockPlanSecurityAllocation maps returnToPool.return_data
+      returnedQuantity <- stockPlanReturnedQuantityForSecurity maps returnToPool.return_data.security_id
+      assertMsg
+        ("Stock plan return to pool exceeds security allocation for " <> returnToPool.return_data.security_id <> ": returned " <> show returnedQuantity <> " exceeds allocated " <> show securityAllocation)
+        (returnedQuantity <= securityAllocation))
+    (Map.values maps.stock_plan_return_to_pools)
+
+stockPlanNetAllocatedQuantity : CapTableMaps -> Text -> Update Decimal
+stockPlanNetAllocatedQuantity maps stockPlanId = do
+  stockAllocation <- stockIssuancePlanAllocation maps stockPlanId
+  equityCompensationAllocation <- equityCompensationPlanAllocation maps stockPlanId
+  returnedQuantity <- stockPlanReturnedQuantity maps stockPlanId
+  pure (stockAllocation + equityCompensationAllocation - returnedQuantity)
+
+validateStockPlanReservedShares :
+  CapTableMaps ->
+  Map Text StockPlanPoolAdjustmentOcfData ->
+  Update ()
+validateStockPlanReservedShares maps adjustmentIndex =
+  mapA_
+    (\stockPlanCid -> do
+      stockPlan <- fetch stockPlanCid
+      let reservedShares = currentStockPlanReservedShares adjustmentIndex stockPlan.plan_data
+      allocatedQuantity <- stockPlanNetAllocatedQuantity maps stockPlan.plan_data.id
+      assertMsg
+        ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
+        (allocatedQuantity <= reservedShares))
+    (Map.values maps.stock_plans)
+
+validateStockPlanPoolCeilings : CapTableMaps -> Update ()
+validateStockPlanPoolCeilings maps = do
+  adjustmentIndex <- stockPlanPoolAdjustmentIndex maps
+  validateStockPlanReturnToPoolQuantities maps
+  validateStockPlanReservedShares maps adjustmentIndex
 
 validateIssuerReference : ContractId Issuer -> Text -> Update ()
 validateIssuerReference issuerCid issuerId = do
@@ -623,6 +780,7 @@ template CapTable
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
         validateAuthorizedShareCeilings finalMaps newIssuerCid
+        validateStockPlanPoolCeilings finalMaps
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
