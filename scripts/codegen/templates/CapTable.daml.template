@@ -15,7 +15,7 @@ import qualified DA.Map as Map
 import DA.List (sortOn)
 import DA.Action (foldlA, when)
 import DA.Foldable (mapA_)
-import DA.Optional (isNone, isSome)
+import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
@@ -119,6 +119,11 @@ data StockClassShareEvent
       event_priority: Int
   deriving (Eq, Show)
 
+data StockClassShareEventIndex = StockClassShareEventIndex with
+    stock_security_events_by_security_id: Map Text [StockClassShareEvent]
+    stock_class_split_events_by_stock_class_id: Map Text [StockClassShareEvent]
+  deriving (Eq, Show)
+
 authorizedSharesCeiling : OcfInitialSharesAuthorized -> AuthorizedSharesCeiling
 authorizedSharesCeiling auth = case auth of
   OcfInitialSharesNumeric n -> AuthorizedSharesFinite n
@@ -218,98 +223,116 @@ stockClassShareEventSortKey event = case event of
   StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority)
   StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority)
 
+stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
+stockClassShareEventOnOrAfter earliest event = case event of
+  StockClassShareDelta with event_date -> event_date >= earliest
+  StockClassShareMultiplier with event_date -> event_date >= earliest
+  StockClassShareRetraction with event_date -> event_date >= earliest
+
 applyStockClassShareEvent : Decimal -> StockClassShareEvent -> Decimal
 applyStockClassShareEvent current event = case event of
   StockClassShareDelta with quantity_delta -> nonNegativeDecimal (current + quantity_delta)
   StockClassShareMultiplier with ratio -> current * ratio.numerator / ratio.denominator
   StockClassShareRetraction _ _ -> 0.0
 
-stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
-stockSecurityShareEvents maps issuanceData = do
-  cancellationEvents <- foldlA
-    (\events cancellationCid -> do
+addStockClassShareEvent : Text -> StockClassShareEvent -> Map Text [StockClassShareEvent] -> Map Text [StockClassShareEvent]
+addStockClassShareEvent key event index =
+  Map.insert key (event :: fromOptional [] (Map.lookup key index)) index
+
+stockClassShareEventIndex : CapTableMaps -> Update StockClassShareEventIndex
+stockClassShareEventIndex maps = do
+  cancellationEventsBySecurityId <- foldlA
+    (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
-      if cancellation.cancellation_data.security_id == issuanceData.security_id
-        then pure ((StockClassShareDelta with
+      pure (addStockClassShareEvent
+        cancellation.cancellation_data.security_id
+        (StockClassShareDelta with
             event_date = cancellation.cancellation_data.date
             event_priority = 1
             quantity_delta = 0.0 - cancellation.cancellation_data.quantity)
-          :: events)
-        else pure events)
-    []
+        index))
+    Map.empty
     (Map.values maps.stock_cancellations)
 
-  repurchaseEvents <- foldlA
-    (\events repurchaseCid -> do
+  repurchaseEventsBySecurityId <- foldlA
+    (\index repurchaseCid -> do
       repurchase <- fetch repurchaseCid
-      if repurchase.repurchase_data.security_id == issuanceData.security_id
-        then pure ((StockClassShareDelta with
+      pure (addStockClassShareEvent
+        repurchase.repurchase_data.security_id
+        (StockClassShareDelta with
             event_date = repurchase.repurchase_data.date
             event_priority = 1
             quantity_delta = 0.0 - repurchase.repurchase_data.quantity)
-          :: events)
-        else pure events)
-    []
+        index))
+    cancellationEventsBySecurityId
     (Map.values maps.stock_repurchases)
 
-  conversionEvents <- foldlA
-    (\events conversionCid -> do
+  conversionEventsBySecurityId <- foldlA
+    (\index conversionCid -> do
       conversion <- fetch conversionCid
-      if conversion.conversion_data.security_id == issuanceData.security_id
-        then pure ((StockClassShareDelta with
+      pure (addStockClassShareEvent
+        conversion.conversion_data.security_id
+        (StockClassShareDelta with
             event_date = conversion.conversion_data.date
             event_priority = 1
             quantity_delta = 0.0 - conversion.conversion_data.quantity_converted)
-          :: events)
-        else pure events)
-    []
+        index))
+    repurchaseEventsBySecurityId
     (Map.values maps.stock_conversions)
 
-  retractionEvents <- foldlA
-    (\events retractionCid -> do
+  retractionEventsBySecurityId <- foldlA
+    (\index retractionCid -> do
       retraction <- fetch retractionCid
-      if retraction.retraction_data.security_id == issuanceData.security_id
-        then pure ((StockClassShareRetraction with
+      pure (addStockClassShareEvent
+        retraction.retraction_data.security_id
+        (StockClassShareRetraction with
             event_date = retraction.retraction_data.date
             event_priority = 3)
-          :: events)
-        else pure events)
-    []
+        index))
+    conversionEventsBySecurityId
     (Map.values maps.stock_retractions)
 
-  splitEvents <- foldlA
-    (\events splitCid -> do
+  splitEventsByStockClassId <- foldlA
+    (\index splitCid -> do
       split <- fetch splitCid
-      if split.split_data.stock_class_id == issuanceData.stock_class_id && split.split_data.date >= issuanceData.date
-        then pure ((StockClassShareMultiplier with
+      pure (addStockClassShareEvent
+        split.split_data.stock_class_id
+        (StockClassShareMultiplier with
             event_date = split.split_data.date
             event_priority = 2
             ratio = split.split_data.split_ratio)
-          :: events)
-        else pure events)
-    []
+        index))
+    Map.empty
     (Map.values maps.stock_class_splits)
 
-  pure ((StockClassShareDelta with
+  pure StockClassShareEventIndex with
+    stock_security_events_by_security_id = retractionEventsBySecurityId
+    stock_class_split_events_by_stock_class_id = splitEventsByStockClassId
+
+stockIssuedShareEvents : StockClassShareEventIndex -> StockIssuanceOcfData -> [StockClassShareEvent]
+stockIssuedShareEvents eventIndex issuanceData =
+  let securityEvents = fromOptional [] (Map.lookup issuanceData.security_id eventIndex.stock_security_events_by_security_id)
+      splitEvents =
+        filter
+          (stockClassShareEventOnOrAfter issuanceData.date)
+          (fromOptional [] (Map.lookup issuanceData.stock_class_id eventIndex.stock_class_split_events_by_stock_class_id))
+  in (StockClassShareDelta with
       event_date = issuanceData.date
       event_priority = 0
       quantity_delta = issuanceData.quantity)
-    :: (cancellationEvents ++ repurchaseEvents ++ conversionEvents ++ retractionEvents ++ splitEvents))
+    :: (securityEvents ++ splitEvents)
 
-stockIssuanceCurrentQuantity : CapTableMaps -> StockIssuanceOcfData -> Update Decimal
-stockIssuanceCurrentQuantity maps issuanceData = do
-  events <- stockSecurityShareEvents maps issuanceData
-  pure $ foldl applyStockClassShareEvent 0.0 (sortOn stockClassShareEventSortKey events)
+stockIssuanceCurrentQuantity : StockClassShareEventIndex -> StockIssuanceOcfData -> Decimal
+stockIssuanceCurrentQuantity eventIndex issuanceData =
+  foldl applyStockClassShareEvent 0.0 (sortOn stockClassShareEventSortKey (stockIssuedShareEvents eventIndex issuanceData))
 
-stockClassIssuedQuantity : CapTableMaps -> Text -> Update Decimal
-stockClassIssuedQuantity maps stockClassId = do
+stockClassIssuedQuantity : StockClassShareEventIndex -> CapTableMaps -> Text -> Update Decimal
+stockClassIssuedQuantity eventIndex maps stockClassId = do
   quantities <- foldlA
     (\acc issuanceCid -> do
       issuance <- fetch issuanceCid
       if issuance.issuance_data.stock_class_id == stockClassId
-        then do
-          quantity <- stockIssuanceCurrentQuantity maps issuance.issuance_data
-          pure (quantity :: acc)
+        then pure (stockIssuanceCurrentQuantity eventIndex issuance.issuance_data :: acc)
         else pure acc)
     []
     (Map.values maps.stock_issuances)
@@ -324,24 +347,25 @@ assertWithinStockClassAuthorizedShares stockClassId issuedQuantity limitOpt = ca
   None -> pure ()
 
 validateAllStockClassAuthorizedShares :
+  StockClassShareEventIndex ->
   CapTableMaps ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   Update ()
-validateAllStockClassAuthorizedShares maps adjustmentIndex =
+validateAllStockClassAuthorizedShares eventIndex maps adjustmentIndex =
   mapA_
     (\stockClassCid -> do
       stockClass <- fetch stockClassCid
-      currentIssued <- stockClassIssuedQuantity maps stockClass.stock_class_data.id
+      currentIssued <- stockClassIssuedQuantity eventIndex maps stockClass.stock_class_data.id
       let limitOpt = currentStockClassAuthorizedLimit adjustmentIndex stockClass.stock_class_data
       assertWithinStockClassAuthorizedShares stockClass.stock_class_data.id currentIssued limitOpt)
     (Map.values maps.stock_classes)
 
-validateEditedStockClassInitialAuthorizedShares : CapTableMaps -> [OcfEditData] -> Update ()
-validateEditedStockClassInitialAuthorizedShares maps edits =
+validateEditedStockClassInitialAuthorizedShares : StockClassShareEventIndex -> CapTableMaps -> [OcfEditData] -> Update ()
+validateEditedStockClassInitialAuthorizedShares eventIndex maps edits =
   mapA_
     (\editData -> case editData of
       OcfEditStockClass stockClassData -> do
-        currentIssued <- stockClassIssuedQuantity maps stockClassData.id
+        currentIssued <- stockClassIssuedQuantity eventIndex maps stockClassData.id
         let limitOpt = authorizedSharesLimit stockClassData.initial_shares_authorized
         assertWithinStockClassAuthorizedShares stockClassData.id currentIssued limitOpt
       _ -> pure ())
@@ -412,19 +436,14 @@ validateAuthorizedShareCeilings :
   CapTableMaps ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   ContractId Issuer ->
-  Update ()
-validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
-  validateAllStockClassAuthorizedShares maps adjustmentIndex
-  validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
-
-validateAuthorizedShareCeilingsForEdits :
-  CapTableMaps ->
-  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   [OcfEditData] ->
   Update ()
-validateAuthorizedShareCeilingsForEdits maps adjustmentIndex edits = do
-  validateEditedStockClassInitialAuthorizedShares maps edits
-  validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits
+validateAuthorizedShareCeilings maps adjustmentIndex issuerCid initialAuthorizedShareEdits = do
+  eventIndex <- stockClassShareEventIndex maps
+  validateAllStockClassAuthorizedShares eventIndex maps adjustmentIndex
+  validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
+  validateEditedStockClassInitialAuthorizedShares eventIndex maps initialAuthorizedShareEdits
+  validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex initialAuthorizedShareEdits
 
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
@@ -565,10 +584,10 @@ template CapTable
           sortedCreates
 
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
-        validateAuthorizedShareCeilings finalMaps authorizedShareAdjustmentIndex newIssuerCid
-        validateAuthorizedShareCeilingsForEdits
+        validateAuthorizedShareCeilings
           finalMaps
           authorizedShareAdjustmentIndex
+          newIssuerCid
           (issuerInitialAuthorizedShareEdits ++ regularInitialAuthorizedShareEdits)
 
         -- Create new CapTable with updated maps and potentially new issuer
