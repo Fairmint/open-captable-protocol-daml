@@ -469,54 +469,49 @@ validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits =
       _ -> pure ())
     edits
 
-stockIssuancePlanAllocation : CapTableMaps -> Text -> Update Decimal
-stockIssuancePlanAllocation maps stockPlanId =
+addQuantityById : Text -> Decimal -> Map Text Decimal -> Map Text Decimal
+addQuantityById id quantity totals =
+  let current = fromOptional 0.0 (Map.lookup id totals)
+   in Map.insert id (current + quantity) totals
+
+stockIssuancePlanAllocationIndex : CapTableMaps -> Update (Map Text Decimal)
+stockIssuancePlanAllocationIndex maps =
   foldlA
-    (\total issuanceCid -> do
+    (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
       case issuance.issuance_data.stock_plan_id of
-        Some planId ->
-          if planId == stockPlanId
-            then pure (total + issuance.issuance_data.quantity)
-            else pure total
-        None -> pure total)
-    0.0
+        Some stockPlanId -> pure (addQuantityById stockPlanId issuance.issuance_data.quantity totals)
+        None -> pure totals)
+    Map.empty
     (Map.values maps.stock_issuances)
 
-equityCompensationPlanAllocation : CapTableMaps -> Text -> Update Decimal
-equityCompensationPlanAllocation maps stockPlanId =
+equityCompensationPlanAllocationIndex : CapTableMaps -> Update (Map Text Decimal)
+equityCompensationPlanAllocationIndex maps =
   foldlA
-    (\total issuanceCid -> do
+    (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
       case issuance.issuance_data.stock_plan_id of
-        Some planId ->
-          if planId == stockPlanId
-            then pure (total + issuance.issuance_data.quantity)
-            else pure total
-        None -> pure total)
-    0.0
+        Some stockPlanId -> pure (addQuantityById stockPlanId issuance.issuance_data.quantity totals)
+        None -> pure totals)
+    Map.empty
     (Map.values maps.equity_compensation_issuances)
 
-stockPlanReturnedQuantity : CapTableMaps -> Text -> Update Decimal
-stockPlanReturnedQuantity maps stockPlanId =
+stockPlanReturnedQuantityIndex : CapTableMaps -> Update (Map Text Decimal)
+stockPlanReturnedQuantityIndex maps =
   foldlA
-    (\total returnCid -> do
+    (\totals returnCid -> do
       returnToPool <- fetch returnCid
-      if returnToPool.return_data.stock_plan_id == stockPlanId
-        then pure (total + returnToPool.return_data.quantity)
-        else pure total)
-    0.0
+      pure (addQuantityById returnToPool.return_data.stock_plan_id returnToPool.return_data.quantity totals))
+    Map.empty
     (Map.values maps.stock_plan_return_to_pools)
 
-stockPlanReturnedQuantityForSecurity : CapTableMaps -> Text -> Update Decimal
-stockPlanReturnedQuantityForSecurity maps securityId =
+stockPlanReturnedQuantityBySecurityIndex : CapTableMaps -> Update (Map Text Decimal)
+stockPlanReturnedQuantityBySecurityIndex maps =
   foldlA
-    (\total returnCid -> do
+    (\totals returnCid -> do
       returnToPool <- fetch returnCid
-      if returnToPool.return_data.security_id == securityId
-        then pure (total + returnToPool.return_data.quantity)
-        else pure total)
-    0.0
+      pure (addQuantityById returnToPool.return_data.security_id returnToPool.return_data.quantity totals))
+    Map.empty
     (Map.values maps.stock_plan_return_to_pools)
 
 stockPlanSecurityAllocation : CapTableMaps -> StockPlanReturnToPoolOcfData -> Update Decimal
@@ -554,34 +549,41 @@ stockPlanSecurityAllocation maps returnData = do
       pure 0.0
 
 validateStockPlanReturnToPoolQuantities : CapTableMaps -> Update ()
-validateStockPlanReturnToPoolQuantities maps =
+validateStockPlanReturnToPoolQuantities maps = do
+  returnedQuantityBySecurity <- stockPlanReturnedQuantityBySecurityIndex maps
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
       securityAllocation <- stockPlanSecurityAllocation maps returnToPool.return_data
-      returnedQuantity <- stockPlanReturnedQuantityForSecurity maps returnToPool.return_data.security_id
+      let returnedQuantity = fromOptional 0.0 (Map.lookup returnToPool.return_data.security_id returnedQuantityBySecurity)
       assertMsg
         ("Stock plan return to pool exceeds security allocation for " <> returnToPool.return_data.security_id <> ": returned " <> show returnedQuantity <> " exceeds allocated " <> show securityAllocation)
         (returnedQuantity <= securityAllocation))
     (Map.values maps.stock_plan_return_to_pools)
 
-stockPlanNetAllocatedQuantity : CapTableMaps -> Text -> Update Decimal
-stockPlanNetAllocatedQuantity maps stockPlanId = do
-  stockAllocation <- stockIssuancePlanAllocation maps stockPlanId
-  equityCompensationAllocation <- equityCompensationPlanAllocation maps stockPlanId
-  returnedQuantity <- stockPlanReturnedQuantity maps stockPlanId
-  pure (stockAllocation + equityCompensationAllocation - returnedQuantity)
+stockPlanNetAllocatedQuantityIndex : CapTableMaps -> Update (Map Text Decimal)
+stockPlanNetAllocatedQuantityIndex maps = do
+  stockAllocation <- stockIssuancePlanAllocationIndex maps
+  equityCompensationAllocation <- equityCompensationPlanAllocationIndex maps
+  returnedQuantity <- stockPlanReturnedQuantityIndex maps
+  let allocatedByPlan = Map.foldlWithKey (\totals stockPlanId quantity -> addQuantityById stockPlanId quantity totals) Map.empty stockAllocation
+  let allocatedByPlanWithEquityCompensation =
+        Map.foldlWithKey (\totals stockPlanId quantity -> addQuantityById stockPlanId quantity totals) allocatedByPlan equityCompensationAllocation
+  let netAllocatedByPlan =
+        Map.foldlWithKey (\totals stockPlanId quantity -> addQuantityById stockPlanId (-quantity) totals) allocatedByPlanWithEquityCompensation returnedQuantity
+  pure netAllocatedByPlan
 
 validateStockPlanReservedShares :
   CapTableMaps ->
   Map Text StockPlanPoolAdjustmentOcfData ->
   Update ()
-validateStockPlanReservedShares maps adjustmentIndex =
+validateStockPlanReservedShares maps adjustmentIndex = do
+  netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndex maps
   mapA_
     (\stockPlanCid -> do
       stockPlan <- fetch stockPlanCid
       let reservedShares = currentStockPlanReservedShares adjustmentIndex stockPlan.plan_data
-      allocatedQuantity <- stockPlanNetAllocatedQuantity maps stockPlan.plan_data.id
+      let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
       assertMsg
         ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
         (allocatedQuantity <= reservedShares))
