@@ -19,7 +19,7 @@ import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionMechanism(..), OcfConversionTrigger(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 
@@ -1175,6 +1175,50 @@ validateStockIssuanceReferences maps =
       validateOptionalReference "Stock issuance vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
     (Map.values maps.stock_issuances)
 
+data StockIssuanceShareNumberLot = StockIssuanceShareNumberLot with
+    stock_class_id: Text
+    issuance_id: Text
+    share_number_range: OcfShareNumberRange
+  deriving (Eq, Show)
+
+stockIssuanceShareNumberLots : CapTableMaps -> Update [StockIssuanceShareNumberLot]
+stockIssuanceShareNumberLots maps =
+  foldlA
+    (\lots issuanceCid -> do
+      issuance <- fetch issuanceCid
+      let issuanceLots =
+            map
+              (\shareNumberRange -> StockIssuanceShareNumberLot with
+                stock_class_id = issuance.issuance_data.stock_class_id
+                issuance_id = issuance.issuance_data.id
+                share_number_range = shareNumberRange)
+              issuance.issuance_data.share_numbers_issued
+      pure (issuanceLots ++ lots))
+    []
+    (Map.values maps.stock_issuances)
+
+validateStockIssuanceShareNumberLotDoesNotOverlap :
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  Update ()
+validateStockIssuanceShareNumberLotDoesNotOverlap lot other =
+  when (lot.stock_class_id == other.stock_class_id && shareNumberRangesOverlap lot.share_number_range other.share_number_range) do
+    assertMsg
+      ("Stock issuance share number ranges overlap for stock class " <> lot.stock_class_id <> ": " <> lot.issuance_id <> " overlaps " <> other.issuance_id)
+      False
+
+validateStockIssuanceShareNumberLotsDoNotOverlap : [StockIssuanceShareNumberLot] -> Update ()
+validateStockIssuanceShareNumberLotsDoNotOverlap lots = case lots of
+  [] -> pure ()
+  lot :: rest -> do
+    mapA_ (validateStockIssuanceShareNumberLotDoesNotOverlap lot) rest
+    validateStockIssuanceShareNumberLotsDoNotOverlap rest
+
+validateStockIssuanceShareNumberRanges : CapTableMaps -> Update ()
+validateStockIssuanceShareNumberRanges maps = do
+  lots <- stockIssuanceShareNumberLots maps
+  validateStockIssuanceShareNumberLotsDoNotOverlap lots
+
 validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
 validateEquityCompensationIssuanceReferences maps =
   mapA_
@@ -1524,6 +1568,7 @@ template CapTable
         validateValuationStockClassReferences finalMaps
         validateStockPlanReferences finalMaps
         validateStockIssuanceReferences finalMaps
+        validateStockIssuanceShareNumberRanges finalMaps
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
