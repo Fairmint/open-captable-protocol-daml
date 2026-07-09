@@ -5,8 +5,10 @@ import Fairmint.OpenCapTable.OCF.StockClassSplit
 import Fairmint.OpenCapTable.OCF.StockConversion
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
+import Fairmint.OpenCapTable.OCF.EquityCompensationRelease
 import Fairmint.OpenCapTable.OCF.StockRepurchase
 import Fairmint.OpenCapTable.OCF.StockRetraction
+import Fairmint.OpenCapTable.OCF.StockClassConversionRatioAdjustment
 import Fairmint.OpenCapTable.OCF.WarrantExercise
 import Fairmint.OpenCapTable.OCF.WarrantIssuance
 import Fairmint.OpenCapTable.Types.Conversion
@@ -94,11 +96,40 @@ stockClassConversionRightTo stockClassId =
     type_ = "STOCK_CLASS_CONVERSION_RIGHT"
     valuation_cap = None
 
+stockClassConversionRatioAdjustment : Text -> Text -> Decimal -> StockClassConversionRatioAdjustmentOcfData
+stockClassConversionRatioAdjustment adjustmentId stockClassId numerator =
+  StockClassConversionRatioAdjustmentOcfData with
+    id = adjustmentId
+    date = defaultTestDate
+    stock_class_id = stockClassId
+    new_ratio_conversion_mechanism = OcfRatioConversionMechanism with
+      conversion_price = OcfMonetary with amount = 1.0, currency = "USD"
+      ratio = OcfRatio with numerator = numerator, denominator = 1.0
+      rounding_type = OcfRoundingNormal
+    comments = []
+
 warrantFixedExerciseTrigger : Text -> Text -> Decimal -> OcfConversionTrigger
 warrantFixedExerciseTrigger triggerId stockClassId convertsToQuantity =
   OcfConversionTrigger with
     conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
       conversion_mechanism = OcfWarrantMechanismFixedAmount with converts_to_quantity = convertsToQuantity
+      converts_to_future_round = None
+      converts_to_stock_class_id = Some stockClassId
+      type_ = "WARRANT_CONVERSION_RIGHT")
+    end_date = None
+    nickname = None
+    start_date = None
+    trigger_condition = None
+    trigger_date = None
+    trigger_description = None
+    trigger_id = triggerId
+    type_ = OcfTriggerTypeTypeElectiveAtWill
+
+warrantCustomExerciseTrigger : Text -> Text -> OcfConversionTrigger
+warrantCustomExerciseTrigger triggerId stockClassId =
+  OcfConversionTrigger with
+    conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
+      conversion_mechanism = OcfWarrantMechanismCustom with custom_conversion_description = "Custom warrant output"
       converts_to_future_round = None
       converts_to_stock_class_id = Some stockClassId
       type_ = "WARRANT_CONVERSION_RIGHT")
@@ -180,6 +211,19 @@ equityCompensationExercise exerciseId securityId quantity =
     comments = []
     resulting_security_ids = [exerciseId <> "_RESULT"]
     consideration_text = None
+
+equityCompensationRelease : Text -> Text -> Time -> Time -> Decimal -> EquityCompensationReleaseOcfData
+equityCompensationRelease releaseId securityId releaseDate settlementDate quantity =
+  EquityCompensationReleaseOcfData with
+    id = releaseId
+    date = releaseDate
+    security_id = securityId
+    settlement_date = settlementDate
+    release_price = OcfMonetary with amount = 1.0, currency = "USD"
+    quantity = quantity
+    resulting_security_ids = [releaseId <> "_RESULT"]
+    consideration_text = None
+    comments = []
 
 testStockIssuanceCannotExceedStockClassInitialAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -596,6 +640,47 @@ testStockConversionWithAmbiguousConversionRightsFailsForCeiling = script do
       edits = []
       deletes = []
 
+testStockConversionUsesRatioAdjustmentForDestinationCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_RATIO_COMMON" 100.0)
+  let preferredClassId = "SC_CONVERSION_RATIO_SOURCE"
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [stockClassConversionRightTo commonClassId]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_RATIO" "Conversion Ratio Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CONVERSION_RATIO_ISSUED" "SEC_CONVERSION_RATIO" stakeholderId preferredClassId) with quantity = 75.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassConversionRatioAdjustment (stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_ADJUST" preferredClassId 2.0)
+        , CT.OcfCreateStockConversion (stockConversion "TX_CONVERSION_RATIO" "SEC_CONVERSION_RATIO" 75.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockConversionWithNonRatioRightFailsForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_NON_RATIO_COMMON" 100.0)
+  let preferredClassId = "SC_CONVERSION_NON_RATIO_SOURCE"
+  let ppsRight = (stockClassConversionRightTo commonClassId) with
+        conversion_mechanism = OcfConversionMechanismPpsBasedConversion
+        ratio = None
+        reference_share_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [ppsRight]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_NON_RATIO" "Conversion Non Ratio Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CONVERSION_NON_RATIO_ISSUED" "SEC_CONVERSION_NON_RATIO" stakeholderId preferredClassId) with quantity = 50.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConversion (stockConversion "TX_CONVERSION_NON_RATIO" "SEC_CONVERSION_NON_RATIO" 50.0)]
+      edits = []
+      deletes = []
+
 testWarrantExerciseCannotExceedStockClassAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -610,6 +695,44 @@ testWarrantExerciseCannotExceedStockClassAuthorizedShares = script do
   submitMustFail issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_OUTPUT_EXERCISE" "WSEC_OUTPUT" 150.0)]
+      edits = []
+      deletes = []
+
+testFixedWarrantPartialExerciseUsesExerciseQuantityForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_PARTIAL" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_PARTIAL" "Warrant Partial Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance (warrantIssuance "TX_WARRANT_PARTIAL_ISSUED" "WSEC_PARTIAL" stakeholderId stockClassId 150.0)]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_PARTIAL_EXERCISE" "WSEC_PARTIAL" 50.0)]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantExerciseWithUnknownOutputQuantityFailsForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_UNKNOWN" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_UNKNOWN" "Warrant Unknown Holder"
+  let issuance = (warrantIssuance "TX_WARRANT_UNKNOWN_ISSUED" "WSEC_UNKNOWN" stakeholderId stockClassId 100.0) with
+        quantity = None
+        exercise_triggers = [warrantCustomExerciseTrigger "TRIGGER_CUSTOM" stockClassId]
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantExercise ((warrantExercise "TX_WARRANT_UNKNOWN_EXERCISE" "WSEC_UNKNOWN" 50.0) with trigger_id = "TRIGGER_CUSTOM", quantity = None)]
       edits = []
       deletes = []
 
@@ -629,6 +752,51 @@ testEquityCompensationExerciseCannotExceedStockClassAuthorizedShares = script do
       creates = [CT.OcfCreateEquityCompensationExercise (equityCompensationExercise "TX_EQUITY_COMP_EXERCISE" "ECSEC_OUTPUT" 150.0)]
       edits = []
       deletes = []
+
+testEquityCompensationExerciseWithResultingStockIssuanceDoesNotDoubleCount = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_EQUITY_COMP_RESULTING" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_EQUITY_COMP_RESULTING" "Equity Comp Resulting Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationIssuance (equityCompensationIssuance "TX_EQUITY_COMP_RESULTING_GRANTED" "ECSEC_RESULTING" stakeholderId stockClassId 100.0)]
+      edits = []
+      deletes = []
+
+  let exercise = equityCompensationExercise "TX_EQUITY_COMP_RESULTING_EXERCISE" "ECSEC_RESULTING" 100.0
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise exercise
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_EQUITY_COMP_RESULTING_STOCK" "TX_EQUITY_COMP_RESULTING_EXERCISE_RESULT" stakeholderId stockClassId) with quantity = 100.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationReleaseUsesSettlementDateForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_EQUITY_COMP_RELEASE_DATE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_EQUITY_COMP_RELEASE_DATE" "Equity Comp Release Date Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationIssuance (equityCompensationIssuance "TX_EQUITY_COMP_RELEASE_GRANTED" "ECSEC_RELEASE_DATE" stakeholderId stockClassId 150.0)]
+      edits = []
+      deletes = []
+
+  let releaseDate = DT.time (DA.date 2024 Jan 01) 0 0 0
+  let settlementDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment ((stockClassAuthorizedSharesAdjustment "TX_EQUITY_COMP_RELEASE_AUTH" stockClassId 150.0) with date = settlementDate)
+        , CT.OcfCreateEquityCompensationRelease (equityCompensationRelease "TX_EQUITY_COMP_RELEASE" "ECSEC_RELEASE_DATE" releaseDate settlementDate 150.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testStockRetractionReducesIssuedSharesForCeiling = script do
   TestOcp{issuer, cap_table} <- setupTestOcp

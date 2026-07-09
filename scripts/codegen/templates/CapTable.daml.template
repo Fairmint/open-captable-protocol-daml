@@ -18,7 +18,7 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionTrigger(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionMechanism(..), OcfConversionTrigger(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 
@@ -163,6 +163,13 @@ issuerAuthorizedAdjustmentTakesPrecedence candidate current =
   candidate.date > current.date ||
     (candidate.date == current.date && candidate.new_shares_authorized < current.new_shares_authorized)
 
+stockClassConversionRatioAdjustmentTakesPrecedence :
+  StockClassConversionRatioAdjustmentOcfData ->
+  StockClassConversionRatioAdjustmentOcfData ->
+  Bool
+stockClassConversionRatioAdjustmentTakesPrecedence candidate current =
+  candidate.date > current.date
+
 addDateById : Text -> Time -> Map Text [Time] -> Map Text [Time]
 addDateById key date index =
   Map.insert key (date :: fromOptional [] (Map.lookup key index)) index
@@ -190,6 +197,10 @@ addStockClassShareLotByStockClass :
 addStockClassShareLotByStockClass lot index =
   Map.insert lot.stock_class_id (lot :: fromOptional [] (Map.lookup lot.stock_class_id index)) index
 
+resultingStockIssuanceExists : CapTableMaps -> [Text] -> Bool
+resultingStockIssuanceExists maps securityIds =
+  any (\securityId -> isSome (Map.lookup securityId maps.stock_issuances_by_security_id)) securityIds
+
 stockIssuanceShareLot : StockIssuanceOcfData -> StockClassShareLot
 stockIssuanceShareLot issuanceData =
   StockClassShareLot with
@@ -216,27 +227,66 @@ stockClassDataList maps =
     []
     (Map.values maps.stock_classes)
 
-stockClassConversionOutputQuantity : OcfStockClassConversionRight -> Decimal -> Decimal
-stockClassConversionOutputQuantity conversionRight quantityConverted =
-  case conversionRight.ratio of
-    Some ratio -> quantityConverted * ratio.numerator / ratio.denominator
-    None -> quantityConverted
+stockClassConversionRatioAdjustmentAsOf :
+  CapTableMaps ->
+  Text ->
+  Time ->
+  Update (Optional StockClassConversionRatioAdjustmentOcfData)
+stockClassConversionRatioAdjustmentAsOf maps stockClassId asOf =
+  foldlA
+    (\latest adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let candidate = adjustment.adjustment_data
+      if candidate.stock_class_id == stockClassId && candidate.date <= asOf
+        then case latest of
+          Some current ->
+            if stockClassConversionRatioAdjustmentTakesPrecedence candidate current
+              then pure (Some candidate)
+              else pure latest
+          None -> pure (Some candidate)
+        else pure latest)
+    None
+    (Map.values maps.stock_class_conversion_ratio_adjustments)
+
+stockClassConversionOutputQuantity :
+  CapTableMaps ->
+  StockClassOcfData ->
+  OcfStockClassConversionRight ->
+  StockConversionOcfData ->
+  Update Decimal
+stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData =
+  case conversionRight.conversion_mechanism of
+    OcfConversionMechanismRatioConversion -> do
+      adjustmentOpt <- stockClassConversionRatioAdjustmentAsOf maps sourceStockClass.id conversionData.date
+      let ratioOpt = case adjustmentOpt of
+            Some adjustment -> Some adjustment.new_ratio_conversion_mechanism.ratio
+            None -> conversionRight.ratio
+      case ratioOpt of
+        Some ratio -> pure (conversionData.quantity_converted * ratio.numerator / ratio.denominator)
+        None -> do
+          assertMsg ("Stock conversion output cannot be reconstructed because ratio conversion has no ratio: " <> sourceStockClass.id) False
+          pure 0.0
+    _ -> do
+      assertMsg ("Stock conversion output cannot be reconstructed for non-ratio conversion mechanism: " <> sourceStockClass.id) False
+      pure 0.0
 
 stockConversionOutputShareLot :
+  CapTableMaps ->
   Map Text StockClassOcfData ->
   StockIssuanceOcfData ->
   StockConversionOcfData ->
   Update (Optional StockClassShareLot)
-stockConversionOutputShareLot stockClassIndex sourceIssuanceData conversionData =
+stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversionData =
   case Map.lookup sourceIssuanceData.stock_class_id stockClassIndex of
     Some sourceStockClass ->
       case sourceStockClass.conversion_rights of
-        [conversionRight] ->
+        [conversionRight] -> do
+          outputQuantity <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
           pure (Some (StockClassShareLot with
             stock_class_id = conversionRight.converts_to_stock_class_id
             security_id = None
             event_date = conversionData.date
-            quantity = stockClassConversionOutputQuantity conversionRight conversionData.quantity_converted))
+            quantity = outputQuantity))
         [] -> pure None
         _ -> do
           assertMsg ("Stock conversion output cannot be reconstructed because stock class has multiple conversion rights: " <> sourceStockClass.id) False
@@ -256,13 +306,13 @@ warrantExerciseTrigger issuanceData triggerId =
 warrantExerciseQuantity : WarrantIssuanceOcfData -> WarrantExerciseOcfData -> OcfWarrantConversionRight -> Decimal
 warrantExerciseQuantity issuanceData exerciseData conversionRight =
   case conversionRight.conversion_mechanism of
-    OcfWarrantMechanismFixedAmount with converts_to_quantity -> converts_to_quantity
+    OcfWarrantMechanismFixedAmount with converts_to_quantity -> fromOptional converts_to_quantity exerciseData.quantity
     _ -> fromOptional (fromOptional 0.0 issuanceData.quantity) exerciseData.quantity
 
 warrantExerciseOutputShareLot :
   WarrantIssuanceOcfData ->
   WarrantExerciseOcfData ->
-  Optional StockClassShareLot
+  Update (Optional StockClassShareLot)
 warrantExerciseOutputShareLot issuanceData exerciseData =
   case warrantExerciseTrigger issuanceData exerciseData.trigger_id of
     Some trigger ->
@@ -270,14 +320,31 @@ warrantExerciseOutputShareLot issuanceData exerciseData =
         OcfRightWarrant conversionRight ->
           case conversionRight.converts_to_stock_class_id of
             Some stockClassId ->
-              Some (StockClassShareLot with
-                stock_class_id = stockClassId
-                security_id = None
-                event_date = exerciseData.date
-                quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight)
-            None -> None
-        _ -> None
-    None -> None
+              case (conversionRight.conversion_mechanism, exerciseData.quantity, issuanceData.quantity) of
+                (OcfWarrantMechanismFixedAmount _, _, _) ->
+                  pure (Some (StockClassShareLot with
+                    stock_class_id = stockClassId
+                    security_id = None
+                    event_date = exerciseData.date
+                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
+                (_, Some _, _) ->
+                  pure (Some (StockClassShareLot with
+                    stock_class_id = stockClassId
+                    security_id = None
+                    event_date = exerciseData.date
+                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
+                (_, None, Some _) ->
+                  pure (Some (StockClassShareLot with
+                    stock_class_id = stockClassId
+                    security_id = None
+                    event_date = exerciseData.date
+                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
+                (_, None, None) -> do
+                  assertMsg ("Warrant exercise output cannot be reconstructed because exercise and issuance quantities are missing: " <> exerciseData.id) False
+                  pure None
+            None -> pure None
+        _ -> pure None
+    None -> pure None
 
 equityCompensationExerciseOutputShareLot :
   EquityCompensationIssuanceOcfData ->
@@ -287,10 +354,10 @@ equityCompensationExerciseOutputShareLot issuanceData exerciseData =
   case issuanceData.stock_class_id of
     Some stockClassId ->
       Some (StockClassShareLot with
-        stock_class_id = stockClassId
-        security_id = None
-        event_date = exerciseData.date
-        quantity = exerciseData.quantity)
+                stock_class_id = stockClassId
+                security_id = None
+                event_date = exerciseData.date
+                quantity = exerciseData.quantity)
     None -> None
 
 equityCompensationReleaseOutputShareLot :
@@ -303,7 +370,7 @@ equityCompensationReleaseOutputShareLot issuanceData releaseData =
       Some (StockClassShareLot with
         stock_class_id = stockClassId
         security_id = None
-        event_date = releaseData.date
+        event_date = releaseData.settlement_date
         quantity = releaseData.quantity)
     None -> None
 
@@ -331,45 +398,54 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
   stockConversionLots <- foldlA
     (\index conversionCid -> do
       conversion <- fetch conversionCid
-      case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
-        Some sourceIssuanceCid -> do
-          sourceIssuance <- fetch sourceIssuanceCid
-          lotOpt <- stockConversionOutputShareLot stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
-          pure (addOptionalStockClassShareLot lotOpt index)
-        None -> pure index)
+      if resultingStockIssuanceExists maps conversion.conversion_data.resulting_security_ids
+        then pure index
+        else case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
+          Some sourceIssuanceCid -> do
+            sourceIssuance <- fetch sourceIssuanceCid
+            lotOpt <- stockConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
+            pure (addOptionalStockClassShareLot lotOpt index)
+          None -> pure index)
     stockIssuanceLots
     (Map.values maps.stock_conversions)
 
   warrantExerciseLots <- foldlA
     (\index exerciseCid -> do
       exercise <- fetch exerciseCid
-      case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          pure (addOptionalStockClassShareLot (warrantExerciseOutputShareLot issuance.issuance_data exercise.exercise_data) index)
-        None -> pure index)
+      if resultingStockIssuanceExists maps exercise.exercise_data.resulting_security_ids
+        then pure index
+        else case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
+          Some issuanceCid -> do
+            issuance <- fetch issuanceCid
+            lotOpt <- warrantExerciseOutputShareLot issuance.issuance_data exercise.exercise_data
+            pure (addOptionalStockClassShareLot lotOpt index)
+          None -> pure index)
     stockConversionLots
     (Map.values maps.warrant_exercises)
 
   equityExerciseLots <- foldlA
     (\index exerciseCid -> do
       exercise <- fetch exerciseCid
-      case Map.lookup exercise.exercise_data.security_id maps.equity_compensation_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          pure (addOptionalStockClassShareLot (equityCompensationExerciseOutputShareLot issuance.issuance_data exercise.exercise_data) index)
-        None -> pure index)
+      if resultingStockIssuanceExists maps exercise.exercise_data.resulting_security_ids
+        then pure index
+        else case Map.lookup exercise.exercise_data.security_id maps.equity_compensation_issuances_by_security_id of
+          Some issuanceCid -> do
+            issuance <- fetch issuanceCid
+            pure (addOptionalStockClassShareLot (equityCompensationExerciseOutputShareLot issuance.issuance_data exercise.exercise_data) index)
+          None -> pure index)
     warrantExerciseLots
     (Map.values maps.equity_compensation_exercises)
 
   foldlA
     (\index releaseCid -> do
       release <- fetch releaseCid
-      case Map.lookup release.release_data.security_id maps.equity_compensation_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          pure (addOptionalStockClassShareLot (equityCompensationReleaseOutputShareLot issuance.issuance_data release.release_data) index)
-        None -> pure index)
+      if resultingStockIssuanceExists maps release.release_data.resulting_security_ids
+        then pure index
+        else case Map.lookup release.release_data.security_id maps.equity_compensation_issuances_by_security_id of
+          Some issuanceCid -> do
+            issuance <- fetch issuanceCid
+            pure (addOptionalStockClassShareLot (equityCompensationReleaseOutputShareLot issuance.issuance_data release.release_data) index)
+          None -> pure index)
     equityExerciseLots
     (Map.values maps.equity_compensation_releases)
 
