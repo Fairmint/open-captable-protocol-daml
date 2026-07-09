@@ -1301,6 +1301,46 @@ stockIssuancePlanAllocationIndex eventIndex maps =
     Map.empty
     (Map.values maps.stock_issuances)
 
+equityCompensationPlanAllocationEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
+equityCompensationPlanAllocationEvents maps issuanceData = do
+  retractionEvents <- foldlA
+    (\events retractionCid -> do
+      retraction <- fetch retractionCid
+      if retraction.retraction_data.security_id == issuanceData.security_id
+        then pure ((StockClassShareRetraction with
+          event_date = retraction.retraction_data.date
+          event_priority = 3) :: events)
+        else pure events)
+    []
+    (Map.values maps.equity_compensation_retractions)
+
+  pure ((StockClassShareDelta with
+      event_date = issuanceData.date
+      event_priority = 0
+      quantity_delta = issuanceData.quantity)
+    :: retractionEvents)
+
+equityCompensationPlanAllocatedQuantity : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update (Optional Decimal)
+equityCompensationPlanAllocatedQuantity maps issuanceData = do
+  events <- equityCompensationPlanAllocationEvents maps issuanceData
+  pure (foldl
+    applyStockClassShareEventOptional
+    (Some 0.0)
+    (sortOn stockClassShareEventSortKey events))
+
+equityCompensationPlanAllocatedQuantityAt : CapTableMaps -> EquityCompensationIssuanceOcfData -> Time -> Update (Optional Decimal)
+equityCompensationPlanAllocatedQuantityAt maps issuanceData asOf = do
+  if issuanceData.date <= asOf
+    then do
+      events <- equityCompensationPlanAllocationEvents maps issuanceData
+      pure (foldl
+        applyStockClassShareEventOptional
+        (Some 0.0)
+        (sortOn
+          stockClassShareEventSortKey
+          (filter (stockClassShareEventOnOrBefore asOf) events)))
+    else pure (Some 0.0)
+
 equityCompensationPlanAllocationIndex : CapTableMaps -> Update (Map Text Decimal)
 equityCompensationPlanAllocationIndex maps =
   foldlA
@@ -1309,7 +1349,14 @@ equityCompensationPlanAllocationIndex maps =
       case issuance.issuance_data.stock_plan_id of
         Some stockPlanId -> do
           assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) issuance.issuance_data.quantity
-          pure (addQuantityById stockPlanId issuance.issuance_data.quantity totals)
+          allocationQuantityOpt <- equityCompensationPlanAllocatedQuantity maps issuance.issuance_data
+          case allocationQuantityOpt of
+            Some allocationQuantity -> do
+              assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
+              pure (addQuantityById stockPlanId allocationQuantity totals)
+            None -> do
+              assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id) False
+              pure totals
         None -> pure totals)
     Map.empty
     (Map.values maps.equity_compensation_issuances)
@@ -1516,7 +1563,14 @@ equityCompensationPlanAllocationIndexAt maps asOf =
           if issuance.issuance_data.date <= asOf
             then do
               assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) issuance.issuance_data.quantity
-              pure (addQuantityById stockPlanId issuance.issuance_data.quantity totals)
+              allocationQuantityOpt <- equityCompensationPlanAllocatedQuantityAt maps issuance.issuance_data asOf
+              case allocationQuantityOpt of
+                Some allocationQuantity -> do
+                  assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
+                  pure (addQuantityById stockPlanId allocationQuantity totals)
+                None -> do
+                  assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id <> " on " <> show asOf) False
+                  pure totals
             else pure totals
         None -> pure totals)
     Map.empty
