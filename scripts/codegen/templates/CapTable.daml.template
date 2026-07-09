@@ -226,7 +226,7 @@ applyStockClassShareEvent : Decimal -> StockClassShareEvent -> Decimal
 applyStockClassShareEvent current event = case event of
   StockClassShareDelta with quantity_delta -> nonNegativeDecimal (current + quantity_delta)
   StockClassShareMultiplier with ratio -> current * ratio.numerator / ratio.denominator
-  StockClassShareRetraction with event_date; event_priority -> 0.0
+  StockClassShareRetraction _ _ -> 0.0
 
 stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
 stockSecurityShareEvents maps issuanceData = do
@@ -236,7 +236,7 @@ stockSecurityShareEvents maps issuanceData = do
       if cancellation.cancellation_data.security_id == issuanceData.security_id
         then pure ((StockClassShareDelta with
             event_date = cancellation.cancellation_data.date
-            event_priority = 2
+            event_priority = 1
             quantity_delta = 0.0 - cancellation.cancellation_data.quantity)
           :: events)
         else pure events)
@@ -249,7 +249,7 @@ stockSecurityShareEvents maps issuanceData = do
       if repurchase.repurchase_data.security_id == issuanceData.security_id
         then pure ((StockClassShareDelta with
             event_date = repurchase.repurchase_data.date
-            event_priority = 2
+            event_priority = 1
             quantity_delta = 0.0 - repurchase.repurchase_data.quantity)
           :: events)
         else pure events)
@@ -271,10 +271,10 @@ stockSecurityShareEvents maps issuanceData = do
   splitEvents <- foldlA
     (\events splitCid -> do
       split <- fetch splitCid
-      if split.split_data.stock_class_id == issuanceData.stock_class_id
+      if split.split_data.stock_class_id == issuanceData.stock_class_id && split.split_data.date >= issuanceData.date
         then pure ((StockClassShareMultiplier with
             event_date = split.split_data.date
-            event_priority = 1
+            event_priority = 2
             ratio = split.split_data.split_ratio)
           :: events)
         else pure events)
@@ -327,6 +327,17 @@ validateAllStockClassAuthorizedShares maps adjustmentIndex =
       assertWithinStockClassAuthorizedShares stockClass.stock_class_data.id currentIssued limitOpt)
     (Map.values maps.stock_classes)
 
+validateEditedStockClassInitialAuthorizedShares : CapTableMaps -> [OcfEditData] -> Update ()
+validateEditedStockClassInitialAuthorizedShares maps edits =
+  mapA_
+    (\editData -> case editData of
+      OcfEditStockClass stockClassData -> do
+        currentIssued <- stockClassIssuedQuantity maps stockClassData.id
+        let limitOpt = authorizedSharesLimit stockClassData.initial_shares_authorized
+        assertWithinStockClassAuthorizedShares stockClassData.id currentIssued limitOpt
+      _ -> pure ())
+    edits
+
 addStockClassAuthorizedContribution : Optional Decimal -> AuthorizedSharesCeiling -> Optional Decimal
 addStockClassAuthorizedContribution totalOpt ceiling = case (totalOpt, ceiling) of
   (Some total, AuthorizedSharesFinite shares) -> Some (total + shares)
@@ -366,9 +377,34 @@ validateIssuerAuthorizedShares maps adjustmentIndex issuerCid = do
         None ->
           assertMsg "Issuer authorized shares exceeded: stock class authorization is unlimited but issuer authorization is finite" False
 
-validateAuthorizedShareCeilings : CapTableMaps -> ContractId Issuer -> Update ()
-validateAuthorizedShareCeilings maps issuerCid = do
-  adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
+validateEditedIssuerInitialAuthorizedShares :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  [OcfEditData] ->
+  Update ()
+validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits =
+  mapA_
+    (\editData -> case editData of
+      OcfEditIssuer issuerData -> case issuerAuthorizedSharesLimit issuerData.initial_shares_authorized of
+        None -> pure ()
+        Some issuerLimit -> do
+          stockClassTotalOpt <- currentStockClassAuthorizedTotal maps adjustmentIndex
+          case stockClassTotalOpt of
+            Some stockClassTotal ->
+              assertMsg
+                ("Issuer initial authorized shares exceeded: stock classes authorize " <> show stockClassTotal <> " shares but issuer initially authorizes " <> show issuerLimit)
+                (stockClassTotal <= issuerLimit)
+            None ->
+              assertMsg "Issuer initial authorized shares exceeded: stock class authorization is unlimited but issuer initial authorization is finite" False
+      _ -> pure ())
+    edits
+
+validateAuthorizedShareCeilings :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  ContractId Issuer ->
+  Update ()
+validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
   validateAllStockClassAuthorizedShares maps adjustmentIndex
   validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
 
@@ -482,6 +518,15 @@ validateWarrantIssuanceReferences maps =
       validateOptionalReference "Warrant vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
     (Map.values maps.warrant_issuances)
 
+validateAuthorizedShareCeilingsForEdits :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  [OcfEditData] ->
+  Update ()
+validateAuthorizedShareCeilingsForEdits maps adjustmentIndex edits = do
+  validateEditedStockClassInitialAuthorizedShares maps edits
+  validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits
+
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
 getCreateTier createData = case createData of
@@ -496,9 +541,10 @@ processCreate ctx issuerCid maps createData = case createData of
       {{> create-case}}
 {{/each}}
 
--- | Process a single edit operation, returning updated maps and the edited ContractId
+-- | Process a single edit operation, returning updated maps, the edited ContractId,
+-- and any edit that changed initial authorized shares.
 -- Note: OcfEditIssuer is handled separately in UpdateCapTable since issuer is not a map
-processEdit : Context -> ContractId Issuer -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId)
+processEdit : Context -> ContractId Issuer -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId, [OcfEditData])
 processEdit ctx issuerCid maps editData = case editData of
       OcfEditIssuer _ -> error "OcfEditIssuer should be handled separately in UpdateCapTable"
 {{#each types_alpha}}
@@ -581,27 +627,31 @@ template CapTable
         assertMsg "Cannot edit issuer more than once per batch" (length issuerEdits <= 1)
 
         -- Process regular edits (map-based entities)
-        (mapsAfterEdits, regularEditedCids) <- foldlA
-          (\(maps, cids) editData -> do
-            (newMaps, cid) <- processEdit context issuer maps editData
-            pure (newMaps, cids ++ [cid]))
-          (mapsAfterDeletes, [])
+        (mapsAfterEdits, regularEditedCids, regularInitialAuthorizedShareEdits) <- foldlA
+          (\(maps, cids, initialAuthorizedShareEdits) editData -> do
+            (newMaps, cid, editInitialAuthorizedShareEdits) <- processEdit context issuer maps editData
+            pure (newMaps, cids ++ [cid], initialAuthorizedShareEdits ++ editInitialAuthorizedShareEdits))
+          (mapsAfterDeletes, [], [])
           regularEdits
 
         -- Process issuer edit (if any) - special handling since it's a single reference
         -- Note: In editedCids output, issuer edits appear first regardless of input position
-        (newIssuerCid, issuerEditedCids) <- case issuerEdits of
-          [] -> pure (issuer, [])  -- No issuer edit, keep current
+        (newIssuerCid, issuerEditedCids, issuerInitialAuthorizedShareEdits) <- case issuerEdits of
+          [] -> pure (issuer, [], [])  -- No issuer edit, keep current
           [OcfEditIssuer newIssuerData] -> do
             -- Validate issuer ID matches (cannot change ID during edit)
             currentIssuer <- fetch issuer
             assertMsg "Issuer ID mismatch: cannot change issuer ID during edit"
               (newIssuerData.id == currentIssuer.issuer_data.id)
+            let initialAuthorizedShareEdits =
+                  if newIssuerData.initial_shares_authorized /= currentIssuer.issuer_data.initial_shares_authorized
+                    then [OcfEditIssuer newIssuerData]
+                    else []
             archive issuer
             newCid <- create Issuer with
               context = context
               issuer_data = newIssuerData
-            pure (newCid, [CidIssuer newCid])
+            pure (newCid, [CidIssuer newCid], initialAuthorizedShareEdits)
           _ -> error "Multiple issuer edits not allowed"  -- Defensive: assertMsg above prevents this
 
         -- Sort creates by tier for dependency ordering
@@ -622,7 +672,12 @@ template CapTable
         validateValuationStockClassReferences finalMaps
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
-        validateAuthorizedShareCeilings finalMaps newIssuerCid
+        authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
+        validateAuthorizedShareCeilings finalMaps authorizedShareAdjustmentIndex newIssuerCid
+        validateAuthorizedShareCeilingsForEdits
+          finalMaps
+          authorizedShareAdjustmentIndex
+          (issuerInitialAuthorizedShareEdits ++ regularInitialAuthorizedShareEdits)
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
