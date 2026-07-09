@@ -22,6 +22,7 @@ import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCon
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
+import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
 
 -- OCF Types
 {{#each types_alpha}}
@@ -1889,6 +1890,116 @@ validateWarrantIssuanceReferences maps =
       validateOptionalReference "Warrant vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
     (Map.values maps.warrant_issuances)
 
+vestingTermsIdForSecurity : CapTableMaps -> Text -> Update (Optional Text)
+vestingTermsIdForSecurity maps securityId = do
+  let stockCidOpt = Map.lookup securityId maps.stock_issuances_by_security_id
+  let warrantCidOpt = Map.lookup securityId maps.warrant_issuances_by_security_id
+  let equityCompensationCidOpt = Map.lookup securityId maps.equity_compensation_issuances_by_security_id
+  let stockMatch = if isSome stockCidOpt then 1 else 0
+  let warrantMatch = if isSome warrantCidOpt then 1 else 0
+  let equityCompensationMatch = if isSome equityCompensationCidOpt then 1 else 0
+  assertMsg
+    ("Vesting transaction security id is ambiguous: " <> securityId)
+    (stockMatch + warrantMatch + equityCompensationMatch <= 1)
+  case (stockCidOpt, warrantCidOpt, equityCompensationCidOpt) of
+    (Some stockCid, None, None) -> do
+      issuance <- fetch stockCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, Some warrantCid, None) -> do
+      issuance <- fetch warrantCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, None, Some equityCompensationCid) -> do
+      issuance <- fetch equityCompensationCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, None, None) -> do
+      assertMsg ("Vesting transaction security not found: " <> securityId) False
+      pure None
+    _ -> do
+      assertMsg ("Vesting transaction security id is ambiguous: " <> securityId) False
+      pure None
+
+vestingTermsDataForSecurity : CapTableMaps -> Text -> Update (Optional VestingTermsOcfData)
+vestingTermsDataForSecurity maps securityId = do
+  vestingTermsIdOpt <- vestingTermsIdForSecurity maps securityId
+  case vestingTermsIdOpt of
+    Some vestingTermsId -> case Map.lookup vestingTermsId maps.vesting_terms of
+      Some vestingTermsCid -> do
+        vestingTerms <- fetch vestingTermsCid
+        pure (Some vestingTerms.vesting_terms_data)
+      None -> do
+        assertMsg ("Vesting transaction references missing VestingTerms " <> vestingTermsId <> " for security " <> securityId) False
+        pure None
+    None -> do
+      assertMsg ("Vesting transaction security has no VestingTerms: " <> securityId) False
+      pure None
+
+vestingConditionMatchesExpectedTrigger : VT.OcfVestingTrigger -> VT.OcfVestingCondition -> Bool
+vestingConditionMatchesExpectedTrigger expectedTrigger condition =
+  case (expectedTrigger, condition.trigger) of
+    (VT.OcfVestingStartTrigger, VT.OcfVestingStartTrigger) -> True
+    (VT.OcfVestingEventTrigger, VT.OcfVestingEventTrigger) -> True
+    _ -> False
+
+vestingConditionById : [VT.OcfVestingCondition] -> Text -> Optional VT.OcfVestingCondition
+vestingConditionById conditions conditionId = case conditions of
+  [] -> None
+  condition :: rest ->
+    if condition.id == conditionId
+      then Some condition
+      else vestingConditionById rest conditionId
+
+validateVestingTransactionCondition :
+  Text ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  VT.OcfVestingTrigger ->
+  Update ()
+validateVestingTransactionCondition label maps securityId vestingConditionId expectedTrigger = do
+  vestingTermsDataOpt <- vestingTermsDataForSecurity maps securityId
+  case vestingTermsDataOpt of
+    Some vestingTermsData -> do
+      let conditionOpt = vestingConditionById vestingTermsData.vesting_conditions vestingConditionId
+      assertMsg
+        (label <> " references missing VestingCondition " <> vestingConditionId <> " for security " <> securityId)
+        (isSome conditionOpt)
+      let Some condition = conditionOpt
+      assertMsg
+        (label <> " references VestingCondition " <> vestingConditionId <> " with the wrong trigger type")
+        (vestingConditionMatchesExpectedTrigger expectedTrigger condition)
+    None -> pure ()
+
+validateVestingStartConditionReferences : CapTableMaps -> Update ()
+validateVestingStartConditionReferences maps =
+  mapA_
+    (\vestingStartCid -> do
+      vestingStart <- fetch vestingStartCid
+      validateVestingTransactionCondition
+        "VestingStart"
+        maps
+        vestingStart.vesting_data.security_id
+        vestingStart.vesting_data.vesting_condition_id
+        VT.OcfVestingStartTrigger)
+    (Map.values maps.vesting_starts)
+
+validateVestingEventConditionReferences : CapTableMaps -> Update ()
+validateVestingEventConditionReferences maps =
+  mapA_
+    (\vestingEventCid -> do
+      vestingEvent <- fetch vestingEventCid
+      validateVestingTransactionCondition
+        "VestingEvent"
+        maps
+        vestingEvent.vesting_data.security_id
+        vestingEvent.vesting_data.vesting_condition_id
+        VT.OcfVestingEventTrigger)
+    (Map.values maps.vesting_events)
+
+validateVestingTransactionConditionReferences : CapTableMaps -> Update ()
+validateVestingTransactionConditionReferences maps = do
+  validateVestingStartConditionReferences maps
+  validateVestingEventConditionReferences maps
+
 validateConvertibleConversionTriggerReferences : CapTableMaps -> Update ()
 validateConvertibleConversionTriggerReferences maps =
   mapA_
@@ -2733,6 +2844,7 @@ template CapTable
         validateStockIssuanceShareNumberRanges finalMaps
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
+        validateVestingTransactionConditionReferences finalMaps
         validateConvertibleConversionTriggerReferences finalMaps
         validateWarrantExerciseTriggerReferences finalMaps
         validateStockReissuanceSplitReferences finalMaps
