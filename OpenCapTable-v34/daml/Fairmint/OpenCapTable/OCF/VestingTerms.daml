@@ -4,6 +4,8 @@ module Fairmint.OpenCapTable.OCF.VestingTerms where
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Validation (validateNonEmptyStringsArray)
 import Fairmint.Shared.TypeHelpers (validateOptionalText)
+import qualified DA.Map as Map
+import qualified DA.Optional as Optional
 
 
 template VestingTerms
@@ -231,14 +233,6 @@ hasDuplicateTexts texts = case texts of
   [] -> False
   text :: rest -> text `elem` rest || hasDuplicateTexts rest
 
-conditionById : [OcfVestingCondition] -> Text -> Optional OcfVestingCondition
-conditionById conditions conditionId = case conditions of
-  [] -> None
-  condition :: rest ->
-    if condition.id == conditionId
-      then Some condition
-      else conditionById rest conditionId
-
 vestingTriggerReferencesKnownCondition : [Text] -> OcfVestingCondition -> Bool
 vestingTriggerReferencesKnownCondition conditionIds condition = case condition.trigger of
   OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
@@ -251,25 +245,41 @@ vestingConditionReferencesKnownConditions conditionIds condition =
   all (`elem` conditionIds) condition.next_condition_ids &&
   vestingTriggerReferencesKnownCondition conditionIds condition
 
-vestingConditionEdgeIds : OcfVestingCondition -> [Text]
-vestingConditionEdgeIds condition = case condition.trigger of
-  OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
-    relative_to_condition_id :: condition.next_condition_ids
-  _ -> condition.next_condition_ids
+addDependentEdge : Text -> Text -> Map.Map Text [Text] -> Map.Map Text [Text]
+addDependentEdge fromConditionId toConditionId edges =
+  let conditionEdges = Optional.fromOptional [] (Map.lookup fromConditionId edges)
+      updatedEdges =
+        if toConditionId `elem` conditionEdges
+          then conditionEdges
+          else toConditionId :: conditionEdges
+  in Map.insert fromConditionId updatedEdges edges
 
-vestingConditionHasCycle : [OcfVestingCondition] -> [Text] -> Text -> Bool
-vestingConditionHasCycle conditions path conditionId =
+vestingConditionEdges : [OcfVestingCondition] -> Map.Map Text [Text]
+vestingConditionEdges conditions =
+  let baseEdges = Map.fromList (map (\condition -> (condition.id, condition.next_condition_ids)) conditions)
+  in foldl addRelativeEdge baseEdges conditions
+  where
+    addRelativeEdge : Map.Map Text [Text] -> OcfVestingCondition -> Map.Map Text [Text]
+    addRelativeEdge edges condition = case condition.trigger of
+      OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
+        addDependentEdge relative_to_condition_id condition.id edges
+      _ -> edges
+
+conditionEdgeIds : Map.Map Text [Text] -> Text -> [Text]
+conditionEdgeIds edges conditionId =
+  Optional.fromOptional [] (Map.lookup conditionId edges)
+
+vestingConditionHasCycle : Map.Map Text [Text] -> [Text] -> Text -> Bool
+vestingConditionHasCycle edges path conditionId =
   conditionId `elem` path ||
-  case conditionById conditions conditionId of
-    None -> False
-    Some condition ->
-      any
-        (vestingConditionHasCycle conditions (conditionId :: path))
-        (vestingConditionEdgeIds condition)
+  any
+    (vestingConditionHasCycle edges (conditionId :: path))
+    (conditionEdgeIds edges conditionId)
 
 validateOcfVestingConditionGraph : [OcfVestingCondition] -> Bool
 validateOcfVestingConditionGraph conditions =
   let conditionIds = vestingConditionIds conditions
+      edges = vestingConditionEdges conditions
   in not (hasDuplicateTexts conditionIds) &&
      all (vestingConditionReferencesKnownConditions conditionIds) conditions &&
-     not (any (vestingConditionHasCycle conditions []) conditionIds)
+     not (any (vestingConditionHasCycle edges []) conditionIds)
