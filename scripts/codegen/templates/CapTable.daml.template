@@ -222,7 +222,7 @@ applyStockClassShareEvent : Decimal -> StockClassShareEvent -> Decimal
 applyStockClassShareEvent current event = case event of
   StockClassShareDelta with quantity_delta -> nonNegativeDecimal (current + quantity_delta)
   StockClassShareMultiplier with ratio -> current * ratio.numerator / ratio.denominator
-  StockClassShareRetraction with event_date; event_priority -> 0.0
+  StockClassShareRetraction _ _ -> 0.0
 
 stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
 stockSecurityShareEvents maps issuanceData = do
@@ -323,6 +323,17 @@ validateAllStockClassAuthorizedShares maps adjustmentIndex =
       assertWithinStockClassAuthorizedShares stockClass.stock_class_data.id currentIssued limitOpt)
     (Map.values maps.stock_classes)
 
+validateEditedStockClassInitialAuthorizedShares : CapTableMaps -> [OcfEditData] -> Update ()
+validateEditedStockClassInitialAuthorizedShares maps edits =
+  mapA_
+    (\editData -> case editData of
+      OcfEditStockClass stockClassData -> do
+        currentIssued <- stockClassIssuedQuantity maps stockClassData.id
+        let limitOpt = authorizedSharesLimit stockClassData.initial_shares_authorized
+        assertWithinStockClassAuthorizedShares stockClassData.id currentIssued limitOpt
+      _ -> pure ())
+    edits
+
 addStockClassAuthorizedContribution : Optional Decimal -> AuthorizedSharesCeiling -> Optional Decimal
 addStockClassAuthorizedContribution totalOpt ceiling = case (totalOpt, ceiling) of
   (Some total, AuthorizedSharesFinite shares) -> Some (total + shares)
@@ -362,11 +373,39 @@ validateIssuerAuthorizedShares maps adjustmentIndex issuerCid = do
         None ->
           assertMsg "Issuer authorized shares exceeded: stock class authorization is unlimited but issuer authorization is finite" False
 
+validateEditedIssuerInitialAuthorizedShares :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  [OcfEditData] ->
+  Update ()
+validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits =
+  mapA_
+    (\editData -> case editData of
+      OcfEditIssuer issuerData -> case issuerAuthorizedSharesLimit issuerData.initial_shares_authorized of
+        None -> pure ()
+        Some issuerLimit -> do
+          stockClassTotalOpt <- currentStockClassAuthorizedTotal maps adjustmentIndex
+          case stockClassTotalOpt of
+            Some stockClassTotal ->
+              assertMsg
+                ("Issuer initial authorized shares exceeded: stock classes authorize " <> show stockClassTotal <> " shares but issuer initially authorizes " <> show issuerLimit)
+                (stockClassTotal <= issuerLimit)
+            None ->
+              assertMsg "Issuer initial authorized shares exceeded: stock class authorization is unlimited but issuer initial authorization is finite" False
+      _ -> pure ())
+    edits
+
 validateAuthorizedShareCeilings : CapTableMaps -> ContractId Issuer -> Update ()
 validateAuthorizedShareCeilings maps issuerCid = do
   adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
   validateAllStockClassAuthorizedShares maps adjustmentIndex
   validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
+
+validateAuthorizedShareCeilingsForEdits : CapTableMaps -> [OcfEditData] -> Update ()
+validateAuthorizedShareCeilingsForEdits maps edits = do
+  adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
+  validateEditedStockClassInitialAuthorizedShares maps edits
+  validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits
 
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
@@ -502,6 +541,7 @@ template CapTable
           sortedCreates
 
         validateAuthorizedShareCeilings finalMaps newIssuerCid
+        validateAuthorizedShareCeilingsForEdits finalMaps edits
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
