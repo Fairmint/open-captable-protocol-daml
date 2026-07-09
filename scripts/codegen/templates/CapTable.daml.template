@@ -175,6 +175,32 @@ addStockClassAuthorizedAdjustmentById :
 addStockClassAuthorizedAdjustmentById key adjustment index =
   Map.insert key (adjustment :: fromOptional [] (Map.lookup key index)) index
 
+addStockIssuanceDataByStockClass :
+  Text ->
+  StockIssuanceOcfData ->
+  Map Text [StockIssuanceOcfData] ->
+  Map Text [StockIssuanceOcfData]
+addStockIssuanceDataByStockClass key issuanceData index =
+  Map.insert key (issuanceData :: fromOptional [] (Map.lookup key index)) index
+
+stockIssuanceDataByStockClass : CapTableMaps -> Update (Map Text [StockIssuanceOcfData])
+stockIssuanceDataByStockClass maps =
+  foldlA
+    (\index issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure (addStockIssuanceDataByStockClass issuance.issuance_data.stock_class_id issuance.issuance_data index))
+    Map.empty
+    (Map.values maps.stock_issuances)
+
+stockClassDataList : CapTableMaps -> Update [StockClassOcfData]
+stockClassDataList maps =
+  foldlA
+    (\stockClasses stockClassCid -> do
+      stockClass <- fetch stockClassCid
+      pure (stockClass.stock_class_data :: stockClasses))
+    []
+    (Map.values maps.stock_classes)
+
 stockClassAuthorizedAdjustmentIndex : CapTableMaps -> Update (Map Text StockClassAuthorizedSharesAdjustmentOcfData)
 stockClassAuthorizedAdjustmentIndex maps =
   foldlA
@@ -450,29 +476,28 @@ stockIssuanceQuantityAt eventIndex issuanceData asOf =
           (filter (stockClassShareEventOnOrBefore asOf) (stockIssuedShareEvents eventIndex issuanceData)))
     else 0.0
 
-stockClassIssuedQuantity : StockClassShareEventIndex -> CapTableMaps -> Text -> Update Decimal
-stockClassIssuedQuantity eventIndex maps stockClassId = do
-  quantities <- foldlA
-    (\acc issuanceCid -> do
-      issuance <- fetch issuanceCid
-      if issuance.issuance_data.stock_class_id == stockClassId
-        then pure (stockIssuanceCurrentQuantity eventIndex issuance.issuance_data :: acc)
-        else pure acc)
-    []
-    (Map.values maps.stock_issuances)
-  pure (foldl (\total quantity -> total + quantity) 0.0 quantities)
+stockClassIssuedQuantity :
+  StockClassShareEventIndex ->
+  Map Text [StockIssuanceOcfData] ->
+  Text ->
+  Decimal
+stockClassIssuedQuantity eventIndex issuancesByStockClass stockClassId =
+  foldl
+    (\total issuanceData -> total + stockIssuanceCurrentQuantity eventIndex issuanceData)
+    0.0
+    (fromOptional [] (Map.lookup stockClassId issuancesByStockClass))
 
-stockClassIssuedQuantityAt : StockClassShareEventIndex -> CapTableMaps -> Text -> Time -> Update Decimal
-stockClassIssuedQuantityAt eventIndex maps stockClassId asOf = do
-  quantities <- foldlA
-    (\acc issuanceCid -> do
-      issuance <- fetch issuanceCid
-      if issuance.issuance_data.stock_class_id == stockClassId
-        then pure (stockIssuanceQuantityAt eventIndex issuance.issuance_data asOf :: acc)
-        else pure acc)
-    []
-    (Map.values maps.stock_issuances)
-  pure (foldl (\total quantity -> total + quantity) 0.0 quantities)
+stockClassIssuedQuantityAt :
+  StockClassShareEventIndex ->
+  Map Text [StockIssuanceOcfData] ->
+  Text ->
+  Time ->
+  Decimal
+stockClassIssuedQuantityAt eventIndex issuancesByStockClass stockClassId asOf =
+  foldl
+    (\total issuanceData -> total + stockIssuanceQuantityAt eventIndex issuanceData asOf)
+    0.0
+    (fromOptional [] (Map.lookup stockClassId issuancesByStockClass))
 
 assertWithinStockClassAuthorizedShares : Text -> Decimal -> Optional Decimal -> Update ()
 assertWithinStockClassAuthorizedShares stockClassId issuedQuantity limitOpt = case limitOpt of
@@ -515,43 +540,47 @@ stockClassAuthorizedValidationDateIndex maps = do
 
 validateAllStockClassAuthorizedShares :
   StockClassShareEventIndex ->
-  CapTableMaps ->
+  [StockClassOcfData] ->
+  Map Text [StockIssuanceOcfData] ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   Update ()
-validateAllStockClassAuthorizedShares eventIndex maps adjustmentIndex =
+validateAllStockClassAuthorizedShares eventIndex stockClasses issuancesByStockClass adjustmentIndex =
   mapA_
-    (\stockClassCid -> do
-      stockClass <- fetch stockClassCid
-      currentIssued <- stockClassIssuedQuantity eventIndex maps stockClass.stock_class_data.id
-      let limitOpt = currentStockClassAuthorizedLimit adjustmentIndex stockClass.stock_class_data
-      assertWithinStockClassAuthorizedShares stockClass.stock_class_data.id currentIssued limitOpt)
-    (Map.values maps.stock_classes)
+    (\stockClassData -> do
+      let currentIssued = stockClassIssuedQuantity eventIndex issuancesByStockClass stockClassData.id
+      let limitOpt = currentStockClassAuthorizedLimit adjustmentIndex stockClassData
+      assertWithinStockClassAuthorizedShares stockClassData.id currentIssued limitOpt)
+    stockClasses
 
 validateStockClassAuthorizedSharesAtDates :
   StockClassShareEventIndex ->
-  CapTableMaps ->
+  [StockClassOcfData] ->
+  Map Text [StockIssuanceOcfData] ->
   Map Text [StockClassAuthorizedSharesAdjustmentOcfData] ->
   Map Text [Time] ->
   Update ()
-validateStockClassAuthorizedSharesAtDates eventIndex maps adjustmentHistory validationDates =
+validateStockClassAuthorizedSharesAtDates eventIndex stockClasses issuancesByStockClass adjustmentHistory validationDates =
   mapA_
-    (\stockClassCid -> do
-      stockClass <- fetch stockClassCid
-      let stockClassId = stockClass.stock_class_data.id
+    (\stockClassData -> do
+      let stockClassId = stockClassData.id
       mapA_
         (\asOf -> do
-          issuedAtDate <- stockClassIssuedQuantityAt eventIndex maps stockClassId asOf
-          let limitOpt = stockClassAuthorizedLimitAt adjustmentHistory stockClass.stock_class_data asOf
+          let issuedAtDate = stockClassIssuedQuantityAt eventIndex issuancesByStockClass stockClassId asOf
+          let limitOpt = stockClassAuthorizedLimitAt adjustmentHistory stockClassData asOf
           assertWithinStockClassAuthorizedSharesAtDate stockClassId asOf issuedAtDate limitOpt)
         (fromOptional [] (Map.lookup stockClassId validationDates)))
-    (Map.values maps.stock_classes)
+    stockClasses
 
-validateEditedStockClassInitialAuthorizedShares : StockClassShareEventIndex -> CapTableMaps -> [OcfEditData] -> Update ()
-validateEditedStockClassInitialAuthorizedShares eventIndex maps edits =
+validateEditedStockClassInitialAuthorizedShares :
+  StockClassShareEventIndex ->
+  Map Text [StockIssuanceOcfData] ->
+  [OcfEditData] ->
+  Update ()
+validateEditedStockClassInitialAuthorizedShares eventIndex issuancesByStockClass edits =
   mapA_
     (\editData -> case editData of
       OcfEditStockClass stockClassData -> do
-        currentIssued <- stockClassIssuedQuantity eventIndex maps stockClassData.id
+        let currentIssued = stockClassIssuedQuantity eventIndex issuancesByStockClass stockClassData.id
         let limitOpt = authorizedSharesLimit stockClassData.initial_shares_authorized
         assertWithinStockClassAuthorizedShares stockClassData.id currentIssued limitOpt
       _ -> pure ())
@@ -565,43 +594,42 @@ addStockClassAuthorizedContribution totalOpt ceiling = case (totalOpt, ceiling) 
   (None, _) -> None
 
 currentStockClassAuthorizedTotalAt :
-  CapTableMaps ->
+  [StockClassOcfData] ->
   Map Text [StockClassAuthorizedSharesAdjustmentOcfData] ->
   Time ->
-  Update (Optional Decimal)
-currentStockClassAuthorizedTotalAt maps adjustmentHistory asOf =
-  foldlA
-    (\totalOpt stockClassCid -> do
-      stockClass <- fetch stockClassCid
-      let ceiling = stockClassAuthorizedCeilingAt adjustmentHistory stockClass.stock_class_data asOf
-      pure (addStockClassAuthorizedContribution totalOpt ceiling))
+  Optional Decimal
+currentStockClassAuthorizedTotalAt stockClasses adjustmentHistory asOf =
+  foldl
+    (\totalOpt stockClassData ->
+      let ceiling = stockClassAuthorizedCeilingAt adjustmentHistory stockClassData asOf
+      in addStockClassAuthorizedContribution totalOpt ceiling)
     (Some 0.0)
-    (Map.values maps.stock_classes)
+    stockClasses
 
 currentStockClassAuthorizedTotal :
-  CapTableMaps ->
+  [StockClassOcfData] ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
-  Update (Optional Decimal)
-currentStockClassAuthorizedTotal maps adjustmentIndex =
-  foldlA
-    (\totalOpt stockClassCid -> do
-      stockClass <- fetch stockClassCid
-      let ceiling = currentStockClassAuthorizedCeiling adjustmentIndex stockClass.stock_class_data
-      pure (addStockClassAuthorizedContribution totalOpt ceiling))
+  Optional Decimal
+currentStockClassAuthorizedTotal stockClasses adjustmentIndex =
+  foldl
+    (\totalOpt stockClassData ->
+      let ceiling = currentStockClassAuthorizedCeiling adjustmentIndex stockClassData
+      in addStockClassAuthorizedContribution totalOpt ceiling)
     (Some 0.0)
-    (Map.values maps.stock_classes)
+    stockClasses
 
 validateIssuerAuthorizedShares :
+  [StockClassOcfData] ->
   CapTableMaps ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   ContractId Issuer ->
   Update ()
-validateIssuerAuthorizedShares maps adjustmentIndex issuerCid = do
+validateIssuerAuthorizedShares stockClasses maps adjustmentIndex issuerCid = do
   issuerLimitOpt <- currentIssuerAuthorizedLimit maps issuerCid
   case issuerLimitOpt of
     None -> pure ()
     Some issuerLimit -> do
-      stockClassTotalOpt <- currentStockClassAuthorizedTotal maps adjustmentIndex
+      let stockClassTotalOpt = currentStockClassAuthorizedTotal stockClasses adjustmentIndex
       case stockClassTotalOpt of
         Some stockClassTotal ->
           assertMsg
@@ -627,19 +655,20 @@ issuerAuthorizedValidationDates maps = do
     (Map.values maps.stock_class_authorized_shares_adjustments)
 
 validateIssuerAuthorizedSharesAtDates :
+  [StockClassOcfData] ->
   CapTableMaps ->
   Map Text [StockClassAuthorizedSharesAdjustmentOcfData] ->
   Map Text [IssuerAuthorizedSharesAdjustmentOcfData] ->
   ContractId Issuer ->
   Update ()
-validateIssuerAuthorizedSharesAtDates maps stockClassAdjustmentHistory issuerAdjustmentHistory issuerCid = do
+validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHistory issuerAdjustmentHistory issuerCid = do
   issuerContract <- fetch issuerCid
   validationDates <- issuerAuthorizedValidationDates maps
   mapA_
     (\asOf -> case issuerAuthorizedLimitAt issuerAdjustmentHistory issuerContract.issuer_data asOf of
       None -> pure ()
       Some issuerLimit -> do
-        stockClassTotalOpt <- currentStockClassAuthorizedTotalAt maps stockClassAdjustmentHistory asOf
+        let stockClassTotalOpt = currentStockClassAuthorizedTotalAt stockClasses stockClassAdjustmentHistory asOf
         case stockClassTotalOpt of
           Some stockClassTotal ->
             assertMsg
@@ -650,17 +679,17 @@ validateIssuerAuthorizedSharesAtDates maps stockClassAdjustmentHistory issuerAdj
     validationDates
 
 validateEditedIssuerInitialAuthorizedShares :
-  CapTableMaps ->
+  [StockClassOcfData] ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   [OcfEditData] ->
   Update ()
-validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits =
+validateEditedIssuerInitialAuthorizedShares stockClasses adjustmentIndex edits =
   mapA_
     (\editData -> case editData of
       OcfEditIssuer issuerData -> case issuerAuthorizedSharesLimit issuerData.initial_shares_authorized of
         None -> pure ()
         Some issuerLimit -> do
-          stockClassTotalOpt <- currentStockClassAuthorizedTotal maps adjustmentIndex
+          let stockClassTotalOpt = currentStockClassAuthorizedTotal stockClasses adjustmentIndex
           case stockClassTotalOpt of
             Some stockClassTotal ->
               assertMsg
@@ -679,15 +708,17 @@ validateAuthorizedShareCeilings :
   Update ()
 validateAuthorizedShareCeilings maps adjustmentIndex issuerCid initialAuthorizedShareEdits = do
   eventIndex <- stockClassShareEventIndex maps
+  stockClasses <- stockClassDataList maps
+  issuancesByStockClass <- stockIssuanceDataByStockClass maps
   stockClassAdjustmentHistory <- stockClassAuthorizedAdjustmentHistoryIndex maps
   stockClassValidationDates <- stockClassAuthorizedValidationDateIndex maps
   issuerAdjustmentHistory <- issuerAuthorizedAdjustmentHistoryIndex maps
-  validateAllStockClassAuthorizedShares eventIndex maps adjustmentIndex
-  validateStockClassAuthorizedSharesAtDates eventIndex maps stockClassAdjustmentHistory stockClassValidationDates
-  validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
-  validateIssuerAuthorizedSharesAtDates maps stockClassAdjustmentHistory issuerAdjustmentHistory issuerCid
-  validateEditedStockClassInitialAuthorizedShares eventIndex maps initialAuthorizedShareEdits
-  validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex initialAuthorizedShareEdits
+  validateAllStockClassAuthorizedShares eventIndex stockClasses issuancesByStockClass adjustmentIndex
+  validateStockClassAuthorizedSharesAtDates eventIndex stockClasses issuancesByStockClass stockClassAdjustmentHistory stockClassValidationDates
+  validateIssuerAuthorizedShares stockClasses maps adjustmentIndex issuerCid
+  validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHistory issuerAdjustmentHistory issuerCid
+  validateEditedStockClassInitialAuthorizedShares eventIndex issuancesByStockClass initialAuthorizedShareEdits
+  validateEditedIssuerInitialAuthorizedShares stockClasses adjustmentIndex initialAuthorizedShareEdits
 
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
