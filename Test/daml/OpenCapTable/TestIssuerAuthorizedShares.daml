@@ -5,6 +5,9 @@ import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSha
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
 import OpenCapTable.TestHelpers
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
 import Daml.Script
 
 issuerAuthorizedSharesAdjustment : Text -> Decimal -> IssuerAuthorizedSharesAdjustmentOcfData
@@ -51,6 +54,26 @@ testIssuerAuthorizedSharesAdjustmentAllowsSameBatchStockClassIncrease = script d
       deletes = []
   pure ()
 
+testIssuerHistoricalTotalsExcludeFutureEffectiveStockClasses = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  (capTableWithExistingClass, _) <- setupStockClassWith issuer capTableLimited (limitedStockClass "SC_ISSUER_EXISTING_EFFECTIVE" 100.0)
+  let jan1 = DT.time (DA.date 2024 Jan 01) 0 0 0
+  let jan2 = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let futureClass = (limitedStockClass "SC_ISSUER_FUTURE_EFFECTIVE" 100.0) with
+        board_approval_date = Some jan2
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithExistingClass CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateIssuerAuthorizedSharesAdjustment ((issuerAuthorizedSharesAdjustment "TX_ISSUER_RAISE_BEFORE_FUTURE_CLASS" 150.0) with date = jan1)
+        , CT.OcfCreateStockClass futureClass
+        , CT.OcfCreateIssuerAuthorizedSharesAdjustment ((issuerAuthorizedSharesAdjustment "TX_ISSUER_RAISE_WITH_FUTURE_CLASS" 200.0) with date = jan2)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
 testIssuerAuthorizedSharesAdjustmentCannotDropBelowStockClasses = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
   capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
@@ -59,6 +82,44 @@ testIssuerAuthorizedSharesAdjustmentCannotDropBelowStockClasses = script do
   submitMustFail issuer do
     exerciseCmd capTableWithClass CT.UpdateCapTable with
       creates = [CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_DROP_TOO_LOW" 99.0)]
+      edits = []
+      deletes = []
+
+testSameDateLowerIssuerAuthorizedSharesAdjustmentWins = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  (capTableWithClass, _) <- setupStockClassWith issuer capTableLimited (limitedStockClass "SC_ISSUER_SAME_DATE" 100.0)
+  result <- submit issuer do
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_SAME_DATE_LOW" 100.0)
+        , CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_SAME_DATE_HIGH" 150.0)
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass (limitedStockClass "SC_ISSUER_SAME_DATE_EXTRA" 50.0)]
+      edits = []
+      deletes = []
+
+testSameDateLowerIssuerAuthorizedSharesAdjustmentWinsWithReversedCreateOrder = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  (capTableWithClass, _) <- setupStockClassWith issuer capTableLimited (limitedStockClass "SC_ISSUER_SAME_DATE_REVERSED" 100.0)
+  result <- submit issuer do
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_SAME_DATE_HIGH_FIRST" 150.0)
+        , CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_SAME_DATE_LOW_SECOND" 100.0)
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass (limitedStockClass "SC_ISSUER_SAME_DATE_REVERSED_EXTRA" 50.0)]
       edits = []
       deletes = []
 
@@ -75,12 +136,16 @@ testIssuerEditCannotDropBelowStockClasses = script do
 
 testIssuerEditCannotDropInitialBelowStockClassesWhenAdjustmentExists = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 125.0
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer capTableLimited (limitedStockClass "SC_ISSUER_EDIT_HISTORICAL_DROP" 100.0)
+  let classAdjustment = stockClassAuthorizedSharesAdjustment "TX_CLASS_RAISE_BEFORE_ISSUER_EDIT" stockClassId 125.0
+  let laterIssuerAdjustment = (issuerAuthorizedSharesAdjustment "TX_ISSUER_RAISE_AFTER_CLASS_EDIT" 150.0) with
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
   result <- submit issuer do
-    exerciseCmd capTableLimited CT.UpdateCapTable with
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
       creates =
-        [ CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_RAISE_MASK" 150.0)
-        , CT.OcfCreateStockClass (limitedStockClass "SC_ISSUER_EDIT_WITH_ADJUSTMENT" 125.0)
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment classAdjustment
+        , CT.OcfCreateIssuerAuthorizedSharesAdjustment laterIssuerAdjustment
         ]
       edits = []
       deletes = []
@@ -88,8 +153,27 @@ testIssuerEditCannotDropInitialBelowStockClassesWhenAdjustmentExists = script do
   submitMustFail issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = []
-      edits = [CT.OcfEditIssuer (defaultIssuerWithAuthorizedShares "ISSUER_1" (Some (OcfInitialSharesNumeric 99.0)))]
+      edits = [CT.OcfEditIssuer (defaultIssuerWithAuthorizedShares "ISSUER_1" (Some (OcfInitialSharesNumeric 100.0)))]
       deletes = []
+
+testIssuerEditAllowsInitialBelowCurrentTotalWhenAdjustmentCoversHistory = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  result <- submit issuer do
+    exerciseCmd capTableLimited CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateIssuerAuthorizedSharesAdjustment (issuerAuthorizedSharesAdjustment "TX_ISSUER_RAISE_HISTORY_OK" 150.0)
+        , CT.OcfCreateStockClass (limitedStockClass "SC_ISSUER_EDIT_HISTORY_OK" 125.0)
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditIssuer (defaultIssuerWithAuthorizedShares "ISSUER_1" (Some (OcfInitialSharesNumeric 110.0)))]
+      deletes = []
+  pure ()
 
 testIssuerMetadataEditAllowedWhenAdjustmentRaisesAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -118,6 +202,23 @@ testStockClassAuthorizedSharesAdjustmentCannotExceedIssuerAuthorizedShares = scr
   submitMustFail issuer do
     exerciseCmd capTableWithClass CT.UpdateCapTable with
       creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_CLASS_RAISE_TOO_HIGH" stockClassId 101.0)]
+      edits = []
+      deletes = []
+
+testStockClassAuthorizedSharesAdjustmentCannotUseLaterIssuerAuthorizedSharesAdjustment = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableLimited <- setIssuerAuthorizedShares issuer cap_table 100.0
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer capTableLimited (limitedStockClass "SC_CLASS_BEFORE_ISSUER_RAISE" 100.0)
+  let classAdjustment = stockClassAuthorizedSharesAdjustment "TX_CLASS_BEFORE_ISSUER_RAISE" stockClassId 150.0
+  let laterIssuerAdjustment = (issuerAuthorizedSharesAdjustment "TX_ISSUER_AFTER_CLASS_RAISE" 150.0) with
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment classAdjustment
+        , CT.OcfCreateIssuerAuthorizedSharesAdjustment laterIssuerAdjustment
+        ]
       edits = []
       deletes = []
 
