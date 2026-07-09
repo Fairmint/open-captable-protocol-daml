@@ -202,6 +202,23 @@ data SecurityQuantityEvent
       event_priority: Int
   deriving (Eq, Show)
 
+data ConvertibleBalanceEvent
+  = ConvertibleMonetaryReduction with
+      event_label: Text
+      event_date: Time
+      event_priority: Int
+      amount: Decimal
+      currency: Text
+      balance_security_id: Optional Text
+      resulting_security_ids: [Text]
+      validate_resulting_amount: Bool
+  | ConvertibleRetirement with
+      event_label: Text
+      event_date: Time
+      event_priority: Int
+      balance_security_id: Optional Text
+  deriving (Eq, Show)
+
 authorizedSharesCeiling : OcfInitialSharesAuthorized -> AuthorizedSharesCeiling
 authorizedSharesCeiling auth = case auth of
   OcfInitialSharesNumeric n -> AuthorizedSharesFinite n
@@ -406,6 +423,53 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
           assertMsg ("Stock conversion output cannot be reconstructed because stock class has multiple conversion rights: " <> sourceStockClass.id) False
           pure None
     None -> pure None
+
+validateStockConversionResultIssuances :
+  CapTableMaps ->
+  StockConversionOcfData ->
+  StockClassShareLot ->
+  Update ()
+validateStockConversionResultIssuances maps conversionData expectedOutput = do
+  actualQuantity <- foldlA
+    (\total securityId ->
+      case Map.lookup securityId maps.stock_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertMsg
+            ("Stock conversion result has wrong stock class for " <> conversionData.id <> ": " <> securityId)
+            (issuance.issuance_data.stock_class_id == expectedOutput.stock_class_id)
+          pure (total + issuance.issuance_data.quantity)
+        None -> do
+          assertMsg ("Stock conversion result security not found: " <> securityId) False
+          pure total)
+    0.0
+    conversionData.resulting_security_ids
+  assertMsg
+    ("Stock conversion result quantity mismatch for " <> conversionData.id <> ": expected " <> show expectedOutput.quantity <> ", found " <> show actualQuantity)
+    (actualQuantity == expectedOutput.quantity)
+
+validateStockConversionResultTerms : CapTableMaps -> Update ()
+validateStockConversionResultTerms maps = do
+  stockClassIndex <- stockClassDataIndex maps
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
+        Some sourceIssuanceCid -> do
+          sourceIssuance <- fetch sourceIssuanceCid
+          expectedOutputOpt <- stockConversionOutputShareLot
+            maps
+            stockClassIndex
+            sourceIssuance.issuance_data
+            conversion.conversion_data
+          case expectedOutputOpt of
+            Some expectedOutput ->
+              validateStockConversionResultIssuances maps conversion.conversion_data expectedOutput
+            None ->
+              assertMsg ("Stock conversion source stock class not found: " <> sourceIssuance.issuance_data.stock_class_id) False
+        None ->
+          assertMsg ("Stock conversion source security not found: " <> conversion.conversion_data.security_id) False)
+    (Map.values maps.stock_conversions)
 
 warrantExerciseTrigger : WarrantIssuanceOcfData -> Text -> Optional OcfConversionTrigger
 warrantExerciseTrigger issuanceData triggerId =
@@ -1231,18 +1295,34 @@ validateSecurityQuantityBalance securityId initialQuantity events = do
     (sortOn securityQuantityEventSortKey events)
   pure ()
 
-convertibleSecurityAmountEvents : CapTableMaps -> ConvertibleIssuanceOcfData -> Update [SecurityQuantityEvent]
-convertibleSecurityAmountEvents maps issuanceData = do
+convertibleBalanceEventSortKey : ConvertibleBalanceEvent -> (Time, Int, Text)
+convertibleBalanceEventSortKey event = case event of
+  ConvertibleMonetaryReduction with event_date; event_priority; event_label ->
+    (event_date, event_priority, event_label)
+  ConvertibleRetirement with event_date; event_priority; event_label ->
+    (event_date, event_priority, event_label)
+
+convertibleBalanceEventDate : ConvertibleBalanceEvent -> Time
+convertibleBalanceEventDate event = case event of
+  ConvertibleMonetaryReduction with event_date -> event_date
+  ConvertibleRetirement with event_date -> event_date
+
+convertibleBalanceEvents : CapTableMaps -> ConvertibleIssuanceOcfData -> Update [ConvertibleBalanceEvent]
+convertibleBalanceEvents maps issuanceData = do
   transferEvents <- foldlA
     (\events transferCid -> do
       transfer <- fetch transferCid
       if transfer.transfer_data.security_id == issuanceData.security_id
-        then
-          pure (securityQuantityReductionEvent
-            transfer.transfer_data.date
-            transfer.transfer_data.amount.amount
-            transfer.transfer_data.balance_security_id
-            :: events)
+        then pure ((ConvertibleMonetaryReduction with
+            event_label = "Convertible transfer " <> transfer.transfer_data.id
+            event_date = transfer.transfer_data.date
+            event_priority = if isSome transfer.transfer_data.balance_security_id then 2 else 1
+            amount = transfer.transfer_data.amount.amount
+            currency = transfer.transfer_data.amount.currency
+            balance_security_id = transfer.transfer_data.balance_security_id
+            resulting_security_ids = transfer.transfer_data.resulting_security_ids
+            validate_resulting_amount = True)
+          :: events)
         else pure events)
     []
     (Map.values maps.convertible_transfers)
@@ -1251,12 +1331,16 @@ convertibleSecurityAmountEvents maps issuanceData = do
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
       if cancellation.cancellation_data.security_id == issuanceData.security_id
-        then
-          pure (securityQuantityReductionEvent
-            cancellation.cancellation_data.date
-            cancellation.cancellation_data.amount.amount
-            cancellation.cancellation_data.balance_security_id
-            :: events)
+        then pure ((ConvertibleMonetaryReduction with
+            event_label = "Convertible cancellation " <> cancellation.cancellation_data.id
+            event_date = cancellation.cancellation_data.date
+            event_priority = if isSome cancellation.cancellation_data.balance_security_id then 2 else 1
+            amount = cancellation.cancellation_data.amount.amount
+            currency = cancellation.cancellation_data.amount.currency
+            balance_security_id = cancellation.cancellation_data.balance_security_id
+            resulting_security_ids = []
+            validate_resulting_amount = False)
+          :: events)
         else pure events)
     []
     (Map.values maps.convertible_cancellations)
@@ -1265,9 +1349,11 @@ convertibleSecurityAmountEvents maps issuanceData = do
     (\events conversionCid -> do
       conversion <- fetch conversionCid
       if conversion.conversion_data.security_id == issuanceData.security_id
-        then pure ((SecurityQuantityRetraction with
+        then pure ((ConvertibleRetirement with
+            event_label = "Convertible conversion " <> conversion.conversion_data.id
             event_date = conversion.conversion_data.date
-            event_priority = 3)
+            event_priority = 3
+            balance_security_id = conversion.conversion_data.balance_security_id)
           :: events)
         else pure events)
     []
@@ -1277,9 +1363,11 @@ convertibleSecurityAmountEvents maps issuanceData = do
     (\events retractionCid -> do
       retraction <- fetch retractionCid
       if retraction.retraction_data.security_id == issuanceData.security_id
-        then pure ((SecurityQuantityRetraction with
+        then pure ((ConvertibleRetirement with
+            event_label = "Convertible retraction " <> retraction.retraction_data.id
             event_date = retraction.retraction_data.date
-            event_priority = 3)
+            event_priority = 3
+            balance_security_id = None)
           :: events)
         else pure events)
     []
@@ -1287,17 +1375,133 @@ convertibleSecurityAmountEvents maps issuanceData = do
 
   pure (transferEvents ++ cancellationEvents ++ conversionEvents ++ retractionEvents)
 
+convertibleResultingInvestmentAmount :
+  CapTableMaps ->
+  Text ->
+  Text ->
+  [Text] ->
+  Update Decimal
+convertibleResultingInvestmentAmount maps label expectedCurrency securityIds =
+  foldlA
+    (\total securityId ->
+      case Map.lookup securityId maps.convertible_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertMsg
+            (label <> " result currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
+            (issuance.issuance_data.investment_amount.currency == expectedCurrency)
+          pure (total + issuance.issuance_data.investment_amount.amount)
+        None -> do
+          assertMsg (label <> " result security not found: " <> securityId) False
+          pure total)
+    0.0
+    securityIds
+
+validateConvertibleBalanceSuccessor :
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Decimal ->
+  Text ->
+  Update ()
+validateConvertibleBalanceSuccessor maps label expectedCurrency expectedAmount securityId =
+  case Map.lookup securityId maps.convertible_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        (label <> " balance currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
+        (issuance.issuance_data.investment_amount.currency == expectedCurrency)
+      assertMsg
+        (label <> " balance amount mismatch for " <> securityId <> ": expected " <> show expectedAmount <> ", found " <> show issuance.issuance_data.investment_amount.amount)
+        (issuance.issuance_data.investment_amount.amount == expectedAmount)
+    None ->
+      assertMsg (label <> " balance security not found: " <> securityId) False
+
+validateConvertiblePartialConversionBalance :
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Decimal ->
+  Text ->
+  Update ()
+validateConvertiblePartialConversionBalance maps label expectedCurrency currentAmount securityId =
+  case Map.lookup securityId maps.convertible_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        (label <> " balance currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
+        (issuance.issuance_data.investment_amount.currency == expectedCurrency)
+      assertMsg
+        (label <> " balance amount must be less than the current source balance for " <> securityId)
+        (issuance.issuance_data.investment_amount.amount < currentAmount)
+    None ->
+      assertMsg (label <> " balance security not found: " <> securityId) False
+
+validateConvertibleBalanceEvent :
+  CapTableMaps ->
+  ConvertibleIssuanceOcfData ->
+  Decimal ->
+  ConvertibleBalanceEvent ->
+  Update Decimal
+validateConvertibleBalanceEvent maps issuanceData currentAmount event = case event of
+  ConvertibleMonetaryReduction with event_label; amount; currency; balance_security_id; resulting_security_ids; validate_resulting_amount -> do
+    assertMsg
+      (event_label <> " currency mismatch: expected " <> issuanceData.investment_amount.currency <> ", found " <> currency)
+      (currency == issuanceData.investment_amount.currency)
+    let remainingAmount = currentAmount - amount
+    assertMsg
+      (event_label <> " exceeds the current balance for " <> issuanceData.security_id <> ": current " <> show currentAmount <> ", reduction " <> show amount)
+      (remainingAmount >= 0.0)
+    if validate_resulting_amount
+      then do
+        resultingAmount <- convertibleResultingInvestmentAmount
+          maps
+          event_label
+          issuanceData.investment_amount.currency
+          resulting_security_ids
+        assertMsg
+          (event_label <> " resulting amount mismatch: expected " <> show amount <> ", found " <> show resultingAmount)
+          (resultingAmount == amount)
+      else pure ()
+    case balance_security_id of
+      Some balanceSecurityId -> do
+        validateConvertibleBalanceSuccessor
+          maps
+          event_label
+          issuanceData.investment_amount.currency
+          remainingAmount
+          balanceSecurityId
+        pure 0.0
+      None -> pure remainingAmount
+  ConvertibleRetirement with event_label; balance_security_id -> do
+    assertMsg
+      (event_label <> " requires a positive source balance for " <> issuanceData.security_id)
+      (currentAmount > 0.0)
+    case balance_security_id of
+      Some balanceSecurityId ->
+        validateConvertiblePartialConversionBalance
+          maps
+          event_label
+          issuanceData.investment_amount.currency
+          currentAmount
+          balanceSecurityId
+      None -> pure ()
+    pure 0.0
+
 validateConvertibleSecurityBalance : CapTableMaps -> ConvertibleIssuanceOcfData -> Update ()
 validateConvertibleSecurityBalance maps issuanceData = do
-  events <- convertibleSecurityAmountEvents maps issuanceData
-  validateSecurityQuantityBalance
-    issuanceData.security_id
-    (Some 0.0)
-    ((SecurityQuantityDelta with
-        event_date = issuanceData.date
-        event_priority = 0
-        quantity_delta = issuanceData.investment_amount.amount)
-      :: events)
+  events <- convertibleBalanceEvents maps issuanceData
+  mapA_
+    (\event ->
+      assertMsg
+        ("Convertible balance event cannot precede issuance for " <> issuanceData.security_id)
+        (convertibleBalanceEventDate event >= issuanceData.date))
+    events
+  _ <- foldlA
+    (validateConvertibleBalanceEvent maps issuanceData)
+    issuanceData.investment_amount.amount
+    (sortOn convertibleBalanceEventSortKey events)
+  pure ()
 
 validateConvertibleSecurityBalances : CapTableMaps -> Update ()
 validateConvertibleSecurityBalances maps =
@@ -3283,6 +3487,7 @@ template CapTable
         validateWarrantExerciseTriggerReferences finalMaps
         validateStockReissuanceSplitReferences finalMaps
         validateConfiguredReferences finalMaps
+        validateStockConversionResultTerms finalMaps
         validateTransactionLifecycleDates finalMaps
         validateStockSecurityBalances finalMaps
         validateConvertibleSecurityBalances finalMaps
