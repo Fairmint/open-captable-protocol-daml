@@ -121,6 +121,10 @@ data StockClassShareEvent
   | StockClassShareRetraction with
       event_date: Time
       event_priority: Int
+  | StockClassShareTerminalDelta with
+      event_date: Time
+      event_priority: Int
+      quantity_delta: Decimal
   deriving (Eq, Show)
 
 data StockClassShareLot = StockClassShareLot with
@@ -710,18 +714,21 @@ issuerAuthorizedLimitAt adjustmentHistory issuerData asOf =
 stockClassShareEventSortKey : StockClassShareEvent -> (Time, Int)
 stockClassShareEventSortKey event = case event of
   StockClassShareDelta with event_date; event_priority -> (event_date, event_priority)
+  StockClassShareTerminalDelta with event_date; event_priority -> (event_date, event_priority)
   StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority)
   StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority)
 
 stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrAfter earliest event = case event of
   StockClassShareDelta with event_date -> event_date >= earliest
+  StockClassShareTerminalDelta with event_date -> event_date >= earliest
   StockClassShareMultiplier with event_date -> event_date >= earliest
   StockClassShareRetraction with event_date -> event_date >= earliest
 
 stockClassShareEventOnOrBefore : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrBefore latest event = case event of
   StockClassShareDelta with event_date -> event_date <= latest
+  StockClassShareTerminalDelta with event_date -> event_date <= latest
   StockClassShareMultiplier with event_date -> event_date <= latest
   StockClassShareRetraction with event_date -> event_date <= latest
 
@@ -730,6 +737,9 @@ applyStockClassShareEvent current event = case event of
   StockClassShareDelta with quantity_delta ->
     let next = current + quantity_delta
     in if next < 0.0 then None else Some next
+  StockClassShareTerminalDelta with quantity_delta ->
+    let next = current + quantity_delta
+    in if next < 0.0 then None else Some 0.0
   StockClassShareMultiplier with ratio -> Some (current * ratio.numerator / ratio.denominator)
   StockClassShareRetraction _ _ -> Some 0.0
 
@@ -739,14 +749,20 @@ applyStockClassShareEventOptional currentOpt event =
     Some current -> applyStockClassShareEvent current event
     None -> None
 
-balanceSecurityTerminalEvents : Time -> Optional Text -> [StockClassShareEvent]
-balanceSecurityTerminalEvents eventDate balanceSecurityId = case balanceSecurityId of
+stockSecurityReductionEvents : Time -> Decimal -> Optional Text -> [StockClassShareEvent]
+stockSecurityReductionEvents eventDate quantity balanceSecurityId = case balanceSecurityId of
   Some _ ->
-    [ StockClassShareRetraction with
+    [ StockClassShareTerminalDelta with
         event_date = eventDate
-        event_priority = 3
+        event_priority = 2
+        quantity_delta = 0.0 - quantity
     ]
-  None -> []
+  None ->
+    [ StockClassShareDelta with
+        event_date = eventDate
+        event_priority = 1
+        quantity_delta = 0.0 - quantity
+    ]
 
 securityQuantityReductionEvent : Time -> Decimal -> Optional Text -> SecurityQuantityEvent
 securityQuantityReductionEvent eventDate quantity balanceSecurityId =
@@ -897,11 +913,7 @@ stockSecurityShareEvents maps issuanceData = do
       cancellation <- fetch cancellationCid
       if cancellation.cancellation_data.security_id == issuanceData.security_id
         then
-          let delta = StockClassShareDelta with
-                event_date = cancellation.cancellation_data.date
-                event_priority = 1
-                quantity_delta = 0.0 - cancellation.cancellation_data.quantity
-          in pure (delta :: (balanceSecurityTerminalEvents cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id ++ events))
+          pure (stockSecurityReductionEvents cancellation.cancellation_data.date cancellation.cancellation_data.quantity cancellation.cancellation_data.balance_security_id ++ events)
         else pure events)
     []
     (Map.values maps.stock_cancellations)
@@ -911,11 +923,7 @@ stockSecurityShareEvents maps issuanceData = do
       repurchase <- fetch repurchaseCid
       if repurchase.repurchase_data.security_id == issuanceData.security_id
         then
-          let delta = StockClassShareDelta with
-                event_date = repurchase.repurchase_data.date
-                event_priority = 1
-                quantity_delta = 0.0 - repurchase.repurchase_data.quantity
-          in pure (delta :: (balanceSecurityTerminalEvents repurchase.repurchase_data.date repurchase.repurchase_data.balance_security_id ++ events))
+          pure (stockSecurityReductionEvents repurchase.repurchase_data.date repurchase.repurchase_data.quantity repurchase.repurchase_data.balance_security_id ++ events)
         else pure events)
     []
     (Map.values maps.stock_repurchases)
@@ -925,11 +933,7 @@ stockSecurityShareEvents maps issuanceData = do
       transfer <- fetch transferCid
       if transfer.transfer_data.security_id == issuanceData.security_id
         then
-          let delta = StockClassShareDelta with
-                event_date = transfer.transfer_data.date
-                event_priority = 1
-                quantity_delta = 0.0 - transfer.transfer_data.quantity
-          in pure (delta :: (balanceSecurityTerminalEvents transfer.transfer_data.date transfer.transfer_data.balance_security_id ++ events))
+          pure (stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id ++ events)
         else pure events)
     []
     (Map.values maps.stock_transfers)
@@ -939,11 +943,7 @@ stockSecurityShareEvents maps issuanceData = do
       conversion <- fetch conversionCid
       if conversion.conversion_data.security_id == issuanceData.security_id
         then
-          let delta = StockClassShareDelta with
-                event_date = conversion.conversion_data.date
-                event_priority = 1
-                quantity_delta = 0.0 - conversion.conversion_data.quantity_converted
-          in pure (delta :: (balanceSecurityTerminalEvents conversion.conversion_data.date conversion.conversion_data.balance_security_id ++ events))
+          pure (stockSecurityReductionEvents conversion.conversion_data.date conversion.conversion_data.quantity_converted conversion.conversion_data.balance_security_id ++ events)
         else pure events)
     []
     (Map.values maps.stock_conversions)
@@ -1011,6 +1011,15 @@ validateStockSecurityBalanceEvent securityId current event = case event of
       ("Stock security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
       (next >= 0.0)
     pure next
+  StockClassShareTerminalDelta with quantity_delta -> do
+    let next = current + quantity_delta
+    assertMsg
+      ("Stock security terminal reduction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
+      (current > 0.0)
+    assertMsg
+      ("Stock security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
+      (next >= 0.0)
+    pure 0.0
   StockClassShareMultiplier with ratio ->
     pure (current * ratio.numerator / ratio.denominator)
   StockClassShareRetraction _ _ -> do
@@ -1041,6 +1050,21 @@ securityQuantityEventSortKey event = case event of
   SecurityQuantityDelta with event_date; event_priority -> (event_date, event_priority)
   SecurityQuantityTerminalDelta with event_date; event_priority -> (event_date, event_priority)
   SecurityQuantityRetraction with event_date; event_priority -> (event_date, event_priority)
+
+securityQuantityEventDate : SecurityQuantityEvent -> Time
+securityQuantityEventDate event = case event of
+  SecurityQuantityDelta with event_date -> event_date
+  SecurityQuantityTerminalDelta with event_date -> event_date
+  SecurityQuantityRetraction with event_date -> event_date
+
+assertSecurityQuantityEventsOnOrAfter : Text -> Time -> [SecurityQuantityEvent] -> Update ()
+assertSecurityQuantityEventsOnOrAfter securityId earliest events =
+  mapA_
+    (\event ->
+      assertMsg
+        ("Security quantity event cannot precede issuance for " <> securityId <> ": event date " <> show (securityQuantityEventDate event) <> " is before " <> show earliest)
+        (securityQuantityEventDate event >= earliest))
+    events
 
 validateSecurityQuantityBalanceEvent : Text -> Optional Decimal -> SecurityQuantityEvent -> Update (Optional Decimal)
 validateSecurityQuantityBalanceEvent securityId currentOpt event = case currentOpt of
@@ -1150,7 +1174,8 @@ validateWarrantSecurityBalance maps issuanceData = do
             event_priority = 0
             quantity_delta = quantity)
           :: events)
-    None ->
+    None -> do
+      assertSecurityQuantityEventsOnOrAfter issuanceData.security_id issuanceData.date events
       validateSecurityQuantityBalance issuanceData.security_id None events
 
 validateWarrantSecurityBalances : CapTableMaps -> Update ()
