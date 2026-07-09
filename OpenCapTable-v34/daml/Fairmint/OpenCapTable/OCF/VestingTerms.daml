@@ -6,6 +6,7 @@ import Fairmint.OpenCapTable.Types.Validation (validateNonEmptyStringsArray)
 import Fairmint.Shared.TypeHelpers (validateOptionalText)
 import qualified DA.Map as Map
 import qualified DA.Optional as Optional
+import qualified DA.Set as Set
 
 
 template VestingTerms
@@ -233,17 +234,64 @@ hasDuplicateTexts texts = case texts of
   [] -> False
   text :: rest -> text `elem` rest || hasDuplicateTexts rest
 
-vestingTriggerReferencesKnownCondition : [Text] -> OcfVestingCondition -> Bool
-vestingTriggerReferencesKnownCondition conditionIds condition = case condition.trigger of
+conditionEdgeIds : Map.Map Text [Text] -> Text -> [Text]
+conditionEdgeIds edges conditionId =
+  Optional.fromOptional [] (Map.lookup conditionId edges)
+
+conditionReachesTarget : Map.Map Text [Text] -> Set.Set Text -> Text -> Text -> Bool
+conditionReachesTarget edges visited sourceId targetId =
+  sourceId == targetId ||
+  (not (Set.member sourceId visited) &&
+    any
+      (\nextId -> conditionReachesTarget edges (Set.insert sourceId visited) nextId targetId)
+      (conditionEdgeIds edges sourceId))
+
+allConditionsReachableFromStart : Map.Map Text [Text] -> [OcfVestingCondition] -> Bool
+allConditionsReachableFromStart nextEdges conditions = case conditions of
+  [] -> True
+  startCondition :: _ ->
+    all
+      (\condition -> conditionReachesTarget nextEdges Set.empty startCondition.id condition.id)
+      conditions
+
+allPathsToTargetPassThrough :
+  Map.Map Text [Text] ->
+  Set.Set Text ->
+  Text ->
+  Text ->
+  Text ->
+  Bool ->
+  Bool
+allPathsToTargetPassThrough edges visited currentId targetId requiredId hasSeenRequired =
+  let nextHasSeenRequired = hasSeenRequired || currentId == requiredId
+  in
+    if currentId == targetId
+      then nextHasSeenRequired
+      else
+        Set.member currentId visited ||
+        all
+          (\nextId -> allPathsToTargetPassThrough edges (Set.insert currentId visited) nextId targetId requiredId nextHasSeenRequired)
+          (conditionEdgeIds edges currentId)
+
+vestingTriggerReferencesKnownCondition : [Text] -> Map.Map Text [Text] -> OcfVestingCondition -> Bool
+vestingTriggerReferencesKnownCondition conditionIds nextEdges condition = case condition.trigger of
   OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
-    relative_to_condition_id /= condition.id && relative_to_condition_id `elem` conditionIds
+    relative_to_condition_id /= condition.id &&
+    relative_to_condition_id `elem` conditionIds &&
+    conditionReachesTarget nextEdges Set.empty relative_to_condition_id condition.id
   _ -> True
 
-vestingConditionReferencesKnownConditions : [Text] -> OcfVestingCondition -> Bool
-vestingConditionReferencesKnownConditions conditionIds condition =
+vestingConditionReferencesKnownConditions : [Text] -> Map.Map Text [Text] -> OcfVestingCondition -> Bool
+vestingConditionReferencesKnownConditions conditionIds nextEdges condition =
   not (hasDuplicateTexts condition.next_condition_ids) &&
   all (`elem` conditionIds) condition.next_condition_ids &&
-  vestingTriggerReferencesKnownCondition conditionIds condition
+  vestingTriggerReferencesKnownCondition conditionIds nextEdges condition
+
+vestingTriggerAnchorDominatesCondition : Map.Map Text [Text] -> Text -> OcfVestingCondition -> Bool
+vestingTriggerAnchorDominatesCondition nextEdges startConditionId condition = case condition.trigger of
+  OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
+    allPathsToTargetPassThrough nextEdges Set.empty startConditionId condition.id relative_to_condition_id False
+  _ -> True
 
 addDependentEdge : Text -> Text -> Map.Map Text [Text] -> Map.Map Text [Text]
 addDependentEdge fromConditionId toConditionId edges =
@@ -265,10 +313,6 @@ vestingConditionEdges conditions =
         addDependentEdge relative_to_condition_id condition.id edges
       _ -> edges
 
-conditionEdgeIds : Map.Map Text [Text] -> Text -> [Text]
-conditionEdgeIds edges conditionId =
-  Optional.fromOptional [] (Map.lookup conditionId edges)
-
 vestingConditionHasCycle : Map.Map Text [Text] -> [Text] -> Text -> Bool
 vestingConditionHasCycle edges path conditionId =
   conditionId `elem` path ||
@@ -279,7 +323,12 @@ vestingConditionHasCycle edges path conditionId =
 validateOcfVestingConditionGraph : [OcfVestingCondition] -> Bool
 validateOcfVestingConditionGraph conditions =
   let conditionIds = vestingConditionIds conditions
+      nextEdges = Map.fromList (map (\condition -> (condition.id, condition.next_condition_ids)) conditions)
       edges = vestingConditionEdges conditions
   in not (hasDuplicateTexts conditionIds) &&
-     all (vestingConditionReferencesKnownConditions conditionIds) conditions &&
+     all (vestingConditionReferencesKnownConditions conditionIds nextEdges) conditions &&
+     allConditionsReachableFromStart nextEdges conditions &&
+     (case conditions of
+       [] -> True
+       startCondition :: _ -> all (vestingTriggerAnchorDominatesCondition nextEdges startCondition.id) conditions) &&
      not (any (vestingConditionHasCycle edges []) conditionIds)
