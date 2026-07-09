@@ -289,6 +289,32 @@ stockSecurityShareEvents maps issuanceData = do
     []
     (Map.values maps.stock_repurchases)
 
+  transferEvents <- foldlA
+    (\events transferCid -> do
+      transfer <- fetch transferCid
+      if transfer.transfer_data.security_id == issuanceData.security_id
+        then pure ((StockClassShareDelta with
+            event_date = transfer.transfer_data.date
+            event_priority = 1
+            quantity_delta = 0.0 - transfer.transfer_data.quantity)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_transfers)
+
+  conversionEvents <- foldlA
+    (\events conversionCid -> do
+      conversion <- fetch conversionCid
+      if conversion.conversion_data.security_id == issuanceData.security_id
+        then pure ((StockClassShareDelta with
+            event_date = conversion.conversion_data.date
+            event_priority = 1
+            quantity_delta = 0.0 - conversion.conversion_data.quantity_converted)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_conversions)
+
   retractionEvents <- foldlA
     (\events retractionCid -> do
       retraction <- fetch retractionCid
@@ -300,6 +326,30 @@ stockSecurityShareEvents maps issuanceData = do
         else pure events)
     []
     (Map.values maps.stock_retractions)
+
+  reissuanceEvents <- foldlA
+    (\events reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      if reissuance.reissuance_data.security_id == issuanceData.security_id
+        then pure ((StockClassShareRetraction with
+            event_date = reissuance.reissuance_data.date
+            event_priority = 3)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_reissuances)
+
+  consolidationEvents <- foldlA
+    (\events consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      if issuanceData.security_id `elem` consolidation.consolidation_data.security_ids
+        then pure ((StockClassShareRetraction with
+            event_date = consolidation.consolidation_data.date
+            event_priority = 3)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_consolidations)
 
   splitEvents <- foldlA
     (\events splitCid -> do
@@ -318,12 +368,42 @@ stockSecurityShareEvents maps issuanceData = do
       event_date = issuanceData.date
       event_priority = 0
       quantity_delta = issuanceData.quantity)
-    :: (cancellationEvents ++ repurchaseEvents ++ retractionEvents ++ splitEvents))
+    :: (cancellationEvents ++ repurchaseEvents ++ transferEvents ++ conversionEvents ++ retractionEvents ++ reissuanceEvents ++ consolidationEvents ++ splitEvents))
 
 stockIssuanceCurrentQuantity : CapTableMaps -> StockIssuanceOcfData -> Update Decimal
 stockIssuanceCurrentQuantity maps issuanceData = do
   events <- stockSecurityShareEvents maps issuanceData
   pure $ foldl applyStockClassShareEvent 0.0 (sortOn stockClassShareEventSortKey events)
+
+validateStockSecurityBalanceEvent : Text -> Decimal -> StockClassShareEvent -> Update Decimal
+validateStockSecurityBalanceEvent securityId current event = case event of
+  StockClassShareDelta with quantity_delta -> do
+    let next = current + quantity_delta
+    assertMsg
+      ("Stock security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
+      (next >= 0.0)
+    pure next
+  StockClassShareMultiplier with ratio ->
+    pure (current * ratio.numerator / ratio.denominator)
+  StockClassShareRetraction _ _ ->
+    pure 0.0
+
+validateStockSecurityBalance : CapTableMaps -> StockIssuanceOcfData -> Update ()
+validateStockSecurityBalance maps issuanceData = do
+  events <- stockSecurityShareEvents maps issuanceData
+  _ <- foldlA
+    (validateStockSecurityBalanceEvent issuanceData.security_id)
+    0.0
+    (sortOn stockClassShareEventSortKey events)
+  pure ()
+
+validateStockSecurityBalances : CapTableMaps -> Update ()
+validateStockSecurityBalances maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateStockSecurityBalance maps issuance.issuance_data)
+    (Map.values maps.stock_issuances)
 
 stockClassIssuedQuantity : CapTableMaps -> Text -> Update Decimal
 stockClassIssuedQuantity maps stockClassId = do
@@ -829,6 +909,7 @@ template CapTable
         validateValuationStockClassReferences finalMaps
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
+        validateStockSecurityBalances finalMaps
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
         validateAuthorizedShareCeilings finalMaps authorizedShareAdjustmentIndex newIssuerCid
         validateAuthorizedShareCeilingsForEdits
