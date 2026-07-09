@@ -2,9 +2,12 @@ module OpenCapTable.TestStockPlanReservedShares where
 
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockPlanPoolAdjustment (StockPlanPoolAdjustmentOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockPlanReturnToPool (StockPlanReturnToPoolOcfData(..))
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import OpenCapTable.Setup
 import OpenCapTable.TestHelpers
@@ -28,6 +31,24 @@ stockPlanReturnToPool returnId securityId stockPlanId quantity = StockPlanReturn
   stock_plan_id = stockPlanId
   quantity = quantity
   reason_text = "Returned to pool"
+  comments = []
+
+stockCancellation : Text -> Text -> Decimal -> StockCancellationOcfData
+stockCancellation cancellationId securityId quantity = StockCancellationOcfData with
+  id = cancellationId
+  date = defaultTestDate
+  security_id = securityId
+  quantity = quantity
+  balance_security_id = None
+  reason_text = "Cancelled shares"
+  comments = []
+
+stockClassSplit : Text -> Text -> Decimal -> Decimal -> StockClassSplitOcfData
+stockClassSplit splitId stockClassId numerator denominator = StockClassSplitOcfData with
+  id = splitId
+  date = defaultTestDate
+  stock_class_id = stockClassId
+  split_ratio = OcfRatio with numerator = numerator, denominator = denominator
   comments = []
 
 equityCompensationIssuance : Text -> Text -> Text -> Text -> Text -> Decimal -> EquityCompensationIssuanceOcfData
@@ -112,6 +133,46 @@ testStockPlanReservedShares_EquityCompensationCannotExceedInitialPool = script d
       edits = []
       deletes = []
 
+testStockPlanReservedShares_NegativeEquityCompensationCannotOffsetOverallocatedPool = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_NEGATIVE_OFFSET"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let stockIssuance = (defaultStockIssuance "TX_STOCK_NEGATIVE_OFFSET" "SEC-STOCK-NEGATIVE-OFFSET" stakeholderId stockClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 150.0
+  let negativeEquityCompensation = equityCompensationIssuance "TX_EC_NEGATIVE_OFFSET" "SEC-EC-NEGATIVE-OFFSET" stakeholderId stockClassId stockPlanId (-50.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateStockIssuance stockIssuance
+        , CT.OcfCreateEquityCompensationIssuance negativeEquityCompensation
+        ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_StockSplitCountsAgainstPlanPool = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_SPLIT_POOL"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let issuance = (defaultStockIssuance "TX_STOCK_SPLIT_POOL" "SEC-STOCK-SPLIT-POOL" stakeholderId stockClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 100.0
+  let split = stockClassSplit "TX_SPLIT_POOL" stockClassId 2.0 1.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockClassSplit split
+        ]
+      edits = []
+      deletes = []
+
 testStockPlanReservedShares_AdjustmentAllowsAdditionalIssuanceSameBatch = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
   (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
@@ -171,6 +232,53 @@ testStockPlanReservedShares_ReturnToPoolAllowsReuse = script do
         , CT.OcfCreateEquityCompensationIssuance firstIssuance
         , CT.OcfCreateStockPlanReturnToPool returnToPool
         , CT.OcfCreateEquityCompensationIssuance secondIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockPlanReservedShares_StockReturnRequiresReturnedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_STOCK_RETURN_LIVE"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let issuance = (defaultStockIssuance "TX_STOCK_RETURN_LIVE" "SEC-STOCK-RETURN-LIVE" stakeholderId stockClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 100.0
+  let returnToPool = stockPlanReturnToPool "TX_RETURN_LIVE_STOCK" issuance.security_id stockPlanId 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockPlanReturnToPool returnToPool
+        ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_StockCancellationReturnAllowsReuse = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_STOCK_RETURN_REUSE"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_RETURN_REUSE_FIRST" "SEC-STOCK-RETURN-REUSE-FIRST" stakeholderId stockClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 100.0
+  let cancellation = stockCancellation "TX_CANCEL_STOCK_RETURN_REUSE" firstIssuance.security_id 40.0
+  let returnToPool = stockPlanReturnToPool "TX_RETURN_STOCK_REUSE" firstIssuance.security_id stockPlanId 40.0
+  let secondIssuance = (defaultStockIssuance "TX_STOCK_RETURN_REUSE_SECOND" "SEC-STOCK-RETURN-REUSE-SECOND" stakeholderId stockClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 40.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateStockIssuance firstIssuance
+        , CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockPlanReturnToPool returnToPool
+        , CT.OcfCreateStockIssuance secondIssuance
         ]
       edits = []
       deletes = []
