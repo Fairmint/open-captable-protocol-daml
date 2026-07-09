@@ -51,7 +51,8 @@ validateOcfVestingTermsData d =
   d.name /= "" && d.description /= "" &&
   validateNonEmptyStringsArray d.comments &&
   (not (null d.vesting_conditions)) &&
-  all validateOcfVestingCondition d.vesting_conditions
+  all validateOcfVestingCondition d.vesting_conditions &&
+  validateOcfVestingConditionGraph d.vesting_conditions
 
 -- Enum - Allocation Type
 -- Enumeration of allocation types for vesting terms. Using an example of 18 shares split across 4 tranches, each allocation type results in a different schedule.
@@ -221,3 +222,48 @@ validateOcfVestingCondition c =
   optional True validateOcfVestingConditionPortion c.portion &&
   validateOcfVestingTrigger c.trigger &&
   validateNonEmptyStringsArray c.next_condition_ids
+
+vestingConditionIds : [OcfVestingCondition] -> [Text]
+vestingConditionIds conditions = map (\condition -> condition.id) conditions
+
+hasDuplicateTexts : [Text] -> Bool
+hasDuplicateTexts texts = case texts of
+  [] -> False
+  text :: rest -> text `elem` rest || hasDuplicateTexts rest
+
+conditionById : [OcfVestingCondition] -> Text -> Optional OcfVestingCondition
+conditionById conditions conditionId = case conditions of
+  [] -> None
+  condition :: rest ->
+    if condition.id == conditionId
+      then Some condition
+      else conditionById rest conditionId
+
+vestingTriggerReferencesKnownCondition : [Text] -> OcfVestingCondition -> Bool
+vestingTriggerReferencesKnownCondition conditionIds condition = case condition.trigger of
+  OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
+    relative_to_condition_id /= condition.id && relative_to_condition_id `elem` conditionIds
+  _ -> True
+
+vestingConditionReferencesKnownConditions : [Text] -> OcfVestingCondition -> Bool
+vestingConditionReferencesKnownConditions conditionIds condition =
+  not (hasDuplicateTexts condition.next_condition_ids) &&
+  all (`elem` conditionIds) condition.next_condition_ids &&
+  vestingTriggerReferencesKnownCondition conditionIds condition
+
+vestingConditionHasCycle : [OcfVestingCondition] -> [Text] -> Text -> Bool
+vestingConditionHasCycle conditions path conditionId =
+  conditionId `elem` path ||
+  case conditionById conditions conditionId of
+    None -> False
+    Some condition ->
+      any
+        (vestingConditionHasCycle conditions (conditionId :: path))
+        condition.next_condition_ids
+
+validateOcfVestingConditionGraph : [OcfVestingCondition] -> Bool
+validateOcfVestingConditionGraph conditions =
+  let conditionIds = vestingConditionIds conditions
+  in not (hasDuplicateTexts conditionIds) &&
+     all (vestingConditionReferencesKnownConditions conditionIds) conditions &&
+     not (any (vestingConditionHasCycle conditions []) conditionIds)
