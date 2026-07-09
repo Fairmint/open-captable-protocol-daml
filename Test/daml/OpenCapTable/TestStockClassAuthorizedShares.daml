@@ -2,7 +2,12 @@ module OpenCapTable.TestStockClassAuthorizedShares where
 
 import Fairmint.OpenCapTable.OCF.StockClass
 import Fairmint.OpenCapTable.OCF.StockClassAuthorizedSharesAdjustment
-import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation
+import Fairmint.OpenCapTable.OCF.StockClassSplit
+import Fairmint.OpenCapTable.OCF.StockRepurchase
+import Fairmint.OpenCapTable.OCF.StockRetraction
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
 import OpenCapTable.TestHelpers
@@ -24,6 +29,47 @@ stockClassAuthorizedSharesAdjustment adjustmentId stockClassId authorizedShares 
     stockholder_approval_date = None
     comments = []
 
+stockCancellation : Text -> Text -> Decimal -> StockCancellationOcfData
+stockCancellation cancellationId securityId quantity =
+  StockCancellationOcfData with
+    id = cancellationId
+    date = defaultTestDate
+    security_id = securityId
+    quantity = quantity
+    balance_security_id = None
+    reason_text = "Cancelled shares"
+    comments = []
+
+stockRepurchase : Text -> Text -> Decimal -> StockRepurchaseOcfData
+stockRepurchase repurchaseId securityId quantity =
+  StockRepurchaseOcfData with
+    id = repurchaseId
+    date = defaultTestDate
+    security_id = securityId
+    price = OcfMonetary with amount = 1.0, currency = "USD"
+    quantity = quantity
+    balance_security_id = None
+    consideration_text = None
+    comments = []
+
+stockRetraction : Text -> Text -> StockRetractionOcfData
+stockRetraction retractionId securityId =
+  StockRetractionOcfData with
+    id = retractionId
+    date = defaultTestDate
+    security_id = securityId
+    reason_text = "Retracted stock issuance"
+    comments = []
+
+stockClassSplit : Text -> Text -> Decimal -> Decimal -> StockClassSplitOcfData
+stockClassSplit splitId stockClassId numerator denominator =
+  StockClassSplitOcfData with
+    id = splitId
+    date = defaultTestDate
+    stock_class_id = stockClassId
+    split_ratio = OcfRatio with numerator = numerator, denominator = denominator
+    comments = []
+
 testStockIssuanceCannotExceedStockClassInitialAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -34,6 +80,20 @@ testStockIssuanceCannotExceedStockClassInitialAuthorizedShares = script do
     exerciseCmd capTableReady CT.UpdateCapTable with
       creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_TOO_MANY" "SEC_TOO_MANY" stakeholderId stockClassId) with quantity = 101.0)]
       edits = []
+      deletes = []
+
+testStockIssuanceEditCannotExceedStockClassAuthorizedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_EDIT_ISSUANCE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_EDIT_ISSUANCE" "Edit Issuance Holder"
+  let originalIssuance = (defaultStockIssuance "TX_EDIT_ISSUANCE" "SEC_EDIT_ISSUANCE" stakeholderId stockClassId) with quantity = 75.0
+  capTableIssued <- createStockIssuanceWith issuer capTableReady originalIssuance
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditStockIssuance (originalIssuance with quantity = 101.0)]
       deletes = []
 
 testStockClassAuthorizedSharesAdjustmentAllowsAdditionalIssuance = script do
@@ -97,14 +157,132 @@ testStockClassAuthorizedSharesAdjustmentDeleteCannotInvalidateIssuedShares = scr
       edits = []
       deletes = [CT.OcfDeleteStockClassAuthorizedSharesAdjustment "TX_AUTH_DELETE"]
 
+testStockClassAuthorizedSharesReplacementAllowedInSameBatch = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REPLACE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REPLACE" "Replacement Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_REPLACE_OLD" stockClassId 150.0)]
+      edits = []
+      deletes = []
+
+  capTableIssued <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_REPLACE_ISSUED" "SEC_REPLACE_ISSUED" stakeholderId stockClassId) with quantity = 125.0)
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_REPLACE_NEW" stockClassId 200.0)]
+      edits = []
+      deletes = [CT.OcfDeleteStockClassAuthorizedSharesAdjustment "TX_AUTH_REPLACE_OLD"]
+  pure ()
+
+testSameDateLowerStockClassAuthorizedSharesAdjustmentWins = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_SAME_DATE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_SAME_DATE" "Same Date Holder"
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_HIGH" stockClassId 200.0)
+        , CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_LOW" stockClassId 100.0)
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_SAME_DATE_ISSUED" "SEC_SAME_DATE_ISSUED" stakeholderId stockClassId) with quantity = 150.0)]
+      edits = []
+      deletes = []
+
+testStockClassSplitCannotLeaveIssuedSharesAboveAuthorizedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_SPLIT" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_SPLIT" "Split Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_SPLIT_ISSUED" "SEC_SPLIT_ISSUED" stakeholderId stockClassId) with quantity = 100.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassSplit (stockClassSplit "TX_SPLIT_TOO_MANY" stockClassId 2.0 1.0)]
+      edits = []
+      deletes = []
+
+testStockCancellationReducesIssuedSharesForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CANCEL" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_CANCEL" "Cancellation Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CANCEL_ISSUED" "SEC_CANCEL_ISSUED" stakeholderId stockClassId) with quantity = 100.0)
+  result <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation (stockCancellation "TX_CANCEL_REDUCE" "SEC_CANCEL_ISSUED" 50.0)]
+      edits = []
+      deletes = []
+
+  _ <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_CANCEL_REISSUE" "SEC_CANCEL_REISSUE" stakeholderId stockClassId) with quantity = 50.0)
+  pure ()
+
+testStockRepurchaseReducesIssuedSharesForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REPURCHASE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REPURCHASE" "Repurchase Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_REPURCHASE_ISSUED" "SEC_REPURCHASE_ISSUED" stakeholderId stockClassId) with quantity = 100.0)
+  result <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockRepurchase (stockRepurchase "TX_REPURCHASE_REDUCE" "SEC_REPURCHASE_ISSUED" 50.0)]
+      edits = []
+      deletes = []
+
+  _ <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_REPURCHASE_REISSUE" "SEC_REPURCHASE_REISSUE" stakeholderId stockClassId) with quantity = 50.0)
+  pure ()
+
+testStockRetractionReducesIssuedSharesForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_RETRACTION" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_RETRACTION" "Retraction Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_RETRACTION_ISSUED" "SEC_RETRACTION_ISSUED" stakeholderId stockClassId) with quantity = 100.0)
+  result <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockRetraction (stockRetraction "TX_RETRACTION_REDUCE" "SEC_RETRACTION_ISSUED")]
+      edits = []
+      deletes = []
+
+  _ <- createStockIssuanceWith issuer result.updatedCapTableCid ((defaultStockIssuance "TX_RETRACTION_REISSUE" "SEC_RETRACTION_REISSUE" stakeholderId stockClassId) with quantity = 100.0)
+  pure ()
+
+testStockClassAuthorizedSharesAdjustmentCreatedWithIssuanceEditInSameBatchSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_EDIT_AND_ADJUST" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_EDIT_AND_ADJUST" "Edit And Adjust Holder"
+  let originalIssuance = (defaultStockIssuance "TX_EDIT_AND_ADJUST" "SEC_EDIT_AND_ADJUST" stakeholderId stockClassId) with quantity = 100.0
+  capTableIssued <- createStockIssuanceWith issuer capTableReady originalIssuance
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_FOR_EDIT" stockClassId 150.0)]
+      edits = [CT.OcfEditStockIssuance (originalIssuance with quantity = 125.0)]
+      deletes = []
+  pure ()
+
 testUnlimitedStockClassAuthorizedSharesAllowsLargeIssuance = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
+  issuerResult <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditIssuer (defaultIssuerWithAuthorizedShares "ISSUER_1" None)]
+      deletes = []
+
   let unlimitedClass = (defaultStockClass "SC_UNLIMITED") with
         initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesUnlimited
-  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table unlimitedClass
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer issuerResult.updatedCapTableCid unlimitedClass
   (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_UNLIMITED" "Unlimited Holder"
 
   _ <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_UNLIMITED" "SEC_UNLIMITED" stakeholderId stockClassId) with quantity = 2_000_000.0)
   pure ()
-
