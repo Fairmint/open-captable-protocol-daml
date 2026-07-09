@@ -18,12 +18,16 @@ import DA.Foldable (mapA_)
 import DA.Optional (isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfInitialSharesAuthorized(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
+import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 
 -- OCF Types
 {{#each types_alpha}}
+{{#unless is_document}}
 import {{module}} ({{name}}(..), {{data_type}})
+{{/unless}}
 {{/each}}
 
 
@@ -269,6 +273,109 @@ validateIssuerReference issuerCid issuerId = do
     ("Issuer ID mismatch: " <> issuerId <> " does not match cap table issuer " <> issuerContract.issuer_data.id)
     (issuerId == issuerContract.issuer_data.id)
 
+validateObjectReference : CapTableMaps -> ContractId Issuer -> OcfObjectReference -> Update ()
+validateObjectReference maps issuerCid ref = case ref.object_type of
+  OcfObjIssuer -> do
+    validateIssuerReference issuerCid ref.object_id
+{{#each types_alpha}}
+  {{object_type_constructor}} ->
+    assertMsg ("{{name}} not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.{{map_field}}))
+{{/each}}
+  _ -> assertMsg ("Unsupported related object type " <> show ref.object_type <> " for object id " <> ref.object_id) False
+
+validateDocumentRelatedObjects : CapTableMaps -> ContractId Issuer -> Update ()
+validateDocumentRelatedObjects maps issuerCid =
+  mapA_
+    (\documentCid -> do
+      document <- fetch documentCid
+      mapA_ (validateObjectReference maps issuerCid) document.document_data.related_objects)
+    (Map.values maps.documents)
+
+validateStockClassReference : Text -> CapTableMaps -> Text -> Update ()
+validateStockClassReference label maps stockClassId =
+  validateReference label maps.stock_classes stockClassId
+
+validateReference : Text -> Map Text a -> Text -> Update ()
+validateReference label refMap refId =
+  assertMsg
+    (label <> " not found: " <> refId)
+    (isSome (Map.lookup refId refMap))
+
+validateOptionalReference : Text -> Map Text a -> Optional Text -> Update ()
+validateOptionalReference label refMap refId = case refId of
+  Some id -> validateReference label refMap id
+  None -> pure ()
+
+validateOptionalStockClassReference : Text -> CapTableMaps -> Optional Text -> Update ()
+validateOptionalStockClassReference label maps stockClassId = case stockClassId of
+  Some id -> validateStockClassReference label maps id
+  None -> pure ()
+
+validateStockClassConversionRightReferences : CapTableMaps -> Update ()
+validateStockClassConversionRightReferences maps =
+  mapA_
+    (\stockClassCid -> do
+      stockClass <- fetch stockClassCid
+      mapA_
+        (\conversionRight -> validateStockClassReference ("Stock class conversion target for " <> stockClass.stock_class_data.id) maps conversionRight.converts_to_stock_class_id)
+        stockClass.stock_class_data.conversion_rights)
+    (Map.values maps.stock_classes)
+
+validateAnyConversionRightStockClassReferences : Text -> CapTableMaps -> OcfAnyConversionRight -> Update ()
+validateAnyConversionRightStockClassReferences label maps conversionRight = case conversionRight of
+  OcfRightConvertible convertibleRight ->
+    validateOptionalStockClassReference (label <> " convertible conversion target") maps convertibleRight.converts_to_stock_class_id
+  OcfRightWarrant warrantRight ->
+    validateOptionalStockClassReference (label <> " warrant conversion target") maps warrantRight.converts_to_stock_class_id
+  OcfRightStockClass stockClassRight ->
+    validateStockClassReference (label <> " stock class conversion target") maps stockClassRight.converts_to_stock_class_id
+
+validateConvertibleConversionRightReferences : CapTableMaps -> Update ()
+validateConvertibleConversionRightReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      mapA_
+        (\trigger -> validateOptionalStockClassReference "Convertible conversion target" maps trigger.conversion_right.converts_to_stock_class_id)
+        issuance.issuance_data.conversion_triggers)
+    (Map.values maps.convertible_issuances)
+
+validateWarrantConversionRightReferences : CapTableMaps -> Update ()
+validateWarrantConversionRightReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      mapA_
+        (\trigger -> validateAnyConversionRightStockClassReferences ("Warrant exercise trigger for " <> issuance.issuance_data.id) maps trigger.conversion_right)
+        issuance.issuance_data.exercise_triggers)
+    (Map.values maps.warrant_issuances)
+
+validateValuationStockClassReferences : CapTableMaps -> Update ()
+validateValuationStockClassReferences maps =
+  mapA_
+    (\valuationCid -> do
+      valuation <- fetch valuationCid
+      validateStockClassReference "Valuation stock class" maps valuation.valuation_data.stock_class_id)
+    (Map.values maps.valuations)
+
+validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
+validateEquityCompensationIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateOptionalStockClassReference "Equity compensation stock class" maps issuance.issuance_data.stock_class_id
+      validateOptionalReference "Equity compensation stock plan" maps.stock_plans issuance.issuance_data.stock_plan_id
+      validateOptionalReference "Equity compensation vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
+    (Map.values maps.equity_compensation_issuances)
+
+validateWarrantIssuanceReferences : CapTableMaps -> Update ()
+validateWarrantIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateOptionalReference "Warrant vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
+    (Map.values maps.warrant_issuances)
+
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
 getCreateTier createData = case createData of
@@ -402,6 +509,13 @@ template CapTable
           (mapsAfterEdits, [])
           sortedCreates
 
+        validateDocumentRelatedObjects finalMaps newIssuerCid
+        validateStockClassConversionRightReferences finalMaps
+        validateConvertibleConversionRightReferences finalMaps
+        validateWarrantConversionRightReferences finalMaps
+        validateValuationStockClassReferences finalMaps
+        validateEquityCompensationIssuanceReferences finalMaps
+        validateWarrantIssuanceReferences finalMaps
         validateIssuerAuthorizedShares finalMaps newIssuerCid
 
         -- Create new CapTable with updated maps and potentially new issuer
