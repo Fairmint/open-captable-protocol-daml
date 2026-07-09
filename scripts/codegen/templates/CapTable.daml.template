@@ -789,17 +789,18 @@ addStockClassShareEvent : Text -> StockClassShareEvent -> Map Text [StockClassSh
 addStockClassShareEvent key event index =
   Map.insert key (event :: fromOptional [] (Map.lookup key index)) index
 
+addStockClassShareEvents : Text -> [StockClassShareEvent] -> Map Text [StockClassShareEvent] -> Map Text [StockClassShareEvent]
+addStockClassShareEvents key events index =
+  foldl (\updatedIndex event -> addStockClassShareEvent key event updatedIndex) index events
+
 stockClassShareEventIndex : CapTableMaps -> Update StockClassShareEventIndex
 stockClassShareEventIndex maps = do
   cancellationEventsBySecurityId <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (addStockClassShareEvent
+      pure (addStockClassShareEvents
         cancellation.cancellation_data.security_id
-        (StockClassShareDelta with
-            event_date = cancellation.cancellation_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - cancellation.cancellation_data.quantity)
+        (stockSecurityReductionEvents cancellation.cancellation_data.date cancellation.cancellation_data.quantity cancellation.cancellation_data.balance_security_id)
         index))
     Map.empty
     (Map.values maps.stock_cancellations)
@@ -807,12 +808,9 @@ stockClassShareEventIndex maps = do
   repurchaseEventsBySecurityId <- foldlA
     (\index repurchaseCid -> do
       repurchase <- fetch repurchaseCid
-      pure (addStockClassShareEvent
+      pure (addStockClassShareEvents
         repurchase.repurchase_data.security_id
-        (StockClassShareDelta with
-            event_date = repurchase.repurchase_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - repurchase.repurchase_data.quantity)
+        (stockSecurityReductionEvents repurchase.repurchase_data.date repurchase.repurchase_data.quantity repurchase.repurchase_data.balance_security_id)
         index))
     cancellationEventsBySecurityId
     (Map.values maps.stock_repurchases)
@@ -820,12 +818,9 @@ stockClassShareEventIndex maps = do
   conversionEventsBySecurityId <- foldlA
     (\index conversionCid -> do
       conversion <- fetch conversionCid
-      pure (addStockClassShareEvent
+      pure (addStockClassShareEvents
         conversion.conversion_data.security_id
-        (StockClassShareDelta with
-            event_date = conversion.conversion_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - conversion.conversion_data.quantity_converted)
+        (stockSecurityReductionEvents conversion.conversion_data.date conversion.conversion_data.quantity_converted conversion.conversion_data.balance_security_id)
         index))
     repurchaseEventsBySecurityId
     (Map.values maps.stock_conversions)
@@ -2013,16 +2008,22 @@ stockPlanReturnedQuantityBySecurityAt maps securityId asOf =
 
 equityCompensationSecurityEvents : CapTableMaps -> Text -> Update [StockClassShareEvent]
 equityCompensationSecurityEvents maps securityId = do
+  transferEvents <- foldlA
+    (\events transferCid -> do
+      transfer <- fetch transferCid
+      if transfer.transfer_data.security_id == securityId
+        then pure (stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id ++ events)
+        else pure events)
+    []
+    (Map.values maps.equity_compensation_transfers)
+
   cancellationEvents <- foldlA
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
       if cancellation.cancellation_data.security_id == securityId
-        then pure ((StockClassShareDelta with
-          event_date = cancellation.cancellation_data.date
-          event_priority = 1
-          quantity_delta = 0.0 - cancellation.cancellation_data.quantity) :: events)
+        then pure (stockSecurityReductionEvents cancellation.cancellation_data.date cancellation.cancellation_data.quantity cancellation.cancellation_data.balance_security_id ++ events)
         else pure events)
-    []
+    transferEvents
     (Map.values maps.equity_compensation_cancellations)
 
   exerciseEvents <- foldlA
