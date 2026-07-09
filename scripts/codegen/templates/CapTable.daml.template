@@ -904,12 +904,12 @@ stockClassShareEventIndex maps = do
     (\index transferCid -> do
       transfer <- fetch transferCid
       if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
-        then pure (addStockClassShareEvent
+        then pure (addStockClassShareEvents
           transfer.transfer_data.security_id
-          (StockClassShareDelta with
-              event_date = transfer.transfer_data.date
-              event_priority = 1
-              quantity_delta = 0.0 - transfer.transfer_data.quantity)
+          (stockSecurityReductionEvents
+            transfer.transfer_data.date
+            transfer.transfer_data.quantity
+            transfer.transfer_data.balance_security_id)
           index)
         else pure index)
     conversionEventsBySecurityId
@@ -1230,6 +1230,82 @@ validateSecurityQuantityBalance securityId initialQuantity events = do
     initialQuantity
     (sortOn securityQuantityEventSortKey events)
   pure ()
+
+convertibleSecurityAmountEvents : CapTableMaps -> ConvertibleIssuanceOcfData -> Update [SecurityQuantityEvent]
+convertibleSecurityAmountEvents maps issuanceData = do
+  transferEvents <- foldlA
+    (\events transferCid -> do
+      transfer <- fetch transferCid
+      if transfer.transfer_data.security_id == issuanceData.security_id
+        then
+          pure (securityQuantityReductionEvent
+            transfer.transfer_data.date
+            transfer.transfer_data.amount.amount
+            transfer.transfer_data.balance_security_id
+            :: events)
+        else pure events)
+    []
+    (Map.values maps.convertible_transfers)
+
+  cancellationEvents <- foldlA
+    (\events cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      if cancellation.cancellation_data.security_id == issuanceData.security_id
+        then
+          pure (securityQuantityReductionEvent
+            cancellation.cancellation_data.date
+            cancellation.cancellation_data.amount.amount
+            cancellation.cancellation_data.balance_security_id
+            :: events)
+        else pure events)
+    []
+    (Map.values maps.convertible_cancellations)
+
+  conversionEvents <- foldlA
+    (\events conversionCid -> do
+      conversion <- fetch conversionCid
+      if conversion.conversion_data.security_id == issuanceData.security_id
+        then pure ((SecurityQuantityRetraction with
+            event_date = conversion.conversion_data.date
+            event_priority = 3)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.convertible_conversions)
+
+  retractionEvents <- foldlA
+    (\events retractionCid -> do
+      retraction <- fetch retractionCid
+      if retraction.retraction_data.security_id == issuanceData.security_id
+        then pure ((SecurityQuantityRetraction with
+            event_date = retraction.retraction_data.date
+            event_priority = 3)
+          :: events)
+        else pure events)
+    []
+    (Map.values maps.convertible_retractions)
+
+  pure (transferEvents ++ cancellationEvents ++ conversionEvents ++ retractionEvents)
+
+validateConvertibleSecurityBalance : CapTableMaps -> ConvertibleIssuanceOcfData -> Update ()
+validateConvertibleSecurityBalance maps issuanceData = do
+  events <- convertibleSecurityAmountEvents maps issuanceData
+  validateSecurityQuantityBalance
+    issuanceData.security_id
+    (Some 0.0)
+    ((SecurityQuantityDelta with
+        event_date = issuanceData.date
+        event_priority = 0
+        quantity_delta = issuanceData.investment_amount.amount)
+      :: events)
+
+validateConvertibleSecurityBalances : CapTableMaps -> Update ()
+validateConvertibleSecurityBalances maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateConvertibleSecurityBalance maps issuance.issuance_data)
+    (Map.values maps.convertible_issuances)
 
 warrantSecurityQuantityEvents : CapTableMaps -> WarrantIssuanceOcfData -> Update [SecurityQuantityEvent]
 warrantSecurityQuantityEvents maps issuanceData = do
@@ -3209,6 +3285,7 @@ template CapTable
         validateConfiguredReferences finalMaps
         validateTransactionLifecycleDates finalMaps
         validateStockSecurityBalances finalMaps
+        validateConvertibleSecurityBalances finalMaps
         validateWarrantSecurityBalances finalMaps
         validateEquityCompensationSecurityBalances finalMaps
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
