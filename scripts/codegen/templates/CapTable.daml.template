@@ -395,15 +395,21 @@ validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits =
       _ -> pure ())
     edits
 
-validateAuthorizedShareCeilings : CapTableMaps -> ContractId Issuer -> Update ()
-validateAuthorizedShareCeilings maps issuerCid = do
-  adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
+validateAuthorizedShareCeilings :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  ContractId Issuer ->
+  Update ()
+validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
   validateAllStockClassAuthorizedShares maps adjustmentIndex
   validateIssuerAuthorizedShares maps adjustmentIndex issuerCid
 
-validateAuthorizedShareCeilingsForEdits : CapTableMaps -> [OcfEditData] -> Update ()
-validateAuthorizedShareCeilingsForEdits maps edits = do
-  adjustmentIndex <- stockClassAuthorizedAdjustmentIndex maps
+validateAuthorizedShareCeilingsForEdits :
+  CapTableMaps ->
+  Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
+  [OcfEditData] ->
+  Update ()
+validateAuthorizedShareCeilingsForEdits maps adjustmentIndex edits = do
   validateEditedStockClassInitialAuthorizedShares maps edits
   validateEditedIssuerInitialAuthorizedShares maps adjustmentIndex edits
 
@@ -421,9 +427,10 @@ processCreate ctx maps createData = case createData of
       {{> create-case}}
 {{/each}}
 
--- | Process a single edit operation, returning updated maps and the edited ContractId
+-- | Process a single edit operation, returning updated maps, the edited ContractId,
+-- and any edit that changed initial authorized shares.
 -- Note: OcfEditIssuer is handled separately in UpdateCapTable since issuer is not a map
-processEdit : Context -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId)
+processEdit : Context -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId, [OcfEditData])
 processEdit ctx maps editData = case editData of
       OcfEditIssuer _ -> error "OcfEditIssuer should be handled separately in UpdateCapTable"
 {{#each types_alpha}}
@@ -506,27 +513,31 @@ template CapTable
         assertMsg "Cannot edit issuer more than once per batch" (length issuerEdits <= 1)
 
         -- Process regular edits (map-based entities)
-        (mapsAfterEdits, regularEditedCids) <- foldlA
-          (\(maps, cids) editData -> do
-            (newMaps, cid) <- processEdit context maps editData
-            pure (newMaps, cids ++ [cid]))
-          (mapsAfterDeletes, [])
+        (mapsAfterEdits, regularEditedCids, regularInitialAuthorizedShareEdits) <- foldlA
+          (\(maps, cids, initialAuthorizedShareEdits) editData -> do
+            (newMaps, cid, editInitialAuthorizedShareEdits) <- processEdit context maps editData
+            pure (newMaps, cids ++ [cid], initialAuthorizedShareEdits ++ editInitialAuthorizedShareEdits))
+          (mapsAfterDeletes, [], [])
           regularEdits
 
         -- Process issuer edit (if any) - special handling since it's a single reference
         -- Note: In editedCids output, issuer edits appear first regardless of input position
-        (newIssuerCid, issuerEditedCids) <- case issuerEdits of
-          [] -> pure (issuer, [])  -- No issuer edit, keep current
+        (newIssuerCid, issuerEditedCids, issuerInitialAuthorizedShareEdits) <- case issuerEdits of
+          [] -> pure (issuer, [], [])  -- No issuer edit, keep current
           [OcfEditIssuer newIssuerData] -> do
             -- Validate issuer ID matches (cannot change ID during edit)
             currentIssuer <- fetch issuer
             assertMsg "Issuer ID mismatch: cannot change issuer ID during edit"
               (newIssuerData.id == currentIssuer.issuer_data.id)
+            let initialAuthorizedShareEdits =
+                  if newIssuerData.initial_shares_authorized /= currentIssuer.issuer_data.initial_shares_authorized
+                    then [OcfEditIssuer newIssuerData]
+                    else []
             archive issuer
             newCid <- create Issuer with
               context = context
               issuer_data = newIssuerData
-            pure (newCid, [CidIssuer newCid])
+            pure (newCid, [CidIssuer newCid], initialAuthorizedShareEdits)
           _ -> error "Multiple issuer edits not allowed"  -- Defensive: assertMsg above prevents this
 
         -- Sort creates by tier for dependency ordering
@@ -540,8 +551,12 @@ template CapTable
           (mapsAfterEdits, [])
           sortedCreates
 
-        validateAuthorizedShareCeilings finalMaps newIssuerCid
-        validateAuthorizedShareCeilingsForEdits finalMaps edits
+        authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
+        validateAuthorizedShareCeilings finalMaps authorizedShareAdjustmentIndex newIssuerCid
+        validateAuthorizedShareCeilingsForEdits
+          finalMaps
+          authorizedShareAdjustmentIndex
+          (issuerInitialAuthorizedShareEdits ++ regularInitialAuthorizedShareEdits)
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
