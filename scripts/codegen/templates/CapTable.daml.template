@@ -193,6 +193,10 @@ data SecurityQuantityEvent
       event_date: Time
       event_priority: Int
       quantity_delta: Decimal
+  | SecurityQuantityMultiplier with
+      event_date: Time
+      event_priority: Int
+      ratio: OcfRatio
   | SecurityQuantityRetraction with
       event_date: Time
       event_priority: Int
@@ -778,12 +782,12 @@ issuerAuthorizedLimitAt adjustmentHistory issuerData asOf =
     Some adjustment -> Some adjustment.new_shares_authorized
     None -> issuerAuthorizedSharesLimit issuerData.initial_shares_authorized
 
-stockClassShareEventSortKey : StockClassShareEvent -> (Time, Int)
+stockClassShareEventSortKey : StockClassShareEvent -> (Time, Int, Int)
 stockClassShareEventSortKey event = case event of
-  StockClassShareDelta with event_date; event_priority -> (event_date, event_priority)
-  StockClassShareTerminalDelta with event_date; event_priority -> (event_date, event_priority)
-  StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority)
-  StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority)
+  StockClassShareDelta with event_date; event_priority -> (event_date, event_priority, 0)
+  StockClassShareTerminalDelta with event_date; event_priority -> (event_date, event_priority, 1)
+  StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority, 2)
+  StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority, 3)
 
 stockClassShareEventDate : StockClassShareEvent -> Time
 stockClassShareEventDate event = case event of
@@ -1161,16 +1165,18 @@ validateStockSecurityBalances maps =
       validateStockSecurityBalance maps issuance.issuance_data)
     (Map.values maps.stock_issuances)
 
-securityQuantityEventSortKey : SecurityQuantityEvent -> (Time, Int)
+securityQuantityEventSortKey : SecurityQuantityEvent -> (Time, Int, Int)
 securityQuantityEventSortKey event = case event of
-  SecurityQuantityDelta with event_date; event_priority -> (event_date, event_priority)
-  SecurityQuantityTerminalDelta with event_date; event_priority -> (event_date, event_priority)
-  SecurityQuantityRetraction with event_date; event_priority -> (event_date, event_priority)
+  SecurityQuantityDelta with event_date; event_priority -> (event_date, event_priority, 0)
+  SecurityQuantityTerminalDelta with event_date; event_priority -> (event_date, event_priority, 1)
+  SecurityQuantityMultiplier with event_date; event_priority -> (event_date, event_priority, 2)
+  SecurityQuantityRetraction with event_date; event_priority -> (event_date, event_priority, 3)
 
 securityQuantityEventDate : SecurityQuantityEvent -> Time
 securityQuantityEventDate event = case event of
   SecurityQuantityDelta with event_date -> event_date
   SecurityQuantityTerminalDelta with event_date -> event_date
+  SecurityQuantityMultiplier with event_date -> event_date
   SecurityQuantityRetraction with event_date -> event_date
 
 assertSecurityQuantityEventsOnOrAfter : Text -> Time -> [SecurityQuantityEvent] -> Update ()
@@ -1200,6 +1206,8 @@ validateSecurityQuantityBalanceEvent securityId currentOpt event = case currentO
         ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
         (next >= 0.0)
       pure (Some 0.0)
+    SecurityQuantityMultiplier with ratio ->
+      pure (Some (current * ratio.numerator / ratio.denominator))
     SecurityQuantityRetraction _ _ -> do
       assertMsg
         ("Security retraction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
@@ -1210,6 +1218,8 @@ validateSecurityQuantityBalanceEvent securityId currentOpt event = case currentO
       pure None
     SecurityQuantityTerminalDelta {} ->
       pure (Some 0.0)
+    SecurityQuantityMultiplier {} ->
+      pure None
     SecurityQuantityRetraction _ _ ->
       pure (Some 0.0)
 
@@ -1342,13 +1352,28 @@ equityCompensationSecurityQuantityEvents maps issuanceData = do
       release <- fetch releaseCid
       if release.release_data.security_id == issuanceData.security_id
         then pure ((SecurityQuantityDelta with
-            event_date = release.release_data.settlement_date
+            event_date = release.release_data.date
             event_priority = 1
             quantity_delta = 0.0 - release.release_data.quantity)
           :: events)
         else pure events)
     []
     (Map.values maps.equity_compensation_releases)
+
+  splitEvents <- case issuanceData.stock_class_id of
+    Some stockClassId ->
+      foldlA
+        (\events splitCid -> do
+          split <- fetch splitCid
+          if split.split_data.stock_class_id == stockClassId && split.split_data.date >= issuanceData.date
+            then pure ((SecurityQuantityMultiplier with
+              event_date = split.split_data.date
+              event_priority = 2
+              ratio = split.split_data.split_ratio) :: events)
+            else pure events)
+        []
+        (Map.values maps.stock_class_splits)
+    None -> pure []
 
   retractionEvents <- foldlA
     (\events retractionCid -> do
@@ -1362,7 +1387,7 @@ equityCompensationSecurityQuantityEvents maps issuanceData = do
     []
     (Map.values maps.equity_compensation_retractions)
 
-  pure (transferEvents ++ cancellationEvents ++ exerciseEvents ++ releaseEvents ++ retractionEvents)
+  pure (transferEvents ++ cancellationEvents ++ exerciseEvents ++ releaseEvents ++ retractionEvents ++ splitEvents)
 
 validateEquityCompensationSecurityBalance : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update ()
 validateEquityCompensationSecurityBalance maps issuanceData = do
@@ -2620,22 +2645,13 @@ stockPlanReturnedQuantityBySecurityAt maps securityId asOf =
 
 equityCompensationSecurityEvents : CapTableMaps -> Text -> Update [StockClassShareEvent]
 equityCompensationSecurityEvents maps securityId = do
-  transferEvents <- foldlA
-    (\events transferCid -> do
-      transfer <- fetch transferCid
-      if transfer.transfer_data.security_id == securityId
-        then pure (stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id ++ events)
-        else pure events)
-    []
-    (Map.values maps.equity_compensation_transfers)
-
   cancellationEvents <- foldlA
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
       if cancellation.cancellation_data.security_id == securityId
         then pure (stockSecurityReductionEvents cancellation.cancellation_data.date cancellation.cancellation_data.quantity cancellation.cancellation_data.balance_security_id ++ events)
         else pure events)
-    transferEvents
+    []
     (Map.values maps.equity_compensation_cancellations)
 
   exerciseEvents <- foldlA
@@ -2655,7 +2671,7 @@ equityCompensationSecurityEvents maps securityId = do
       release <- fetch releaseCid
       if release.release_data.security_id == securityId
         then pure ((StockClassShareDelta with
-          event_date = release.release_data.settlement_date
+          event_date = release.release_data.date
           event_priority = 1
           quantity_delta = 0.0 - release.release_data.quantity) :: events)
         else pure events)
