@@ -58,6 +58,7 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  has_validations: boolean;
   validates_stock_class_initial_authorized_shares: boolean;
   validates_issuer_id_reference: boolean;
   is_document: boolean;
@@ -260,6 +261,7 @@ function discoverTypes(config: Config): TypeDef[] {
           error: `${toTitleCase(fieldSpec)} not found`,
         };
       }),
+      has_validations: validationFields.length > 0,
       validates_stock_class_initial_authorized_shares: name === 'StockClass',
       validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
       is_document: name === 'Document',
