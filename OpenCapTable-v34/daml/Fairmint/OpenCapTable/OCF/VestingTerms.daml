@@ -229,6 +229,20 @@ validateOcfVestingCondition c =
 vestingConditionIds : [OcfVestingCondition] -> [Text]
 vestingConditionIds conditions = map (\condition -> condition.id) conditions
 
+isVestingStartCondition : OcfVestingCondition -> Bool
+isVestingStartCondition condition = case condition.trigger of
+  OcfVestingStartTrigger -> True
+  _ -> False
+
+vestingStartConditionIds : [OcfVestingCondition] -> [Text]
+vestingStartConditionIds conditions =
+  map (\condition -> condition.id) (filter isVestingStartCondition conditions)
+
+singleVestingStartConditionId : [OcfVestingCondition] -> Optional Text
+singleVestingStartConditionId conditions = case vestingStartConditionIds conditions of
+  [startConditionId] -> Some startConditionId
+  _ -> None
+
 hasDuplicateTexts : [Text] -> Bool
 hasDuplicateTexts texts = case texts of
   [] -> False
@@ -246,13 +260,11 @@ conditionReachesTarget edges visited sourceId targetId =
       (\nextId -> conditionReachesTarget edges (Set.insert sourceId visited) nextId targetId)
       (conditionEdgeIds edges sourceId))
 
-allConditionsReachableFromStart : Map.Map Text [Text] -> [OcfVestingCondition] -> Bool
-allConditionsReachableFromStart nextEdges conditions = case conditions of
-  [] -> True
-  startCondition :: _ ->
-    all
-      (\condition -> conditionReachesTarget nextEdges Set.empty startCondition.id condition.id)
-      conditions
+allConditionsReachableFromStart : Map.Map Text [Text] -> Text -> [OcfVestingCondition] -> Bool
+allConditionsReachableFromStart nextEdges startConditionId conditions =
+  all
+    (\condition -> conditionReachesTarget nextEdges Set.empty startConditionId condition.id)
+    conditions
 
 allPathsToTargetPassThrough :
   Map.Map Text [Text] ->
@@ -313,12 +325,45 @@ vestingConditionEdges conditions =
         addDependentEdge relative_to_condition_id condition.id edges
       _ -> edges
 
-vestingConditionHasCycle : Map.Map Text [Text] -> [Text] -> Text -> Bool
-vestingConditionHasCycle edges path conditionId =
-  conditionId `elem` path ||
-  any
-    (vestingConditionHasCycle edges (conditionId :: path))
-    (conditionEdgeIds edges conditionId)
+data CycleCheckResult = CycleCheckResult with
+    has_cycle: Bool
+    checked: Set.Set Text
+  deriving (Eq, Show)
+
+vestingConditionCycleCheck :
+  Map.Map Text [Text] ->
+  Set.Set Text ->
+  Set.Set Text ->
+  Text ->
+  CycleCheckResult
+vestingConditionCycleCheck edges visiting checked conditionId
+  | Set.member conditionId visiting = CycleCheckResult with has_cycle = True; checked = checked
+  | Set.member conditionId checked = CycleCheckResult with has_cycle = False; checked = checked
+  | otherwise =
+      let result =
+            foldl
+              (\current nextId ->
+                if current.has_cycle
+                  then current
+                  else vestingConditionCycleCheck edges (Set.insert conditionId visiting) current.checked nextId)
+              (CycleCheckResult with has_cycle = False; checked = checked)
+              (conditionEdgeIds edges conditionId)
+      in
+        if result.has_cycle
+          then result
+          else result with checked = Set.insert conditionId result.checked
+
+vestingConditionGraphHasCycle : Map.Map Text [Text] -> [Text] -> Bool
+vestingConditionGraphHasCycle edges conditionIds =
+  let result =
+        foldl
+          (\current conditionId ->
+            if current.has_cycle
+              then current
+              else vestingConditionCycleCheck edges Set.empty current.checked conditionId)
+          (CycleCheckResult with has_cycle = False; checked = Set.empty)
+          conditionIds
+  in result.has_cycle
 
 validateOcfVestingConditionGraph : [OcfVestingCondition] -> Bool
 validateOcfVestingConditionGraph conditions =
@@ -327,8 +372,9 @@ validateOcfVestingConditionGraph conditions =
       edges = vestingConditionEdges conditions
   in not (hasDuplicateTexts conditionIds) &&
      all (vestingConditionReferencesKnownConditions conditionIds nextEdges) conditions &&
-     allConditionsReachableFromStart nextEdges conditions &&
-     (case conditions of
-       [] -> True
-       startCondition :: _ -> all (vestingTriggerAnchorDominatesCondition nextEdges startCondition.id) conditions) &&
-     not (any (vestingConditionHasCycle edges []) conditionIds)
+     (case singleVestingStartConditionId conditions of
+       Some startConditionId ->
+         allConditionsReachableFromStart nextEdges startConditionId conditions &&
+         all (vestingTriggerAnchorDominatesCondition nextEdges startConditionId) conditions
+       None -> False) &&
+     not (vestingConditionGraphHasCycle edges conditionIds)
