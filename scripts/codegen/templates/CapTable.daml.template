@@ -1869,15 +1869,32 @@ equityCompensationIssuanceQuantityAtSortKey maps issuanceData targetSortKey =
       stockClassQuantityAtSortKey maps stockClassId issuanceData.date issuanceData.quantity targetSortKey
     None -> pure issuanceData.quantity
 
+equityCompensationSuccessorStockClassIds :
+  CapTableMaps ->
+  EquityCompensationIssuanceOcfData ->
+  Update [Optional Text]
+equityCompensationSuccessorStockClassIds maps issuanceData =
+  case issuanceData.stock_class_id of
+    Some stockClassId -> pure [Some stockClassId]
+    None -> case issuanceData.stock_plan_id of
+      Some stockPlanId -> case Map.lookup stockPlanId maps.stock_plans of
+        Some stockPlanCid -> do
+          stockPlan <- fetch stockPlanCid
+          pure $ case stockPlan.plan_data.stock_class_ids of
+            [stockClassId] -> [None, Some stockClassId]
+            _ -> [None]
+        None -> pure [None]
+      None -> pure [None]
+
 equityCompensationIssuanceQuantityTotal :
   CapTableMaps ->
   Text ->
-  Optional Text ->
+  [Optional Text] ->
   Time ->
   (Time, Int, Int) ->
   [Text] ->
   Update Decimal
-equityCompensationIssuanceQuantityTotal maps label expectedStockClassId expectedDate targetSortKey securityIds =
+equityCompensationIssuanceQuantityTotal maps label expectedStockClassIds expectedDate targetSortKey securityIds =
   foldlA
     (\total securityId ->
       case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
@@ -1887,8 +1904,8 @@ equityCompensationIssuanceQuantityTotal maps label expectedStockClassId expected
             (label <> " successor date mismatch for " <> securityId <> ": expected " <> show expectedDate <> ", found " <> show issuance.issuance_data.date)
             (issuance.issuance_data.date == expectedDate)
           assertMsg
-            (label <> " successor stock class mismatch for " <> securityId <> ": expected " <> show expectedStockClassId <> ", found " <> show issuance.issuance_data.stock_class_id)
-            (issuance.issuance_data.stock_class_id == expectedStockClassId)
+            (label <> " successor stock class mismatch for " <> securityId <> ": expected one of " <> show expectedStockClassIds <> ", found " <> show issuance.issuance_data.stock_class_id)
+            (issuance.issuance_data.stock_class_id `elem` expectedStockClassIds)
           quantity <- equityCompensationIssuanceQuantityAtSortKey maps issuance.issuance_data targetSortKey
           pure (total + quantity)
         None -> do
@@ -3340,13 +3357,13 @@ equityCompensationSecurityQuantityBeforeEvent maps issuanceData targetSortKey = 
 validateEquityCompensationBalanceSuccessorQuantity :
   CapTableMaps ->
   Text ->
-  Optional Text ->
+  [Optional Text] ->
   Time ->
   (Time, Int, Int) ->
   Decimal ->
   Text ->
   Update ()
-validateEquityCompensationBalanceSuccessorQuantity maps label expectedStockClassId expectedDate targetSortKey expectedQuantity securityId =
+validateEquityCompensationBalanceSuccessorQuantity maps label expectedStockClassIds expectedDate targetSortKey expectedQuantity securityId =
   case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
@@ -3354,8 +3371,8 @@ validateEquityCompensationBalanceSuccessorQuantity maps label expectedStockClass
         (label <> " balance date mismatch for " <> securityId <> ": expected " <> show expectedDate <> ", found " <> show issuance.issuance_data.date)
         (issuance.issuance_data.date == expectedDate)
       assertMsg
-        (label <> " balance stock class mismatch for " <> securityId <> ": expected " <> show expectedStockClassId <> ", found " <> show issuance.issuance_data.stock_class_id)
-        (issuance.issuance_data.stock_class_id == expectedStockClassId)
+        (label <> " balance stock class mismatch for " <> securityId <> ": expected one of " <> show expectedStockClassIds <> ", found " <> show issuance.issuance_data.stock_class_id)
+        (issuance.issuance_data.stock_class_id `elem` expectedStockClassIds)
       actualQuantity <- equityCompensationIssuanceQuantityAtSortKey maps issuance.issuance_data targetSortKey
       assertMsg
         (label <> " balance quantity mismatch for " <> securityId <> ": expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
@@ -3386,10 +3403,11 @@ validateEquityCompensationCancellationSuccessorContinuity maps =
               assertMsg
                 (label <> " exceeds the current source quantity for " <> sourceIssuance.issuance_data.security_id)
                 (expectedBalanceQuantity >= 0.0)
+              expectedStockClassIds <- equityCompensationSuccessorStockClassIds maps sourceIssuance.issuance_data
               validateEquityCompensationBalanceSuccessorQuantity
                 maps
                 label
-                sourceIssuance.issuance_data.stock_class_id
+                expectedStockClassIds
                 cancellation.cancellation_data.date
                 terminalSortKey
                 expectedBalanceQuantity
@@ -3418,10 +3436,11 @@ validateEquityCompensationTransferSuccessorContinuity maps =
           Some sourceIssuanceCid -> do
             sourceIssuance <- fetch sourceIssuanceCid
             let targetSortKey = stockReductionSortKey transfer.transfer_data.date transfer.transfer_data.balance_security_id
+            expectedStockClassIds <- equityCompensationSuccessorStockClassIds maps sourceIssuance.issuance_data
             resultingQuantity <- equityCompensationIssuanceQuantityTotal
               maps
               label
-              sourceIssuance.issuance_data.stock_class_id
+              expectedStockClassIds
               transfer.transfer_data.date
               targetSortKey
               transfer.transfer_data.resulting_security_ids
@@ -3442,7 +3461,7 @@ validateEquityCompensationTransferSuccessorContinuity maps =
                 validateEquityCompensationBalanceSuccessorQuantity
                   maps
                   label
-                  sourceIssuance.issuance_data.stock_class_id
+                  expectedStockClassIds
                   transfer.transfer_data.date
                   terminalSortKey
                   expectedBalanceQuantity
@@ -3604,6 +3623,22 @@ validateStockPlanReturnToPoolQuantities maps = do
       assertMsg
         ("Stock plan return to pool exceeds returnable quantity for " <> returnToPool.return_data.security_id <> ": returned " <> show returnedQuantity <> " exceeds returnable " <> show securityAllocation)
         (returnedQuantity <= securityAllocation))
+    (Map.values maps.stock_plan_return_to_pools)
+
+validateStockPlanReturnToPoolClasses : CapTableMaps -> Update ()
+validateStockPlanReturnToPoolClasses maps =
+  mapA_
+    (\returnCid -> do
+      returnToPool <- fetch returnCid
+      stockClassIdOpt <- stockPlanReturnToPoolStockClassId maps returnToPool.return_data.security_id
+      case stockClassIdOpt of
+        Some stockClassId ->
+          assertStockPlanIncludesClass
+            ("Stock plan return-to-pool " <> returnToPool.return_data.id)
+            maps
+            returnToPool.return_data.stock_plan_id
+            stockClassId
+        None -> pure ())
     (Map.values maps.stock_plan_return_to_pools)
 
 stockPlanNetAllocatedQuantityIndex : StockClassShareEventIndex -> CapTableMaps -> Update (Map Text Decimal)
@@ -4036,6 +4071,7 @@ validateStockPlanPoolCeilings eventIndex maps = do
   validateStockPlanAllocationClasses maps
   validateStockPlanAllocationEffectiveDates maps
   validateStockPlanEquityCompensationSourceQuantities maps
+  validateStockPlanReturnToPoolClasses maps
   validateStockPlanReturnToPoolQuantities maps
   validateStockPlanReservedShares eventIndex maps adjustmentIndex
   validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory
