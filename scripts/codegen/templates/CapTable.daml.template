@@ -20,6 +20,7 @@ import DA.Optional (fromOptional, isNone, isSome)
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangesOverlap)
+import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
@@ -176,6 +177,11 @@ data StockClassShareLot = StockClassShareLot with
     stock_class_id: Text
     security_id: Optional Text
     event_date: Time
+    quantity: Decimal
+  deriving (Eq, Show)
+
+data StockConversionResultTerm = StockConversionResultTerm with
+    stock_class_id: Text
     quantity: Decimal
   deriving (Eq, Show)
 
@@ -382,7 +388,7 @@ stockClassConversionOutputQuantity :
   StockClassOcfData ->
   OcfStockClassConversionRight ->
   StockConversionOcfData ->
-  Update Decimal
+  Update (Optional Decimal)
 stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData =
   case conversionRight.conversion_mechanism of
     OcfConversionMechanismRatioConversion -> do
@@ -391,13 +397,9 @@ stockClassConversionOutputQuantity maps sourceStockClass conversionRight convers
             Some adjustment -> Some adjustment.new_ratio_conversion_mechanism.ratio
             None -> conversionRight.ratio
       case ratioOpt of
-        Some ratio -> pure (conversionData.quantity_converted * ratio.numerator / ratio.denominator)
-        None -> do
-          assertMsg ("Stock conversion output cannot be reconstructed because ratio conversion has no ratio: " <> sourceStockClass.id) False
-          pure 0.0
-    _ -> do
-      assertMsg ("Stock conversion output cannot be reconstructed for non-ratio conversion mechanism: " <> sourceStockClass.id) False
-      pure 0.0
+        Some ratio -> pure (Some (conversionData.quantity_converted * ratio.numerator / ratio.denominator))
+        None -> pure None
+    _ -> pure None
 
 stockClassConversionRightDateEligible : Time -> OcfStockClassConversionRight -> Bool
 stockClassConversionRightDateEligible conversionDate conversionRight =
@@ -413,32 +415,32 @@ stockClassConversionRightDateEligible conversionDate conversionRight =
         _ -> True
   in beforeExpiration && triggerDateEligible
 
-stockConversionOutputShareLots :
+stockConversionResultTerms :
   CapTableMaps ->
   Map Text StockClassOcfData ->
   StockIssuanceOcfData ->
   StockConversionOcfData ->
-  Update [StockClassShareLot]
-stockConversionOutputShareLots maps stockClassIndex sourceIssuanceData conversionData =
+  Update [StockConversionResultTerm]
+stockConversionResultTerms maps stockClassIndex sourceIssuanceData conversionData =
   case Map.lookup sourceIssuanceData.stock_class_id stockClassIndex of
     Some sourceStockClass -> do
-      outputs <- foldlA
-        (\lots conversionRight ->
+      terms <- foldlA
+        (\resultTerms conversionRight ->
           if stockClassConversionRightDateEligible conversionData.date conversionRight
             then do
-              outputQuantity <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
-              pure ((StockClassShareLot with
-                stock_class_id = conversionRight.converts_to_stock_class_id
-                security_id = None
-                event_date = conversionData.date
-                quantity = outputQuantity) :: lots)
-            else pure lots)
+              quantityOpt <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
+              case quantityOpt of
+                Some quantity -> pure ((StockConversionResultTerm with
+                  stock_class_id = conversionRight.converts_to_stock_class_id
+                  quantity = quantity) :: resultTerms)
+                None -> pure resultTerms
+            else pure resultTerms)
         []
         sourceStockClass.conversion_rights
       assertMsg
-        ("Stock conversion has no date-eligible conversion right: " <> conversionData.id)
-        (not (null outputs))
-      pure outputs
+        ("Stock conversion has no computable date-eligible conversion right: " <> conversionData.id)
+        (not (null terms))
+      pure terms
     None -> do
       assertMsg ("Stock conversion source stock class not found: " <> sourceIssuanceData.stock_class_id) False
       pure []
@@ -450,9 +452,13 @@ stockConversionOutputShareLot :
   StockConversionOcfData ->
   Update (Optional StockClassShareLot)
 stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversionData = do
-  outputLots <- stockConversionOutputShareLots maps stockClassIndex sourceIssuanceData conversionData
-  case outputLots of
-    [outputLot] -> pure (Some outputLot)
+  resultTerms <- stockConversionResultTerms maps stockClassIndex sourceIssuanceData conversionData
+  case resultTerms of
+    [resultTerm] -> pure (Some (StockClassShareLot with
+      stock_class_id = resultTerm.stock_class_id
+      security_id = None
+      event_date = conversionData.date
+      quantity = resultTerm.quantity))
     [] -> pure None
     _ -> do
       assertMsg
@@ -463,9 +469,9 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
 validateStockConversionResultIssuances :
   CapTableMaps ->
   StockConversionOcfData ->
-  [StockClassShareLot] ->
+  [StockConversionResultTerm] ->
   Update ()
-validateStockConversionResultIssuances maps conversionData expectedOutputs = do
+validateStockConversionResultIssuances maps conversionData expectedTerms = do
   let targetSortKey = securityReductionSortKey conversionData.date conversionData.balance_security_id
   (actualStockClassIdOpt, actualQuantity) <- foldlA
     (\(stockClassIdOpt, total) securityId ->
@@ -490,10 +496,10 @@ validateStockConversionResultIssuances maps conversionData expectedOutputs = do
       assertMsg
         ("Stock conversion results do not match any date-eligible conversion right for " <> conversionData.id <> ": found class " <> actualStockClassId <> " and quantity " <> show actualQuantity)
         (any
-          (\expectedOutput ->
-            expectedOutput.stock_class_id == actualStockClassId &&
-            expectedOutput.quantity == actualQuantity)
-          expectedOutputs)
+          (\expectedTerm ->
+            expectedTerm.stock_class_id == actualStockClassId &&
+            expectedTerm.quantity == actualQuantity)
+          expectedTerms)
     None ->
       assertMsg ("Stock conversion has no resulting security: " <> conversionData.id) False
 
@@ -506,15 +512,55 @@ validateStockConversionResultTerms maps = do
       case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
         Some sourceIssuanceCid -> do
           sourceIssuance <- fetch sourceIssuanceCid
-          expectedOutputs <- stockConversionOutputShareLots
+          expectedTerms <- stockConversionResultTerms
             maps
             stockClassIndex
             sourceIssuance.issuance_data
             conversion.conversion_data
-          validateStockConversionResultIssuances maps conversion.conversion_data expectedOutputs
+          validateStockConversionResultIssuances maps conversion.conversion_data expectedTerms
         None ->
           assertMsg ("Stock conversion source security not found: " <> conversion.conversion_data.security_id) False)
     (Map.values maps.stock_conversions)
+
+convertibleConversionTrigger : ConvertibleIssuanceOcfData -> Text -> Optional ConvertibleIssuance.OcfConvertibleConversionTrigger
+convertibleConversionTrigger issuanceData triggerId =
+  foldl
+    (\matched trigger ->
+      case matched of
+        Some _ -> matched
+        None -> if trigger.trigger_id == triggerId then Some trigger else None)
+    None
+    issuanceData.conversion_triggers
+
+validateConvertibleConversionResultTerms : CapTableMaps -> Update ()
+validateConvertibleConversionResultTerms maps =
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      case Map.lookup conversion.conversion_data.security_id maps.convertible_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          case convertibleConversionTrigger issuance.issuance_data conversion.conversion_data.trigger_id of
+            Some trigger ->
+              case trigger.conversion_right.converts_to_stock_class_id of
+                Some expectedStockClassId ->
+                  mapA_
+                    (\securityId ->
+                      case Map.lookup securityId maps.stock_issuances_by_security_id of
+                        Some resultIssuanceCid -> do
+                          resultIssuance <- fetch resultIssuanceCid
+                          assertMsg
+                            ("Convertible conversion " <> conversion.conversion_data.id <> " result stock class mismatch for " <> securityId <> ": expected " <> expectedStockClassId <> ", found " <> resultIssuance.issuance_data.stock_class_id)
+                            (resultIssuance.issuance_data.stock_class_id == expectedStockClassId)
+                        None ->
+                          assertMsg ("Convertible conversion result stock issuance not found: " <> securityId) False)
+                    conversion.conversion_data.resulting_security_ids
+                None -> pure ()
+            None ->
+              assertMsg ("Convertible conversion trigger not found: " <> conversion.conversion_data.trigger_id) False
+        None ->
+          assertMsg ("Convertible conversion source security not found: " <> conversion.conversion_data.security_id) False)
+    (Map.values maps.convertible_conversions)
 
 warrantExerciseTrigger : WarrantIssuanceOcfData -> Text -> Optional OcfConversionTrigger
 warrantExerciseTrigger issuanceData triggerId =
@@ -526,11 +572,19 @@ warrantExerciseTrigger issuanceData triggerId =
     None
     issuanceData.exercise_triggers
 
-warrantExerciseQuantity : WarrantIssuanceOcfData -> WarrantExerciseOcfData -> OcfWarrantConversionRight -> Decimal
+warrantExerciseQuantity : WarrantIssuanceOcfData -> WarrantExerciseOcfData -> OcfWarrantConversionRight -> Optional Decimal
 warrantExerciseQuantity issuanceData exerciseData conversionRight =
   case conversionRight.conversion_mechanism of
-    OcfWarrantMechanismFixedAmount with converts_to_quantity -> fromOptional converts_to_quantity exerciseData.quantity
-    _ -> fromOptional (fromOptional 0.0 issuanceData.quantity) exerciseData.quantity
+    OcfWarrantMechanismFixedAmount with converts_to_quantity ->
+      case exerciseData.quantity of
+        None -> Some converts_to_quantity
+        Some exercisedQuantity -> case issuanceData.quantity of
+          Some issuedQuantity ->
+            if issuedQuantity > 0.0
+              then Some (converts_to_quantity * exercisedQuantity / issuedQuantity)
+              else None
+          None -> None
+    _ -> None
 
 warrantExerciseResultTerms :
   WarrantIssuanceOcfData ->
@@ -544,8 +598,7 @@ warrantExerciseResultTerms issuanceData exerciseData =
           case conversionRight.converts_to_stock_class_id of
             Some stockClassId ->
               let quantityOpt = case conversionRight.conversion_mechanism of
-                    OcfWarrantMechanismFixedAmount _ ->
-                      Some (warrantExerciseQuantity issuanceData exerciseData conversionRight)
+                    OcfWarrantMechanismFixedAmount _ -> warrantExerciseQuantity issuanceData exerciseData conversionRight
                     _ -> None
               in pure (Some (stockClassId, quantityOpt))
             None -> pure None
@@ -1912,7 +1965,8 @@ stockClassQuantityAtSortKey :
   (Time, Int, Int) ->
   Update Decimal
 stockClassQuantityAtSortKey maps stockClassId quantityDate quantity targetSortKey =
-  let quantitySortKey = (quantityDate, 0, 0)
+  let (targetDate, _, _) = targetSortKey
+      quantitySortKey = if quantityDate == targetDate then targetSortKey else (quantityDate, 0, 0)
   in foldlA
     (\adjustedQuantity splitCid -> do
       split <- fetch splitCid
@@ -2763,8 +2817,117 @@ validateSuccessorSecurityIds label sourceSecurityId balanceSecurityId resultingS
         (balanceId `notElem` resultingSecurityIds)
     None -> pure ()
 
+successorSecurityIdsFor : Optional Text -> [Text] -> [Text]
+successorSecurityIdsFor balanceSecurityId resultingSecurityIds =
+  case balanceSecurityId of
+    Some balanceId -> balanceId :: resultingSecurityIds
+    None -> resultingSecurityIds
+
+validateGlobalSuccessorSecurityIdUniqueness : CapTableMaps -> Update ()
+validateGlobalSuccessorSecurityIdUniqueness maps = do
+  stockTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    []
+    (Map.values maps.stock_transfers)
+  stockCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    stockTransferIds
+    (Map.values maps.stock_cancellations)
+  stockRepurchaseIds <- foldlA
+    (\securityIds repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (successorSecurityIdsFor repurchase.repurchase_data.balance_security_id [] ++ securityIds))
+    stockCancellationIds
+    (Map.values maps.stock_repurchases)
+  stockConversionIds <- foldlA
+    (\securityIds conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
+    stockRepurchaseIds
+    (Map.values maps.stock_conversions)
+  stockReissuanceIds <- foldlA
+    (\securityIds reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (reissuance.reissuance_data.resulting_security_ids ++ securityIds))
+    stockConversionIds
+    (Map.values maps.stock_reissuances)
+  stockConsolidationIds <- foldlA
+    (\securityIds consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      pure (consolidation.consolidation_data.resulting_security_id :: securityIds))
+    stockReissuanceIds
+    (Map.values maps.stock_consolidations)
+  warrantTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    stockConsolidationIds
+    (Map.values maps.warrant_transfers)
+  warrantCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    warrantTransferIds
+    (Map.values maps.warrant_cancellations)
+  warrantExerciseIds <- foldlA
+    (\securityIds exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
+    warrantCancellationIds
+    (Map.values maps.warrant_exercises)
+  convertibleTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    warrantExerciseIds
+    (Map.values maps.convertible_transfers)
+  convertibleCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    convertibleTransferIds
+    (Map.values maps.convertible_cancellations)
+  convertibleConversionIds <- foldlA
+    (\securityIds conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
+    convertibleCancellationIds
+    (Map.values maps.convertible_conversions)
+  equityCompensationTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    convertibleConversionIds
+    (Map.values maps.equity_compensation_transfers)
+  equityCompensationCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    equityCompensationTransferIds
+    (Map.values maps.equity_compensation_cancellations)
+  equityCompensationExerciseIds <- foldlA
+    (\securityIds exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
+    equityCompensationCancellationIds
+    (Map.values maps.equity_compensation_exercises)
+  allSuccessorIds <- foldlA
+    (\securityIds releaseCid -> do
+      release <- fetch releaseCid
+      pure (release.release_data.resulting_security_ids ++ securityIds))
+    equityCompensationExerciseIds
+    (Map.values maps.equity_compensation_releases)
+  assertMsg
+    "Each successor security ID may be produced by only one lifecycle transaction"
+    (length (dedup allSuccessorIds) == length allSuccessorIds)
+
 validateSuccessorSecurityIdContinuity : CapTableMaps -> Update ()
 validateSuccessorSecurityIdContinuity maps = do
+  validateGlobalSuccessorSecurityIdUniqueness maps
   mapA_
     (\transferCid -> do
       transfer <- fetch transferCid
@@ -4281,6 +4444,7 @@ template CapTable
         validateConfiguredReferences finalMaps
         validateSuccessorSecurityIdContinuity finalMaps
         validateStockConversionResultTerms finalMaps
+        validateConvertibleConversionResultTerms finalMaps
         validateTransactionLifecycleDates finalMaps
         validateStockSecurityBalances finalMaps
         validateConvertibleSecurityBalances finalMaps

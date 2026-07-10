@@ -36,7 +36,7 @@ addConversionStockPlan issuer capTableCid = do
   pure result.updatedCapTableCid
 
 -- Create a convertible issuance to convert (follows real workflow)
-createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
+createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount issuanceDate targetStockClassId =
   submit issuer do
     exerciseCmd capTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
@@ -61,8 +61,10 @@ createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
               conversion_timing = None
               conversion_valuation_cap = Some (OcfMonetary with amount = 16000000.0, currency = "USD")
               exit_multiple = None)
-            converts_to_future_round = Some True
-            converts_to_stock_class_id = None
+            converts_to_future_round = case targetStockClassId of
+              Some _ -> None
+              None -> Some True
+            converts_to_stock_class_id = targetStockClassId
             type_ = "CONVERTIBLE_CONVERSION_RIGHT"
           end_date = None
           nickname = Some "Equity Financing"
@@ -77,6 +79,9 @@ createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
         comments = []]
       edits = []
       deletes = []
+
+createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
+  createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount issuanceDate None
 
 -- Test 1: SAFE conversion upon equity financing
 -- Based on prod: SAFE conversion to Series Seed-2 Preferred
@@ -159,3 +164,36 @@ testConvertibleConversion_PartialConversion = script do
       edits = []
       deletes = []
   pure ()
+
+testConvertibleConversion_ResultStockClassMustMatchTrigger = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  capTableCid <- addPreferredStockClass issuer capTableCid
+  let securityId = "CONV-SEC-TARGET-CLASS"
+      conversionDate = DT.time (DA.date 2025 Nov 15) 0 0 0
+  result <- createConvertibleIssuanceWithTargetClass
+    issuer
+    capTableCid
+    securityId
+    100000.0
+    (DT.time (DA.date 2023 Mar 15) 0 0 0)
+    (Some "SC_PREFERRED")
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ stockSuccessorIssuance "STOCK-ISS-CONV-WRONG-CLASS" "SSEC-CONV-WRONG-CLASS" "SH-1" "SC_COMMON" conversionDate 1000.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+            id = "TX_CONV_CONVERSION_WRONG_CLASS"
+            date = conversionDate
+            security_id = securityId
+            trigger_id = "equity-financing-trigger"
+            reason_text = "Conversion result targets the wrong stock class"
+            resulting_security_ids = ["SSEC-CONV-WRONG-CLASS"]
+            comments = []
+            balance_security_id = None
+            capitalization_definition = None
+            quantity_converted = None
+        ]
+      edits = []
+      deletes = []
