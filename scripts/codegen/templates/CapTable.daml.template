@@ -545,7 +545,8 @@ validateConvertibleConversionResultTerms maps =
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
           case convertibleConversionTrigger issuance.issuance_data conversion.conversion_data.trigger_id of
-            Some trigger ->
+            Some trigger -> do
+              let label = "Convertible conversion " <> conversion.conversion_data.id
               case trigger.conversion_right.converts_to_stock_class_id of
                 Some expectedStockClassId ->
                   mapA_
@@ -559,6 +560,17 @@ validateConvertibleConversionResultTerms maps =
                         None ->
                           assertMsg ("Convertible conversion result stock issuance not found: " <> securityId) False)
                     conversion.conversion_data.resulting_security_ids
+                None -> pure ()
+              case conversion.conversion_data.quantity_converted of
+                Some expectedQuantity -> do
+                  actualQuantity <- stockIssuanceQuantityTotalAtSortKey
+                    maps
+                    label
+                    (conversion.conversion_data.date, 3, 3)
+                    conversion.conversion_data.resulting_security_ids
+                  assertMsg
+                    (label <> " resulting quantity mismatch: expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+                    (actualQuantity == expectedQuantity)
                 None -> pure ()
             None ->
               assertMsg ("Convertible conversion trigger not found: " <> conversion.conversion_data.trigger_id) False
@@ -1411,8 +1423,8 @@ stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf =
           (filter (stockClassShareEventOnOrBefore asOf) (stockClassShareLotPlanAllocationEvents eventIndex lot)))
     else Some 0.0
 
-stockSecurityShareEvents : CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
-stockSecurityShareEvents maps issuanceData = do
+stockSecurityShareEvents : StockClassShareEventIndex -> CapTableMaps -> StockIssuanceOcfData -> Update [StockClassShareEvent]
+stockSecurityShareEvents eventIndex maps issuanceData = do
   cancellationEvents <- foldlA
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -1489,10 +1501,12 @@ stockSecurityShareEvents maps issuanceData = do
     []
     (Map.values maps.stock_consolidations)
 
+  let splitCutoffSortKey = stockClassShareLotSplitCutoffSortKey eventIndex (stockIssuanceShareLot issuanceData)
   splitEvents <- foldlA
     (\events splitCid -> do
       split <- fetch splitCid
-      if split.split_data.stock_class_id == issuanceData.stock_class_id && split.split_data.date >= issuanceData.date
+      let splitSortKey = (split.split_data.date, 2, 2)
+      if split.split_data.stock_class_id == issuanceData.stock_class_id && splitSortKey >= splitCutoffSortKey
         then pure ((StockClassShareMultiplier with
             event_date = split.split_data.date
             event_priority = 2
@@ -1533,21 +1547,21 @@ validateStockSecurityBalanceEvent securityId current event = case event of
       (current > 0.0)
     pure 0.0
 
-validateStockSecurityBalance : CapTableMaps -> StockIssuanceOcfData -> Update ()
-validateStockSecurityBalance maps issuanceData = do
-  events <- stockSecurityShareEvents maps issuanceData
+validateStockSecurityBalance : StockClassShareEventIndex -> CapTableMaps -> StockIssuanceOcfData -> Update ()
+validateStockSecurityBalance eventIndex maps issuanceData = do
+  events <- stockSecurityShareEvents eventIndex maps issuanceData
   _ <- foldlA
     (validateStockSecurityBalanceEvent issuanceData.security_id)
     0.0
     (sortOn stockClassShareEventSortKey events)
   pure ()
 
-validateStockSecurityBalances : CapTableMaps -> Update ()
-validateStockSecurityBalances maps =
+validateStockSecurityBalances : StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateStockSecurityBalances eventIndex maps =
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
-      validateStockSecurityBalance maps issuance.issuance_data)
+      validateStockSecurityBalance eventIndex maps issuance.issuance_data)
     (Map.values maps.stock_issuances)
 
 securityQuantityEventSortKey : SecurityQuantityEvent -> (Time, Int, Int)
@@ -1755,6 +1769,9 @@ validateConvertiblePartialConversionBalance maps label expectedCurrency currentA
         (label <> " balance currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
         (issuance.issuance_data.investment_amount.currency == expectedCurrency)
       assertMsg
+        (label <> " balance amount must be positive for " <> securityId)
+        (issuance.issuance_data.investment_amount.amount > 0.0)
+      assertMsg
         (label <> " balance amount must be less than the current source balance for " <> securityId)
         (issuance.issuance_data.investment_amount.amount < currentAmount)
     None ->
@@ -1791,6 +1808,9 @@ validateConvertibleBalanceEvent maps issuanceData currentAmount event = case eve
       else pure ()
     case balance_security_id of
       Some balanceSecurityId -> do
+        assertMsg
+          (event_label <> " balance amount must be positive for " <> balanceSecurityId)
+          (remainingAmount > 0.0)
         validateConvertibleBalanceSuccessor
           maps
           event_label
@@ -2016,12 +2036,13 @@ validateEquityCompensationSecurityBalances maps =
     (Map.values maps.equity_compensation_issuances)
 
 stockSecurityQuantityBeforeEvent :
+  StockClassShareEventIndex ->
   CapTableMaps ->
   StockIssuanceOcfData ->
   (Time, Int, Int) ->
   Update Decimal
-stockSecurityQuantityBeforeEvent maps issuanceData targetSortKey = do
-  events <- stockSecurityShareEvents maps issuanceData
+stockSecurityQuantityBeforeEvent eventIndex maps issuanceData targetSortKey = do
+  events <- stockSecurityShareEvents eventIndex maps issuanceData
   foldlA
     (validateStockSecurityBalanceEvent issuanceData.security_id)
     0.0
@@ -2132,6 +2153,21 @@ equityCompensationIssuanceQuantityAtSortKey maps issuanceData targetSortKey =
       stockClassQuantityAtSortKey maps stockClassId issuanceData.date issuanceData.quantity targetSortKey
     None -> pure issuanceData.quantity
 
+stockIssuanceQuantityTotalAtSortKey : CapTableMaps -> Text -> (Time, Int, Int) -> [Text] -> Update Decimal
+stockIssuanceQuantityTotalAtSortKey maps label targetSortKey securityIds =
+  foldlA
+    (\total securityId ->
+      case Map.lookup securityId maps.stock_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          quantity <- stockIssuanceQuantityAtSortKey maps issuance.issuance_data targetSortKey
+          pure (total + quantity)
+        None -> do
+          assertMsg (label <> " successor stock issuance not found: " <> securityId) False
+          pure total)
+    0.0
+    securityIds
+
 stockIssuanceQuantityTotal : CapTableMaps -> Text -> Text -> (Time, Int, Int) -> [Text] -> Update Decimal
 stockIssuanceQuantityTotal maps label expectedStockClassId targetSortKey securityIds =
   foldlA
@@ -2173,6 +2209,7 @@ validateStockBalanceSuccessorQuantity maps label expectedStockClassId targetSort
       assertMsg (label <> " balance stock issuance not found: " <> securityId) False
 
 validateStockTerminalBalanceSuccessor :
+  StockClassShareEventIndex ->
   CapTableMaps ->
   Text ->
   StockIssuanceOcfData ->
@@ -2180,11 +2217,11 @@ validateStockTerminalBalanceSuccessor :
   Decimal ->
   Optional Text ->
   Update ()
-validateStockTerminalBalanceSuccessor maps label sourceIssuanceData eventDate reductionQuantity balanceSecurityId =
+validateStockTerminalBalanceSuccessor eventIndex maps label sourceIssuanceData eventDate reductionQuantity balanceSecurityId =
   case balanceSecurityId of
     Some securityId -> do
       let targetSortKey = (eventDate, 2, 1)
-      currentQuantity <- stockSecurityQuantityBeforeEvent maps sourceIssuanceData targetSortKey
+      currentQuantity <- stockSecurityQuantityBeforeEvent eventIndex maps sourceIssuanceData targetSortKey
       let expectedQuantity = currentQuantity - reductionQuantity
       assertMsg
         (label <> " exceeds the current source quantity for " <> sourceIssuanceData.security_id)
@@ -2198,8 +2235,8 @@ validateStockTerminalBalanceSuccessor maps label sourceIssuanceData eventDate re
         securityId
     None -> pure ()
 
-validateStockSuccessorQuantityContinuity : CapTableMaps -> Update ()
-validateStockSuccessorQuantityContinuity maps = do
+validateStockSuccessorQuantityContinuity : StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateStockSuccessorQuantityContinuity eventIndex maps = do
   mapA_
     (\transferCid -> do
       transfer <- fetch transferCid
@@ -2218,6 +2255,7 @@ validateStockSuccessorQuantityContinuity maps = do
             (label <> " resulting quantity mismatch: expected " <> show transfer.transfer_data.quantity <> ", found " <> show resultingQuantity)
             (resultingQuantity == transfer.transfer_data.quantity)
           validateStockTerminalBalanceSuccessor
+            eventIndex
             maps
             label
             sourceIssuance.issuance_data
@@ -2233,6 +2271,7 @@ validateStockSuccessorQuantityContinuity maps = do
         Some sourceIssuanceCid -> do
           sourceIssuance <- fetch sourceIssuanceCid
           validateStockTerminalBalanceSuccessor
+            eventIndex
             maps
             ("Stock cancellation " <> cancellation.cancellation_data.id)
             sourceIssuance.issuance_data
@@ -2248,6 +2287,7 @@ validateStockSuccessorQuantityContinuity maps = do
         Some sourceIssuanceCid -> do
           sourceIssuance <- fetch sourceIssuanceCid
           validateStockTerminalBalanceSuccessor
+            eventIndex
             maps
             ("Stock repurchase " <> repurchase.repurchase_data.id)
             sourceIssuance.issuance_data
@@ -2263,6 +2303,7 @@ validateStockSuccessorQuantityContinuity maps = do
         Some sourceIssuanceCid -> do
           sourceIssuance <- fetch sourceIssuanceCid
           validateStockTerminalBalanceSuccessor
+            eventIndex
             maps
             ("Stock conversion " <> conversion.conversion_data.id)
             sourceIssuance.issuance_data
@@ -2280,6 +2321,7 @@ validateStockSuccessorQuantityContinuity maps = do
           let label = "Stock reissuance " <> reissuance.reissuance_data.id
               targetSortKey = (reissuance.reissuance_data.date, 3, 3)
           expectedQuantity <- stockSecurityQuantityBeforeEvent
+            eventIndex
             maps
             sourceIssuance.issuance_data
             targetSortKey
@@ -2311,6 +2353,7 @@ validateStockSuccessorQuantityContinuity maps = do
                     (label <> " source stock class mismatch for " <> sourceSecurityId)
                     (sourceIssuance.issuance_data.stock_class_id == resultIssuance.issuance_data.stock_class_id)
                   currentQuantity <- stockSecurityQuantityBeforeEvent
+                    eventIndex
                     maps
                     sourceIssuance.issuance_data
                     targetSortKey
@@ -2518,9 +2561,9 @@ validateEquityCompensationSuccessorQuantityContinuity maps = do
         None -> pure ())
     (Map.values maps.equity_compensation_cancellations)
 
-validateSuccessorQuantityContinuity : CapTableMaps -> Update ()
-validateSuccessorQuantityContinuity maps = do
-  validateStockSuccessorQuantityContinuity maps
+validateSuccessorQuantityContinuity : StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateSuccessorQuantityContinuity eventIndex maps = do
+  validateStockSuccessorQuantityContinuity eventIndex maps
   validateWarrantSuccessorQuantityContinuity maps
   validateEquityCompensationSuccessorQuantityContinuity maps
   validateWarrantExerciseResultTerms maps
@@ -4409,12 +4452,12 @@ validateStockPlanPoolCeilings eventIndex maps = do
   validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory
 
 validateAuthorizedShareCeilings :
+  StockClassShareEventIndex ->
   CapTableMaps ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   ContractId Issuer ->
   Update ()
-validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
-  eventIndex <- stockClassShareEventIndex maps
+validateAuthorizedShareCeilings eventIndex maps adjustmentIndex issuerCid = do
   stockClassIndex <- stockClassDataIndex maps
   stockClasses <- stockClassDataList maps
   lotsByStockClass <- stockClassShareLotsByStockClass maps stockClassIndex
@@ -4581,13 +4624,15 @@ template CapTable
         validateStockConversionResultTerms finalMaps
         validateConvertibleConversionResultTerms finalMaps
         validateTransactionLifecycleDates finalMaps
-        validateStockSecurityBalances finalMaps
+        stockShareEventIndex <- stockClassShareEventIndex finalMaps
+        validateStockSecurityBalances stockShareEventIndex finalMaps
         validateConvertibleSecurityBalances finalMaps
         validateWarrantSecurityBalances finalMaps
         validateEquityCompensationSecurityBalances finalMaps
-        validateSuccessorQuantityContinuity finalMaps
+        validateSuccessorQuantityContinuity stockShareEventIndex finalMaps
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
         validateAuthorizedShareCeilings
+          stockShareEventIndex
           finalMaps
           authorizedShareAdjustmentIndex
           newIssuerCid
