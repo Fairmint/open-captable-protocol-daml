@@ -7,6 +7,7 @@ import Fairmint.OpenCapTable.OCF.EquityCompensationRelease
 import Fairmint.OpenCapTable.OCF.EquityCompensationTransfer
 import Fairmint.OpenCapTable.OCF.StockConsolidation
 import Fairmint.OpenCapTable.OCF.StockReissuance
+import Fairmint.OpenCapTable.OCF.StockRetraction
 import Fairmint.OpenCapTable.OCF.StockTransfer
 import Fairmint.OpenCapTable.OCF.WarrantExercise
 import Fairmint.OpenCapTable.OCF.WarrantIssuance
@@ -391,6 +392,99 @@ testUnmaterializedStockResultCannotAliasLiveWarrant = script do
       creates = [CT.OcfCreateStockTransfer (lifecycleStockTransfer "TX_LIVE_CROSS_TYPE_ALIAS_TRANSFER" stockSecurityId 50.0 None [warrantSecurityId])]
       edits = []
       deletes = []
+
+testUnmaterializedPartialTransferWithBalancePreservesShareCount = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_UNMATERIALIZED_TRANSFER_BALANCE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_UNMATERIALIZED_TRANSFER_BALANCE" "Unmaterialized Transfer Holder"
+  let sourceSecurityId = "SEC_UNMATERIALIZED_TRANSFER_SOURCE"
+  let balanceSecurityId = "SEC_UNMATERIALIZED_TRANSFER_BALANCE"
+  issued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_UNMATERIALIZED_TRANSFER_SOURCE" sourceSecurityId stakeholderId stockClassId) with quantity = 100.0)
+  let balanceIssuance = (defaultStockIssuance "TX_UNMATERIALIZED_TRANSFER_BALANCE" balanceSecurityId stakeholderId stockClassId) with quantity = 60.0
+  transferred <- submit issuer do
+    exerciseCmd issued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer (lifecycleStockTransfer "TX_UNMATERIALIZED_TRANSFER" sourceSecurityId 40.0 (Some balanceSecurityId) ["SEC_UNMATERIALIZED_TRANSFER_MISSING_RESULT"])
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd transferred.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_UNMATERIALIZED_TRANSFER_EXCESS" "SEC_UNMATERIALIZED_TRANSFER_EXCESS" stakeholderId stockClassId) with quantity = 1.0)]
+      edits = []
+      deletes = []
+
+testUnmaterializedReissuanceCannotOutliveSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_UNMATERIALIZED_REISSUANCE_SOURCE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_UNMATERIALIZED_REISSUANCE_SOURCE" "Unmaterialized Reissuance Holder"
+  let sourceTransactionId = "TX_UNMATERIALIZED_REISSUANCE_SOURCE"
+  let sourceSecurityId = "SEC_UNMATERIALIZED_REISSUANCE_SOURCE"
+  issued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance sourceTransactionId sourceSecurityId stakeholderId stockClassId) with quantity = 100.0)
+  reissued <- submit issuer do
+    exerciseCmd issued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockReissuance (lifecycleStockReissuance "TX_UNMATERIALIZED_REISSUANCE" sourceSecurityId ["SEC_UNMATERIALIZED_REISSUANCE_MISSING_RESULT"])]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd reissued.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance sourceTransactionId]
+
+testUnmaterializedConsolidationCannotOutliveSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_UNMATERIALIZED_CONSOLIDATION_SOURCE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_UNMATERIALIZED_CONSOLIDATION_SOURCE" "Unmaterialized Consolidation Holder"
+  let sourceTransactionId = "TX_UNMATERIALIZED_CONSOLIDATION_SOURCE"
+  let sourceSecurityId = "SEC_UNMATERIALIZED_CONSOLIDATION_SOURCE"
+  issued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance sourceTransactionId sourceSecurityId stakeholderId stockClassId) with quantity = 100.0)
+  consolidated <- submit issuer do
+    exerciseCmd issued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConsolidation (lifecycleStockConsolidation "TX_UNMATERIALIZED_CONSOLIDATION" [sourceSecurityId] "SEC_UNMATERIALIZED_CONSOLIDATION_MISSING_RESULT")]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd consolidated.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance sourceTransactionId]
+
+testSameSecurityIdCorrectionRetainsRetractionHistory = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CORRECTED_RETRACTED_SECURITY" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_CORRECTED_RETRACTED_SECURITY" "Corrected Retracted Holder"
+  let originalTransactionId = "TX_CORRECTED_RETRACTED_ORIGINAL"
+  let securityId = "SEC_CORRECTED_RETRACTED"
+  issued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance originalTransactionId securityId stakeholderId stockClassId) with quantity = 100.0)
+  retracted <- submit issuer do
+    exerciseCmd issued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockRetraction StockRetractionOcfData with
+        id = "TX_CORRECTED_RETRACTED_RETRACTION"
+        date = defaultTestDate
+        security_id = securityId
+        reason_text = "Corrected security remains retracted"
+        comments = []]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd retracted.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CORRECTED_RETRACTED_REPLACEMENT" securityId stakeholderId stockClassId) with quantity = 100.0)
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CORRECTED_RETRACTED_NEW_SECURITY" "SEC_CORRECTED_RETRACTED_NEW_SECURITY" stakeholderId stockClassId) with quantity = 100.0)
+        ]
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance originalTransactionId]
+  pure ()
 
 testStockBalanceSuccessorIncludesPriorUnmaterializedReduction = script do
   TestOcp{issuer, cap_table} <- setupTestOcp

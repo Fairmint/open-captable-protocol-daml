@@ -970,6 +970,29 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
     Map.empty
     (Map.values maps.stock_issuances)
 
+  stockTransferLots <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      let label = "Stock transfer " <> transfer.transfer_data.id
+      assertNoPartialResultingStockIssuanceCoverage label maps transfer.transfer_data.resulting_security_ids
+      if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
+        then pure index
+        else case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
+          Some sourceIssuanceCid -> do
+            sourceIssuance <- fetch sourceIssuanceCid
+            pure (addStockClassShareLotByStockClass
+              (StockClassShareLot with
+                stock_class_id = sourceIssuance.issuance_data.stock_class_id
+                security_id = None
+                event_date = transfer.transfer_data.date
+                quantity = transfer.transfer_data.quantity)
+              index)
+          None -> do
+            assertMsg (label <> " references missing source stock issuance: " <> transfer.transfer_data.security_id) False
+            pure index)
+    stockIssuanceLots
+    (Map.values maps.stock_transfers)
+
   stockConversionLots <- foldlA
     (\index conversionCid -> do
       conversion <- fetch conversionCid
@@ -992,7 +1015,7 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
           None -> do
             assertMsg ("Stock conversion references missing source stock issuance: " <> conversion.conversion_data.security_id) False
             pure index)
-    stockIssuanceLots
+    stockTransferLots
     (Map.values maps.stock_conversions)
 
   warrantExerciseLots <- foldlA
@@ -1426,10 +1449,7 @@ stockClassShareEventIndex maps = do
       transfer <- fetch transferCid
       assertNoPartialResultingStockIssuanceCoverage ("Stock transfer " <> transfer.transfer_data.id) maps transfer.transfer_data.resulting_security_ids
       let events = stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id
-      if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
-          && stockBalanceSecurityIssuanceExists maps transfer.transfer_data.balance_security_id
-        then pure (addStockClassShareEvents transfer.transfer_data.security_id events index)
-        else pure index)
+      pure (addStockClassShareEvents transfer.transfer_data.security_id events index))
     conversionEventsBySecurityId
     (Map.values maps.stock_transfers)
 
@@ -2037,28 +2057,29 @@ validateStockReissuanceResultIssuances eventIndex maps =
       reissuance <- fetch reissuanceCid
       let label = "Stock reissuance " <> reissuance.reissuance_data.id
       assertNoPartialResultingStockIssuanceCoverage label maps reissuance.reissuance_data.resulting_security_ids
-      if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
-        then case Map.lookup reissuance.reissuance_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            let targetSortKey = (reissuance.reissuance_data.date, 3, 0)
-            sourceQuantity <- stockSecurityQuantityBeforeEvent
-              eventIndex
-              maps
-              sourceIssuance.issuance_data
-              targetSortKey
-            resultingQuantity <- stockIssuanceQuantityTotal
-              maps
-              label
-              sourceIssuance.issuance_data.stock_class_id
-              reissuance.reissuance_data.date
-              targetSortKey
-              reissuance.reissuance_data.resulting_security_ids
-            assertMsg
-              (label <> " resulting quantity mismatch: expected " <> show sourceQuantity <> ", found " <> show resultingQuantity)
-              (resultingQuantity == sourceQuantity)
-          None -> assertMsg (label <> " source stock issuance not found: " <> reissuance.reissuance_data.security_id) False
-        else pure ())
+      case Map.lookup reissuance.reissuance_data.security_id maps.stock_issuances_by_security_id of
+        Some sourceIssuanceCid ->
+          if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
+            then do
+              sourceIssuance <- fetch sourceIssuanceCid
+              let targetSortKey = (reissuance.reissuance_data.date, 3, 0)
+              sourceQuantity <- stockSecurityQuantityBeforeEvent
+                eventIndex
+                maps
+                sourceIssuance.issuance_data
+                targetSortKey
+              resultingQuantity <- stockIssuanceQuantityTotal
+                maps
+                label
+                sourceIssuance.issuance_data.stock_class_id
+                reissuance.reissuance_data.date
+                targetSortKey
+                reissuance.reissuance_data.resulting_security_ids
+              assertMsg
+                (label <> " resulting quantity mismatch: expected " <> show sourceQuantity <> ", found " <> show resultingQuantity)
+                (resultingQuantity == sourceQuantity)
+            else pure ()
+        None -> assertMsg (label <> " source stock issuance not found: " <> reissuance.reissuance_data.security_id) False)
     (Map.values maps.stock_reissuances)
 
 validateStockConsolidationResultIssuances : StockClassShareEventIndex -> CapTableMaps -> Update ()
@@ -2067,6 +2088,12 @@ validateStockConsolidationResultIssuances eventIndex maps =
     (\consolidationCid -> do
       consolidation <- fetch consolidationCid
       let label = "Stock consolidation " <> consolidation.consolidation_data.id
+      mapA_
+        (\sourceSecurityId ->
+          assertMsg
+            (label <> " source stock issuance not found: " <> sourceSecurityId)
+            (isSome (Map.lookup sourceSecurityId maps.stock_issuances_by_security_id)))
+        consolidation.consolidation_data.security_ids
       case Map.lookup consolidation.consolidation_data.resulting_security_id maps.stock_issuances_by_security_id of
         Some resultIssuanceCid -> do
           resultIssuance <- fetch resultIssuanceCid
@@ -3866,9 +3893,24 @@ addStockClassSplitDateToStockPlans splitData maps index =
     index
     (Map.values maps.stock_plans)
 
-stockPlanValidationDateIndex : CapTableMaps -> Update (Map Text [Time])
-stockPlanValidationDateIndex maps = do
+addStockClassSplitDateToConvertedStockPlans :
+  [(Text, StockClassShareLot, [StockClassShareLot])] ->
+  StockClassSplitOcfData ->
+  Map Text [Time] ->
+  Map Text [Time]
+addStockClassSplitDateToConvertedStockPlans transitions splitData index =
+  foldl
+    (\dates (stockPlanId, _, outputLots) ->
+      if any (\outputLot -> outputLot.stock_class_id == splitData.stock_class_id) outputLots
+        then addStockPlanDate stockPlanId splitData.date dates
+        else dates)
+    index
+    transitions
+
+stockPlanValidationDateIndex : StockClassShareEventIndex -> CapTableMaps -> Update (Map Text [Time])
+stockPlanValidationDateIndex eventIndex maps = do
   successorIndex <- stockPlanSuccessorIndex maps
+  conversionTransitions <- stockPlanConversionAllocationTransitions eventIndex successorIndex maps
   planDates <- foldlA
     (\index stockPlanCid -> do
       stockPlan <- fetch stockPlanCid
@@ -3953,7 +3995,8 @@ stockPlanValidationDateIndex maps = do
   foldlA
     (\index splitCid -> do
       split <- fetch splitCid
-      addStockClassSplitDateToStockPlans split.split_data maps index)
+      planSplitDates <- addStockClassSplitDateToStockPlans split.split_data maps index
+      pure (addStockClassSplitDateToConvertedStockPlans conversionTransitions split.split_data planSplitDates))
     equityCompensationRetractionDates
     (Map.values maps.stock_class_splits)
 
@@ -3963,7 +4006,7 @@ validateStockPlanReservedSharesAtDates :
   Map Text [StockPlanPoolAdjustmentOcfData] ->
   Update ()
 validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
-  validationDates <- stockPlanValidationDateIndex maps
+  validationDates <- stockPlanValidationDateIndex eventIndex maps
   mapA_
     (\stockPlanCid -> do
       stockPlan <- fetch stockPlanCid
