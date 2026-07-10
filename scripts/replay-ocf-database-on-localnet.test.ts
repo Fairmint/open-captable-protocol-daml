@@ -144,6 +144,74 @@ function run(): void {
   ];
   expectReplayPhase(() => preparePortal(unknownSchemaRows), 'schema');
 
+  let invalidAliasConversionCount = 0;
+  for (const objectType of ['TX_STAKEHOLDER_RELATIONSHIP_CHANGE_EVENT', 'TX_STAKEHOLDER_STATUS_CHANGE_EVENT']) {
+    const invalidAliasPlan = prepareReplaySnapshot(
+      [
+        ...validRows,
+        {
+          portalId: PORTAL_ID,
+          type: 'TRANSACTION',
+          subtype: objectType,
+          data: {
+            id: `invalid-${objectType}`,
+            object_type: objectType,
+            date: '2024-01-01',
+            stakeholder_id: 'stakeholder-secret-id',
+          },
+        },
+      ],
+      'ledger-backed',
+      () => {
+        invalidAliasConversionCount += 1;
+      }
+    );
+    assert.equal(invalidAliasPlan.portals.length, 0);
+    assert.deepEqual(
+      invalidAliasPlan.failures.map((failure) => failure.phase),
+      ['schema']
+    );
+    assert.ok(
+      invalidAliasPlan.failures[0].diagnostics?.some((diagnostic) => diagnostic.objectType === objectType),
+      `${objectType} should be rejected as a non-schema discriminator`
+    );
+  }
+  assert.equal(invalidAliasConversionCount, 0, 'schema-invalid aliases must never reach OCF-to-DAML conversion');
+
+  const canonicalStakeholderEventPortal = preparePortal([
+    ...validRows,
+    {
+      portalId: PORTAL_ID,
+      type: 'TRANSACTION',
+      subtype: 'CE_STAKEHOLDER_RELATIONSHIP',
+      data: {
+        id: 'stakeholder-relationship-event',
+        object_type: 'CE_STAKEHOLDER_RELATIONSHIP',
+        date: '2024-01-01',
+        stakeholder_id: 'stakeholder-secret-id',
+        relationship_started: 'ADVISOR',
+      },
+    },
+    {
+      portalId: PORTAL_ID,
+      type: 'TRANSACTION',
+      subtype: 'CE_STAKEHOLDER_STATUS',
+      data: {
+        id: 'stakeholder-status-event',
+        object_type: 'CE_STAKEHOLDER_STATUS',
+        date: '2024-01-02',
+        stakeholder_id: 'stakeholder-secret-id',
+        new_status: 'TERMINATION_VOLUNTARY_OTHER',
+      },
+    },
+  ]);
+  assert.deepEqual(
+    canonicalStakeholderEventPortal.creates
+      .map((item) => item.data.object_type)
+      .filter((objectType) => objectType.startsWith('CE_STAKEHOLDER_')),
+    ['CE_STAKEHOLDER_RELATIONSHIP', 'CE_STAKEHOLDER_STATUS']
+  );
+
   const planSecurityPortal = preparePortal([
     validRows[0],
     validRows[1],

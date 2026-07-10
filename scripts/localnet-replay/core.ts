@@ -38,6 +38,11 @@ export interface DatabaseOcfRow {
 
 type OcfSnapshotObjectData = Record<string, unknown> & { id: string; object_type: string };
 
+export type OcfReplayConverter = (entityType: OcfEntityType, data: OcfSnapshotObjectData) => unknown;
+
+const convertReplayObject: OcfReplayConverter = (entityType, data) =>
+  convertToDaml(...([entityType, data] as unknown as OcfEntityArguments));
+
 export interface PreparedOcfObject {
   entityType: OcfEntityType;
   objectAlias: string;
@@ -363,14 +368,15 @@ function validateRawRow(row: DatabaseOcfRow, portalAlias: string): ValidatedOcfR
     });
   }
 
-  // Deliberately validate the original database JSON before the SDK normalizes legacy aliases.
+  // Validate the original database JSON before any ledger canonicalization. A schema parser must not silently
+  // rewrite the discriminator: the source row itself must declare an exact, current OCF object_type.
   let rawSchemaResult: ReturnType<ReturnType<typeof getOcfSchema>['safeParse']>;
   try {
     rawSchemaResult = getOcfSchema(objectType).safeParse(data);
   } catch (error) {
     throw new ReplayPhaseError('schema', 'No strict OCF schema is available for object_type', {
       objectAlias,
-      diagnostics: [{ code: 'STRICT_SCHEMA_UNAVAILABLE' }],
+      diagnostics: [{ code: 'STRICT_SCHEMA_UNAVAILABLE', objectType }],
       cause: error,
     });
   }
@@ -390,7 +396,19 @@ function validateRawRow(row: DatabaseOcfRow, portalAlias: string): ValidatedOcfR
     );
   }
 
-  return { data: data as OcfSnapshotObjectData, objectAlias, objectId, objectType };
+  if (rawSchemaResult.data['object_type'] !== objectType) {
+    throw new ReplayPhaseError('schema', 'Strict OCF schema validation changed object_type', {
+      objectAlias,
+      diagnostics: [{ code: 'SCHEMA_DISCRIMINATOR_NORMALIZED', objectType, objectAlias, path: 'object_type' }],
+    });
+  }
+
+  return {
+    data: rawSchemaResult.data as OcfSnapshotObjectData,
+    objectAlias,
+    objectId,
+    objectType,
+  };
 }
 
 function prepareValidatedRow(row: DatabaseOcfRow, validated: ValidatedOcfRow): PreparedSourceObject {
@@ -467,17 +485,26 @@ function prepareValidatedRow(row: DatabaseOcfRow, validated: ValidatedOcfRow): P
     );
   }
 
-  let normalizedData: OcfSnapshotObjectData;
-  try {
-    // Raw source JSON has already passed its original discriminator schema. Canonicalization belongs only at the
-    // ledger boundary so compatibility aliases never bypass strict source validation.
-    normalizedData = normalizeOcfData(data) as OcfSnapshotObjectData;
-  } catch (error) {
-    throw new ReplayPhaseError('conversion', 'OCF compatibility normalization failed', {
-      objectAlias,
-      diagnostics: [{ code: 'NORMALIZATION_FAILED', objectType, objectAlias }],
-      cause: error,
-    });
+  let ledgerData = data;
+  if (capability.canonicalObjectType !== objectType) {
+    try {
+      // Some current, schema-valid OCF types (notably PlanSecurity variants) share a canonical ledger entity. This
+      // transformation is deliberately after strict raw validation and is never a retry path for invalid input.
+      ledgerData = normalizeOcfData(data) as OcfSnapshotObjectData;
+    } catch (error) {
+      throw new ReplayPhaseError('conversion', 'OCF ledger canonicalization failed', {
+        objectAlias,
+        diagnostics: [{ code: 'LEDGER_CANONICALIZATION_FAILED', objectType, objectAlias }],
+        cause: error,
+      });
+    }
+
+    if (ledgerData.object_type !== capability.canonicalObjectType) {
+      throw new ReplayPhaseError('conversion', 'OCF ledger canonicalization produced an unexpected object_type', {
+        objectAlias,
+        diagnostics: [{ code: 'LEDGER_CANONICALIZATION_MISMATCH', objectType, objectAlias, path: 'object_type' }],
+      });
+    }
   }
 
   return {
@@ -485,7 +512,7 @@ function prepareValidatedRow(row: DatabaseOcfRow, validated: ValidatedOcfRow): P
     entityType: categorizedEntityType,
     objectAlias,
     objectId,
-    data: normalizedData,
+    data: ledgerData,
   };
 }
 
@@ -524,7 +551,8 @@ function prepareValidatedPortal(
   rows: DatabaseOcfRow[],
   validatedRows: readonly ValidatedOcfRow[],
   validationMode: ReplayValidationMode,
-  warnings: ReplayWarning[]
+  warnings: ReplayWarning[],
+  convertObject: OcfReplayConverter
 ): PreparedPortal | null {
   if (rows.length === 0) {
     throw new ReplayPhaseError('database', 'Portal group has no OCF rows');
@@ -599,7 +627,7 @@ function prepareValidatedPortal(
 
   for (const item of ledgerBacked) {
     try {
-      convertToDaml(...([item.entityType, item.data] as unknown as OcfEntityArguments));
+      convertObject(item.entityType, item.data);
     } catch (error) {
       throw new ReplayPhaseError('conversion', 'Canonical OCF-to-DAML conversion preflight failed', {
         entityType: item.entityType,
@@ -624,7 +652,10 @@ function prepareValidatedPortal(
   };
 }
 
-export function preparePortal(rows: DatabaseOcfRow[]): PreparedPortal {
+export function preparePortal(
+  rows: DatabaseOcfRow[],
+  convertObject: OcfReplayConverter = convertReplayObject
+): PreparedPortal {
   if (rows.length === 0) {
     throw new ReplayPhaseError('database', 'Portal group has no OCF rows');
   }
@@ -634,7 +665,8 @@ export function preparePortal(rows: DatabaseOcfRow[]): PreparedPortal {
     rows,
     rows.map((row) => validateRawRow(row, portalAlias)),
     'ledger-backed',
-    warnings
+    warnings,
+    convertObject
   );
   if (portal === null) {
     throw new ReplayPhaseError('snapshot', 'Expected exactly one ISSUER object; found 0', {
@@ -650,7 +682,8 @@ export function preparePortal(rows: DatabaseOcfRow[]): PreparedPortal {
  */
 export function prepareReplaySnapshot(
   rows: DatabaseOcfRow[],
-  validationMode: ReplayValidationMode = 'ledger-backed'
+  validationMode: ReplayValidationMode = 'ledger-backed',
+  convertObject: OcfReplayConverter = convertReplayObject
 ): PreparedReplaySnapshot {
   const groupedRows = groupRowsByPortal(rows);
   const validatedByRow = new Map<DatabaseOcfRow, ValidatedOcfRow>();
@@ -693,7 +726,7 @@ export function prepareReplaySnapshot(
         if (!validated) throw new ReplayPhaseError('schema', 'Raw OCF row validation result is unavailable');
         return validated;
       });
-      const portal = prepareValidatedPortal(portalRows, validatedRows, validationMode, warnings);
+      const portal = prepareValidatedPortal(portalRows, validatedRows, validationMode, warnings, convertObject);
       if (portal === null) {
         excludedPortalCount += 1;
       } else {
