@@ -188,6 +188,7 @@ data StockConversionResultTerm = StockConversionResultTerm with
 data StockClassShareEventIndex = StockClassShareEventIndex with
     stock_security_events_by_security_id: Map Text [StockClassShareEvent]
     stock_class_split_events_by_stock_class_id: Map Text [StockClassShareEvent]
+    stock_successor_sort_keys_by_security_id: Optional (Map Text (Time, Int, Int))
   deriving (Eq, Show)
 
 data SecurityQuantityEvent
@@ -572,35 +573,37 @@ warrantExerciseTrigger issuanceData triggerId =
     None
     issuanceData.exercise_triggers
 
-warrantExerciseQuantity : WarrantIssuanceOcfData -> WarrantExerciseOcfData -> OcfWarrantConversionRight -> Optional Decimal
-warrantExerciseQuantity issuanceData exerciseData conversionRight =
+warrantExerciseQuantity : CapTableMaps -> WarrantIssuanceOcfData -> WarrantExerciseOcfData -> OcfWarrantConversionRight -> Update (Optional Decimal)
+warrantExerciseQuantity maps issuanceData exerciseData conversionRight =
   case conversionRight.conversion_mechanism of
-    OcfWarrantMechanismFixedAmount with converts_to_quantity ->
-      case exerciseData.quantity of
-        None -> Some converts_to_quantity
-        Some exercisedQuantity -> case issuanceData.quantity of
-          Some issuedQuantity ->
-            if issuedQuantity > 0.0
-              then Some (converts_to_quantity * exercisedQuantity / issuedQuantity)
-              else None
-          None -> None
-    _ -> None
+    OcfWarrantMechanismFixedAmount with converts_to_quantity -> do
+      exercisedQuantityOpt <- case exerciseData.quantity of
+        Some exercisedQuantity -> pure (Some exercisedQuantity)
+        None -> warrantSecurityQuantityBeforeTerminal maps issuanceData exerciseData.date
+      case (issuanceData.quantity, exercisedQuantityOpt) of
+        (Some issuedQuantity, Some exercisedQuantity) ->
+          if issuedQuantity > 0.0
+            then pure (Some (converts_to_quantity * exercisedQuantity / issuedQuantity))
+            else pure None
+        _ -> pure None
+    _ -> pure None
 
 warrantExerciseResultTerms :
+  CapTableMaps ->
   WarrantIssuanceOcfData ->
   WarrantExerciseOcfData ->
   Update (Optional (Text, Optional Decimal))
-warrantExerciseResultTerms issuanceData exerciseData =
+warrantExerciseResultTerms maps issuanceData exerciseData =
   case warrantExerciseTrigger issuanceData exerciseData.trigger_id of
     Some trigger ->
       case trigger.conversion_right of
         OcfRightWarrant conversionRight ->
           case conversionRight.converts_to_stock_class_id of
-            Some stockClassId ->
-              let quantityOpt = case conversionRight.conversion_mechanism of
-                    OcfWarrantMechanismFixedAmount _ -> warrantExerciseQuantity issuanceData exerciseData conversionRight
-                    _ -> None
-              in pure (Some (stockClassId, quantityOpt))
+            Some stockClassId -> do
+              quantityOpt <- case conversionRight.conversion_mechanism of
+                OcfWarrantMechanismFixedAmount _ -> warrantExerciseQuantity maps issuanceData exerciseData conversionRight
+                _ -> pure None
+              pure (Some (stockClassId, quantityOpt))
             None -> pure None
         _ -> pure None
     None -> do
@@ -608,11 +611,12 @@ warrantExerciseResultTerms issuanceData exerciseData =
       pure None
 
 warrantExerciseOutputShareLot :
+  CapTableMaps ->
   WarrantIssuanceOcfData ->
   WarrantExerciseOcfData ->
   Update (Optional StockClassShareLot)
-warrantExerciseOutputShareLot issuanceData exerciseData = do
-  resultTermsOpt <- warrantExerciseResultTerms issuanceData exerciseData
+warrantExerciseOutputShareLot maps issuanceData exerciseData = do
+  resultTermsOpt <- warrantExerciseResultTerms maps issuanceData exerciseData
   case resultTermsOpt of
     Some (stockClassId, Some quantity) ->
       pure (Some (StockClassShareLot with
@@ -643,18 +647,25 @@ equityCompensationExerciseOutputShareLot issuanceData exerciseData =
     None -> pure None
 
 equityCompensationReleaseOutputShareLot :
+  CapTableMaps ->
   EquityCompensationIssuanceOcfData ->
   EquityCompensationReleaseOcfData ->
-  Optional StockClassShareLot
-equityCompensationReleaseOutputShareLot issuanceData releaseData =
+  Update (Optional StockClassShareLot)
+equityCompensationReleaseOutputShareLot maps issuanceData releaseData =
   case issuanceData.stock_class_id of
-    Some stockClassId ->
-      Some (StockClassShareLot with
+    Some stockClassId -> do
+      quantity <- stockClassQuantityAtSortKey
+        maps
+        stockClassId
+        releaseData.date
+        releaseData.quantity
+        (releaseData.settlement_date, 1, 0)
+      pure (Some (StockClassShareLot with
         stock_class_id = stockClassId
         security_id = None
         event_date = releaseData.settlement_date
-        quantity = releaseData.quantity)
-    None -> None
+        quantity = quantity))
+    None -> pure None
 
 validateExpectedStockResultIssuances :
   CapTableMaps ->
@@ -684,7 +695,7 @@ validateWarrantExerciseResultTerms maps =
         else case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
           Some issuanceCid -> do
             issuance <- fetch issuanceCid
-            resultTermsOpt <- warrantExerciseResultTerms issuance.issuance_data exercise.exercise_data
+            resultTermsOpt <- warrantExerciseResultTerms maps issuance.issuance_data exercise.exercise_data
             case resultTermsOpt of
               Some (stockClassId, quantityOpt) -> do
                 let label = "Warrant exercise " <> exercise.exercise_data.id
@@ -733,7 +744,8 @@ validateEquityCompensationResultTerms maps = do
       case Map.lookup release.release_data.security_id maps.equity_compensation_issuances_by_security_id of
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
-          case equityCompensationReleaseOutputShareLot issuance.issuance_data release.release_data of
+          expectedOutputOpt <- equityCompensationReleaseOutputShareLot maps issuance.issuance_data release.release_data
+          case expectedOutputOpt of
             Some expectedOutput ->
               validateExpectedStockResultIssuances
                 maps
@@ -790,7 +802,7 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
         else case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
           Some issuanceCid -> do
             issuance <- fetch issuanceCid
-            lotOpt <- warrantExerciseOutputShareLot issuance.issuance_data exercise.exercise_data
+            lotOpt <- warrantExerciseOutputShareLot maps issuance.issuance_data exercise.exercise_data
             pure (addOptionalStockClassShareLot lotOpt index)
           None -> pure index)
     stockConversionLots
@@ -820,7 +832,8 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
         else case Map.lookup release.release_data.security_id maps.equity_compensation_issuances_by_security_id of
           Some issuanceCid -> do
             issuance <- fetch issuanceCid
-            pure (addOptionalStockClassShareLot (equityCompensationReleaseOutputShareLot issuance.issuance_data release.release_data) index)
+            lotOpt <- equityCompensationReleaseOutputShareLot maps issuance.issuance_data release.release_data
+            pure (addOptionalStockClassShareLot lotOpt index)
           None -> pure index)
     equityExerciseLots
     (Map.values maps.equity_compensation_releases)
@@ -1046,13 +1059,6 @@ stockClassShareEventDate event = case event of
   StockClassShareMultiplier with event_date -> event_date
   StockClassShareRetraction with event_date -> event_date
 
-stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
-stockClassShareEventOnOrAfter earliest event = case event of
-  StockClassShareDelta with event_date -> event_date >= earliest
-  StockClassShareTerminalDelta with event_date -> event_date >= earliest
-  StockClassShareMultiplier with event_date -> event_date >= earliest
-  StockClassShareRetraction with event_date -> event_date >= earliest
-
 stockClassShareEventOnOrBefore : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrBefore latest event = case event of
   StockClassShareDelta with event_date -> event_date <= latest
@@ -1218,28 +1224,64 @@ stockClassShareEventIndex maps = do
     Map.empty
     (Map.values maps.stock_class_splits)
 
+  reissuanceSuccessorSortKeys <- foldlA
+    (\index reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (foldl
+        (\updatedIndex securityId -> Map.insert securityId (reissuance.reissuance_data.date, 3, 0) updatedIndex)
+        index
+        reissuance.reissuance_data.resulting_security_ids))
+    Map.empty
+    (Map.values maps.stock_reissuances)
+
+  successorSortKeys <- foldlA
+    (\index consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      pure (Map.insert
+        consolidation.consolidation_data.resulting_security_id
+        (consolidation.consolidation_data.date, 3, 0)
+        index))
+    reissuanceSuccessorSortKeys
+    (Map.values maps.stock_consolidations)
+
   pure StockClassShareEventIndex with
     stock_security_events_by_security_id = retractionEventsBySecurityId
     stock_class_split_events_by_stock_class_id = splitEventsByStockClassId
+    stock_successor_sort_keys_by_security_id = Some successorSortKeys
+
+stockClassShareLotSortKey : StockClassShareEventIndex -> StockClassShareLot -> (Time, Int, Int)
+stockClassShareLotSortKey eventIndex lot =
+  let defaultSortKey = (lot.event_date, 0, 0)
+  in case lot.security_id of
+    Some securityId -> case Map.lookup securityId (fromOptional Map.empty eventIndex.stock_successor_sort_keys_by_security_id) of
+      Some successorSortKey ->
+        let (successorDate, _, _) = successorSortKey
+        in if successorDate == lot.event_date then successorSortKey else defaultSortKey
+      None -> defaultSortKey
+    None -> defaultSortKey
 
 stockClassShareLotEvents : StockClassShareEventIndex -> StockClassShareLot -> [StockClassShareEvent]
 stockClassShareLotEvents eventIndex lot =
-  let securityEvents = case lot.security_id of
+  let lotSortKey = stockClassShareLotSortKey eventIndex lot
+      (_, lotPriority, _) = lotSortKey
+      securityEvents = case lot.security_id of
         Some securityId -> fromOptional [] (Map.lookup securityId eventIndex.stock_security_events_by_security_id)
         None -> []
       splitEvents =
         filter
-          (stockClassShareEventOnOrAfter lot.event_date)
+          (\event -> stockClassShareEventSortKey event >= lotSortKey)
           (fromOptional [] (Map.lookup lot.stock_class_id eventIndex.stock_class_split_events_by_stock_class_id))
   in (StockClassShareDelta with
       event_date = lot.event_date
-      event_priority = 0
+      event_priority = lotPriority
       quantity_delta = lot.quantity)
     :: (securityEvents ++ splitEvents)
 
 stockClassShareLotPlanAllocationEvents : StockClassShareEventIndex -> StockClassShareLot -> [StockClassShareEvent]
 stockClassShareLotPlanAllocationEvents eventIndex lot =
-  let retractionEvents = case lot.security_id of
+  let lotSortKey = stockClassShareLotSortKey eventIndex lot
+      (_, lotPriority, _) = lotSortKey
+      retractionEvents = case lot.security_id of
         Some securityId ->
           filter
             (\event -> case event of
@@ -1249,11 +1291,11 @@ stockClassShareLotPlanAllocationEvents eventIndex lot =
         None -> []
       splitEvents =
         filter
-          (stockClassShareEventOnOrAfter lot.event_date)
+          (\event -> stockClassShareEventSortKey event >= lotSortKey)
           (fromOptional [] (Map.lookup lot.stock_class_id eventIndex.stock_class_split_events_by_stock_class_id))
   in (StockClassShareDelta with
       event_date = lot.event_date
-      event_priority = 0
+      event_priority = lotPriority
       quantity_delta = lot.quantity)
     :: (retractionEvents ++ splitEvents)
 

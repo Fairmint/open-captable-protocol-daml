@@ -4,7 +4,7 @@ import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
 import Fairmint.OpenCapTable.OCF.EquityCompensationRelease
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, stockSuccessorIssuance)
+import OpenCapTable.TestHelpers (addPrerequisites, stockClassSplitOn, stockSuccessorIssuance)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import qualified DA.Date as DA
@@ -12,8 +12,8 @@ import DA.Date (Month(..))
 import qualified DA.Time as DT
 import Daml.Script
 
-addEquityCompensationReleaseIssuance : Party -> ContractId CT.CapTable -> Text -> Text -> Text -> Decimal -> Script (ContractId CT.CapTable)
-addEquityCompensationReleaseIssuance issuer capTableCid issuanceId securityId stakeholderId quantity = do
+addEquityCompensationReleaseIssuanceWithStockClass : Party -> ContractId CT.CapTable -> Text -> Text -> Text -> Decimal -> Optional Text -> Script (ContractId CT.CapTable)
+addEquityCompensationReleaseIssuanceWithStockClass issuer capTableCid issuanceId securityId stakeholderId quantity stockClassId = do
   result <- submit issuer do
     exerciseCmd capTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
@@ -34,13 +34,17 @@ addEquityCompensationReleaseIssuance issuer capTableCid issuanceId securityId st
         early_exercisable = None
         exercise_price = None
         expiration_date = None
-        stock_class_id = None
+        stock_class_id = stockClassId
         stock_plan_id = None
         stockholder_approval_date = None
         vesting_terms_id = None]
       edits = []
       deletes = []
   pure result.updatedCapTableCid
+
+addEquityCompensationReleaseIssuance : Party -> ContractId CT.CapTable -> Text -> Text -> Text -> Decimal -> Script (ContractId CT.CapTable)
+addEquityCompensationReleaseIssuance issuer capTableCid issuanceId securityId stakeholderId quantity =
+  addEquityCompensationReleaseIssuanceWithStockClass issuer capTableCid issuanceId securityId stakeholderId quantity None
 
 
 -- Test: Create and archive RSU release/settlement
@@ -89,6 +93,41 @@ testCreateAndArchiveEquityCompensationReleaseQuarterly = script do
         resulting_security_ids = ["SEC_STOCK_102", "SEC_STOCK_103"]
         consideration_text = None
         comments = ["Q3 2024 quarterly vest", "Net settlement after tax withholding"]]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationRelease_AdjustsResultAcrossSettlementSplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  capTableCid <- addEquityCompensationReleaseIssuanceWithStockClass
+    issuer
+    capTableCid
+    "EC-ISS-RSU-SETTLEMENT-SPLIT"
+    "SEC-RSU-SETTLEMENT-SPLIT"
+    "SH-1"
+    100.0
+    (Some "SC_COMMON")
+  let releaseDate = DT.time (DA.date 2024 Apr 01) 0 0 0
+      splitDate = DT.time (DA.date 2024 Apr 02) 0 0 0
+      settlementDate = DT.time (DA.date 2024 Apr 03) 0 0 0
+
+  _ <- submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassSplit (stockClassSplitOn "TX-EC-RELEASE-SETTLEMENT-SPLIT" "SC_COMMON" 2.0 1.0 splitDate)
+        , stockSuccessorIssuance "STOCK-ISS-EC-RELEASE-SETTLEMENT-SPLIT" "SEC-STOCK-EC-RELEASE-SETTLEMENT-SPLIT" "SH-1" "SC_COMMON" settlementDate 200.0
+        , CT.OcfCreateEquityCompensationRelease EquityCompensationReleaseOcfData with
+            id = "TX-EC-RELEASE-SETTLEMENT-SPLIT"
+            date = releaseDate
+            security_id = "SEC-RSU-SETTLEMENT-SPLIT"
+            settlement_date = settlementDate
+            release_price = OcfMonetary with amount = 10.0; currency = "USD"
+            quantity = 100.0
+            resulting_security_ids = ["SEC-STOCK-EC-RELEASE-SETTLEMENT-SPLIT"]
+            consideration_text = None
+            comments = []
+        ]
       edits = []
       deletes = []
   pure ()
