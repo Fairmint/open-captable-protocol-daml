@@ -426,6 +426,19 @@ testStockClassAuthorizedSharesReplacementAllowedInSameBatch = script do
       deletes = [CT.OcfDeleteStockClassAuthorizedSharesAdjustment "TX_AUTH_REPLACE_OLD"]
   pure ()
 
+testStockClassDeleteWithLiveStockIssuanceFailsForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_DELETE_LIVE_LOTS" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_DELETE_LIVE_LOTS" "Delete Live Lots Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_DELETE_LIVE_LOTS" "SEC_DELETE_LIVE_LOTS" stakeholderId stockClassId) with quantity = 50.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockClass stockClassId]
+
 testSameDateLowerStockClassAuthorizedSharesAdjustmentWins = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -669,6 +682,39 @@ testStockConversionCreditsDestinationClassForCeiling = script do
       edits = []
       deletes = []
 
+testStockConversionMissingDestinationClassFailsForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  let preferredClassId = "SC_CONVERSION_MISSING_DEST_SOURCE"
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [stockClassConversionRightTo "SC_CONVERSION_MISSING_DEST"]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer cap_table preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_MISSING_DEST" "Conversion Missing Destination Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CONVERSION_MISSING_DEST_SOURCE" "SEC_CONVERSION_MISSING_DEST_SOURCE" stakeholderId preferredClassId) with quantity = 50.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConversion (stockConversion "TX_CONVERSION_MISSING_DEST" "SEC_CONVERSION_MISSING_DEST_SOURCE" 50.0)]
+      edits = []
+      deletes = []
+
+testStockConversionMissingSourceIssuanceFailsForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_MISSING_SOURCE_COMMON" 100.0)
+  let preferredClassId = "SC_CONVERSION_MISSING_SOURCE"
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [stockClassConversionRightTo commonClassId]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_MISSING_SOURCE" "Conversion Missing Source Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CONVERSION_MISSING_SOURCE_ISSUED" "SEC_CONVERSION_MISSING_SOURCE" stakeholderId preferredClassId) with quantity = 50.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConversion (stockConversion "TX_CONVERSION_MISSING_SOURCE" "SEC_CONVERSION_MISSING_SOURCE" 50.0)]
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance "TX_CONVERSION_MISSING_SOURCE_ISSUED"]
+
 testStockConversionWithPartialResultingIssuancesFailsForCeiling = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -858,6 +904,29 @@ testWarrantExerciseWithUnknownOutputQuantityFailsForCeiling = script do
       edits = []
       deletes = []
 
+testNonFixedWarrantExerciseRequiresResultingStockIssuanceForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_NON_FIXED" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_NON_FIXED" "Warrant Non Fixed Holder"
+  let issuance = (warrantIssuance "TX_WARRANT_NON_FIXED_ISSUED" "WSEC_NON_FIXED" stakeholderId stockClassId 1.0) with
+        exercise_triggers = [warrantCustomExerciseTrigger "TRIGGER_CUSTOM_NON_FIXED" stockClassId]
+  result <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise
+            ((warrantExercise "TX_WARRANT_NON_FIXED_EXERCISE" "WSEC_NON_FIXED" 1.0) with
+              trigger_id = "TRIGGER_CUSTOM_NON_FIXED")
+        ]
+      edits = []
+      deletes = []
+
 testWarrantExerciseWithUnknownTriggerFailsForCeiling = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -1000,3 +1069,59 @@ testUnlimitedStockClassAuthorizedSharesAllowsLargeIssuance = script do
 
   _ <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_UNLIMITED" "SEC_UNLIMITED" stakeholderId stockClassId) with quantity = 2_000_000.0)
   pure ()
+
+testBalanceSecurityReplacementPreservesAuthorizedShareHeadroom = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_BALANCE_SUCCESSOR" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_BALANCE_SUCCESSOR" "Balance Successor Holder"
+  let sourceSecurityId = "SEC_BALANCE_SUCCESSOR_SOURCE"
+  let balanceSecurityId = "SEC_BALANCE_SUCCESSOR_REMAINDER"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_BALANCE_SUCCESSOR_SOURCE" sourceSecurityId stakeholderId stockClassId) with quantity = 100.0)
+  let cancellation = (stockCancellation "TX_BALANCE_SUCCESSOR_CANCEL" sourceSecurityId 50.0) with
+        balance_security_id = Some balanceSecurityId
+  let balanceIssuance = (defaultStockIssuance "TX_BALANCE_SUCCESSOR_REMAINDER" balanceSecurityId stakeholderId stockClassId) with quantity = 50.0
+  let replacementIssuance = (defaultStockIssuance "TX_BALANCE_SUCCESSOR_REPLACEMENT" "SEC_BALANCE_SUCCESSOR_REPLACEMENT" stakeholderId stockClassId) with quantity = 50.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockIssuance balanceIssuance
+        , CT.OcfCreateStockIssuance replacementIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockTransferPartialResultingIssuanceCoverageFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_TRANSFER_PARTIAL_RESULTS" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_TRANSFER_PARTIAL_RESULTS" "Partial Transfer Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_TRANSFER_PARTIAL_SOURCE" "SEC_TRANSFER_PARTIAL_SOURCE" stakeholderId stockClassId) with quantity = 100.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer (stockTransfer "TX_TRANSFER_PARTIAL_RESULTS" "SEC_TRANSFER_PARTIAL_SOURCE" 100.0 ["SEC_TRANSFER_PARTIAL_PRESENT", "SEC_TRANSFER_PARTIAL_MISSING"])
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_TRANSFER_PARTIAL_PRESENT" "SEC_TRANSFER_PARTIAL_PRESENT" stakeholderId stockClassId) with quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockReissuancePartialResultingIssuanceCoverageFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REISSUE_PARTIAL_RESULTS" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REISSUE_PARTIAL_RESULTS" "Partial Reissuance Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_REISSUE_PARTIAL_SOURCE" "SEC_REISSUE_PARTIAL_SOURCE" stakeholderId stockClassId) with quantity = 100.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUE_PARTIAL_RESULTS" "SEC_REISSUE_PARTIAL_SOURCE" ["SEC_REISSUE_PARTIAL_PRESENT", "SEC_REISSUE_PARTIAL_MISSING"])
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUE_PARTIAL_PRESENT" "SEC_REISSUE_PARTIAL_PRESENT" stakeholderId stockClassId) with quantity = 50.0)
+        ]
+      edits = []
+      deletes = []

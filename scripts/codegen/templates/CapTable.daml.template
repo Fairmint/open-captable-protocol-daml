@@ -122,6 +122,10 @@ data StockClassShareEvent
   | StockClassShareRetraction with
       event_date: Time
       event_priority: Int
+  | StockClassShareTerminalDelta with
+      event_date: Time
+      event_priority: Int
+      quantity_delta: Decimal
   deriving (Eq, Show)
 
 data StockClassShareLot = StockClassShareLot with
@@ -134,6 +138,12 @@ data StockClassShareLot = StockClassShareLot with
 data StockClassShareEventIndex = StockClassShareEventIndex with
     stock_security_events_by_security_id: Map Text [StockClassShareEvent]
     stock_class_split_events_by_stock_class_id: Map Text [StockClassShareEvent]
+    stock_plan_retraction_events_by_security_id: Optional (Map Text [StockClassShareEvent])
+  deriving (Eq, Show)
+
+data StockPlanSuccessorIndex = StockPlanSuccessorIndex with
+    stock_successors_by_security_id: Map Text (Time, Optional Text)
+    equity_compensation_successors_by_security_id: Map Text (Time, Optional Text)
   deriving (Eq, Show)
 
 authorizedSharesCeiling : OcfInitialSharesAuthorized -> AuthorizedSharesCeiling
@@ -231,6 +241,16 @@ allResultingStockIssuancesExist : CapTableMaps -> [Text] -> Bool
 allResultingStockIssuancesExist maps securityIds =
   not (null securityIds) && all (\securityId -> isSome (Map.lookup securityId maps.stock_issuances_by_security_id)) securityIds
 
+stockBalanceSecurityIssuanceExists : CapTableMaps -> Optional Text -> Bool
+stockBalanceSecurityIssuanceExists maps balanceSecurityId = case balanceSecurityId of
+  Some securityId -> isSome (Map.lookup securityId maps.stock_issuances_by_security_id)
+  None -> True
+
+equityCompensationBalanceSecurityIssuanceExists : CapTableMaps -> Optional Text -> Bool
+equityCompensationBalanceSecurityIssuanceExists maps balanceSecurityId = case balanceSecurityId of
+  Some securityId -> isSome (Map.lookup securityId maps.equity_compensation_issuances_by_security_id)
+  None -> True
+
 noResultingStockIssuancesExist : CapTableMaps -> [Text] -> Bool
 noResultingStockIssuancesExist maps securityIds =
   all (\securityId -> isNone (Map.lookup securityId maps.stock_issuances_by_security_id)) securityIds
@@ -327,6 +347,9 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
     Some sourceStockClass ->
       case sourceStockClass.conversion_rights of
         [conversionRight] -> do
+          assertMsg
+            ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
+            (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
           outputQuantity <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
           pure (Some (StockClassShareLot with
             stock_class_id = conversionRight.converts_to_stock_class_id
@@ -368,27 +391,15 @@ warrantExerciseOutputShareLot issuanceData exerciseData =
         OcfRightWarrant conversionRight ->
           case conversionRight.converts_to_stock_class_id of
             Some stockClassId ->
-              case (conversionRight.conversion_mechanism, exerciseData.quantity, issuanceData.quantity) of
-                (OcfWarrantMechanismFixedAmount _, _, _) ->
+              case conversionRight.conversion_mechanism of
+                OcfWarrantMechanismFixedAmount _ ->
                   pure (Some (StockClassShareLot with
                     stock_class_id = stockClassId
                     security_id = None
                     event_date = exerciseData.date
                     quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, Some _, _) ->
-                  pure (Some (StockClassShareLot with
-                    stock_class_id = stockClassId
-                    security_id = None
-                    event_date = exerciseData.date
-                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, None, Some _) ->
-                  pure (Some (StockClassShareLot with
-                    stock_class_id = stockClassId
-                    security_id = None
-                    event_date = exerciseData.date
-                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, None, None) -> do
-                  assertMsg ("Warrant exercise output cannot be reconstructed because exercise and issuance quantities are missing: " <> exerciseData.id) False
+                _ -> do
+                  assertMsg ("Warrant exercise output cannot be reconstructed for a non-fixed conversion mechanism; a resulting stock issuance is required: " <> exerciseData.id) False
                   pure None
             None -> do
               assertMsg ("Warrant exercise output cannot be reconstructed because trigger has no destination stock class: " <> exerciseData.trigger_id) False
@@ -456,12 +467,14 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
       assertNoPartialResultingStockIssuanceCoverage ("Stock conversion " <> conversion.conversion_data.id) maps conversion.conversion_data.resulting_security_ids
       if allResultingStockIssuancesExist maps conversion.conversion_data.resulting_security_ids
         then pure index
-        else case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            lotOpt <- stockConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
-            pure (addOptionalStockClassShareLot lotOpt index)
-          None -> pure index)
+          else case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
+            Some sourceIssuanceCid -> do
+              sourceIssuance <- fetch sourceIssuanceCid
+              lotOpt <- stockConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
+              pure (addOptionalStockClassShareLot lotOpt index)
+            None -> do
+              assertMsg ("Stock conversion references missing source stock issuance: " <> conversion.conversion_data.security_id) False
+              pure index)
     stockIssuanceLots
     (Map.values maps.stock_conversions)
 
@@ -716,21 +729,24 @@ issuerAuthorizedLimitAt adjustmentHistory issuerData asOf =
     Some adjustment -> Some adjustment.new_shares_authorized
     None -> issuerAuthorizedSharesLimit issuerData.initial_shares_authorized
 
-stockClassShareEventSortKey : StockClassShareEvent -> (Time, Int)
+stockClassShareEventSortKey : StockClassShareEvent -> (Time, Int, Int)
 stockClassShareEventSortKey event = case event of
-  StockClassShareDelta with event_date; event_priority -> (event_date, event_priority)
-  StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority)
-  StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority)
+  StockClassShareDelta with event_date; event_priority -> (event_date, event_priority, 0)
+  StockClassShareTerminalDelta with event_date; event_priority -> (event_date, event_priority, 1)
+  StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority, 2)
+  StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority, 3)
 
 stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrAfter earliest event = case event of
   StockClassShareDelta with event_date -> event_date >= earliest
+  StockClassShareTerminalDelta with event_date -> event_date >= earliest
   StockClassShareMultiplier with event_date -> event_date >= earliest
   StockClassShareRetraction with event_date -> event_date >= earliest
 
 stockClassShareEventOnOrBefore : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrBefore latest event = case event of
   StockClassShareDelta with event_date -> event_date <= latest
+  StockClassShareTerminalDelta with event_date -> event_date <= latest
   StockClassShareMultiplier with event_date -> event_date <= latest
   StockClassShareRetraction with event_date -> event_date <= latest
 
@@ -739,6 +755,9 @@ applyStockClassShareEvent current event = case event of
   StockClassShareDelta with quantity_delta ->
     let next = current + quantity_delta
     in if next < 0.0 then None else Some next
+  StockClassShareTerminalDelta with quantity_delta ->
+    let next = current + quantity_delta
+    in if next < 0.0 then None else Some 0.0
   StockClassShareMultiplier with ratio -> Some (current * ratio.numerator / ratio.denominator)
   StockClassShareRetraction _ _ -> Some 0.0
 
@@ -747,6 +766,21 @@ applyStockClassShareEventOptional currentOpt event =
   case currentOpt of
     Some current -> applyStockClassShareEvent current event
     None -> None
+
+stockSecurityReductionEvents : Time -> Decimal -> Optional Text -> [StockClassShareEvent]
+stockSecurityReductionEvents eventDate quantity balanceSecurityId = case balanceSecurityId of
+  Some _ ->
+    [ StockClassShareTerminalDelta with
+        event_date = eventDate
+        event_priority = 2
+        quantity_delta = 0.0 - quantity
+    ]
+  None ->
+    [ StockClassShareDelta with
+        event_date = eventDate
+        event_priority = 1
+        quantity_delta = 0.0 - quantity
+    ]
 
 addStockClassShareEvent : Text -> StockClassShareEvent -> Map Text [StockClassShareEvent] -> Map Text [StockClassShareEvent]
 addStockClassShareEvent key event index =
@@ -765,53 +799,41 @@ stockClassShareEventIndex maps = do
   cancellationEventsBySecurityId <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (addStockClassShareEvent
-        cancellation.cancellation_data.security_id
-        (StockClassShareDelta with
-            event_date = cancellation.cancellation_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - cancellation.cancellation_data.quantity)
-        index))
+      let events = stockSecurityReductionEvents cancellation.cancellation_data.date cancellation.cancellation_data.quantity cancellation.cancellation_data.balance_security_id
+      if stockBalanceSecurityIssuanceExists maps cancellation.cancellation_data.balance_security_id
+        then pure (addStockClassShareEvents cancellation.cancellation_data.security_id events index)
+        else pure index)
     Map.empty
     (Map.values maps.stock_cancellations)
 
   repurchaseEventsBySecurityId <- foldlA
     (\index repurchaseCid -> do
       repurchase <- fetch repurchaseCid
-      pure (addStockClassShareEvent
-        repurchase.repurchase_data.security_id
-        (StockClassShareDelta with
-            event_date = repurchase.repurchase_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - repurchase.repurchase_data.quantity)
-        index))
+      let events = stockSecurityReductionEvents repurchase.repurchase_data.date repurchase.repurchase_data.quantity repurchase.repurchase_data.balance_security_id
+      if stockBalanceSecurityIssuanceExists maps repurchase.repurchase_data.balance_security_id
+        then pure (addStockClassShareEvents repurchase.repurchase_data.security_id events index)
+        else pure index)
     cancellationEventsBySecurityId
     (Map.values maps.stock_repurchases)
 
   conversionEventsBySecurityId <- foldlA
     (\index conversionCid -> do
       conversion <- fetch conversionCid
-      pure (addStockClassShareEvent
-        conversion.conversion_data.security_id
-        (StockClassShareDelta with
-            event_date = conversion.conversion_data.date
-            event_priority = 1
-            quantity_delta = 0.0 - conversion.conversion_data.quantity_converted)
-        index))
+      let events = stockSecurityReductionEvents conversion.conversion_data.date conversion.conversion_data.quantity_converted conversion.conversion_data.balance_security_id
+      if stockBalanceSecurityIssuanceExists maps conversion.conversion_data.balance_security_id
+        then pure (addStockClassShareEvents conversion.conversion_data.security_id events index)
+        else pure index)
     repurchaseEventsBySecurityId
     (Map.values maps.stock_conversions)
 
   transferEventsBySecurityId <- foldlA
     (\index transferCid -> do
       transfer <- fetch transferCid
+      assertNoPartialResultingStockIssuanceCoverage ("Stock transfer " <> transfer.transfer_data.id) maps transfer.transfer_data.resulting_security_ids
+      let events = stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id
       if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
-        then pure (addStockClassShareEvent
-          transfer.transfer_data.security_id
-          (StockClassShareDelta with
-              event_date = transfer.transfer_data.date
-              event_priority = 1
-              quantity_delta = 0.0 - transfer.transfer_data.quantity)
-          index)
+          && stockBalanceSecurityIssuanceExists maps transfer.transfer_data.balance_security_id
+        then pure (addStockClassShareEvents transfer.transfer_data.security_id events index)
         else pure index)
     conversionEventsBySecurityId
     (Map.values maps.stock_transfers)
@@ -819,6 +841,7 @@ stockClassShareEventIndex maps = do
   reissuanceEventsBySecurityId <- foldlA
     (\index reissuanceCid -> do
       reissuance <- fetch reissuanceCid
+      assertNoPartialResultingStockIssuanceCoverage ("Stock reissuance " <> reissuance.reissuance_data.id) maps reissuance.reissuance_data.resulting_security_ids
       if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
         then pure (addStockClassShareEvent
           reissuance.reissuance_data.security_id
@@ -844,16 +867,17 @@ stockClassShareEventIndex maps = do
     reissuanceEventsBySecurityId
     (Map.values maps.stock_consolidations)
 
-  retractionEventsBySecurityId <- foldlA
-    (\index retractionCid -> do
+  (retractionEventsBySecurityId, planRetractionEventsBySecurityId) <- foldlA
+    (\(shareIndex, planIndex) retractionCid -> do
       retraction <- fetch retractionCid
-      pure (addStockClassShareEvent
-        retraction.retraction_data.security_id
-        (StockClassShareRetraction with
+      let event = StockClassShareRetraction with
             event_date = retraction.retraction_data.date
-            event_priority = 3)
-        index))
-    consolidationEventsBySecurityId
+            event_priority = 3
+      pure
+        ( addStockClassShareEvent retraction.retraction_data.security_id event shareIndex
+        , addStockClassShareEvent retraction.retraction_data.security_id event planIndex
+        ))
+    (consolidationEventsBySecurityId, Map.empty)
     (Map.values maps.stock_retractions)
 
   splitEventsByStockClassId <- foldlA
@@ -871,6 +895,7 @@ stockClassShareEventIndex maps = do
 
   pure StockClassShareEventIndex with
     stock_security_events_by_security_id = retractionEventsBySecurityId
+    stock_plan_retraction_events_by_security_id = Some planRetractionEventsBySecurityId
     stock_class_split_events_by_stock_class_id = splitEventsByStockClassId
 
 stockClassShareLotEvents : StockClassShareEventIndex -> StockClassShareLot -> [StockClassShareEvent]
@@ -896,7 +921,7 @@ stockClassShareLotPlanAllocationEvents eventIndex lot =
             (\event -> case event of
               StockClassShareRetraction _ _ -> True
               _ -> False)
-            (fromOptional [] (Map.lookup securityId eventIndex.stock_security_events_by_security_id))
+            (fromOptional [] (Map.lookup securityId (fromOptional Map.empty eventIndex.stock_plan_retraction_events_by_security_id)))
         None -> []
       splitEvents =
         filter
@@ -1174,7 +1199,33 @@ validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHist
               (stockClassTotal <= issuerLimit)
           None ->
             assertMsg ("Issuer authorized shares exceeded on " <> show asOf <> ": stock class authorization is unlimited but issuer authorization is finite") False)
-    validationDates
+    (issuerContract.issuer_data.formation_date :: validationDates)
+
+validateStockClassShareLotReferences :
+  Map Text StockClassOcfData ->
+  Map Text [StockClassShareLot] ->
+  Update ()
+validateStockClassShareLotReferences stockClassIndex lotsByStockClass =
+  mapA_
+    (\stockClassId ->
+      assertMsg
+        ("Stock class share lot references missing stock class: " <> stockClassId)
+        (isSome (Map.lookup stockClassId stockClassIndex)))
+    (Map.keys lotsByStockClass)
+
+validateIssuerAuthorizedShareAdjustmentReferences :
+  CapTableMaps ->
+  ContractId Issuer ->
+  Update ()
+validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid = do
+  issuerContract <- fetch issuerCid
+  mapA_
+    (\adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      assertMsg
+        ("Issuer authorized shares adjustment references another issuer: " <> adjustment.adjustment_data.id)
+        (adjustment.adjustment_data.issuer_id == issuerContract.issuer_data.id))
+    (Map.values maps.issuer_authorized_shares_adjustments)
 
 validateIssuerReference : ContractId Issuer -> Text -> Update ()
 validateIssuerReference issuerCid issuerId = do
@@ -1561,24 +1612,273 @@ assertNonNegativeQuantity : Text -> Decimal -> Update ()
 assertNonNegativeQuantity label quantity =
   assertMsg (label <> " cannot be negative: " <> show quantity) (quantity >= 0.0)
 
-stockIssuancePlanAllocationIndex : StockClassShareEventIndex -> CapTableMaps -> Update (Map Text Decimal)
-stockIssuancePlanAllocationIndex eventIndex maps =
+addPlanSuccessor : Time -> Text -> Text -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addPlanSuccessor producedAt stockPlanId securityId index =
+  case Map.lookup securityId index of
+    Some (existingDate, existingPlanIdOpt) ->
+      let earliestDate = if producedAt < existingDate then producedAt else existingDate
+          inheritedPlanIdOpt = case existingPlanIdOpt of
+            Some existingPlanId -> if existingPlanId == stockPlanId then Some stockPlanId else None
+            None -> None
+      in Map.insert securityId (earliestDate, inheritedPlanIdOpt) index
+    None -> Map.insert securityId (producedAt, Some stockPlanId) index
+
+addOptionalPlanSuccessor : Time -> Text -> Optional Text -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addOptionalPlanSuccessor producedAt stockPlanId securityIdOpt index = case securityIdOpt of
+  Some securityId -> addPlanSuccessor producedAt stockPlanId securityId index
+  None -> index
+
+addPlanSuccessors : Time -> Text -> [Text] -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addPlanSuccessors producedAt stockPlanId securityIds index =
+  foldl (\updatedIndex securityId -> addPlanSuccessor producedAt stockPlanId securityId updatedIndex) index securityIds
+
+declaredPlanForSecurity : Map Text Text -> Map Text (Time, Optional Text) -> Text -> Optional Text
+declaredPlanForSecurity declaredPlans successorIndex securityId =
+  case Map.lookup securityId declaredPlans of
+    Some stockPlanId -> Some stockPlanId
+    None -> case Map.lookup securityId successorIndex of
+      Some (_, stockPlanIdOpt) -> stockPlanIdOpt
+      None -> None
+
+addInheritedPlanSuccessorsForSource :
+  Map Text Text ->
+  Map Text (Time, Optional Text) ->
+  Text ->
+  Time ->
+  Optional Text ->
+  [Text] ->
+  Map Text (Time, Optional Text)
+addInheritedPlanSuccessorsForSource declaredPlans successorIndex sourceSecurityId producedAt balanceSecurityId resultingSecurityIds =
+  case declaredPlanForSecurity declaredPlans successorIndex sourceSecurityId of
+    Some stockPlanId ->
+      let withBalance = addOptionalPlanSuccessor producedAt stockPlanId balanceSecurityId successorIndex
+      in addPlanSuccessors producedAt stockPlanId resultingSecurityIds withBalance
+    None -> successorIndex
+
+successorCarriesPlanAllocation : Map Text (Time, Optional Text) -> Text -> Optional Text -> Bool
+successorCarriesPlanAllocation successorIndex securityId declaredPlanIdOpt =
+  case Map.lookup securityId successorIndex of
+    Some (_, Some inheritedPlanId) -> case declaredPlanIdOpt of
+      Some declaredPlanId -> declaredPlanId == inheritedPlanId
+      None -> True
+    _ -> False
+
+successorCarriesPlanAllocationOnOrBefore : Map Text (Time, Optional Text) -> Text -> Optional Text -> Time -> Bool
+successorCarriesPlanAllocationOnOrBefore successorIndex securityId declaredPlanIdOpt asOf =
+  case Map.lookup securityId successorIndex of
+    Some (producedAt, Some inheritedPlanId) ->
+      producedAt <= asOf && case declaredPlanIdOpt of
+        Some declaredPlanId -> declaredPlanId == inheritedPlanId
+        None -> True
+    _ -> False
+
+effectivePlanIndex : Map Text Text -> Map Text (Time, Optional Text) -> Map Text Text
+effectivePlanIndex declaredPlans successorIndex =
+  foldl
+    (\plans (securityId, (_, stockPlanIdOpt)) ->
+      case (Map.lookup securityId plans, stockPlanIdOpt) of
+        (None, Some stockPlanId) -> Map.insert securityId stockPlanId plans
+        _ -> plans)
+    declaredPlans
+    (Map.toList successorIndex)
+
+mergePlanIndexes : Map Text Text -> Map Text Text -> Map Text Text
+mergePlanIndexes base additions =
+  foldl
+    (\plans (securityId, stockPlanId) ->
+      if isSome (Map.lookup securityId plans) then plans else Map.insert securityId stockPlanId plans)
+    base
+    (Map.toList additions)
+
+equityPlanSuccessorPass : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+equityPlanSuccessorPass maps declaredPlans initialIndex = do
+  cancellationSuccessors <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addInheritedPlanSuccessorsForSource
+        declaredPlans
+        index
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id
+        []))
+    initialIndex
+    (Map.values maps.equity_compensation_cancellations)
+
+  foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addInheritedPlanSuccessorsForSource
+        declaredPlans
+        index
+        transfer.transfer_data.security_id
+        transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids))
+    cancellationSuccessors
+    (Map.values maps.equity_compensation_transfers)
+
+stabilizeEquityPlanSuccessors : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stabilizeEquityPlanSuccessors maps declaredPlans currentIndex = do
+  nextIndex <- equityPlanSuccessorPass maps declaredPlans currentIndex
+  if nextIndex == currentIndex
+    then pure currentIndex
+    else stabilizeEquityPlanSuccessors maps declaredPlans nextIndex
+
+stockPlanSuccessorPass : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stockPlanSuccessorPass maps sourcePlans initialIndex = do
+  cancellationSuccessors <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id []))
+    initialIndex
+    (Map.values maps.stock_cancellations)
+
+  repurchaseSuccessors <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index repurchase.repurchase_data.security_id repurchase.repurchase_data.date repurchase.repurchase_data.balance_security_id []))
+    cancellationSuccessors
+    (Map.values maps.stock_repurchases)
+
+  transferSuccessors <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids))
+    repurchaseSuccessors
+    (Map.values maps.stock_transfers)
+
+  conversionSuccessors <- foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index conversion.conversion_data.security_id conversion.conversion_data.date conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids))
+    transferSuccessors
+    (Map.values maps.stock_conversions)
+
+  reissuanceSuccessors <- foldlA
+    (\index reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index reissuance.reissuance_data.security_id reissuance.reissuance_data.date None reissuance.reissuance_data.resulting_security_ids))
+    conversionSuccessors
+    (Map.values maps.stock_reissuances)
+
+  consolidationSuccessors <- foldlA
+    (\index consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      foldlA
+        (\nextIndex sourceSecurityId ->
+          pure (addInheritedPlanSuccessorsForSource sourcePlans nextIndex sourceSecurityId consolidation.consolidation_data.date None [consolidation.consolidation_data.resulting_security_id]))
+        index
+        consolidation.consolidation_data.security_ids)
+    reissuanceSuccessors
+    (Map.values maps.stock_consolidations)
+
+  exerciseSuccessors <- foldlA
+    (\index exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index exercise.exercise_data.security_id exercise.exercise_data.date None exercise.exercise_data.resulting_security_ids))
+    consolidationSuccessors
+    (Map.values maps.equity_compensation_exercises)
+
+  foldlA
+    (\index releaseCid -> do
+      release <- fetch releaseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index release.release_data.security_id release.release_data.settlement_date None release.release_data.resulting_security_ids))
+    exerciseSuccessors
+    (Map.values maps.equity_compensation_releases)
+
+stabilizeStockPlanSuccessors : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stabilizeStockPlanSuccessors maps sourcePlans currentIndex = do
+  nextIndex <- stockPlanSuccessorPass maps sourcePlans currentIndex
+  if nextIndex == currentIndex
+    then pure currentIndex
+    else stabilizeStockPlanSuccessors maps sourcePlans nextIndex
+
+stockPlanSuccessorIndex : CapTableMaps -> Update StockPlanSuccessorIndex
+stockPlanSuccessorIndex maps = do
+  equityDeclaredPlans <- foldlA
+    (\index issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure $ case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> Map.insert issuance.issuance_data.security_id stockPlanId index
+        None -> index)
+    Map.empty
+    (Map.values maps.equity_compensation_issuances)
+  equitySuccessors <- stabilizeEquityPlanSuccessors maps equityDeclaredPlans Map.empty
+  let equityEffectivePlans = effectivePlanIndex equityDeclaredPlans equitySuccessors
+
+  stockDeclaredPlans <- foldlA
+    (\index issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure $ case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> Map.insert issuance.issuance_data.security_id stockPlanId index
+        None -> index)
+    Map.empty
+    (Map.values maps.stock_issuances)
+  let stockSourcePlans = mergePlanIndexes stockDeclaredPlans equityEffectivePlans
+  stockSuccessors <- stabilizeStockPlanSuccessors maps stockSourcePlans Map.empty
+
+  pure StockPlanSuccessorIndex with
+    stock_successors_by_security_id = stockSuccessors
+    equity_compensation_successors_by_security_id = equitySuccessors
+
+stockIssuancePlanAllocationIndex : StockClassShareEventIndex -> StockPlanSuccessorIndex -> CapTableMaps -> Update (Map Text Decimal)
+stockIssuancePlanAllocationIndex eventIndex successorIndex maps =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId -> do
-          let lot = stockIssuanceShareLot issuance.issuance_data
-          case stockClassShareLotPlanAllocatedQuantity eventIndex lot of
-            Some allocationQuantity -> do
-              assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
-              pure (addQuantityById stockPlanId allocationQuantity totals)
-            None -> do
-              assertMsg ("Stock issuance plan allocation has an invalid quantity for " <> issuance.issuance_data.id) False
-              pure totals
-        None -> pure totals)
+      if successorCarriesPlanAllocation
+          successorIndex.stock_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+        then pure totals
+        else case issuance.issuance_data.stock_plan_id of
+          Some stockPlanId -> do
+            let lot = stockIssuanceShareLot issuance.issuance_data
+            case stockClassShareLotPlanAllocatedQuantity eventIndex lot of
+              Some allocationQuantity -> do
+                assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
+                pure (addQuantityById stockPlanId allocationQuantity totals)
+              None -> do
+                assertMsg ("Stock issuance plan allocation has an invalid quantity for " <> issuance.issuance_data.id) False
+                pure totals
+          None -> pure totals)
     Map.empty
     (Map.values maps.stock_issuances)
+
+equityCompensationPlanStockClassIds : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [Text]
+equityCompensationPlanStockClassIds maps issuanceData =
+  case issuanceData.stock_class_id of
+    Some stockClassId -> pure [stockClassId]
+    None -> case issuanceData.stock_plan_id of
+      Some stockPlanId -> case Map.lookup stockPlanId maps.stock_plans of
+        Some stockPlanCid -> do
+          stockPlan <- fetch stockPlanCid
+          pure stockPlan.plan_data.stock_class_ids
+        None -> pure []
+      None -> pure []
+
+equityCompensationPlanSplitEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
+equityCompensationPlanSplitEvents maps issuanceData = do
+  stockClassIds <- equityCompensationPlanStockClassIds maps issuanceData
+  splitEvents <- foldlA
+    (\events splitCid -> do
+      split <- fetch splitCid
+      if split.split_data.stock_class_id `elem` stockClassIds && split.split_data.date >= issuanceData.date
+        then pure ((StockClassShareMultiplier with
+          event_date = split.split_data.date
+          event_priority = 2
+          ratio = split.split_data.split_ratio) :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_class_splits)
+  case (issuanceData.stock_class_id, stockClassIds, splitEvents) of
+    (None, _ :: _ :: _, _ :: _) -> do
+      assertMsg
+        ("Equity compensation issuance without stock_class_id cannot be split-adjusted across multiple stock-plan classes: " <> issuanceData.id)
+        False
+      pure []
+    _ -> pure splitEvents
 
 equityCompensationPlanAllocationEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
 equityCompensationPlanAllocationEvents maps issuanceData = do
@@ -1593,20 +1893,7 @@ equityCompensationPlanAllocationEvents maps issuanceData = do
     []
     (Map.values maps.equity_compensation_retractions)
 
-  splitEvents <- case issuanceData.stock_class_id of
-    Some stockClassId ->
-      foldlA
-        (\events splitCid -> do
-          split <- fetch splitCid
-          if split.split_data.stock_class_id == stockClassId && split.split_data.date >= issuanceData.date
-            then pure ((StockClassShareMultiplier with
-              event_date = split.split_data.date
-              event_priority = 2
-              ratio = split.split_data.split_ratio) :: events)
-            else pure events)
-        []
-        (Map.values maps.stock_class_splits)
-    None -> pure []
+  splitEvents <- equityCompensationPlanSplitEvents maps issuanceData
 
   pure ((StockClassShareDelta with
       event_date = issuanceData.date
@@ -1635,23 +1922,28 @@ equityCompensationPlanAllocatedQuantityAt maps issuanceData asOf = do
           (filter (stockClassShareEventOnOrBefore asOf) events)))
     else pure (Some 0.0)
 
-equityCompensationPlanAllocationIndex : CapTableMaps -> Update (Map Text Decimal)
-equityCompensationPlanAllocationIndex maps =
+equityCompensationPlanAllocationIndex : StockPlanSuccessorIndex -> CapTableMaps -> Update (Map Text Decimal)
+equityCompensationPlanAllocationIndex successorIndex maps =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId -> do
-          assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) issuance.issuance_data.quantity
-          allocationQuantityOpt <- equityCompensationPlanAllocatedQuantity maps issuance.issuance_data
-          case allocationQuantityOpt of
-            Some allocationQuantity -> do
-              assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
-              pure (addQuantityById stockPlanId allocationQuantity totals)
-            None -> do
-              assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id) False
-              pure totals
-        None -> pure totals)
+      if successorCarriesPlanAllocation
+          successorIndex.equity_compensation_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+        then pure totals
+        else case issuance.issuance_data.stock_plan_id of
+          Some stockPlanId -> do
+            assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) issuance.issuance_data.quantity
+            allocationQuantityOpt <- equityCompensationPlanAllocatedQuantity maps issuance.issuance_data
+            case allocationQuantityOpt of
+              Some allocationQuantity -> do
+                assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
+                pure (addQuantityById stockPlanId allocationQuantity totals)
+              None -> do
+                assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id) False
+                pure totals
+          None -> pure totals)
     Map.empty
     (Map.values maps.equity_compensation_issuances)
 
@@ -1663,7 +1955,10 @@ stockPlanReturnToPoolStockClassId maps securityId =
       pure (Some issuance.issuance_data.stock_class_id)
     (None, Some equityCompensationCid) -> do
       issuance <- fetch equityCompensationCid
-      pure issuance.issuance_data.stock_class_id
+      stockClassIds <- equityCompensationPlanStockClassIds maps issuance.issuance_data
+      case stockClassIds of
+        [stockClassId] -> pure (Some stockClassId)
+        _ -> pure None
     (Some _, Some _) -> do
       assertMsg ("Stock plan return-to-pool security id is ambiguous: " <> securityId) False
       pure None
@@ -1738,17 +2033,24 @@ stockPlanReturnedQuantityBySecurityAt maps securityId asOf =
       if returnToPool.return_data.security_id == securityId && returnToPool.return_data.date <= asOf
         then do
           assertNonNegativeQuantity ("Stock plan return-to-pool quantity for " <> returnToPool.return_data.id <> " on " <> show asOf) returnToPool.return_data.quantity
-          pure (total + returnToPool.return_data.quantity)
+          returnedQuantityOpt <- stockPlanReturnToPoolQuantityAt maps returnToPool.return_data asOf
+          case returnedQuantityOpt of
+            Some returnedQuantity -> do
+              assertNonNegativeQuantity ("Stock plan split-adjusted return-to-pool quantity for " <> returnToPool.return_data.id <> " on " <> show asOf) returnedQuantity
+              pure (total + returnedQuantity)
+            None -> do
+              assertMsg ("Stock plan return-to-pool has an invalid quantity history for " <> returnToPool.return_data.id <> " on " <> show asOf) False
+              pure total
         else pure total)
     0.0
     (Map.values maps.stock_plan_return_to_pools)
 
-equityCompensationSecurityEvents : CapTableMaps -> Text -> Update [StockClassShareEvent]
-equityCompensationSecurityEvents maps securityId = do
+equityCompensationSecurityEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
+equityCompensationSecurityEvents maps issuanceData = do
   cancellationEvents <- foldlA
     (\events cancellationCid -> do
       cancellation <- fetch cancellationCid
-      if cancellation.cancellation_data.security_id == securityId
+      if cancellation.cancellation_data.security_id == issuanceData.security_id
         then pure ((StockClassShareDelta with
           event_date = cancellation.cancellation_data.date
           event_priority = 1
@@ -1760,7 +2062,7 @@ equityCompensationSecurityEvents maps securityId = do
   exerciseEvents <- foldlA
     (\events exerciseCid -> do
       exercise <- fetch exerciseCid
-      if exercise.exercise_data.security_id == securityId
+      if exercise.exercise_data.security_id == issuanceData.security_id
         then pure ((StockClassShareDelta with
           event_date = exercise.exercise_data.date
           event_priority = 1
@@ -1772,7 +2074,7 @@ equityCompensationSecurityEvents maps securityId = do
   releaseEvents <- foldlA
     (\events releaseCid -> do
       release <- fetch releaseCid
-      if release.release_data.security_id == securityId
+      if release.release_data.security_id == issuanceData.security_id
         then pure ((StockClassShareDelta with
           event_date = release.release_data.settlement_date
           event_priority = 1
@@ -1781,10 +2083,10 @@ equityCompensationSecurityEvents maps securityId = do
     exerciseEvents
     (Map.values maps.equity_compensation_releases)
 
-  foldlA
+  retractionEvents <- foldlA
     (\events retractionCid -> do
       retraction <- fetch retractionCid
-      if retraction.retraction_data.security_id == securityId
+      if retraction.retraction_data.security_id == issuanceData.security_id
         then pure ((StockClassShareRetraction with
           event_date = retraction.retraction_data.date
           event_priority = 3) :: events)
@@ -1792,9 +2094,13 @@ equityCompensationSecurityEvents maps securityId = do
     releaseEvents
     (Map.values maps.equity_compensation_retractions)
 
+  splitEvents <- equityCompensationPlanSplitEvents maps issuanceData
+
+  pure (retractionEvents ++ splitEvents)
+
 equityCompensationCurrentQuantity : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update (Optional Decimal)
 equityCompensationCurrentQuantity maps issuanceData = do
-  events <- equityCompensationSecurityEvents maps issuanceData.security_id
+  events <- equityCompensationSecurityEvents maps issuanceData
   pure (foldl
     applyStockClassShareEventOptional
     (Some issuanceData.quantity)
@@ -1804,62 +2110,92 @@ equityCompensationQuantityAt : CapTableMaps -> EquityCompensationIssuanceOcfData
 equityCompensationQuantityAt maps issuanceData asOf = do
   if issuanceData.date <= asOf
     then do
-      events <- equityCompensationSecurityEvents maps issuanceData.security_id
+      events <- equityCompensationSecurityEvents maps issuanceData
       pure (foldl
         applyStockClassShareEventOptional
         (Some issuanceData.quantity)
         (sortOn stockClassShareEventSortKey (filter (stockClassShareEventOnOrBefore asOf) events)))
     else pure (Some 0.0)
 
-stockPlanSecurityReturnableQuantityAt : StockClassShareEventIndex -> CapTableMaps -> StockPlanReturnToPoolOcfData -> Time -> Update Decimal
-stockPlanSecurityReturnableQuantityAt eventIndex maps returnData asOf = do
+stockPlanReturnableSplitEvents : CapTableMaps -> Optional Text -> Update [StockClassShareEvent]
+stockPlanReturnableSplitEvents maps stockClassIdOpt = case stockClassIdOpt of
+  Some stockClassId ->
+    foldlA
+      (\events splitCid -> do
+        split <- fetch splitCid
+        if split.split_data.stock_class_id == stockClassId
+          then pure ((StockClassShareMultiplier with
+            event_date = split.split_data.date
+            event_priority = 2
+            ratio = split.split_data.split_ratio) :: events)
+          else pure events)
+      []
+      (Map.values maps.stock_class_splits)
+  None -> pure []
+
+stockPlanCancellationQuantityAt : Text -> [StockClassShareEvent] -> Time -> Update Decimal
+stockPlanCancellationQuantityAt securityId events asOf =
+  case foldl
+      applyStockClassShareEventOptional
+      (Some 0.0)
+      (sortOn stockClassShareEventSortKey (filter (stockClassShareEventOnOrBefore asOf) events)) of
+    Some quantity -> do
+      assertNonNegativeQuantity ("Stock plan split-adjusted cancellation quantity for " <> securityId <> " on " <> show asOf) quantity
+      pure quantity
+    None -> do
+      assertMsg ("Stock plan cancellation quantity history is invalid for " <> securityId <> " on " <> show asOf) False
+      pure 0.0
+
+stockCancellationQuantityAt : CapTableMaps -> StockIssuanceOcfData -> Time -> Update Decimal
+stockCancellationQuantityAt maps issuanceData asOf = do
+  cancellationEvents <- foldlA
+    (\events cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      if cancellation.cancellation_data.security_id == issuanceData.security_id
+          && stockBalanceSecurityIssuanceExists maps cancellation.cancellation_data.balance_security_id
+        then pure ((StockClassShareDelta with
+          event_date = cancellation.cancellation_data.date
+          event_priority = 1
+          quantity_delta = cancellation.cancellation_data.quantity) :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_cancellations)
+  splitEvents <- stockPlanReturnableSplitEvents maps (Some issuanceData.stock_class_id)
+  stockPlanCancellationQuantityAt issuanceData.security_id (cancellationEvents ++ splitEvents) asOf
+
+equityCompensationCancellationQuantityAt : CapTableMaps -> EquityCompensationIssuanceOcfData -> Time -> Update Decimal
+equityCompensationCancellationQuantityAt maps issuanceData asOf = do
+  cancellationEvents <- foldlA
+    (\events cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      if cancellation.cancellation_data.security_id == issuanceData.security_id
+          && equityCompensationBalanceSecurityIssuanceExists maps cancellation.cancellation_data.balance_security_id
+        then pure ((StockClassShareDelta with
+          event_date = cancellation.cancellation_data.date
+          event_priority = 1
+          quantity_delta = cancellation.cancellation_data.quantity) :: events)
+        else pure events)
+    []
+    (Map.values maps.equity_compensation_cancellations)
+  splitEvents <- stockPlanReturnableSplitEvents maps issuanceData.stock_class_id
+  stockPlanCancellationQuantityAt issuanceData.security_id (cancellationEvents ++ splitEvents) asOf
+
+stockPlanSecurityReturnableQuantityAt : CapTableMaps -> StockPlanReturnToPoolOcfData -> Time -> Update Decimal
+stockPlanSecurityReturnableQuantityAt maps returnData asOf = do
   let stockCidOpt = Map.lookup returnData.security_id maps.stock_issuances_by_security_id
   let equityCompensationCidOpt = Map.lookup returnData.security_id maps.equity_compensation_issuances_by_security_id
   case (stockCidOpt, equityCompensationCidOpt) of
     (Some stockCid, None) -> do
       issuance <- fetch stockCid
       case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId -> do
-          assertMsg
-            ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
-            (stockPlanId == returnData.stock_plan_id)
-          let lot = stockIssuanceShareLot issuance.issuance_data
-          case (stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf, stockClassShareLotQuantityAt eventIndex lot asOf) of
-            (Some allocationQuantity, Some outstandingQuantity) -> do
-              assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
-              assertNonNegativeQuantity ("Stock issuance outstanding quantity for " <> issuance.issuance_data.id) outstandingQuantity
-              let returnableQuantity = allocationQuantity - outstandingQuantity
-              assertMsg
-                ("Stock plan return-to-pool quantity basis is invalid for " <> returnData.security_id)
-                (returnableQuantity >= 0.0)
-              pure returnableQuantity
-            _ -> do
-              assertMsg ("Stock plan return-to-pool security has invalid stock quantity history: " <> returnData.security_id) False
-              pure 0.0
+        Some _ -> stockCancellationQuantityAt maps issuance.issuance_data asOf
         None -> do
           assertMsg ("Stock plan return to pool references non-plan stock security: " <> returnData.security_id) False
           pure 0.0
     (None, Some equityCompensationCid) -> do
       issuance <- fetch equityCompensationCid
       case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId -> do
-          assertMsg
-            ("Stock plan return to pool references security " <> returnData.security_id <> " from stock plan " <> stockPlanId <> " but returns to " <> returnData.stock_plan_id)
-            (stockPlanId == returnData.stock_plan_id)
-          allocationQuantityOpt <- equityCompensationPlanAllocatedQuantityAt maps issuance.issuance_data asOf
-          outstandingQuantityOpt <- equityCompensationQuantityAt maps issuance.issuance_data asOf
-          case (allocationQuantityOpt, outstandingQuantityOpt) of
-            (Some allocationQuantity, Some outstandingQuantity) -> do
-              assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id) allocationQuantity
-              assertNonNegativeQuantity ("Equity compensation outstanding quantity for " <> issuance.issuance_data.id) outstandingQuantity
-              let returnableQuantity = allocationQuantity - outstandingQuantity
-              assertMsg
-                ("Stock plan return-to-pool quantity basis is invalid for " <> returnData.security_id)
-                (returnableQuantity >= 0.0)
-              pure returnableQuantity
-            _ -> do
-              assertMsg ("Stock plan return-to-pool security has invalid equity compensation quantity history: " <> returnData.security_id) False
-              pure 0.0
+        Some _ -> equityCompensationCancellationQuantityAt maps issuance.issuance_data asOf
         None -> do
           assertMsg ("Stock plan return to pool references non-plan equity compensation security: " <> returnData.security_id) False
           pure 0.0
@@ -1870,12 +2206,12 @@ stockPlanSecurityReturnableQuantityAt eventIndex maps returnData asOf = do
       assertMsg ("Stock plan return to pool security not found: " <> returnData.security_id) False
       pure 0.0
 
-validateStockPlanReturnToPoolQuantities : StockClassShareEventIndex -> CapTableMaps -> Update ()
-validateStockPlanReturnToPoolQuantities eventIndex maps = do
+validateStockPlanReturnToPoolQuantities : CapTableMaps -> Update ()
+validateStockPlanReturnToPoolQuantities maps = do
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
-      securityAllocation <- stockPlanSecurityReturnableQuantityAt eventIndex maps returnToPool.return_data returnToPool.return_data.date
+      securityAllocation <- stockPlanSecurityReturnableQuantityAt maps returnToPool.return_data returnToPool.return_data.date
       returnedQuantity <- stockPlanReturnedQuantityBySecurityAt maps returnToPool.return_data.security_id returnToPool.return_data.date
       assertMsg
         ("Stock plan return to pool exceeds returnable quantity for " <> returnToPool.return_data.security_id <> ": returned " <> show returnedQuantity <> " exceeds returnable " <> show securityAllocation)
@@ -1884,55 +2220,68 @@ validateStockPlanReturnToPoolQuantities eventIndex maps = do
 
 stockPlanNetAllocatedQuantityIndex : StockClassShareEventIndex -> CapTableMaps -> Update (Map Text Decimal)
 stockPlanNetAllocatedQuantityIndex eventIndex maps = do
-  stockAllocation <- stockIssuancePlanAllocationIndex eventIndex maps
-  equityCompensationAllocation <- equityCompensationPlanAllocationIndex maps
+  successorIndex <- stockPlanSuccessorIndex maps
+  stockAllocation <- stockIssuancePlanAllocationIndex eventIndex successorIndex maps
+  equityCompensationAllocation <- equityCompensationPlanAllocationIndex successorIndex maps
   returnedQuantity <- stockPlanReturnedQuantityIndex maps
   let combinedAllocation = mergeQuantityMaps stockAllocation equityCompensationAllocation
   let netAllocatedByPlan = mergeQuantityMaps combinedAllocation (negateQuantityMap returnedQuantity)
   pure netAllocatedByPlan
 
-stockIssuancePlanAllocationIndexAt : StockClassShareEventIndex -> CapTableMaps -> Time -> Update (Map Text Decimal)
-stockIssuancePlanAllocationIndexAt eventIndex maps asOf =
+stockIssuancePlanAllocationIndexAt : StockClassShareEventIndex -> StockPlanSuccessorIndex -> CapTableMaps -> Time -> Update (Map Text Decimal)
+stockIssuancePlanAllocationIndexAt eventIndex successorIndex maps asOf =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId ->
-          if issuance.issuance_data.date <= asOf
-            then do
-              let lot = stockIssuanceShareLot issuance.issuance_data
-              case stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf of
-                Some allocationQuantity -> do
-                  assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
-                  pure (addQuantityById stockPlanId allocationQuantity totals)
-                None -> do
-                  assertMsg ("Stock issuance plan allocation has an invalid quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) False
-                  pure totals
-            else pure totals
-        None -> pure totals)
+      if successorCarriesPlanAllocationOnOrBefore
+          successorIndex.stock_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+          asOf
+        then pure totals
+        else case issuance.issuance_data.stock_plan_id of
+          Some stockPlanId ->
+            if issuance.issuance_data.date <= asOf
+              then do
+                let lot = stockIssuanceShareLot issuance.issuance_data
+                case stockClassShareLotPlanAllocatedQuantityAt eventIndex lot asOf of
+                  Some allocationQuantity -> do
+                    assertNonNegativeQuantity ("Stock issuance plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
+                    pure (addQuantityById stockPlanId allocationQuantity totals)
+                  None -> do
+                    assertMsg ("Stock issuance plan allocation has an invalid quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) False
+                    pure totals
+              else pure totals
+          None -> pure totals)
     Map.empty
     (Map.values maps.stock_issuances)
 
-equityCompensationPlanAllocationIndexAt : CapTableMaps -> Time -> Update (Map Text Decimal)
-equityCompensationPlanAllocationIndexAt maps asOf =
+equityCompensationPlanAllocationIndexAt : StockPlanSuccessorIndex -> CapTableMaps -> Time -> Update (Map Text Decimal)
+equityCompensationPlanAllocationIndexAt successorIndex maps asOf =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.stock_plan_id of
-        Some stockPlanId ->
-          if issuance.issuance_data.date <= asOf
-            then do
-              assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) issuance.issuance_data.quantity
-              allocationQuantityOpt <- equityCompensationPlanAllocatedQuantityAt maps issuance.issuance_data asOf
-              case allocationQuantityOpt of
-                Some allocationQuantity -> do
-                  assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
-                  pure (addQuantityById stockPlanId allocationQuantity totals)
-                None -> do
-                  assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id <> " on " <> show asOf) False
-                  pure totals
-            else pure totals
-        None -> pure totals)
+      if successorCarriesPlanAllocationOnOrBefore
+          successorIndex.equity_compensation_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+          asOf
+        then pure totals
+        else case issuance.issuance_data.stock_plan_id of
+          Some stockPlanId ->
+            if issuance.issuance_data.date <= asOf
+              then do
+                assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) issuance.issuance_data.quantity
+                allocationQuantityOpt <- equityCompensationPlanAllocatedQuantityAt maps issuance.issuance_data asOf
+                case allocationQuantityOpt of
+                  Some allocationQuantity -> do
+                    assertNonNegativeQuantity ("Equity compensation plan allocation quantity for " <> issuance.issuance_data.id <> " on " <> show asOf) allocationQuantity
+                    pure (addQuantityById stockPlanId allocationQuantity totals)
+                  None -> do
+                    assertMsg ("Equity compensation plan allocation has an invalid quantity history for " <> issuance.issuance_data.id <> " on " <> show asOf) False
+                    pure totals
+              else pure totals
+          None -> pure totals)
     Map.empty
     (Map.values maps.equity_compensation_issuances)
 
@@ -1958,8 +2307,9 @@ stockPlanReturnedQuantityIndexAt maps asOf =
 
 stockPlanNetAllocatedQuantityIndexAt : StockClassShareEventIndex -> CapTableMaps -> Time -> Update (Map Text Decimal)
 stockPlanNetAllocatedQuantityIndexAt eventIndex maps asOf = do
-  stockAllocation <- stockIssuancePlanAllocationIndexAt eventIndex maps asOf
-  equityCompensationAllocation <- equityCompensationPlanAllocationIndexAt maps asOf
+  successorIndex <- stockPlanSuccessorIndex maps
+  stockAllocation <- stockIssuancePlanAllocationIndexAt eventIndex successorIndex maps asOf
+  equityCompensationAllocation <- equityCompensationPlanAllocationIndexAt successorIndex maps asOf
   returnedQuantity <- stockPlanReturnedQuantityIndexAt maps asOf
   let combinedAllocation = mergeQuantityMaps stockAllocation equityCompensationAllocation
   pure (mergeQuantityMaps combinedAllocation (negateQuantityMap returnedQuantity))
@@ -2121,10 +2471,13 @@ validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
         (\asOf -> do
           netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndexAt eventIndex maps asOf
           validateStockPlanAllocationReferences maps netAllocatedQuantityIndex
+          let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
+          assertNonNegativeQuantity
+            ("Stock plan allocated quantity for " <> stockPlan.plan_data.id <> " on " <> show asOf)
+            allocatedQuantity
           if stockPlanEffectiveOnOrBefore asOf stockPlan.plan_data
             then do
               let reservedShares = stockPlanReservedSharesAt adjustmentHistory stockPlan.plan_data asOf
-              let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
               assertMsg
                 ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> " on " <> show asOf <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
                 (allocatedQuantity <= reservedShares)
@@ -2137,7 +2490,7 @@ validateStockPlanPoolCeilings eventIndex maps = do
   adjustmentIndex <- stockPlanPoolAdjustmentIndex maps
   adjustmentHistory <- stockPlanPoolAdjustmentHistoryIndex maps
   validateStockPlanAllocationEffectiveDates maps
-  validateStockPlanReturnToPoolQuantities eventIndex maps
+  validateStockPlanReturnToPoolQuantities maps
   validateStockPlanReservedShares eventIndex maps adjustmentIndex
   validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory
 
@@ -2154,6 +2507,8 @@ validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
   stockClassAdjustmentHistory <- stockClassAuthorizedAdjustmentHistoryIndex maps
   stockClassValidationDates <- stockClassAuthorizedValidationDateIndex maps lotsByStockClass
   issuerAdjustmentHistory <- issuerAuthorizedAdjustmentHistoryIndex maps
+  validateStockClassShareLotReferences stockClassIndex lotsByStockClass
+  validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid
   validateAllStockClassAuthorizedShares eventIndex stockClasses lotsByStockClass adjustmentIndex
   validateStockClassAuthorizedSharesAtDates eventIndex stockClasses lotsByStockClass stockClassAdjustmentHistory stockClassValidationDates
   validateIssuerAuthorizedShares stockClasses maps adjustmentIndex issuerCid
