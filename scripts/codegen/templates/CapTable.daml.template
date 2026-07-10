@@ -18,7 +18,7 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
@@ -337,20 +337,6 @@ stockClassConversionOutputQuantity maps sourceStockClass conversionRight convers
         None -> pure None
     _ -> pure None
 
-stockClassConversionRightDateEligible : Time -> OcfStockClassConversionRight -> Bool
-stockClassConversionRightDateEligible conversionDate conversionRight =
-  let trigger = conversionRight.conversion_trigger
-      beforeExpiration = case conversionRight.expires_at of
-        Some expiresAt -> conversionDate <= expiresAt
-        None -> True
-      triggerDateEligible = case trigger.type_ of
-        OcfTriggerTypeTypeAutomaticOnDate -> trigger.trigger_date == Some conversionDate
-        OcfTriggerTypeTypeElectiveInRange -> case (trigger.start_date, trigger.end_date) of
-          (Some startDate, Some endDate) -> startDate <= conversionDate && conversionDate <= endDate
-          _ -> False
-        _ -> True
-  in beforeExpiration && triggerDateEligible
-
 stockConversionResultTerms :
   CapTableMaps ->
   Map Text StockClassOcfData ->
@@ -361,24 +347,23 @@ stockConversionResultTerms maps stockClassIndex sourceIssuanceData conversionDat
   case Map.lookup sourceIssuanceData.stock_class_id stockClassIndex of
     Some sourceStockClass -> do
       terms <- foldlA
-        (\resultTerms conversionRight ->
-          if stockClassConversionRightDateEligible conversionData.date conversionRight
-            then do
-              quantityOpt <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
-              case quantityOpt of
-                Some quantity -> do
-                  assertMsg
-                    ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
-                    (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
-                  pure ((StockConversionResultTerm with
-                    stock_class_id = conversionRight.converts_to_stock_class_id
-                    quantity = quantity) :: resultTerms)
-                None -> pure resultTerms
-            else pure resultTerms)
+        (\resultTerms conversionRight -> do
+          -- OCF StockClassConversionRight defines no trigger or expiration;
+          -- every schema-valid right is eligible for quantity calculation.
+          quantityOpt <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
+          case quantityOpt of
+            Some quantity -> do
+              assertMsg
+                ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
+                (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
+              pure ((StockConversionResultTerm with
+                stock_class_id = conversionRight.converts_to_stock_class_id
+                quantity = quantity) :: resultTerms)
+            None -> pure resultTerms)
         []
         sourceStockClass.conversion_rights
       assertMsg
-        ("Stock conversion has no computable date-eligible conversion right: " <> conversionData.id)
+        ("Stock conversion has no computable conversion right: " <> conversionData.id)
         (not (null terms))
       pure terms
     None -> do
@@ -402,7 +387,7 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
     [] -> pure None
     _ -> do
       assertMsg
-        ("Stock conversion output cannot be reconstructed without explicit results because multiple conversion rights are date-eligible: " <> conversionData.id)
+        ("Stock conversion output cannot be reconstructed without explicit results because multiple conversion rights are computable: " <> conversionData.id)
         False
       pure None
 
@@ -550,7 +535,7 @@ validateStockConversionResultIssuances maps conversionData expectedTerms = do
   case actualStockClassIdOpt of
     Some actualStockClassId ->
       assertMsg
-        ("Stock conversion results do not match any date-eligible conversion right for " <> conversionData.id <> ": found class " <> actualStockClassId <> " and quantity " <> show actualQuantity)
+        ("Stock conversion results do not match any conversion right for " <> conversionData.id <> ": found class " <> actualStockClassId <> " and quantity " <> show actualQuantity)
         (any
           (\expectedTerm ->
             expectedTerm.stock_class_id == actualStockClassId &&
@@ -1194,6 +1179,41 @@ stockSecurityQuantityBeforeTerminal :
 stockSecurityQuantityBeforeTerminal eventIndex issuanceData eventDate =
   stockSecurityQuantityBeforeEvent eventIndex issuanceData (eventDate, 2, 1)
 
+validateStockSuccessorShareNumberRanges :
+  Text ->
+  StockIssuanceOcfData ->
+  StockIssuanceOcfData ->
+  Update ()
+validateStockSuccessorShareNumberRanges label sourceIssuanceData successorIssuanceData =
+  case sourceIssuanceData.share_numbers_issued of
+    [] -> pure ()
+    sourceShareNumberRanges ->
+      assertMsg
+        (label <> " share numbers are outside the source issuance range for " <> successorIssuanceData.security_id)
+        (not (null successorIssuanceData.share_numbers_issued) &&
+          all
+            (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+            successorIssuanceData.share_numbers_issued)
+
+validateStockResultShareNumberRanges :
+  CapTableMaps ->
+  Text ->
+  StockIssuanceOcfData ->
+  [Text] ->
+  Update ()
+validateStockResultShareNumberRanges maps label sourceIssuanceData resultSecurityIds =
+  mapA_
+    (\resultSecurityId ->
+      case Map.lookup resultSecurityId maps.stock_issuances_by_security_id of
+        Some resultIssuanceCid -> do
+          resultIssuance <- fetch resultIssuanceCid
+          validateStockSuccessorShareNumberRanges label sourceIssuanceData resultIssuance.issuance_data
+        -- OCF lifecycle transactions may be imported without materializing
+        -- their resulting StockIssuance objects. Partial materialization is
+        -- rejected by the existing result-coverage validation.
+        None -> pure ())
+    resultSecurityIds
+
 validateStockBalanceSuccessor :
   CapTableMaps ->
   Text ->
@@ -1215,15 +1235,7 @@ validateStockBalanceSuccessor maps label sourceIssuanceData eventDate expectedQu
       assertMsg
         (label <> " balance quantity mismatch for " <> balanceSecurityId <> ": expected " <> show expectedQuantity <> ", found " <> show balanceIssuance.issuance_data.quantity)
         (balanceIssuance.issuance_data.quantity == expectedQuantity)
-      case sourceIssuanceData.share_numbers_issued of
-        [] -> pure ()
-        sourceShareNumberRanges ->
-          assertMsg
-            (label <> " balance result share numbers are outside the source issuance range for " <> balanceSecurityId)
-            (not (null balanceIssuance.issuance_data.share_numbers_issued) &&
-              all
-                (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
-                balanceIssuance.issuance_data.share_numbers_issued)
+      validateStockSuccessorShareNumberRanges label sourceIssuanceData balanceIssuance.issuance_data
     None ->
       assertMsg (label <> " balance stock issuance not found: " <> balanceSecurityId) False
 
@@ -1297,16 +1309,20 @@ validateStockBalanceSuccessors eventIndex maps = do
   mapA_
     (\transferCid -> do
       transfer <- fetch transferCid
-      case transfer.transfer_data.balance_security_id of
-        Some _ -> case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            validateStockTerminalBalanceSuccessor
-              eventIndex maps ("Stock transfer " <> transfer.transfer_data.id)
-              sourceIssuance.issuance_data transfer.transfer_data.date transfer.transfer_data.quantity
-              transfer.transfer_data.balance_security_id
-          None -> assertMsg ("Stock transfer source issuance not found: " <> transfer.transfer_data.security_id) False
-        None -> pure ())
+      case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
+        Some sourceIssuanceCid -> do
+          sourceIssuance <- fetch sourceIssuanceCid
+          let label = "Stock transfer " <> transfer.transfer_data.id
+          validateStockResultShareNumberRanges
+            maps label sourceIssuance.issuance_data transfer.transfer_data.resulting_security_ids
+          case transfer.transfer_data.balance_security_id of
+            Some _ ->
+              validateStockTerminalBalanceSuccessor
+                eventIndex maps label
+                sourceIssuance.issuance_data transfer.transfer_data.date transfer.transfer_data.quantity
+                transfer.transfer_data.balance_security_id
+            None -> pure ()
+        None -> assertMsg ("Stock transfer source issuance not found: " <> transfer.transfer_data.security_id) False)
     (Map.values maps.stock_transfers)
 
 addOptionalDecimal : Optional Decimal -> Optional Decimal -> Optional Decimal
