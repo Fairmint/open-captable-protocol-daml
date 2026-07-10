@@ -33,6 +33,8 @@ interface Validation {
   thirdMap?: string;
   // For array field validation (validates each element in the array)
   is_array?: boolean;
+  // OCF permits some required arrays to be empty while still requiring element references when present.
+  allow_empty_array?: boolean;
   // For Optional Text reference fields
   is_optional?: boolean;
 }
@@ -204,11 +206,12 @@ function discoverTypes(config: Config): TypeDef[] {
       map_field: pluralize(snakeName),
       tier,
       validations: validationFields.map((fieldSpec) => {
-        // Support five formats:
+        // Support six formats:
         // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
         // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
         // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
         // - Array: "security_ids[]:stock_issuances_by_security_id" -> field: security_ids, validates each element in array
+        // - Allow-empty array: "security_ids[*]:stock_issuances_by_security_id" -> validates any present elements
         // - Optional: "stock_plan_id?:stock_plans" -> field: stock_plan_id, validates only when Some
         if (fieldSpec.includes(':')) {
           const parts = fieldSpec.split(':');
@@ -219,9 +222,12 @@ function discoverTypes(config: Config): TypeDef[] {
           if (is_optional) {
             field = field.slice(0, -1); // Remove ? suffix
           }
-          // Check for array syntax (e.g., "security_ids[]")
-          const is_array = field.endsWith('[]');
-          if (is_array) {
+          // Check for array syntax (e.g., "security_ids[]" or allow-empty "security_ids[*]")
+          const allow_empty_array = field.endsWith('[*]');
+          const is_array = allow_empty_array || field.endsWith('[]');
+          if (allow_empty_array) {
+            field = field.slice(0, -3); // Remove [*] suffix
+          } else if (is_array) {
             field = field.slice(0, -2); // Remove [] suffix
           }
           const error = field.includes('security_id') ? 'Security not found' : `${toTitleCase(field)} not found`;
@@ -244,6 +250,7 @@ function discoverTypes(config: Config): TypeDef[] {
               thirdMap: maps[2],
               is_array,
               is_optional,
+              allow_empty_array,
             };
           }
           return {
@@ -252,6 +259,7 @@ function discoverTypes(config: Config): TypeDef[] {
             error,
             is_array,
             is_optional,
+            allow_empty_array,
           };
         }
         return {
