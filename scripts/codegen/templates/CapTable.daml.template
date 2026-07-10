@@ -1880,9 +1880,7 @@ equityCompensationSuccessorStockClassIds maps issuanceData =
       Some stockPlanId -> case Map.lookup stockPlanId maps.stock_plans of
         Some stockPlanCid -> do
           stockPlan <- fetch stockPlanCid
-          pure $ case stockPlan.plan_data.stock_class_ids of
-            [stockClassId] -> [None, Some stockClassId]
-            _ -> [None]
+          pure (None :: map Some stockPlan.plan_data.stock_class_ids)
         None -> pure [None]
       None -> pure [None]
 
@@ -2624,6 +2622,26 @@ stabilizeStockPlanSuccessors maps sourcePlans currentIndex = do
     then pure currentIndex
     else stabilizeStockPlanSuccessors maps sourcePlans nextIndex
 
+validateStockConsolidationPlanSources :
+  CapTableMaps ->
+  Map Text Text ->
+  Map Text (Time, Optional Text) ->
+  Update ()
+validateStockConsolidationPlanSources maps sourcePlans successorIndex =
+  mapA_
+    (\consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      let sourcePlanIds = map
+            (declaredPlanForSecurity sourcePlans successorIndex)
+            consolidation.consolidation_data.security_ids
+      case sourcePlanIds of
+        [] -> pure ()
+        firstPlanId :: remainingPlanIds ->
+          assertMsg
+            ("Stock consolidation " <> consolidation.consolidation_data.id <> " cannot combine sources with different stock-plan attribution")
+            (all (== firstPlanId) remainingPlanIds))
+    (Map.values maps.stock_consolidations)
+
 stockPlanSuccessorIndex : CapTableMaps -> Update StockPlanSuccessorIndex
 stockPlanSuccessorIndex maps = do
   equityDeclaredPlans <- foldlA
@@ -2647,6 +2665,7 @@ stockPlanSuccessorIndex maps = do
     (Map.values maps.stock_issuances)
   let stockSourcePlans = mergePlanIndexes stockDeclaredPlans equityEffectivePlans
   stockSuccessors <- stabilizeStockPlanSuccessors maps stockSourcePlans Map.empty
+  validateStockConsolidationPlanSources maps stockSourcePlans stockSuccessors
 
   pure StockPlanSuccessorIndex with
     stock_successors_by_security_id = stockSuccessors
@@ -3612,6 +3631,26 @@ stockPlanSecurityReturnableQuantityAt successorIndex maps returnData asOf = do
       assertMsg ("Stock plan return to pool security not found: " <> returnData.security_id) False
       pure 0.0
 
+stockPlanSecurityEffectivePlanId : StockPlanSuccessorIndex -> CapTableMaps -> Text -> Update (Optional Text)
+stockPlanSecurityEffectivePlanId successorIndex maps securityId =
+  case (Map.lookup securityId maps.stock_issuances_by_security_id, Map.lookup securityId maps.equity_compensation_issuances_by_security_id) of
+    (Some stockCid, None) -> do
+      issuance <- fetch stockCid
+      pure (effectivePlanForSecurity
+        successorIndex.stock_successors_by_security_id
+        issuance.issuance_data.security_id
+        issuance.issuance_data.stock_plan_id)
+    (None, Some equityCompensationCid) -> do
+      issuance <- fetch equityCompensationCid
+      pure (effectivePlanForSecurity
+        successorIndex.equity_compensation_successors_by_security_id
+        issuance.issuance_data.security_id
+        issuance.issuance_data.stock_plan_id)
+    (Some _, Some _) -> do
+      assertMsg ("Stock plan return to pool security id is ambiguous: " <> securityId) False
+      pure None
+    (None, None) -> pure None
+
 validateStockPlanReturnToPoolQuantities : CapTableMaps -> Update ()
 validateStockPlanReturnToPoolQuantities maps = do
   successorIndex <- stockPlanSuccessorIndex maps
@@ -3626,11 +3665,13 @@ validateStockPlanReturnToPoolQuantities maps = do
     (Map.values maps.stock_plan_return_to_pools)
 
 validateStockPlanReturnToPoolClasses : CapTableMaps -> Update ()
-validateStockPlanReturnToPoolClasses maps =
+validateStockPlanReturnToPoolClasses maps = do
+  successorIndex <- stockPlanSuccessorIndex maps
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
       stockClassIdOpt <- stockPlanReturnToPoolStockClassId maps returnToPool.return_data.security_id
+      sourcePlanIdOpt <- stockPlanSecurityEffectivePlanId successorIndex maps returnToPool.return_data.security_id
       case stockClassIdOpt of
         Some stockClassId ->
           assertStockPlanIncludesClass
@@ -3638,7 +3679,15 @@ validateStockPlanReturnToPoolClasses maps =
             maps
             returnToPool.return_data.stock_plan_id
             stockClassId
-        None -> pure ())
+        None -> case sourcePlanIdOpt of
+          Some sourcePlanId ->
+            assertMsg
+              ("Stock plan return-to-pool " <> returnToPool.return_data.id <> " cannot roll an ambiguous classless security into a different stock plan")
+              (returnToPool.return_data.stock_plan_id == sourcePlanId)
+          None ->
+            assertMsg
+              ("Stock plan return-to-pool " <> returnToPool.return_data.id <> " cannot determine the source stock plan")
+              False)
     (Map.values maps.stock_plan_return_to_pools)
 
 stockPlanNetAllocatedQuantityIndex : StockClassShareEventIndex -> CapTableMaps -> Update (Map Text Decimal)
