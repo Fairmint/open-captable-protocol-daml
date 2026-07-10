@@ -1522,6 +1522,20 @@ validateSecurityQuantityBalance securityId initialQuantity events = do
     (sortOn securityQuantityEventSortKey events)
   pure ()
 
+securityQuantityBeforeEvent :
+  Text ->
+  Optional Decimal ->
+  [SecurityQuantityEvent] ->
+  (Time, Int, Int) ->
+  Update (Optional Decimal)
+securityQuantityBeforeEvent securityId initialQuantity events targetSortKey =
+  foldlA
+    (validateSecurityQuantityBalanceEvent securityId)
+    initialQuantity
+    (filter
+      (\event -> securityQuantityEventSortKey event < targetSortKey)
+      (sortOn securityQuantityEventSortKey events))
+
 addSecurityQuantityEvent : Text -> SecurityQuantityEvent -> Map Text [SecurityQuantityEvent] -> Map Text [SecurityQuantityEvent]
 addSecurityQuantityEvent key event index =
   Map.insert key (event :: fromOptional [] (Map.lookup key index)) index
@@ -1641,6 +1655,27 @@ warrantSecurityQuantityEvents : NonStockSecurityBalanceEventIndex -> WarrantIssu
 warrantSecurityQuantityEvents eventIndex issuanceData =
   fromOptional [] (Map.lookup issuanceData.security_id eventIndex.warrant_events_by_security_id)
 
+warrantSecurityQuantityBeforeTerminal :
+  NonStockSecurityBalanceEventIndex ->
+  WarrantIssuanceOcfData ->
+  Time ->
+  Update (Optional Decimal)
+warrantSecurityQuantityBeforeTerminal eventIndex issuanceData eventDate =
+  let events = warrantSecurityQuantityEvents eventIndex issuanceData
+      targetSortKey = (eventDate, 2, 1)
+  in case issuanceData.quantity of
+    Some quantity ->
+      securityQuantityBeforeEvent
+        issuanceData.security_id
+        (Some 0.0)
+        ((SecurityQuantityDelta with
+            event_date = issuanceData.date
+            event_priority = 0
+            quantity_delta = quantity)
+          :: events)
+        targetSortKey
+    None -> securityQuantityBeforeEvent issuanceData.security_id None events targetSortKey
+
 validateWarrantSecurityBalance : NonStockSecurityBalanceEventIndex -> WarrantIssuanceOcfData -> Update ()
 validateWarrantSecurityBalance eventIndex issuanceData = do
   let events = warrantSecurityQuantityEvents eventIndex issuanceData
@@ -1689,6 +1724,29 @@ equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex issua
         None -> []
   in securityEvents ++ splitEvents
 
+equityCompensationSecurityQuantityBeforeTerminal :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  EquityCompensationIssuanceOcfData ->
+  Time ->
+  Update Decimal
+equityCompensationSecurityQuantityBeforeTerminal stockEventIndex balanceEventIndex issuanceData eventDate = do
+  let events = equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex issuanceData
+  quantityOpt <- securityQuantityBeforeEvent
+    issuanceData.security_id
+    (Some 0.0)
+    ((SecurityQuantityDelta with
+        event_date = issuanceData.date
+        event_priority = 0
+        quantity_delta = issuanceData.quantity)
+      :: events)
+    (eventDate, 2, 1)
+  case quantityOpt of
+    Some quantity -> pure quantity
+    None -> do
+      assertMsg ("Equity compensation quantity unexpectedly became unknown: " <> issuanceData.security_id) False
+      pure 0.0
+
 validateEquityCompensationSecurityBalance :
   StockClassShareEventIndex ->
   NonStockSecurityBalanceEventIndex ->
@@ -1714,10 +1772,144 @@ validateEquityCompensationSecurityBalances stockEventIndex balanceEventIndex map
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.stock_plan_id of
-        Some _ -> pure ()
-        None -> validateEquityCompensationSecurityBalance stockEventIndex balanceEventIndex issuance.issuance_data)
+      validateEquityCompensationSecurityBalance stockEventIndex balanceEventIndex issuance.issuance_data)
     (Map.values maps.equity_compensation_issuances)
+
+validateWarrantBalanceSuccessorQuantity :
+  CapTableMaps ->
+  Text ->
+  Time ->
+  Decimal ->
+  Text ->
+  Update ()
+validateWarrantBalanceSuccessorQuantity maps label eventDate expectedQuantity securityId =
+  case Map.lookup securityId maps.warrant_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        (label <> " balance result date mismatch for " <> securityId <> ": expected " <> show eventDate <> ", found " <> show issuance.issuance_data.date)
+        (issuance.issuance_data.date == eventDate)
+      case issuance.issuance_data.quantity of
+        Some actualQuantity ->
+          assertMsg
+            (label <> " balance quantity mismatch for " <> securityId <> ": expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+            (actualQuantity == expectedQuantity)
+        None -> assertMsg (label <> " balance warrant quantity is missing for " <> securityId) False
+    None -> assertMsg (label <> " balance warrant issuance not found: " <> securityId) False
+
+validateWarrantTerminalBalanceSuccessor :
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Decimal ->
+  Optional Text ->
+  Update ()
+validateWarrantTerminalBalanceSuccessor eventIndex maps label sourceSecurityId eventDate reductionQuantity balanceSecurityId =
+  case balanceSecurityId of
+    Some securityId -> case Map.lookup sourceSecurityId maps.warrant_issuances_by_security_id of
+      Some sourceIssuanceCid -> do
+        sourceIssuance <- fetch sourceIssuanceCid
+        currentQuantityOpt <- warrantSecurityQuantityBeforeTerminal eventIndex sourceIssuance.issuance_data eventDate
+        case currentQuantityOpt of
+          Some currentQuantity -> do
+            let expectedQuantity = currentQuantity - reductionQuantity
+            assertMsg (label <> " balance successor requires a positive remainder") (expectedQuantity > 0.0)
+            validateWarrantBalanceSuccessorQuantity maps label eventDate expectedQuantity securityId
+          None -> assertMsg (label <> " balance successor cannot be validated because the source warrant quantity is unknown") False
+      None -> assertMsg (label <> " source warrant issuance not found: " <> sourceSecurityId) False
+    None -> pure ()
+
+validateEquityCompensationBalanceSuccessorQuantity :
+  CapTableMaps ->
+  Text ->
+  EquityCompensationIssuanceOcfData ->
+  Time ->
+  Decimal ->
+  Text ->
+  Update ()
+validateEquityCompensationBalanceSuccessorQuantity maps label sourceIssuanceData eventDate expectedQuantity securityId =
+  case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        (label <> " balance result date mismatch for " <> securityId <> ": expected " <> show eventDate <> ", found " <> show issuance.issuance_data.date)
+        (issuance.issuance_data.date == eventDate)
+      assertMsg
+        (label <> " balance stock class mismatch for " <> securityId)
+        (issuance.issuance_data.stock_class_id == sourceIssuanceData.stock_class_id)
+      let targetSortKey = (eventDate, 2, 1)
+      actualQuantity <- case issuance.issuance_data.stock_class_id of
+        Some stockClassId -> stockClassQuantityAtSortKey maps stockClassId issuance.issuance_data.date issuance.issuance_data.quantity targetSortKey
+        None -> pure issuance.issuance_data.quantity
+      assertMsg
+        (label <> " balance quantity mismatch for " <> securityId <> ": expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+        (actualQuantity == expectedQuantity)
+    None -> assertMsg (label <> " balance equity compensation issuance not found: " <> securityId) False
+
+validateEquityCompensationTerminalBalanceSuccessor :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Decimal ->
+  Optional Text ->
+  Update ()
+validateEquityCompensationTerminalBalanceSuccessor stockEventIndex balanceEventIndex maps label sourceSecurityId eventDate reductionQuantity balanceSecurityId =
+  case balanceSecurityId of
+    Some securityId -> case Map.lookup sourceSecurityId maps.equity_compensation_issuances_by_security_id of
+      Some sourceIssuanceCid -> do
+        sourceIssuance <- fetch sourceIssuanceCid
+        currentQuantity <- equityCompensationSecurityQuantityBeforeTerminal
+          stockEventIndex balanceEventIndex sourceIssuance.issuance_data eventDate
+        let expectedQuantity = currentQuantity - reductionQuantity
+        assertMsg (label <> " balance successor requires a positive remainder") (expectedQuantity > 0.0)
+        validateEquityCompensationBalanceSuccessorQuantity
+          maps label sourceIssuance.issuance_data eventDate expectedQuantity securityId
+      None -> assertMsg (label <> " source equity compensation issuance not found: " <> sourceSecurityId) False
+    None -> pure ()
+
+validateNonStockBalanceSuccessorQuantities :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Update ()
+validateNonStockBalanceSuccessorQuantities stockEventIndex balanceEventIndex maps = do
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateWarrantTerminalBalanceSuccessor
+        balanceEventIndex maps ("Warrant transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
+        transfer.transfer_data.balance_security_id)
+    (Map.values maps.warrant_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateWarrantTerminalBalanceSuccessor
+        balanceEventIndex maps ("Warrant cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.quantity
+        cancellation.cancellation_data.balance_security_id)
+    (Map.values maps.warrant_cancellations)
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateEquityCompensationTerminalBalanceSuccessor
+        stockEventIndex balanceEventIndex maps ("Equity compensation transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
+        transfer.transfer_data.balance_security_id)
+    (Map.values maps.equity_compensation_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateEquityCompensationTerminalBalanceSuccessor
+        stockEventIndex balanceEventIndex maps ("Equity compensation cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.quantity
+        cancellation.cancellation_data.balance_security_id)
+    (Map.values maps.equity_compensation_cancellations)
 stockClassShareLotCurrentQuantity : StockClassShareEventIndex -> StockClassShareLot -> Optional Decimal
 stockClassShareLotCurrentQuantity eventIndex lot =
   foldl
@@ -3247,6 +3439,18 @@ equityCompensationSecurityEvents maps issuanceData = do
     []
     (Map.values maps.equity_compensation_cancellations)
 
+  transferEvents <- foldlA
+    (\events transferCid -> do
+      transfer <- fetch transferCid
+      if transfer.transfer_data.security_id == issuanceData.security_id
+        then pure (stockSecurityReductionEvents
+          transfer.transfer_data.date
+          transfer.transfer_data.quantity
+          transfer.transfer_data.balance_security_id ++ events)
+        else pure events)
+    cancellationEvents
+    (Map.values maps.equity_compensation_transfers)
+
   exerciseEvents <- foldlA
     (\events exerciseCid -> do
       exercise <- fetch exerciseCid
@@ -3256,7 +3460,7 @@ equityCompensationSecurityEvents maps issuanceData = do
           event_priority = 1
           quantity_delta = 0.0 - exercise.exercise_data.quantity) :: events)
         else pure events)
-    cancellationEvents
+    transferEvents
     (Map.values maps.equity_compensation_exercises)
 
   releaseEvents <- foldlA
@@ -4031,6 +4235,7 @@ template CapTable
         validateStockReissuanceSplitReferences finalMaps
         validateConfiguredReferences finalMaps
         validateStockBalanceSuccessorQuantities stockEventIndex finalMaps
+        validateNonStockBalanceSuccessorQuantities stockEventIndex nonStockBalanceEventIndex finalMaps
         validateStockSecurityBalances stockEventIndex finalMaps
         validateWarrantSecurityBalances nonStockBalanceEventIndex finalMaps
         validateEquityCompensationSecurityBalances stockEventIndex nonStockBalanceEventIndex finalMaps
