@@ -11,6 +11,7 @@ import {
   extractCantonOcfManifest,
   getCapTableState,
   OcpClient,
+  type OcfCreateArguments,
   type OcfIssuer,
 } from '@open-captable-protocol/canton';
 import { Pool, type PoolConfig } from 'pg';
@@ -21,8 +22,9 @@ import {
   hashIdentifier,
   matchesLedgerTemplateId,
   parseReplayOptions,
-  preparePortal,
+  prepareReplaySnapshot,
   renderReplayMarkdown,
+  renderPrivateReplayFailure,
   ReplayHelpRequested,
   ReplayPhaseError,
   replayUsage,
@@ -36,6 +38,7 @@ import {
   type ReplayFailure,
   type ReplayOptions,
   type ReplayReport,
+  type ReplayWarning,
 } from './localnet-replay/core';
 
 const LOCALNET_USER_ID = 'ledger-api-user';
@@ -396,7 +399,8 @@ async function replayPortal(context: ReplayLedgerContext, portal: PreparedPortal
 
   for (const item of portal.creates) {
     try {
-      batch.create(item.entityType, item.data as never);
+      // The preflight schema/capability gates establish this correlation; DB-backed unions cannot retain it in TS.
+      batch.create(...([item.entityType, item.data] as unknown as OcfCreateArguments));
     } catch (error) {
       throw new ReplayPhaseError('conversion', 'OCF-to-DAML conversion failed', {
         entityType: item.entityType,
@@ -444,6 +448,9 @@ function buildReport(params: {
   sourceObjectCount: number;
   portalCount: number;
   results: PortalReplayResult[];
+  warnings: ReplayWarning[];
+  excludedPortalCount: number;
+  notRunPortalCount: number;
   fatalFailure?: ReplayFailure;
 }): ReplayReport {
   const finishedAt = new Date();
@@ -452,6 +459,8 @@ function buildReport(params: {
   const status = params.fatalFailure || failedPortalCount > 0 ? 'failed' : 'passed';
   return {
     database: params.options.database,
+    validationMode: params.options.validationMode,
+    executionMode: params.options.preflightOnly ? 'preflight' : 'replay',
     gitRef: process.env['GITHUB_REF_NAME'] ?? null,
     gitSha: process.env['GITHUB_SHA'] ?? null,
     startedAt: params.startedAt.toISOString(),
@@ -461,9 +470,12 @@ function buildReport(params: {
     portalCount: params.portalCount,
     passedPortalCount,
     failedPortalCount,
+    excludedPortalCount: params.excludedPortalCount,
+    notRunPortalCount: params.notRunPortalCount,
     createdObjectCount: params.results.reduce((sum, result) => sum + result.createdObjectCount, 0),
     status,
     results: params.results,
+    warnings: params.warnings,
     ...(params.fatalFailure ? { fatalFailure: params.fatalFailure } : {}),
   };
 }
@@ -471,8 +483,11 @@ function buildReport(params: {
 async function run(options: ReplayOptions): Promise<ReplayReport> {
   const startedAt = new Date();
   const results: PortalReplayResult[] = [];
+  const warnings: ReplayWarning[] = [];
   let sourceObjectCount = 0;
   let portalCount = 0;
+  let excludedPortalCount = 0;
+  let notRunPortalCount = 0;
 
   try {
     const database = resolveDatabaseUrl(options.database);
@@ -485,18 +500,75 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
 
     const groupedRows = groupRowsByPortal(rows);
     portalCount = groupedRows.size;
+    const snapshot = prepareReplaySnapshot(rows, options.validationMode);
+    warnings.push(...snapshot.warnings);
+    ({ excludedPortalCount } = snapshot);
+    notRunPortalCount = snapshot.portals.length;
+
+    for (const warning of warnings) {
+      const context = warning.objectAlias ? `${warning.portalAlias}/${warning.objectAlias}` : warning.portalAlias;
+      const location = warning.objectType ? ` (${warning.objectType})` : '';
+      console.warn(
+        `::warning title=OCP LocalNet replay (${warning.phase})::${escapeWorkflowCommand(`${warning.code}${location}: ${warning.message} [${context}]`)}`
+      );
+    }
+
+    if (snapshot.failures.length > 0) {
+      const sourceCountByAlias = new Map(
+        Array.from(groupedRows.values()).map((portalRows) => [
+          hashIdentifier(portalRows[0].portalId, 'portal'),
+          portalRows.length,
+        ])
+      );
+      for (const failure of snapshot.failures) {
+        results.push({
+          portalAlias: failure.portalAlias,
+          sourceObjectCount: sourceCountByAlias.get(failure.portalAlias) ?? 0,
+          createdObjectCount: 0,
+          durationMs: 0,
+          success: false,
+          failure,
+        });
+        console.error(
+          `::error title=OCP LocalNet replay (${failure.phase})::${escapeWorkflowCommand(renderPrivateReplayFailure(failure))}`
+        );
+      }
+      return buildReport({
+        options,
+        startedAt,
+        sourceObjectCount,
+        portalCount,
+        results,
+        warnings,
+        excludedPortalCount,
+        notRunPortalCount,
+      });
+    }
+
+    if (options.preflightOnly || snapshot.portals.length === 0) {
+      return buildReport({
+        options,
+        startedAt,
+        sourceObjectCount,
+        portalCount,
+        results,
+        warnings,
+        excludedPortalCount,
+        notRunPortalCount,
+      });
+    }
+
     const context = await initializeReplayLedger();
 
     console.log('Replaying the committed OCF snapshot on isolated LocalNet...');
-    for (const portalRows of groupedRows.values()) {
+    for (const portal of snapshot.portals) {
       const portalStartedAt = Date.now();
-      const portalAlias = hashIdentifier(portalRows[0].portalId, 'portal');
+      const { portalAlias } = portal;
       try {
-        const portal = preparePortal(portalRows);
         const createdObjectCount = await replayPortal(context, portal);
         results.push({
           portalAlias,
-          sourceObjectCount: portalRows.length,
+          sourceObjectCount: portal.sourceObjectCount,
           createdObjectCount,
           durationMs: Date.now() - portalStartedAt,
           success: true,
@@ -505,23 +577,46 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
         const failure = toReplayFailure(portalAlias, error);
         results.push({
           portalAlias,
-          sourceObjectCount: portalRows.length,
+          sourceObjectCount: portal.sourceObjectCount,
           createdObjectCount: 0,
           durationMs: Date.now() - portalStartedAt,
           success: false,
           failure,
         });
         console.error(
-          `::error title=OCP LocalNet replay (${failure.phase})::${escapeWorkflowCommand(failure.message)}`
+          `::error title=OCP LocalNet replay (${failure.phase})::${escapeWorkflowCommand(renderPrivateReplayFailure(failure))}`
         );
+      } finally {
+        notRunPortalCount -= 1;
       }
     }
 
-    return buildReport({ options, startedAt, sourceObjectCount, portalCount, results });
+    return buildReport({
+      options,
+      startedAt,
+      sourceObjectCount,
+      portalCount,
+      results,
+      warnings,
+      excludedPortalCount,
+      notRunPortalCount,
+    });
   } catch (error) {
     const fatalFailure = toReplayFailure('all-portals', error);
-    console.error(`::error title=OCP LocalNet replay setup::${escapeWorkflowCommand(fatalFailure.message)}`);
-    return buildReport({ options, startedAt, sourceObjectCount, portalCount, results, fatalFailure });
+    console.error(
+      `::error title=OCP LocalNet replay setup::${escapeWorkflowCommand(renderPrivateReplayFailure(fatalFailure))}`
+    );
+    return buildReport({
+      options,
+      startedAt,
+      sourceObjectCount,
+      portalCount,
+      results,
+      warnings,
+      excludedPortalCount,
+      notRunPortalCount,
+      fatalFailure,
+    });
   }
 }
 
@@ -549,7 +644,8 @@ async function main(): Promise<void> {
     return;
   }
 
-  console.log(`Replay ${report.status}. Customer and object details are intentionally omitted.`);
+  const operation = options.preflightOnly ? 'Preflight' : 'Replay';
+  console.log(`${operation} ${report.status}. Customer and object details are intentionally omitted.`);
   if (report.status === 'failed') process.exitCode = 1;
 }
 

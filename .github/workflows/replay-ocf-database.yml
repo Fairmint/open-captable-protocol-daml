@@ -1,5 +1,5 @@
 name: Replay OCF Database on LocalNet
-run-name: OCF LocalNet replay (${{ inputs.database }}) at ${{ github.ref_name }}
+run-name: OCF LocalNet replay (${{ inputs.database }}, ${{ inputs.validation_mode }}) at ${{ github.ref_name }}
 
 on:
   workflow_dispatch:
@@ -12,6 +12,14 @@ on:
         options:
           - dev
           - production
+      validation_mode:
+        description: Validate ledger-backed objects, or require every object to have ledger coverage
+        required: true
+        default: ledger-backed
+        type: choice
+        options:
+          - ledger-backed
+          - require-ledger-coverage
 
 permissions:
   contents: read
@@ -113,6 +121,18 @@ jobs:
             exit 1
           fi
 
+      - name: Preflight the complete database snapshot
+        id: preflight
+        env:
+          POSTGRES_DB_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
+          POSTGRES_SSL_CA: ${{ secrets.OCP_REPLAY_SSL_CA }}
+        run: >-
+          npm run replay-ocf:localnet --
+          --database "${{ inputs.database }}"
+          --validation-mode "${{ inputs.validation_mode }}"
+          --preflight-only
+        timeout-minutes: 30
+
       - name: Restore LocalNet asset cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
@@ -122,6 +142,7 @@ jobs:
             canton-localnet-${{ runner.os }}-
 
       - name: Start LocalNet
+        id: start-localnet
         run: ./node_modules/.bin/canton-localnet start
         timeout-minutes: 45
 
@@ -133,12 +154,15 @@ jobs:
         env:
           POSTGRES_DB_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
           POSTGRES_SSL_CA: ${{ secrets.OCP_REPLAY_SSL_CA }}
-        run: npm run replay-ocf:localnet -- --database "${{ inputs.database }}"
+        run: >-
+          npm run replay-ocf:localnet --
+          --database "${{ inputs.database }}"
+          --validation-mode "${{ inputs.validation_mode }}"
         timeout-minutes: 120
 
       # Canton command logs may contain submitted OCF payloads. Only inspect them when replay never started.
       - name: Show LocalNet startup logs
-        if: failure() && steps.replay.outcome == 'skipped'
+        if: failure() && steps.start-localnet.outcome != 'skipped' && steps.replay.outcome == 'skipped'
         run: ./node_modules/.bin/canton-localnet logs || true
 
       - name: Upload sanitized replay report
@@ -151,7 +175,7 @@ jobs:
           retention-days: 7
 
       - name: Stop LocalNet
-        if: always()
+        if: always() && steps.start-localnet.outcome != 'skipped'
         run: |
           ./node_modules/.bin/canton-localnet stop || true
           docker volume prune --force || true
