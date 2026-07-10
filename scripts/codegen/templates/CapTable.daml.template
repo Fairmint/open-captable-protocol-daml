@@ -1339,9 +1339,88 @@ validateStockIssuanceReferences maps =
 data StockIssuanceShareNumberLot = StockIssuanceShareNumberLot with
     stock_class_id: Text
     issuance_id: Text
+    security_id: Text
     share_lot: StockClassShareLot
     share_number_range: OcfShareNumberRange
   deriving (Eq, Show)
+
+addStockShareNumberTerminalDate : Text -> Time -> Map Text [Time] -> Map Text [Time]
+addStockShareNumberTerminalDate securityId eventDate index =
+  Map.insert securityId (eventDate :: fromOptional [] (Map.lookup securityId index)) index
+
+addStockShareNumberBalanceTerminalDate :
+  CapTableMaps ->
+  Text ->
+  Time ->
+  Optional Text ->
+  Map Text [Time] ->
+  Update (Map Text [Time])
+addStockShareNumberBalanceTerminalDate maps sourceSecurityId eventDate balanceSecurityId index =
+  case balanceSecurityId of
+    Some balanceSecurityId' ->
+      case (Map.lookup sourceSecurityId maps.stock_issuances_by_security_id, Map.lookup balanceSecurityId' maps.stock_issuances_by_security_id) of
+        (Some sourceCid, Some balanceCid) -> do
+          source <- fetch sourceCid
+          balance <- fetch balanceCid
+          case source.issuance_data.share_numbers_issued of
+            [] -> pure ()
+            _ ->
+              assertMsg
+                ("Stock balance issuance must preserve share-number tracking for " <> sourceSecurityId)
+                (not (null balance.issuance_data.share_numbers_issued))
+          pure (addStockShareNumberTerminalDate sourceSecurityId eventDate index)
+        _ -> pure index
+    None -> pure index
+
+stockShareNumberBalanceTerminalDateIndex : CapTableMaps -> Update (Map Text [Time])
+stockShareNumberBalanceTerminalDateIndex maps = do
+  cancellationIndex <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      addStockShareNumberBalanceTerminalDate
+        maps
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id
+        index)
+    Map.empty
+    (Map.values maps.stock_cancellations)
+
+  repurchaseIndex <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      addStockShareNumberBalanceTerminalDate
+        maps
+        repurchase.repurchase_data.security_id
+        repurchase.repurchase_data.date
+        repurchase.repurchase_data.balance_security_id
+        index)
+    cancellationIndex
+    (Map.values maps.stock_repurchases)
+
+  transferIndex <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      addStockShareNumberBalanceTerminalDate
+        maps
+        transfer.transfer_data.security_id
+        transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id
+        index)
+    repurchaseIndex
+    (Map.values maps.stock_transfers)
+
+  foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      addStockShareNumberBalanceTerminalDate
+        maps
+        conversion.conversion_data.security_id
+        conversion.conversion_data.date
+        conversion.conversion_data.balance_security_id
+        index)
+    transferIndex
+    (Map.values maps.stock_conversions)
 
 stockIssuanceShareNumberLots : StockClassShareEventIndex -> CapTableMaps -> Update [StockIssuanceShareNumberLot]
 stockIssuanceShareNumberLots eventIndex maps =
@@ -1356,6 +1435,7 @@ stockIssuanceShareNumberLots eventIndex maps =
                   (\shareNumberRange -> StockIssuanceShareNumberLot with
                     stock_class_id = issuance.issuance_data.stock_class_id
                     issuance_id = issuance.issuance_data.id
+                    security_id = issuance.issuance_data.security_id
                     share_lot = shareLot
                     share_number_range = shareNumberRange)
                   issuance.issuance_data.share_numbers_issued
@@ -1368,12 +1448,13 @@ stockIssuanceShareNumberLots eventIndex maps =
 
 validateStockIssuanceShareNumberLotDoesNotOverlap :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   StockIssuanceShareNumberLot ->
   Update ()
-validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex lot other =
+validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex terminalDateIndex lot other =
   when (lot.issuance_id /= other.issuance_id && lot.stock_class_id == other.stock_class_id && shareNumberRangesOverlap lot.share_number_range other.share_number_range) do
-    overlapsWhileActive <- stockIssuanceShareNumberLotsOverlapWhileActive eventIndex lot other
+    overlapsWhileActive <- stockIssuanceShareNumberLotsOverlapWhileActive eventIndex terminalDateIndex lot other
     when overlapsWhileActive do
       assertMsg
         ("Stock issuance share number ranges overlap for stock class " <> lot.stock_class_id <> ": " <> lot.issuance_id <> " overlaps " <> other.issuance_id)
@@ -1389,32 +1470,42 @@ stockIssuanceShareNumberLotIndex lots =
 
 stockIssuanceShareNumberLotRelevantDates :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   StockIssuanceShareNumberLot ->
   [Time]
-stockIssuanceShareNumberLotRelevantDates eventIndex lot other =
+stockIssuanceShareNumberLotRelevantDates eventIndex terminalDateIndex lot other =
   map
     stockClassShareEventDate
-    (stockClassShareLotEvents eventIndex lot.share_lot ++ stockClassShareLotEvents eventIndex other.share_lot)
+    (stockClassShareLotEvents eventIndex lot.share_lot ++ stockClassShareLotEvents eventIndex other.share_lot) ++
+  fromOptional [] (Map.lookup lot.security_id terminalDateIndex) ++
+  fromOptional [] (Map.lookup other.security_id terminalDateIndex)
 
 stockIssuanceShareNumberLotActiveAt :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   Time ->
   Optional Bool
-stockIssuanceShareNumberLotActiveAt eventIndex lot asOf =
-  case stockClassShareLotQuantityAt eventIndex lot.share_lot asOf of
-    Some quantity -> Some (quantity > 0.0)
-    None -> None
+stockIssuanceShareNumberLotActiveAt eventIndex terminalDateIndex lot asOf =
+  let replacedByBalance = any
+        (\eventDate -> lot.share_lot.event_date <= eventDate && eventDate <= asOf)
+        (fromOptional [] (Map.lookup lot.security_id terminalDateIndex))
+  in if replacedByBalance
+    then Some False
+    else case stockClassShareLotQuantityAt eventIndex lot.share_lot asOf of
+      Some quantity -> Some (quantity > 0.0)
+      None -> None
 
 stockIssuanceShareNumberLotsOverlapOnDate :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   StockIssuanceShareNumberLot ->
   Time ->
   Update Bool
-stockIssuanceShareNumberLotsOverlapOnDate eventIndex lot other asOf =
-  case (stockIssuanceShareNumberLotActiveAt eventIndex lot asOf, stockIssuanceShareNumberLotActiveAt eventIndex other asOf) of
+stockIssuanceShareNumberLotsOverlapOnDate eventIndex terminalDateIndex lot other asOf =
+  case (stockIssuanceShareNumberLotActiveAt eventIndex terminalDateIndex lot asOf, stockIssuanceShareNumberLotActiveAt eventIndex terminalDateIndex other asOf) of
     (Some lotActive, Some otherActive) -> pure (lotActive && otherActive)
     _ -> do
       assertMsg ("Stock issuance share number ranges cannot be validated because stock quantity history is invalid for " <> lot.issuance_id <> " or " <> other.issuance_id) False
@@ -1422,47 +1513,51 @@ stockIssuanceShareNumberLotsOverlapOnDate eventIndex lot other asOf =
 
 stockIssuanceShareNumberLotsOverlapWhileActive :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   StockIssuanceShareNumberLot ->
   Update Bool
-stockIssuanceShareNumberLotsOverlapWhileActive eventIndex lot other =
+stockIssuanceShareNumberLotsOverlapWhileActive eventIndex terminalDateIndex lot other =
   foldlA
     (\overlaps asOf ->
       if overlaps
         then pure True
-        else stockIssuanceShareNumberLotsOverlapOnDate eventIndex lot other asOf)
+        else stockIssuanceShareNumberLotsOverlapOnDate eventIndex terminalDateIndex lot other asOf)
     False
-    (stockIssuanceShareNumberLotRelevantDates eventIndex lot other)
+    (stockIssuanceShareNumberLotRelevantDates eventIndex terminalDateIndex lot other)
 
 validateStockIssuanceShareNumberLotAgainstRest :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   StockIssuanceShareNumberLot ->
   [StockIssuanceShareNumberLot] ->
   Update ()
-validateStockIssuanceShareNumberLotAgainstRest eventIndex lot lots =
-  mapA_ (validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex lot) lots
+validateStockIssuanceShareNumberLotAgainstRest eventIndex terminalDateIndex lot lots =
+  mapA_ (validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex terminalDateIndex lot) lots
 
 validateStockClassShareNumberLotsDoNotOverlap :
   StockClassShareEventIndex ->
+  Map Text [Time] ->
   [StockIssuanceShareNumberLot] ->
   Update ()
-validateStockClassShareNumberLotsDoNotOverlap eventIndex lots = case lots of
+validateStockClassShareNumberLotsDoNotOverlap eventIndex terminalDateIndex lots = case lots of
   lot :: rest -> do
-    validateStockIssuanceShareNumberLotAgainstRest eventIndex lot rest
-    validateStockClassShareNumberLotsDoNotOverlap eventIndex rest
+    validateStockIssuanceShareNumberLotAgainstRest eventIndex terminalDateIndex lot rest
+    validateStockClassShareNumberLotsDoNotOverlap eventIndex terminalDateIndex rest
   _ -> pure ()
 
-validateStockIssuanceShareNumberLotsDoNotOverlap : StockClassShareEventIndex -> [StockIssuanceShareNumberLot] -> Update ()
-validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots =
+validateStockIssuanceShareNumberLotsDoNotOverlap : StockClassShareEventIndex -> Map Text [Time] -> [StockIssuanceShareNumberLot] -> Update ()
+validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex terminalDateIndex lots =
   mapA_
-    (validateStockClassShareNumberLotsDoNotOverlap eventIndex)
+    (validateStockClassShareNumberLotsDoNotOverlap eventIndex terminalDateIndex)
     (Map.values (stockIssuanceShareNumberLotIndex lots))
 
 validateStockIssuanceShareNumberRanges : CapTableMaps -> Update ()
 validateStockIssuanceShareNumberRanges maps = do
   eventIndex <- stockClassShareEventIndex maps
+  terminalDateIndex <- stockShareNumberBalanceTerminalDateIndex maps
   lots <- stockIssuanceShareNumberLots eventIndex maps
-  validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots
+  validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex terminalDateIndex lots
 
 validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
 validateEquityCompensationIssuanceReferences maps =
