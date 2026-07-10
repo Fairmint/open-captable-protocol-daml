@@ -384,27 +384,15 @@ warrantExerciseOutputShareLot issuanceData exerciseData =
         OcfRightWarrant conversionRight ->
           case conversionRight.converts_to_stock_class_id of
             Some stockClassId ->
-              case (conversionRight.conversion_mechanism, exerciseData.quantity, issuanceData.quantity) of
-                (OcfWarrantMechanismFixedAmount _, _, _) ->
+              case conversionRight.conversion_mechanism of
+                OcfWarrantMechanismFixedAmount _ ->
                   pure (Some (StockClassShareLot with
                     stock_class_id = stockClassId
                     security_id = None
                     event_date = exerciseData.date
                     quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, Some _, _) ->
-                  pure (Some (StockClassShareLot with
-                    stock_class_id = stockClassId
-                    security_id = None
-                    event_date = exerciseData.date
-                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, None, Some _) ->
-                  pure (Some (StockClassShareLot with
-                    stock_class_id = stockClassId
-                    security_id = None
-                    event_date = exerciseData.date
-                    quantity = warrantExerciseQuantity issuanceData exerciseData conversionRight))
-                (_, None, None) -> do
-                  assertMsg ("Warrant exercise output cannot be reconstructed because exercise and issuance quantities are missing: " <> exerciseData.id) False
+                _ -> do
+                  assertMsg ("Warrant exercise output cannot be reconstructed for a non-fixed conversion mechanism; a resulting stock issuance is required: " <> exerciseData.id) False
                   pure None
             None -> do
               assertMsg ("Warrant exercise output cannot be reconstructed because trigger has no destination stock class: " <> exerciseData.trigger_id) False
@@ -1455,6 +1443,40 @@ stockIssuancePlanAllocationIndex eventIndex successorIndex maps =
     Map.empty
     (Map.values maps.stock_issuances)
 
+equityCompensationPlanStockClassIds : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [Text]
+equityCompensationPlanStockClassIds maps issuanceData =
+  case issuanceData.stock_class_id of
+    Some stockClassId -> pure [stockClassId]
+    None -> case issuanceData.stock_plan_id of
+      Some stockPlanId -> case Map.lookup stockPlanId maps.stock_plans of
+        Some stockPlanCid -> do
+          stockPlan <- fetch stockPlanCid
+          pure stockPlan.plan_data.stock_class_ids
+        None -> pure []
+      None -> pure []
+
+equityCompensationPlanSplitEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
+equityCompensationPlanSplitEvents maps issuanceData = do
+  stockClassIds <- equityCompensationPlanStockClassIds maps issuanceData
+  splitEvents <- foldlA
+    (\events splitCid -> do
+      split <- fetch splitCid
+      if split.split_data.stock_class_id `elem` stockClassIds && split.split_data.date >= issuanceData.date
+        then pure ((StockClassShareMultiplier with
+          event_date = split.split_data.date
+          event_priority = 2
+          ratio = split.split_data.split_ratio) :: events)
+        else pure events)
+    []
+    (Map.values maps.stock_class_splits)
+  case (issuanceData.stock_class_id, stockClassIds, splitEvents) of
+    (None, _ :: _ :: _, _ :: _) -> do
+      assertMsg
+        ("Equity compensation issuance without stock_class_id cannot be split-adjusted across multiple stock-plan classes: " <> issuanceData.id)
+        False
+      pure []
+    _ -> pure splitEvents
+
 equityCompensationPlanAllocationEvents : CapTableMaps -> EquityCompensationIssuanceOcfData -> Update [StockClassShareEvent]
 equityCompensationPlanAllocationEvents maps issuanceData = do
   retractionEvents <- foldlA
@@ -1468,20 +1490,7 @@ equityCompensationPlanAllocationEvents maps issuanceData = do
     []
     (Map.values maps.equity_compensation_retractions)
 
-  splitEvents <- case issuanceData.stock_class_id of
-    Some stockClassId ->
-      foldlA
-        (\events splitCid -> do
-          split <- fetch splitCid
-          if split.split_data.stock_class_id == stockClassId && split.split_data.date >= issuanceData.date
-            then pure ((StockClassShareMultiplier with
-              event_date = split.split_data.date
-              event_priority = 2
-              ratio = split.split_data.split_ratio) :: events)
-            else pure events)
-        []
-        (Map.values maps.stock_class_splits)
-    None -> pure []
+  splitEvents <- equityCompensationPlanSplitEvents maps issuanceData
 
   pure ((StockClassShareDelta with
       event_date = issuanceData.date
@@ -1543,7 +1552,10 @@ stockPlanReturnToPoolStockClassId maps securityId =
       pure (Some issuance.issuance_data.stock_class_id)
     (None, Some equityCompensationCid) -> do
       issuance <- fetch equityCompensationCid
-      pure issuance.issuance_data.stock_class_id
+      stockClassIds <- equityCompensationPlanStockClassIds maps issuance.issuance_data
+      case stockClassIds of
+        [stockClassId] -> pure (Some stockClassId)
+        _ -> pure None
     (Some _, Some _) -> do
       assertMsg ("Stock plan return-to-pool security id is ambiguous: " <> securityId) False
       pure None
@@ -1679,20 +1691,7 @@ equityCompensationSecurityEvents maps issuanceData = do
     releaseEvents
     (Map.values maps.equity_compensation_retractions)
 
-  splitEvents <- case issuanceData.stock_class_id of
-    Some stockClassId ->
-      foldlA
-        (\events splitCid -> do
-          split <- fetch splitCid
-          if split.split_data.stock_class_id == stockClassId && split.split_data.date >= issuanceData.date
-            then pure ((StockClassShareMultiplier with
-              event_date = split.split_data.date
-              event_priority = 2
-              ratio = split.split_data.split_ratio) :: events)
-            else pure events)
-        []
-        (Map.values maps.stock_class_splits)
-    None -> pure []
+  splitEvents <- equityCompensationPlanSplitEvents maps issuanceData
 
   pure (retractionEvents ++ splitEvents)
 
