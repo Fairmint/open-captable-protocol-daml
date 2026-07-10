@@ -343,6 +343,9 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
     Some sourceStockClass ->
       case sourceStockClass.conversion_rights of
         [conversionRight] -> do
+          assertMsg
+            ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
+            (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
           outputQuantity <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
           pure (Some (StockClassShareLot with
             stock_class_id = conversionRight.converts_to_stock_class_id
@@ -460,12 +463,14 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
       assertNoPartialResultingStockIssuanceCoverage ("Stock conversion " <> conversion.conversion_data.id) maps conversion.conversion_data.resulting_security_ids
       if allResultingStockIssuancesExist maps conversion.conversion_data.resulting_security_ids
         then pure index
-        else case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            lotOpt <- stockConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
-            pure (addOptionalStockClassShareLot lotOpt index)
-          None -> pure index)
+          else case Map.lookup conversion.conversion_data.security_id maps.stock_issuances_by_security_id of
+            Some sourceIssuanceCid -> do
+              sourceIssuance <- fetch sourceIssuanceCid
+              lotOpt <- stockConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
+              pure (addOptionalStockClassShareLot lotOpt index)
+            None -> do
+              assertMsg ("Stock conversion references missing source stock issuance: " <> conversion.conversion_data.security_id) False
+              pure index)
     stockIssuanceLots
     (Map.values maps.stock_conversions)
 
@@ -1191,6 +1196,32 @@ validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHist
           None ->
             assertMsg ("Issuer authorized shares exceeded on " <> show asOf <> ": stock class authorization is unlimited but issuer authorization is finite") False)
     (issuerContract.issuer_data.formation_date :: validationDates)
+
+validateStockClassShareLotReferences :
+  Map Text StockClassOcfData ->
+  Map Text [StockClassShareLot] ->
+  Update ()
+validateStockClassShareLotReferences stockClassIndex lotsByStockClass =
+  mapA_
+    (\stockClassId ->
+      assertMsg
+        ("Stock class share lot references missing stock class: " <> stockClassId)
+        (isSome (Map.lookup stockClassId stockClassIndex)))
+    (Map.keys lotsByStockClass)
+
+validateIssuerAuthorizedShareAdjustmentReferences :
+  CapTableMaps ->
+  ContractId Issuer ->
+  Update ()
+validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid = do
+  issuerContract <- fetch issuerCid
+  mapA_
+    (\adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      assertMsg
+        ("Issuer authorized shares adjustment references another issuer: " <> adjustment.adjustment_data.id)
+        (adjustment.adjustment_data.issuer_id == issuerContract.issuer_data.id))
+    (Map.values maps.issuer_authorized_shares_adjustments)
 
 addQuantityById : Text -> Decimal -> Map Text Decimal -> Map Text Decimal
 addQuantityById key quantity totals =
@@ -2104,6 +2135,8 @@ validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
   stockClassAdjustmentHistory <- stockClassAuthorizedAdjustmentHistoryIndex maps
   stockClassValidationDates <- stockClassAuthorizedValidationDateIndex maps lotsByStockClass
   issuerAdjustmentHistory <- issuerAuthorizedAdjustmentHistoryIndex maps
+  validateStockClassShareLotReferences stockClassIndex lotsByStockClass
+  validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid
   validateAllStockClassAuthorizedShares eventIndex stockClasses lotsByStockClass adjustmentIndex
   validateStockClassAuthorizedSharesAtDates eventIndex stockClasses lotsByStockClass stockClassAdjustmentHistory stockClassValidationDates
   validateIssuerAuthorizedShares stockClasses maps adjustmentIndex issuerCid
