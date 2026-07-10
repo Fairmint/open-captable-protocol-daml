@@ -2,6 +2,7 @@ module OpenCapTable.TestStockPlanReservedShares where
 
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation (EquityCompensationCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationRetraction (EquityCompensationRetractionOcfData(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationTransfer (EquityCompensationTransferOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
@@ -44,6 +45,16 @@ equityCompensationCancellation cancellationId securityId quantity = EquityCompen
   quantity = quantity
   balance_security_id = None
   reason_text = "Cancelled equity compensation"
+  comments = []
+
+planEquityCompensationExercise : Text -> Text -> Decimal -> EquityCompensationExerciseOcfData
+planEquityCompensationExercise exerciseId securityId quantity = EquityCompensationExerciseOcfData with
+  id = exerciseId
+  date = defaultTestDate
+  security_id = securityId
+  quantity = quantity
+  resulting_security_ids = []
+  consideration_text = None
   comments = []
 
 planStockTransfer : Text -> Text -> Text -> Decimal -> StockTransferOcfData
@@ -133,6 +144,127 @@ testStockPlanReservedShares_EquityCompensationCannotExceedInitialPool = script d
         [ CT.OcfCreateStockPlan plan
         , CT.OcfCreateEquityCompensationIssuance issuance
         ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_StockIssuanceClassMustBelongToPlan = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPlanClass, planClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  (capTableReady, otherClassId) <- setupStockClassWithId issuer capTableWithPlanClass "SC_PLAN_MEMBERSHIP_OTHER"
+  let stockPlanId = "PLAN_STOCK_CLASS_MEMBERSHIP"
+  let plan = (defaultStockPlan stockPlanId planClassId) with initial_shares_reserved = 100.0
+  let issuance = (defaultStockIssuance "TX_STOCK_CLASS_OUTSIDE_PLAN" "SEC-STOCK-CLASS-OUTSIDE-PLAN" stakeholderId otherClassId) with
+        stock_plan_id = Some stockPlanId
+        quantity = 50.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateStockIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_EquityCompensationClassMustBelongToPlan = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithPlanClass, planClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  (capTableReady, otherClassId) <- setupStockClassWithId issuer capTableWithPlanClass "SC_EQUITY_PLAN_MEMBERSHIP_OTHER"
+  let stockPlanId = "PLAN_EQUITY_CLASS_MEMBERSHIP"
+  let plan = (defaultStockPlan stockPlanId planClassId) with initial_shares_reserved = 100.0
+  let issuance = stockPlanEquityCompensationIssuance
+        "TX_EQUITY_CLASS_OUTSIDE_PLAN"
+        "SEC-EQUITY-CLASS-OUTSIDE-PLAN"
+        stakeholderId
+        otherClassId
+        stockPlanId
+        50.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_ExercisedEquityCannotBeCancelledAndReturnedAgain = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_EQUITY_SOURCE_HISTORY"
+  let securityId = "SEC-EQUITY-SOURCE-HISTORY"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let issuance = stockPlanEquityCompensationIssuance
+        "TX_EQUITY_SOURCE_HISTORY"
+        securityId
+        stakeholderId
+        stockClassId
+        stockPlanId
+        100.0
+  initialResult <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd initialResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise (planEquityCompensationExercise "TX_EQUITY_SOURCE_EXERCISE" securityId 100.0)
+        , CT.OcfCreateEquityCompensationCancellation (equityCompensationCancellation "TX_EQUITY_SOURCE_CANCEL" securityId 100.0)
+        , CT.OcfCreateStockPlanReturnToPool (stockPlanReturnToPool "TX_EQUITY_SOURCE_RETURN" securityId stockPlanId 100.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockPlanReservedShares_ExercisedEquityCannotBeRetracted = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let stockPlanId = "PLAN_EQUITY_RETRACTION_HISTORY"
+  let securityId = "SEC-EQUITY-RETRACTION-HISTORY"
+  let resultSecurityId = "SEC-EQUITY-RETRACTION-STOCK"
+  let plan = (defaultStockPlan stockPlanId stockClassId) with initial_shares_reserved = 100.0
+  let issuance = stockPlanEquityCompensationIssuance
+        "TX_EQUITY_RETRACTION_HISTORY"
+        securityId
+        stakeholderId
+        stockClassId
+        stockPlanId
+        100.0
+  initialResult <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+  let exercise = (planEquityCompensationExercise "TX_EQUITY_RETRACTION_EXERCISE" securityId 40.0) with
+        resulting_security_ids = [resultSecurityId]
+  let resultIssuance = (defaultStockIssuance "TX_EQUITY_RETRACTION_STOCK" resultSecurityId stakeholderId stockClassId) with quantity = 40.0
+  exerciseResult <- submit issuer do
+    exerciseCmd initialResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise exercise
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+
+  let retraction = EquityCompensationRetractionOcfData with
+        id = "TX_EQUITY_RETRACTION_AFTER_EXERCISE"
+        date = defaultTestDate
+        security_id = securityId
+        reason_text = "Cannot retract exercised equity compensation"
+        comments = []
+  submitMustFail issuer do
+    exerciseCmd exerciseResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationRetraction retraction]
       edits = []
       deletes = []
 
