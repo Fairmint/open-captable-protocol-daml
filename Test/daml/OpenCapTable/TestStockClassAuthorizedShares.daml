@@ -122,13 +122,13 @@ stockClassConversionRatioAdjustment adjustmentId stockClassId numerator =
       rounding_type = OcfRoundingNormal
     comments = []
 
-warrantFixedExerciseTrigger : Text -> Text -> Decimal -> OcfConversionTrigger
-warrantFixedExerciseTrigger triggerId stockClassId convertsToQuantity =
+warrantExerciseTriggerWith : Text -> OcfWarrantConversionMechanism -> Optional Text -> OcfConversionTrigger
+warrantExerciseTriggerWith triggerId conversionMechanism stockClassId =
   OcfConversionTrigger with
     conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
-      conversion_mechanism = OcfWarrantMechanismFixedAmount with converts_to_quantity = convertsToQuantity
+      conversion_mechanism = conversionMechanism
       converts_to_future_round = None
-      converts_to_stock_class_id = Some stockClassId
+      converts_to_stock_class_id = stockClassId
       type_ = "WARRANT_CONVERSION_RIGHT")
     end_date = None
     nickname = None
@@ -139,22 +139,19 @@ warrantFixedExerciseTrigger triggerId stockClassId convertsToQuantity =
     trigger_id = triggerId
     type_ = OcfTriggerTypeTypeElectiveAtWill
 
+warrantFixedExerciseTrigger : Text -> Text -> Decimal -> OcfConversionTrigger
+warrantFixedExerciseTrigger triggerId stockClassId convertsToQuantity =
+  warrantExerciseTriggerWith
+    triggerId
+    (OcfWarrantMechanismFixedAmount with converts_to_quantity = convertsToQuantity)
+    (Some stockClassId)
+
 warrantCustomExerciseTrigger : Text -> Text -> OcfConversionTrigger
 warrantCustomExerciseTrigger triggerId stockClassId =
-  OcfConversionTrigger with
-    conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
-      conversion_mechanism = OcfWarrantMechanismCustom with custom_conversion_description = "Custom warrant output"
-      converts_to_future_round = None
-      converts_to_stock_class_id = Some stockClassId
-      type_ = "WARRANT_CONVERSION_RIGHT")
-    end_date = None
-    nickname = None
-    start_date = None
-    trigger_condition = None
-    trigger_date = None
-    trigger_description = None
-    trigger_id = triggerId
-    type_ = OcfTriggerTypeTypeElectiveAtWill
+  warrantExerciseTriggerWith
+    triggerId
+    (OcfWarrantMechanismCustom with custom_conversion_description = "Custom warrant output")
+    (Some stockClassId)
 
 warrantIssuance : Text -> Text -> Text -> Text -> Decimal -> WarrantIssuanceOcfData
 warrantIssuance issuanceId securityId stakeholderId stockClassId convertsToQuantity =
@@ -663,31 +660,28 @@ testStockTransferResultMustRemainInSourceStockClass = script do
       edits = []
       deletes = []
 
-testStockTransferResultQuantityNormalizesInterveningSplit = script do
+testStockTransferResultDateMustMatchTransferDate = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
-  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_TRANSFER_SPLIT_NORMALIZED" 1_000.0)
-  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_TRANSFER_SPLIT_NORMALIZED" "Transfer Split Holder"
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_TRANSFER_RESULT_DATE" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_TRANSFER_RESULT_DATE" "Transfer Result Date Holder"
   let sourceDate = DT.time (DA.date 2024 Jan 01) 0 0 0
   let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
-  let splitDate = DT.time (DA.date 2024 Jan 03) 0 0 0
-  let resultDate = DT.time (DA.date 2024 Jan 04) 0 0 0
-  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_TRANSFER_SPLIT_SOURCE" "SEC_TRANSFER_SPLIT_SOURCE" stakeholderId stockClassId) with
+  let resultDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_TRANSFER_RESULT_DATE_SOURCE" "SEC_TRANSFER_RESULT_DATE_SOURCE" stakeholderId stockClassId) with
     date = sourceDate
     quantity = 100.0)
 
-  _ <- submit issuer do
+  submitMustFail issuer do
     exerciseCmd capTableIssued CT.UpdateCapTable with
       creates =
-        [ CT.OcfCreateStockTransfer ((stockTransfer "TX_TRANSFER_SPLIT_NORMALIZED" "SEC_TRANSFER_SPLIT_SOURCE" 100.0 ["SEC_TRANSFER_SPLIT_RESULT"]) with date = transferDate)
-        , CT.OcfCreateStockClassSplit ((stockClassSplit "TX_TRANSFER_INTERVENING_SPLIT" stockClassId 2.0 1.0) with date = splitDate)
-        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_TRANSFER_SPLIT_RESULT" "SEC_TRANSFER_SPLIT_RESULT" stakeholderId stockClassId) with
+        [ CT.OcfCreateStockTransfer ((stockTransfer "TX_TRANSFER_RESULT_DATE" "SEC_TRANSFER_RESULT_DATE_SOURCE" 100.0 ["SEC_TRANSFER_RESULT_DATE_RESULT"]) with date = transferDate)
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_TRANSFER_RESULT_DATE_RESULT" "SEC_TRANSFER_RESULT_DATE_RESULT" stakeholderId stockClassId) with
             date = resultDate
-            quantity = 200.0)
+            quantity = 100.0)
         ]
       edits = []
       deletes = []
-  pure ()
 
 testStockReissuanceWithResultingIssuanceDoesNotDoubleCountForCeiling = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -701,6 +695,84 @@ testStockReissuanceWithResultingIssuanceDoesNotDoubleCountForCeiling = script do
       creates =
         [ CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUANCE_RESULTING" "SEC_REISSUANCE_SOURCE" ["SEC_REISSUANCE_RESULT"])
         , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUANCE_RESULT" "SEC_REISSUANCE_RESULT" stakeholderId stockClassId) with quantity = 100.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockReissuanceResultQuantityMustMatchSourceQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REISSUANCE_QUANTITY" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REISSUANCE_QUANTITY" "Reissuance Quantity Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_REISSUANCE_QUANTITY_SOURCE" "SEC_REISSUANCE_QUANTITY_SOURCE" stakeholderId stockClassId) with quantity = 100.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUANCE_QUANTITY" "SEC_REISSUANCE_QUANTITY_SOURCE" ["SEC_REISSUANCE_QUANTITY_RESULT"])
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUANCE_QUANTITY_RESULT" "SEC_REISSUANCE_QUANTITY_RESULT" stakeholderId stockClassId) with quantity = 10.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockReissuanceResultMustRemainInSourceStockClass = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithSource, sourceStockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REISSUANCE_CLASS_SOURCE" 1_000.0)
+  (capTableWithResult, resultStockClassId) <- setupStockClassWith issuer capTableWithSource (limitedStockClass "SC_REISSUANCE_CLASS_RESULT" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithResult "SH_REISSUANCE_CLASS" "Reissuance Class Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_REISSUANCE_CLASS_SOURCE" "SEC_REISSUANCE_CLASS_SOURCE" stakeholderId sourceStockClassId) with quantity = 100.0)
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUANCE_CLASS" "SEC_REISSUANCE_CLASS_SOURCE" ["SEC_REISSUANCE_CLASS_RESULT"])
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUANCE_CLASS_RESULT" "SEC_REISSUANCE_CLASS_RESULT" stakeholderId resultStockClassId) with quantity = 100.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockReissuanceResultDateMustMatchReissuanceDate = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REISSUANCE_DATE" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REISSUANCE_DATE" "Reissuance Date Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_REISSUANCE_DATE_SOURCE" "SEC_REISSUANCE_DATE_SOURCE" stakeholderId stockClassId) with quantity = 100.0)
+  let reissuanceDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let resultDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance ((stockReissuance "TX_REISSUANCE_DATE" "SEC_REISSUANCE_DATE_SOURCE" ["SEC_REISSUANCE_DATE_RESULT"]) with date = reissuanceDate)
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUANCE_DATE_RESULT" "SEC_REISSUANCE_DATE_RESULT" stakeholderId stockClassId) with
+            date = resultDate
+            quantity = 100.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockReissuanceSameTimestampSplitUsesAdjustedSourceQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_REISSUANCE_SPLIT" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_REISSUANCE_SPLIT" "Reissuance Split Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_REISSUANCE_SPLIT_SOURCE" "SEC_REISSUANCE_SPLIT_SOURCE" stakeholderId stockClassId) with quantity = 50.0)
+  let eventDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassSplit ((stockClassSplit "TX_REISSUANCE_SPLIT_EVENT" stockClassId 2.0 1.0) with date = eventDate)
+        , CT.OcfCreateStockReissuance ((stockReissuance "TX_REISSUANCE_SPLIT" "SEC_REISSUANCE_SPLIT_SOURCE" ["SEC_REISSUANCE_SPLIT_RESULT"]) with date = eventDate)
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_REISSUANCE_SPLIT_RESULT" "SEC_REISSUANCE_SPLIT_RESULT" stakeholderId stockClassId) with
+            date = eventDate
+            quantity = 100.0)
         ]
       edits = []
       deletes = []
@@ -737,6 +809,27 @@ testStockConsolidationResultQuantityMustEqualSourceTotal = script do
       creates =
         [ CT.OcfCreateStockConsolidation (stockConsolidation "TX_CONSOLIDATION_QUANTITY" ["SEC_CONSOLIDATION_QUANTITY_SOURCE_A", "SEC_CONSOLIDATION_QUANTITY_SOURCE_B"] "SEC_CONSOLIDATION_QUANTITY_RESULT")
         , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CONSOLIDATION_QUANTITY_RESULT" "SEC_CONSOLIDATION_QUANTITY_RESULT" stakeholderId stockClassId) with quantity = 10.0)
+        ]
+      edits = []
+      deletes = []
+
+testStockConsolidationResultDateMustMatchConsolidationDate = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONSOLIDATION_DATE" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_CONSOLIDATION_DATE" "Consolidation Date Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_CONSOLIDATION_DATE_SOURCE" "SEC_CONSOLIDATION_DATE_SOURCE" stakeholderId stockClassId) with quantity = 100.0)
+  let consolidationDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let resultDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation ((stockConsolidation "TX_CONSOLIDATION_DATE" ["SEC_CONSOLIDATION_DATE_SOURCE"] "SEC_CONSOLIDATION_DATE_RESULT") with date = consolidationDate)
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CONSOLIDATION_DATE_RESULT" "SEC_CONSOLIDATION_DATE_RESULT" stakeholderId stockClassId) with
+            date = resultDate
+            quantity = 100.0)
         ]
       edits = []
       deletes = []
@@ -1081,6 +1174,34 @@ testStockConversionWithNonRatioRightFailsForCeiling = script do
       edits = []
       deletes = []
 
+testStockConversionSkipsNonComputableRightWhenRatioRightMatchesResult = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_MIXED_COMMON" 100.0)
+  let preferredClassId = "SC_CONVERSION_MIXED_SOURCE"
+  let ppsRight = (stockClassConversionRightTo commonClassId) with
+        conversion_mechanism = OcfConversionMechanismPpsBasedConversion
+        ratio = None
+        reference_share_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
+  let preferredClass = (limitedStockClass preferredClassId 100.0) with
+        conversion_rights = [ppsRight, stockClassConversionRightTo commonClassId]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_MIXED" "Conversion Mixed Rights Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_CONVERSION_MIXED_SOURCE" "SEC_CONVERSION_MIXED_SOURCE" stakeholderId preferredClassId) with quantity = 50.0)
+  let conversion = stockConversion "TX_CONVERSION_MIXED" "SEC_CONVERSION_MIXED_SOURCE" 50.0
+  let resultIssuance = (defaultStockIssuance "TX_CONVERSION_MIXED_RESULT" "TX_CONVERSION_MIXED_RESULT" stakeholderId commonClassId) with quantity = 50.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConversion conversion
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
 testWarrantExerciseCannotExceedStockClassAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -1112,6 +1233,85 @@ testFixedWarrantPartialExerciseUsesExerciseQuantityForCeiling = script do
   _ <- submit issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateWarrantExercise (warrantExercise "TX_WARRANT_PARTIAL_EXERCISE" "WSEC_PARTIAL" 50.0)]
+      edits = []
+      deletes = []
+  pure ()
+
+testFixedWarrantExerciseScalesDeclaredShareOutput = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_FIXED_SCALE" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_FIXED_SCALE" "Warrant Fixed Scale Holder"
+  let securityId = "WSEC_FIXED_SCALE"
+  let issuance = (warrantIssuance "TX_WARRANT_FIXED_SCALE_ISSUED" securityId stakeholderId stockClassId 100.0) with
+        exercise_triggers = [warrantFixedExerciseTrigger "TRIGGER_FIXED_SCALE" stockClassId 1_000.0]
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  let exerciseDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let exercise = (warrantExercise "TX_WARRANT_FIXED_SCALE_EXERCISE" securityId 50.0) with
+        date = exerciseDate
+        trigger_id = "TRIGGER_FIXED_SCALE"
+  let resultIssuance = (defaultStockIssuance "TX_WARRANT_FIXED_SCALE_RESULT" "TX_WARRANT_FIXED_SCALE_EXERCISE_RESULT" stakeholderId stockClassId) with
+        date = exerciseDate
+        quantity = 500.0
+  _ <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise exercise
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testFixedWarrantFullExerciseScalesToRemainingBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_FIXED_REMAINDER" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_FIXED_REMAINDER" "Warrant Fixed Remainder Holder"
+  let securityId = "WSEC_FIXED_REMAINDER"
+  let issuance = (warrantIssuance "TX_WARRANT_FIXED_REMAINDER_ISSUED" securityId stakeholderId stockClassId 100.0) with
+        exercise_triggers = [warrantFixedExerciseTrigger "TRIGGER_FIXED_REMAINDER" stockClassId 1_000.0]
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  let partialDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let partialExercise = (warrantExercise "TX_WARRANT_FIXED_REMAINDER_PARTIAL" securityId 50.0) with
+        date = partialDate
+        trigger_id = "TRIGGER_FIXED_REMAINDER"
+  let partialResult = (defaultStockIssuance "TX_WARRANT_FIXED_REMAINDER_PARTIAL_RESULT" "TX_WARRANT_FIXED_REMAINDER_PARTIAL_RESULT" stakeholderId stockClassId) with
+        date = partialDate
+        quantity = 500.0
+  partiallyExercised <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise partialExercise
+        , CT.OcfCreateStockIssuance partialResult
+        ]
+      edits = []
+      deletes = []
+
+  let finalDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+  let finalExercise = (warrantExercise "TX_WARRANT_FIXED_REMAINDER_FINAL" securityId 0.0) with
+        date = finalDate
+        trigger_id = "TRIGGER_FIXED_REMAINDER"
+        quantity = None
+  let finalResult = (defaultStockIssuance "TX_WARRANT_FIXED_REMAINDER_FINAL_RESULT" "TX_WARRANT_FIXED_REMAINDER_FINAL_RESULT" stakeholderId stockClassId) with
+        date = finalDate
+        quantity = 500.0
+  _ <- submit issuer do
+    exerciseCmd partiallyExercised.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise finalExercise
+        , CT.OcfCreateStockIssuance finalResult
+        ]
       edits = []
       deletes = []
   pure ()
@@ -1158,6 +1358,73 @@ testNonFixedWarrantExerciseRequiresResultingStockIssuanceForCeiling = script do
         ]
       edits = []
       deletes = []
+
+testNonFixedWarrantExerciseUsesRecordedStockQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_NON_FIXED_RESULT" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_NON_FIXED_RESULT" "Warrant Non Fixed Result Holder"
+  let securityId = "WSEC_NON_FIXED_RESULT"
+  let issuance = (warrantIssuance "TX_WARRANT_NON_FIXED_RESULT_ISSUED" securityId stakeholderId stockClassId 100.0) with
+        exercise_triggers = [warrantCustomExerciseTrigger "TRIGGER_NON_FIXED_RESULT" stockClassId]
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  let exerciseDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let exercise = (warrantExercise "TX_WARRANT_NON_FIXED_RESULT_EXERCISE" securityId 100.0) with
+        date = exerciseDate
+        trigger_id = "TRIGGER_NON_FIXED_RESULT"
+  let resultIssuance = (defaultStockIssuance "TX_WARRANT_NON_FIXED_RESULT" "TX_WARRANT_NON_FIXED_RESULT_EXERCISE_RESULT" stakeholderId stockClassId) with
+        date = exerciseDate
+        quantity = 25.0
+  _ <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise exercise
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantExerciseWithUnspecifiedTargetClassUsesRecordedStock = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_WARRANT_UNSPECIFIED_TARGET" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_WARRANT_UNSPECIFIED_TARGET" "Warrant Unspecified Target Holder"
+  let securityId = "WSEC_UNSPECIFIED_TARGET"
+  let issuance = (warrantIssuance "TX_WARRANT_UNSPECIFIED_TARGET_ISSUED" securityId stakeholderId stockClassId 100.0) with
+        exercise_triggers =
+          [ warrantExerciseTriggerWith
+              "TRIGGER_UNSPECIFIED_TARGET"
+              (OcfWarrantMechanismFixedAmount with converts_to_quantity = 100.0)
+              None
+          ]
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+  let exerciseDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let exercise = (warrantExercise "TX_WARRANT_UNSPECIFIED_TARGET_EXERCISE" securityId 100.0) with
+        date = exerciseDate
+        trigger_id = "TRIGGER_UNSPECIFIED_TARGET"
+  let resultIssuance = (defaultStockIssuance "TX_WARRANT_UNSPECIFIED_TARGET_RESULT" "TX_WARRANT_UNSPECIFIED_TARGET_EXERCISE_RESULT" stakeholderId stockClassId) with
+        date = exerciseDate
+        quantity = 100.0
+  _ <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantExercise exercise
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testWarrantExerciseResultStockClassMustMatchTrigger = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -1245,6 +1512,48 @@ testClasslessEquityCompensationExerciseUsesSinglePlanClassForCeiling = script do
       edits = []
       deletes = []
 
+testClasslessEquityCompensationMaterializedExerciseMustUseSinglePlanClass = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithExpected, expectedStockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CLASSLESS_MATERIALIZED_EXERCISE" 1_000.0)
+  (capTableWithWrong, wrongStockClassId) <- setupStockClassWith issuer capTableWithExpected (limitedStockClass "SC_CLASSLESS_MATERIALIZED_EXERCISE_WRONG" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithWrong "SH_CLASSLESS_MATERIALIZED_EXERCISE" "Classless Materialized Exercise Holder"
+  let stockPlanId = "PLAN_CLASSLESS_MATERIALIZED_EXERCISE"
+  let securityId = "ECSEC_CLASSLESS_MATERIALIZED_EXERCISE"
+  let plan = (defaultStockPlan stockPlanId expectedStockClassId) with initial_shares_reserved = 100.0
+  let issuance = (equityCompensationIssuance "TX_CLASSLESS_MATERIALIZED_EXERCISE_GRANTED" securityId stakeholderId expectedStockClassId 50.0) with
+        stock_class_id = None
+        stock_plan_id = Some stockPlanId
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+  let wrongExercise = equityCompensationExercise "TX_CLASSLESS_MATERIALIZED_EXERCISE_WRONG" securityId 50.0
+  submitMustFail issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise wrongExercise
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CLASSLESS_MATERIALIZED_EXERCISE_WRONG_RESULT" "TX_CLASSLESS_MATERIALIZED_EXERCISE_WRONG_RESULT" stakeholderId wrongStockClassId) with quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+
+  let validExercise = equityCompensationExercise "TX_CLASSLESS_MATERIALIZED_EXERCISE_VALID" securityId 50.0
+  _ <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise validExercise
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CLASSLESS_MATERIALIZED_EXERCISE_VALID_RESULT" "TX_CLASSLESS_MATERIALIZED_EXERCISE_VALID_RESULT" stakeholderId expectedStockClassId) with quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
 testClasslessEquityCompensationExerciseRejectsAmbiguousPlanClass = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
 
@@ -1289,6 +1598,16 @@ testClasslessCashSettledSarExerciseAllowsNoStockOutput = script do
       edits = []
       deletes = []
 
+  let stockExercise = equityCompensationExercise "TX_CASH_SETTLED_SAR_STOCK_EXERCISE" "ECSEC_CASH_SETTLED_SAR" 50.0
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationExercise stockExercise
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CASH_SETTLED_SAR_STOCK_RESULT" "TX_CASH_SETTLED_SAR_STOCK_EXERCISE_RESULT" stakeholderId stockClassId) with quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+
   _ <- submit issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateEquityCompensationExercise ((equityCompensationExercise "TX_CASH_SETTLED_SAR_EXERCISE" "ECSEC_CASH_SETTLED_SAR" 50.0) with resulting_security_ids = [])]
@@ -1324,6 +1643,56 @@ testClasslessEquityCompensationReleaseUsesSinglePlanClassForCeiling = script do
       creates = [CT.OcfCreateEquityCompensationRelease (equityCompensationRelease "TX_CLASSLESS_EQUITY_RELEASE" "ECSEC_CLASSLESS_RELEASE" releaseDate settlementDate 150.0)]
       edits = []
       deletes = []
+
+testClasslessEquityCompensationMaterializedReleaseMustUseSinglePlanClass = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  (capTableWithExpected, expectedStockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CLASSLESS_MATERIALIZED_RELEASE" 1_000.0)
+  (capTableWithWrong, wrongStockClassId) <- setupStockClassWith issuer capTableWithExpected (limitedStockClass "SC_CLASSLESS_MATERIALIZED_RELEASE_WRONG" 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithWrong "SH_CLASSLESS_MATERIALIZED_RELEASE" "Classless Materialized Release Holder"
+  let stockPlanId = "PLAN_CLASSLESS_MATERIALIZED_RELEASE"
+  let securityId = "ECSEC_CLASSLESS_MATERIALIZED_RELEASE"
+  let plan = (defaultStockPlan stockPlanId expectedStockClassId) with initial_shares_reserved = 100.0
+  let issuance = (equityCompensationIssuance "TX_CLASSLESS_MATERIALIZED_RELEASE_GRANTED" securityId stakeholderId expectedStockClassId 50.0) with
+        compensation_type = OcfCompensationTypeRSU
+        exercise_price = None
+        stock_class_id = None
+        stock_plan_id = Some stockPlanId
+  issued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance issuance
+        ]
+      edits = []
+      deletes = []
+
+  let releaseDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let settlementDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+  let wrongRelease = equityCompensationRelease "TX_CLASSLESS_MATERIALIZED_RELEASE_WRONG" securityId releaseDate settlementDate 50.0
+  submitMustFail issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationRelease wrongRelease
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CLASSLESS_MATERIALIZED_RELEASE_WRONG_RESULT" "TX_CLASSLESS_MATERIALIZED_RELEASE_WRONG_RESULT" stakeholderId wrongStockClassId) with
+            date = settlementDate
+            quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+
+  let validRelease = equityCompensationRelease "TX_CLASSLESS_MATERIALIZED_RELEASE_VALID" securityId releaseDate settlementDate 50.0
+  _ <- submit issuer do
+    exerciseCmd issued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationRelease validRelease
+        , CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_CLASSLESS_MATERIALIZED_RELEASE_VALID_RESULT" "TX_CLASSLESS_MATERIALIZED_RELEASE_VALID_RESULT" stakeholderId expectedStockClassId) with
+            date = settlementDate
+            quantity = 50.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testClasslessEquityCompensationReleaseRejectsAmbiguousPlanClass = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
