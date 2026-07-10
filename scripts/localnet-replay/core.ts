@@ -8,6 +8,7 @@ import {
   mapOcfObjectTypeToEntityType,
   matchesTemplateIdentity,
   normalizeEntityType,
+  normalizeObjectType,
   sortTransactions,
   type OcfEntityType,
 } from '@open-captable-protocol/canton';
@@ -286,8 +287,10 @@ function prepareRow(row: DatabaseOcfRow, portalAlias: string): PreparedOcfObject
     );
   }
 
-  const categorizedEntityType = mapCategorizedTypeToEntityType(row.type, row.subtype);
-  const objectEntityType = mapOcfObjectTypeToEntityType(objectType);
+  const normalizedSubtype = row.subtype === null ? null : normalizeObjectType(row.subtype);
+  const normalizedObjectType = normalizeObjectType(objectType);
+  const categorizedEntityType = mapCategorizedTypeToEntityType(row.type, normalizedSubtype);
+  const objectEntityType = mapOcfObjectTypeToEntityType(normalizedObjectType);
   if (!categorizedEntityType || !objectEntityType) {
     throw new ReplayPhaseError(
       'mapping',
@@ -297,8 +300,8 @@ function prepareRow(row: DatabaseOcfRow, portalAlias: string): PreparedOcfObject
   }
 
   const normalizedCategorizedType = normalizeEntityType(categorizedEntityType);
-  const normalizedObjectType = normalizeEntityType(objectEntityType);
-  if (normalizedCategorizedType !== normalizedObjectType) {
+  const normalizedObjectEntityType = normalizeEntityType(objectEntityType);
+  if (normalizedCategorizedType !== normalizedObjectEntityType) {
     throw new ReplayPhaseError(
       'mapping',
       `Database category maps to ${categorizedEntityType}, but object_type maps to ${objectEntityType}`,
@@ -307,7 +310,10 @@ function prepareRow(row: DatabaseOcfRow, portalAlias: string): PreparedOcfObject
   }
 
   const expectedObjectType = ENTITY_OBJECT_TYPE_MAP[categorizedEntityType];
-  if (normalizeEntityType(categorizedEntityType) === categorizedEntityType && expectedObjectType !== objectType) {
+  if (
+    normalizeEntityType(categorizedEntityType) === categorizedEntityType &&
+    expectedObjectType !== normalizedObjectType
+  ) {
     throw new ReplayPhaseError(
       'mapping',
       `Entity ${categorizedEntityType} expects object_type=${expectedObjectType}, received ${objectType}`,

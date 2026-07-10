@@ -107,6 +107,30 @@ function run(): void {
   ];
   expectReplayPhase(() => preparePortal(unknownSchemaRows), 'schema');
 
+  const planSecurityPortal = preparePortal([
+    validRows[0],
+    {
+      portalId: PORTAL_ID,
+      type: 'TRANSACTION',
+      subtype: 'TX_PLAN_SECURITY_ISSUANCE',
+      data: {
+        object_type: 'TX_PLAN_SECURITY_ISSUANCE',
+        id: 'grant-1',
+        custom_id: 'grant-1',
+        security_id: 'security-1',
+        stakeholder_id: 'stakeholder-secret-id',
+        stock_plan_id: 'plan-1',
+        compensation_type: 'RSU',
+        quantity: '1000',
+        date: '2024-01-01',
+        expiration_date: null,
+        termination_exercise_windows: [],
+        security_law_exemptions: [],
+      },
+    },
+  ]);
+  assert.equal(planSecurityPortal.creates[0].entityType, 'equityCompensationIssuance');
+
   assert.equal(
     matchesLedgerTemplateId(
       '534319ff0f8e273fce07984ee471fa86c19b15528e177f7e3e42ba858d89ed8d:Fairmint.OpenCapTable.CapTable:CapTable',
