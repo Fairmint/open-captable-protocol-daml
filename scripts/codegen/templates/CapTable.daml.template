@@ -138,8 +138,8 @@ data StockClassShareEventIndex = StockClassShareEventIndex with
   deriving (Eq, Show)
 
 data StockPlanSuccessorIndex = StockPlanSuccessorIndex with
-    stock_successors_by_security_id: Map Text Time
-    equity_compensation_successors_by_security_id: Map Text Time
+    stock_successors_by_security_id: Map Text (Time, Optional Text)
+    equity_compensation_successors_by_security_id: Map Text (Time, Optional Text)
   deriving (Eq, Show)
 
 authorizedSharesCeiling : OcfInitialSharesAuthorized -> AuthorizedSharesCeiling
@@ -1202,7 +1202,7 @@ validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHist
               (stockClassTotal <= issuerLimit)
           None ->
             assertMsg ("Issuer authorized shares exceeded on " <> show asOf <> ": stock class authorization is unlimited but issuer authorization is finite") False)
-    validationDates
+    (issuerContract.issuer_data.formation_date :: validationDates)
 
 addQuantityById : Text -> Decimal -> Map Text Decimal -> Map Text Decimal
 addQuantityById key quantity totals =
@@ -1221,101 +1221,211 @@ assertNonNegativeQuantity : Text -> Decimal -> Update ()
 assertNonNegativeQuantity label quantity =
   assertMsg (label <> " cannot be negative: " <> show quantity) (quantity >= 0.0)
 
-addPlanSuccessor : Time -> Text -> Map Text Time -> Map Text Time
-addPlanSuccessor producedAt securityId index =
+addPlanSuccessor : Time -> Text -> Text -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addPlanSuccessor producedAt stockPlanId securityId index =
   case Map.lookup securityId index of
-    Some existingDate -> Map.insert securityId (if producedAt < existingDate then producedAt else existingDate) index
-    None -> Map.insert securityId producedAt index
+    Some (existingDate, existingPlanIdOpt) ->
+      let earliestDate = if producedAt < existingDate then producedAt else existingDate
+          inheritedPlanIdOpt = case existingPlanIdOpt of
+            Some existingPlanId -> if existingPlanId == stockPlanId then Some stockPlanId else None
+            None -> None
+      in Map.insert securityId (earliestDate, inheritedPlanIdOpt) index
+    None -> Map.insert securityId (producedAt, Some stockPlanId) index
 
-addOptionalPlanSuccessor : Time -> Optional Text -> Map Text Time -> Map Text Time
-addOptionalPlanSuccessor producedAt securityIdOpt index = case securityIdOpt of
-  Some securityId -> addPlanSuccessor producedAt securityId index
+addOptionalPlanSuccessor : Time -> Text -> Optional Text -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addOptionalPlanSuccessor producedAt stockPlanId securityIdOpt index = case securityIdOpt of
+  Some securityId -> addPlanSuccessor producedAt stockPlanId securityId index
   None -> index
 
-addPlanSuccessors : Time -> [Text] -> Map Text Time -> Map Text Time
-addPlanSuccessors producedAt securityIds index =
-  foldl (\updatedIndex securityId -> addPlanSuccessor producedAt securityId updatedIndex) index securityIds
+addPlanSuccessors : Time -> Text -> [Text] -> Map Text (Time, Optional Text) -> Map Text (Time, Optional Text)
+addPlanSuccessors producedAt stockPlanId securityIds index =
+  foldl (\updatedIndex securityId -> addPlanSuccessor producedAt stockPlanId securityId updatedIndex) index securityIds
 
-planSuccessorProducedOnOrBefore : Map Text Time -> Text -> Time -> Bool
-planSuccessorProducedOnOrBefore successorIndex securityId asOf =
+declaredPlanForSecurity : Map Text Text -> Map Text (Time, Optional Text) -> Text -> Optional Text
+declaredPlanForSecurity declaredPlans successorIndex securityId =
+  case Map.lookup securityId declaredPlans of
+    Some stockPlanId -> Some stockPlanId
+    None -> case Map.lookup securityId successorIndex of
+      Some (_, stockPlanIdOpt) -> stockPlanIdOpt
+      None -> None
+
+addInheritedPlanSuccessorsForSource :
+  Map Text Text ->
+  Map Text (Time, Optional Text) ->
+  Text ->
+  Time ->
+  Optional Text ->
+  [Text] ->
+  Map Text (Time, Optional Text)
+addInheritedPlanSuccessorsForSource declaredPlans successorIndex sourceSecurityId producedAt balanceSecurityId resultingSecurityIds =
+  case declaredPlanForSecurity declaredPlans successorIndex sourceSecurityId of
+    Some stockPlanId ->
+      let withBalance = addOptionalPlanSuccessor producedAt stockPlanId balanceSecurityId successorIndex
+      in addPlanSuccessors producedAt stockPlanId resultingSecurityIds withBalance
+    None -> successorIndex
+
+successorCarriesPlanAllocation : Map Text (Time, Optional Text) -> Text -> Optional Text -> Bool
+successorCarriesPlanAllocation successorIndex securityId declaredPlanIdOpt =
   case Map.lookup securityId successorIndex of
-    Some producedAt -> producedAt <= asOf
-    None -> False
+    Some (_, Some inheritedPlanId) -> case declaredPlanIdOpt of
+      Some declaredPlanId -> declaredPlanId == inheritedPlanId
+      None -> True
+    _ -> False
+
+successorCarriesPlanAllocationOnOrBefore : Map Text (Time, Optional Text) -> Text -> Optional Text -> Time -> Bool
+successorCarriesPlanAllocationOnOrBefore successorIndex securityId declaredPlanIdOpt asOf =
+  case Map.lookup securityId successorIndex of
+    Some (producedAt, Some inheritedPlanId) ->
+      producedAt <= asOf && case declaredPlanIdOpt of
+        Some declaredPlanId -> declaredPlanId == inheritedPlanId
+        None -> True
+    _ -> False
+
+effectivePlanIndex : Map Text Text -> Map Text (Time, Optional Text) -> Map Text Text
+effectivePlanIndex declaredPlans successorIndex =
+  foldl
+    (\plans (securityId, (_, stockPlanIdOpt)) ->
+      case (Map.lookup securityId plans, stockPlanIdOpt) of
+        (None, Some stockPlanId) -> Map.insert securityId stockPlanId plans
+        _ -> plans)
+    declaredPlans
+    (Map.toList successorIndex)
+
+mergePlanIndexes : Map Text Text -> Map Text Text -> Map Text Text
+mergePlanIndexes base additions =
+  foldl
+    (\plans (securityId, stockPlanId) ->
+      if isSome (Map.lookup securityId plans) then plans else Map.insert securityId stockPlanId plans)
+    base
+    (Map.toList additions)
+
+equityPlanSuccessorPass : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+equityPlanSuccessorPass maps declaredPlans initialIndex = do
+  cancellationSuccessors <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addInheritedPlanSuccessorsForSource
+        declaredPlans
+        index
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id
+        []))
+    initialIndex
+    (Map.values maps.equity_compensation_cancellations)
+
+  foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addInheritedPlanSuccessorsForSource
+        declaredPlans
+        index
+        transfer.transfer_data.security_id
+        transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids))
+    cancellationSuccessors
+    (Map.values maps.equity_compensation_transfers)
+
+stabilizeEquityPlanSuccessors : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stabilizeEquityPlanSuccessors maps declaredPlans currentIndex = do
+  nextIndex <- equityPlanSuccessorPass maps declaredPlans currentIndex
+  if nextIndex == currentIndex
+    then pure currentIndex
+    else stabilizeEquityPlanSuccessors maps declaredPlans nextIndex
+
+stockPlanSuccessorPass : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stockPlanSuccessorPass maps sourcePlans initialIndex = do
+  cancellationSuccessors <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id []))
+    initialIndex
+    (Map.values maps.stock_cancellations)
+
+  repurchaseSuccessors <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index repurchase.repurchase_data.security_id repurchase.repurchase_data.date repurchase.repurchase_data.balance_security_id []))
+    cancellationSuccessors
+    (Map.values maps.stock_repurchases)
+
+  transferSuccessors <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids))
+    repurchaseSuccessors
+    (Map.values maps.stock_transfers)
+
+  conversionSuccessors <- foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index conversion.conversion_data.security_id conversion.conversion_data.date conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids))
+    transferSuccessors
+    (Map.values maps.stock_conversions)
+
+  reissuanceSuccessors <- foldlA
+    (\index reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index reissuance.reissuance_data.security_id reissuance.reissuance_data.date None reissuance.reissuance_data.resulting_security_ids))
+    conversionSuccessors
+    (Map.values maps.stock_reissuances)
+
+  consolidationSuccessors <- foldlA
+    (\index consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      foldlA
+        (\nextIndex sourceSecurityId ->
+          pure (addInheritedPlanSuccessorsForSource sourcePlans nextIndex sourceSecurityId consolidation.consolidation_data.date None [consolidation.consolidation_data.resulting_security_id]))
+        index
+        consolidation.consolidation_data.security_ids)
+    reissuanceSuccessors
+    (Map.values maps.stock_consolidations)
+
+  exerciseSuccessors <- foldlA
+    (\index exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index exercise.exercise_data.security_id exercise.exercise_data.date None exercise.exercise_data.resulting_security_ids))
+    consolidationSuccessors
+    (Map.values maps.equity_compensation_exercises)
+
+  foldlA
+    (\index releaseCid -> do
+      release <- fetch releaseCid
+      pure (addInheritedPlanSuccessorsForSource sourcePlans index release.release_data.security_id release.release_data.settlement_date None release.release_data.resulting_security_ids))
+    exerciseSuccessors
+    (Map.values maps.equity_compensation_releases)
+
+stabilizeStockPlanSuccessors : CapTableMaps -> Map Text Text -> Map Text (Time, Optional Text) -> Update (Map Text (Time, Optional Text))
+stabilizeStockPlanSuccessors maps sourcePlans currentIndex = do
+  nextIndex <- stockPlanSuccessorPass maps sourcePlans currentIndex
+  if nextIndex == currentIndex
+    then pure currentIndex
+    else stabilizeStockPlanSuccessors maps sourcePlans nextIndex
 
 stockPlanSuccessorIndex : CapTableMaps -> Update StockPlanSuccessorIndex
 stockPlanSuccessorIndex maps = do
-  stockCancellationSuccessors <- foldlA
-    (\index cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (addOptionalPlanSuccessor cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id index))
+  equityDeclaredPlans <- foldlA
+    (\index issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure $ case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> Map.insert issuance.issuance_data.security_id stockPlanId index
+        None -> index)
     Map.empty
-    (Map.values maps.stock_cancellations)
+    (Map.values maps.equity_compensation_issuances)
+  equitySuccessors <- stabilizeEquityPlanSuccessors maps equityDeclaredPlans Map.empty
+  let equityEffectivePlans = effectivePlanIndex equityDeclaredPlans equitySuccessors
 
-  stockRepurchaseSuccessors <- foldlA
-    (\index repurchaseCid -> do
-      repurchase <- fetch repurchaseCid
-      pure (addOptionalPlanSuccessor repurchase.repurchase_data.date repurchase.repurchase_data.balance_security_id index))
-    stockCancellationSuccessors
-    (Map.values maps.stock_repurchases)
-
-  stockTransferSuccessors <- foldlA
-    (\index transferCid -> do
-      transfer <- fetch transferCid
-      let withBalance = addOptionalPlanSuccessor transfer.transfer_data.date transfer.transfer_data.balance_security_id index
-      pure (addPlanSuccessors transfer.transfer_data.date transfer.transfer_data.resulting_security_ids withBalance))
-    stockRepurchaseSuccessors
-    (Map.values maps.stock_transfers)
-
-  stockConversionSuccessors <- foldlA
-    (\index conversionCid -> do
-      conversion <- fetch conversionCid
-      let withBalance = addOptionalPlanSuccessor conversion.conversion_data.date conversion.conversion_data.balance_security_id index
-      pure (addPlanSuccessors conversion.conversion_data.date conversion.conversion_data.resulting_security_ids withBalance))
-    stockTransferSuccessors
-    (Map.values maps.stock_conversions)
-
-  stockReissuanceSuccessors <- foldlA
-    (\index reissuanceCid -> do
-      reissuance <- fetch reissuanceCid
-      pure (addPlanSuccessors reissuance.reissuance_data.date reissuance.reissuance_data.resulting_security_ids index))
-    stockConversionSuccessors
-    (Map.values maps.stock_reissuances)
-
-  stockConsolidationSuccessors <- foldlA
-    (\index consolidationCid -> do
-      consolidation <- fetch consolidationCid
-      pure (addPlanSuccessor consolidation.consolidation_data.date consolidation.consolidation_data.resulting_security_id index))
-    stockReissuanceSuccessors
-    (Map.values maps.stock_consolidations)
-
-  stockExerciseSuccessors <- foldlA
-    (\index exerciseCid -> do
-      exercise <- fetch exerciseCid
-      pure (addPlanSuccessors exercise.exercise_data.date exercise.exercise_data.resulting_security_ids index))
-    stockConsolidationSuccessors
-    (Map.values maps.equity_compensation_exercises)
-
-  stockSuccessors <- foldlA
-    (\index releaseCid -> do
-      release <- fetch releaseCid
-      pure (addPlanSuccessors release.release_data.settlement_date release.release_data.resulting_security_ids index))
-    stockExerciseSuccessors
-    (Map.values maps.equity_compensation_releases)
-
-  equityCancellationSuccessors <- foldlA
-    (\index cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (addOptionalPlanSuccessor cancellation.cancellation_data.date cancellation.cancellation_data.balance_security_id index))
+  stockDeclaredPlans <- foldlA
+    (\index issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure $ case issuance.issuance_data.stock_plan_id of
+        Some stockPlanId -> Map.insert issuance.issuance_data.security_id stockPlanId index
+        None -> index)
     Map.empty
-    (Map.values maps.equity_compensation_cancellations)
-
-  equitySuccessors <- foldlA
-    (\index transferCid -> do
-      transfer <- fetch transferCid
-      let withBalance = addOptionalPlanSuccessor transfer.transfer_data.date transfer.transfer_data.balance_security_id index
-      pure (addPlanSuccessors transfer.transfer_data.date transfer.transfer_data.resulting_security_ids withBalance))
-    equityCancellationSuccessors
-    (Map.values maps.equity_compensation_transfers)
+    (Map.values maps.stock_issuances)
+  let stockSourcePlans = mergePlanIndexes stockDeclaredPlans equityEffectivePlans
+  stockSuccessors <- stabilizeStockPlanSuccessors maps stockSourcePlans Map.empty
 
   pure StockPlanSuccessorIndex with
     stock_successors_by_security_id = stockSuccessors
@@ -1326,7 +1436,10 @@ stockIssuancePlanAllocationIndex eventIndex successorIndex maps =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      if isSome (Map.lookup issuance.issuance_data.security_id successorIndex.stock_successors_by_security_id)
+      if successorCarriesPlanAllocation
+          successorIndex.stock_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
         then pure totals
         else case issuance.issuance_data.stock_plan_id of
           Some stockPlanId -> do
@@ -1402,7 +1515,10 @@ equityCompensationPlanAllocationIndex successorIndex maps =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      if isSome (Map.lookup issuance.issuance_data.security_id successorIndex.equity_compensation_successors_by_security_id)
+      if successorCarriesPlanAllocation
+          successorIndex.equity_compensation_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
         then pure totals
         else case issuance.issuance_data.stock_plan_id of
           Some stockPlanId -> do
@@ -1715,7 +1831,11 @@ stockIssuancePlanAllocationIndexAt eventIndex successorIndex maps asOf =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      if planSuccessorProducedOnOrBefore successorIndex.stock_successors_by_security_id issuance.issuance_data.security_id asOf
+      if successorCarriesPlanAllocationOnOrBefore
+          successorIndex.stock_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+          asOf
         then pure totals
         else case issuance.issuance_data.stock_plan_id of
           Some stockPlanId ->
@@ -1739,7 +1859,11 @@ equityCompensationPlanAllocationIndexAt successorIndex maps asOf =
   foldlA
     (\totals issuanceCid -> do
       issuance <- fetch issuanceCid
-      if planSuccessorProducedOnOrBefore successorIndex.equity_compensation_successors_by_security_id issuance.issuance_data.security_id asOf
+      if successorCarriesPlanAllocationOnOrBefore
+          successorIndex.equity_compensation_successors_by_security_id
+          issuance.issuance_data.security_id
+          issuance.issuance_data.stock_plan_id
+          asOf
         then pure totals
         else case issuance.issuance_data.stock_plan_id of
           Some stockPlanId ->
@@ -1945,10 +2069,13 @@ validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
         (\asOf -> do
           netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndexAt eventIndex maps asOf
           validateStockPlanAllocationReferences maps netAllocatedQuantityIndex
+          let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
+          assertNonNegativeQuantity
+            ("Stock plan allocated quantity for " <> stockPlan.plan_data.id <> " on " <> show asOf)
+            allocatedQuantity
           if stockPlanEffectiveOnOrBefore asOf stockPlan.plan_data
             then do
               let reservedShares = stockPlanReservedSharesAt adjustmentHistory stockPlan.plan_data asOf
-              let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
               assertMsg
                 ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> " on " <> show asOf <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
                 (allocatedQuantity <= reservedShares)
