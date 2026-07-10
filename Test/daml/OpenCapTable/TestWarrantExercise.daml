@@ -13,13 +13,13 @@ import DA.Date (Month(..))
 import qualified DA.Time as DT
 import Daml.Script
 
-warrantExerciseTrigger : Decimal -> OcfConversionTrigger
-warrantExerciseTrigger convertsToQuantity =
+warrantExerciseTriggerWith : OcfWarrantConversionMechanism -> Optional Text -> OcfConversionTrigger
+warrantExerciseTriggerWith conversionMechanism stockClassId =
   OcfConversionTrigger with
     conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
-      conversion_mechanism = OcfWarrantMechanismFixedAmount with converts_to_quantity = convertsToQuantity
-      converts_to_future_round = None
-      converts_to_stock_class_id = Some "SC_COMMON"
+      conversion_mechanism = conversionMechanism
+      converts_to_future_round = case stockClassId of None -> Some True; Some _ -> None
+      converts_to_stock_class_id = stockClassId
       type_ = "WARRANT_CONVERSION_RIGHT")
     end_date = None
     nickname = None
@@ -30,8 +30,14 @@ warrantExerciseTrigger convertsToQuantity =
     trigger_id = "ELECTIVE_AT_WILL"
     type_ = OcfTriggerTypeTypeElectiveAtWill
 
+warrantExerciseTrigger : Decimal -> OcfConversionTrigger
+warrantExerciseTrigger convertsToQuantity =
+  warrantExerciseTriggerWith
+    (OcfWarrantMechanismFixedAmount with converts_to_quantity = convertsToQuantity)
+    (Some "SC_COMMON")
+
 -- Create a warrant issuance to exercise (follows real workflow)
-createWarrantIssuance issuer capTableCid securityId qty =
+createWarrantIssuanceWithTrigger issuer capTableCid securityId qty trigger =
   submit issuer do
     exerciseCmd capTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
@@ -47,7 +53,7 @@ createWarrantIssuance issuer capTableCid securityId qty =
         quantity = Some qty
         quantity_source = Some OcfQuantityUnspecified
         exercise_price = Some (OcfMonetary with amount = 0.01, currency = "USD")
-        exercise_triggers = [warrantExerciseTrigger qty]
+        exercise_triggers = [trigger]
         purchase_price = OcfMonetary with amount = 0.01, currency = "USD"
         vestings = []
         vesting_terms_id = None
@@ -55,6 +61,9 @@ createWarrantIssuance issuer capTableCid securityId qty =
         comments = []]
       edits = []
       deletes = []
+
+createWarrantIssuance issuer capTableCid securityId qty =
+  createWarrantIssuanceWithTrigger issuer capTableCid securityId qty (warrantExerciseTrigger qty)
 
 -- Test 1: Basic warrant exercise
 -- Warrants exercised into common stock
@@ -78,6 +87,50 @@ testWarrantExercise_BasicExercise = script do
       edits = []
       deletes = []
   pure ()
+
+testWarrantExercise_AllowsEmptyResultingSecurityIds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "WSEC-EMPTY-RESULTS"
+  result <- createWarrantIssuance issuer capTableCid securityId 100.0
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
+        id = "TX-WARRANT-EXERCISE-EMPTY-RESULTS"
+        date = DT.time (DA.date 2025 Jun 15) 0 0 0
+        security_id = securityId
+        trigger_id = "ELECTIVE_AT_WILL"
+        quantity = Some 100.0
+        resulting_security_ids = []
+        comments = []
+        consideration_text = None]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantExercise_NonFixedEmptyResultsFailWhenOutputCannotBeReconstructed = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "WSEC-NON-FIXED-EMPTY-RESULTS"
+      trigger = warrantExerciseTriggerWith
+        (OcfWarrantMechanismCustom with custom_conversion_description = "Output is determined by the exercise agreement")
+        (Some "SC_COMMON")
+  result <- createWarrantIssuanceWithTrigger issuer capTableCid securityId 100.0 trigger
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
+        id = "TX-WARRANT-EXERCISE-NON-FIXED-EMPTY-RESULTS"
+        date = DT.time (DA.date 2025 Jun 15) 0 0 0
+        security_id = securityId
+        trigger_id = "ELECTIVE_AT_WILL"
+        quantity = Some 100.0
+        resulting_security_ids = []
+        comments = []
+        consideration_text = None]
+      edits = []
+      deletes = []
 
 testWarrantExercise_ResultQuantityMustMatchTrigger = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -129,6 +182,60 @@ testWarrantExercise_ResultStockClassMustMatchTrigger = script do
         ]
       edits = []
       deletes = []
+
+testWarrantExercise_NonFixedResultQuantityUsesRecordedStock = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "WSEC-NON-FIXED-RESULT"
+      trigger = warrantExerciseTriggerWith
+        (OcfWarrantMechanismCustom with custom_conversion_description = "One warrant converts into a negotiated share quantity")
+        (Some "SC_COMMON")
+  result <- createWarrantIssuanceWithTrigger issuer capTableCid securityId 100.0 trigger
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ stockSuccessorIssuance "STOCK-ISS-WARRANT-NON-FIXED" "SSEC-WARRANT-NON-FIXED" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Jun 15) 0 0 0) 25.0
+        , CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
+            id = "TX-WARRANT-EXERCISE-NON-FIXED"
+            date = DT.time (DA.date 2025 Jun 15) 0 0 0
+            security_id = securityId
+            trigger_id = "ELECTIVE_AT_WILL"
+            quantity = Some 100.0
+            resulting_security_ids = ["SSEC-WARRANT-NON-FIXED"]
+            comments = []
+            consideration_text = None
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantExercise_UnspecifiedTargetClassUsesRecordedStock = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "WSEC-UNSPECIFIED-TARGET"
+      trigger = warrantExerciseTriggerWith
+        (OcfWarrantMechanismFixedAmount with converts_to_quantity = 100.0)
+        None
+  result <- createWarrantIssuanceWithTrigger issuer capTableCid securityId 100.0 trigger
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ stockSuccessorIssuance "STOCK-ISS-WARRANT-UNSPECIFIED-TARGET" "SSEC-WARRANT-UNSPECIFIED-TARGET" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Jun 15) 0 0 0) 100.0
+        , CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
+            id = "TX-WARRANT-EXERCISE-UNSPECIFIED-TARGET"
+            date = DT.time (DA.date 2025 Jun 15) 0 0 0
+            security_id = securityId
+            trigger_id = "ELECTIVE_AT_WILL"
+            quantity = Some 100.0
+            resulting_security_ids = ["SSEC-WARRANT-UNSPECIFIED-TARGET"]
+            comments = []
+            consideration_text = None
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 -- Test 2: Warrant exercise with comments (partial exercise scenario)
 testWarrantExercise_PartialWithComments = script do

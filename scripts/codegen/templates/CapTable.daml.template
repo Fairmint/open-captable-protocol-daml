@@ -543,21 +543,13 @@ warrantExerciseResultTerms issuanceData exerciseData =
         OcfRightWarrant conversionRight ->
           case conversionRight.converts_to_stock_class_id of
             Some stockClassId ->
-              let quantityOpt = case (conversionRight.conversion_mechanism, exerciseData.quantity, issuanceData.quantity) of
-                    (OcfWarrantMechanismFixedAmount _, _, _) ->
+              let quantityOpt = case conversionRight.conversion_mechanism of
+                    OcfWarrantMechanismFixedAmount _ ->
                       Some (warrantExerciseQuantity issuanceData exerciseData conversionRight)
-                    (_, Some _, _) ->
-                      Some (warrantExerciseQuantity issuanceData exerciseData conversionRight)
-                    (_, None, Some _) ->
-                      Some (warrantExerciseQuantity issuanceData exerciseData conversionRight)
-                    (_, None, None) -> None
+                    _ -> None
               in pure (Some (stockClassId, quantityOpt))
-            None -> do
-              assertMsg ("Warrant exercise output cannot be reconstructed because trigger has no destination stock class: " <> exerciseData.trigger_id) False
-              pure None
-        _ -> do
-          assertMsg ("Warrant exercise output cannot be reconstructed because trigger is not a warrant conversion right: " <> exerciseData.trigger_id) False
-          pure None
+            None -> pure None
+        _ -> pure None
     None -> do
       assertMsg ("Warrant exercise output cannot be reconstructed because trigger does not exist on warrant issuance: " <> exerciseData.trigger_id) False
       pure None
@@ -576,9 +568,11 @@ warrantExerciseOutputShareLot issuanceData exerciseData = do
         event_date = exerciseData.date
         quantity = quantity))
     Some (_, None) -> do
-      assertMsg ("Warrant exercise output cannot be reconstructed because exercise and issuance quantities are missing: " <> exerciseData.id) False
+      assertMsg ("Warrant exercise output cannot be reconstructed because its conversion mechanism does not determine a share quantity: " <> exerciseData.id) False
       pure None
-    None -> pure None
+    None -> do
+      assertMsg ("Warrant exercise output cannot be reconstructed because its trigger does not declare warrant stock terms: " <> exerciseData.trigger_id) False
+      pure None
 
 equityCompensationExerciseOutputShareLot :
   EquityCompensationIssuanceOcfData ->
@@ -632,28 +626,30 @@ validateWarrantExerciseResultTerms maps =
   mapA_
     (\exerciseCid -> do
       exercise <- fetch exerciseCid
-      case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          resultTermsOpt <- warrantExerciseResultTerms issuance.issuance_data exercise.exercise_data
-          case resultTermsOpt of
-            Some (stockClassId, quantityOpt) -> do
-              let label = "Warrant exercise " <> exercise.exercise_data.id
-              actualQuantity <- stockIssuanceQuantityTotal
-                maps
-                label
-                stockClassId
-                (exercise.exercise_data.date, 1, 0)
-                exercise.exercise_data.resulting_security_ids
-              case quantityOpt of
-                Some expectedQuantity ->
-                  assertMsg
-                    (label <> " resulting quantity mismatch: expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
-                    (actualQuantity == expectedQuantity)
-                None -> pure ()
-            None -> pure ()
-        None ->
-          assertMsg ("Warrant exercise source security not found: " <> exercise.exercise_data.security_id) False)
+      if null exercise.exercise_data.resulting_security_ids
+        then pure ()
+        else case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
+          Some issuanceCid -> do
+            issuance <- fetch issuanceCid
+            resultTermsOpt <- warrantExerciseResultTerms issuance.issuance_data exercise.exercise_data
+            case resultTermsOpt of
+              Some (stockClassId, quantityOpt) -> do
+                let label = "Warrant exercise " <> exercise.exercise_data.id
+                actualQuantity <- stockIssuanceQuantityTotal
+                  maps
+                  label
+                  stockClassId
+                  (exercise.exercise_data.date, 1, 0)
+                  exercise.exercise_data.resulting_security_ids
+                case quantityOpt of
+                  Some expectedQuantity ->
+                    assertMsg
+                      (label <> " resulting quantity mismatch: expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+                      (actualQuantity == expectedQuantity)
+                  None -> pure ()
+              None -> pure ()
+          None ->
+            assertMsg ("Warrant exercise source security not found: " <> exercise.exercise_data.security_id) False)
     (Map.values maps.warrant_exercises)
 
 validateEquityCompensationResultTerms : CapTableMaps -> Update ()
