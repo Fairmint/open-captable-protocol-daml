@@ -191,6 +191,9 @@ data StockClassShareEventIndex = StockClassShareEventIndex with
     stock_successor_sort_keys_by_security_id: Optional (Map Text (Time, Int, Int))
   deriving (Eq, Show)
 
+type StockSuccessorEdge = (Text, Time, [Text])
+type StockSuccessorEdgeIndex = Map Text [(Time, [Text])]
+
 data SecurityQuantityEvent
   = SecurityQuantityDelta with
       event_date: Time
@@ -1124,6 +1127,56 @@ addStockClassShareEventForKeys : [Text] -> StockClassShareEvent -> Map Text [Sto
 addStockClassShareEventForKeys keys event index =
   foldl (\updatedIndex key -> addStockClassShareEvent key event updatedIndex) index keys
 
+stockSuccessorEdgeIndex : [StockSuccessorEdge] -> StockSuccessorEdgeIndex
+stockSuccessorEdgeIndex =
+  foldl
+    (\index (sourceSecurityId, eventDate, successorSecurityIds) ->
+      Map.insert
+        sourceSecurityId
+        ((eventDate, successorSecurityIds) :: fromOptional [] (Map.lookup sourceSecurityId index))
+        index)
+    Map.empty
+
+propagateStockSuccessorSortKeysFrom :
+  StockSuccessorEdgeIndex ->
+  [(Text, (Time, Int, Int))] ->
+  Map Text (Time, Int, Int) ->
+  Map Text (Time, Int, Int) ->
+  Map Text (Time, Int, Int)
+propagateStockSuccessorSortKeysFrom edgeIndex pending expanded sortKeys =
+  case pending of
+    [] -> sortKeys
+    (sourceSecurityId, sourceSortKey) :: remaining ->
+      if Map.lookup sourceSecurityId expanded == Some sourceSortKey
+        then propagateStockSuccessorSortKeysFrom edgeIndex remaining expanded sortKeys
+        else
+          let (sourceDate, _, _) = sourceSortKey
+              successorSecurityIds = concatMap
+                (\(eventDate, edgeSuccessorIds) ->
+                  if eventDate == sourceDate then edgeSuccessorIds else [])
+                (fromOptional [] (Map.lookup sourceSecurityId edgeIndex))
+              nextSortKeys = foldl
+                (\index successorSecurityId -> Map.insert successorSecurityId sourceSortKey index)
+                sortKeys
+                successorSecurityIds
+              nextPending = map (\successorSecurityId -> (successorSecurityId, sourceSortKey)) successorSecurityIds ++ remaining
+          in propagateStockSuccessorSortKeysFrom
+            edgeIndex
+            nextPending
+            (Map.insert sourceSecurityId sourceSortKey expanded)
+            nextSortKeys
+
+propagateStockSuccessorSortKeys :
+  [StockSuccessorEdge] ->
+  Map Text (Time, Int, Int) ->
+  Map Text (Time, Int, Int)
+propagateStockSuccessorSortKeys edges initialSortKeys =
+  propagateStockSuccessorSortKeysFrom
+    (stockSuccessorEdgeIndex edges)
+    (Map.toList initialSortKeys)
+    Map.empty
+    initialSortKeys
+
 stockClassShareEventIndex : CapTableMaps -> Update StockClassShareEventIndex
 stockClassShareEventIndex maps = do
   cancellationEventsBySecurityId <- foldlA
@@ -1244,10 +1297,52 @@ stockClassShareEventIndex maps = do
     reissuanceSuccessorSortKeys
     (Map.values maps.stock_consolidations)
 
+  stockTransferSuccessorEdges <- foldlA
+    (\edges transferCid -> do
+      transfer <- fetch transferCid
+      let successorSecurityIds = case transfer.transfer_data.balance_security_id of
+            Some balanceSecurityId -> balanceSecurityId :: transfer.transfer_data.resulting_security_ids
+            None -> transfer.transfer_data.resulting_security_ids
+      pure ((transfer.transfer_data.security_id, transfer.transfer_data.date, successorSecurityIds) :: edges))
+    []
+    (Map.values maps.stock_transfers)
+
+  stockCancellationSuccessorEdges <- foldlA
+    (\edges cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      case cancellation.cancellation_data.balance_security_id of
+        Some balanceSecurityId ->
+          pure ((cancellation.cancellation_data.security_id, cancellation.cancellation_data.date, [balanceSecurityId]) :: edges)
+        None -> pure edges)
+    stockTransferSuccessorEdges
+    (Map.values maps.stock_cancellations)
+
+  stockRepurchaseSuccessorEdges <- foldlA
+    (\edges repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      case repurchase.repurchase_data.balance_security_id of
+        Some balanceSecurityId ->
+          pure ((repurchase.repurchase_data.security_id, repurchase.repurchase_data.date, [balanceSecurityId]) :: edges)
+        None -> pure edges)
+    stockCancellationSuccessorEdges
+    (Map.values maps.stock_repurchases)
+
+  stockSuccessorEdges <- foldlA
+    (\edges conversionCid -> do
+      conversion <- fetch conversionCid
+      let successorSecurityIds = case conversion.conversion_data.balance_security_id of
+            Some balanceSecurityId -> balanceSecurityId :: conversion.conversion_data.resulting_security_ids
+            None -> conversion.conversion_data.resulting_security_ids
+      pure ((conversion.conversion_data.security_id, conversion.conversion_data.date, successorSecurityIds) :: edges))
+    stockRepurchaseSuccessorEdges
+    (Map.values maps.stock_conversions)
+
+  let propagatedSuccessorSortKeys = propagateStockSuccessorSortKeys stockSuccessorEdges successorSortKeys
+
   pure StockClassShareEventIndex with
     stock_security_events_by_security_id = retractionEventsBySecurityId
     stock_class_split_events_by_stock_class_id = splitEventsByStockClassId
-    stock_successor_sort_keys_by_security_id = Some successorSortKeys
+    stock_successor_sort_keys_by_security_id = Some propagatedSuccessorSortKeys
 
 stockClassShareLotSplitCutoffSortKey : StockClassShareEventIndex -> StockClassShareLot -> (Time, Int, Int)
 stockClassShareLotSplitCutoffSortKey eventIndex lot =
