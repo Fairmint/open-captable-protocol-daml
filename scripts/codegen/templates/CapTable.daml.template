@@ -149,6 +149,281 @@ validateFinalSecurityIdUniqueness maps = do
   securityIds <- securityIdsInFinalMaps maps
   assertMsg "Security IDs must be globally unique" (not (VT.hasDuplicateTexts securityIds))
 
+assertSuccessorSecurityIdDistinct : Text -> Text -> Text -> Update ()
+assertSuccessorSecurityIdDistinct label sourceSecurityId successorSecurityId =
+  assertMsg
+    (label <> " must use a new successor security ID instead of reusing " <> sourceSecurityId)
+    (successorSecurityId /= sourceSecurityId)
+
+validateSuccessorSecurityIds : Text -> Text -> Optional Text -> [Text] -> Update ()
+validateSuccessorSecurityIds label sourceSecurityId balanceSecurityId resultingSecurityIds = do
+  mapA_ (assertSuccessorSecurityIdDistinct label sourceSecurityId) resultingSecurityIds
+  case balanceSecurityId of
+    Some balanceId -> do
+      assertSuccessorSecurityIdDistinct label sourceSecurityId balanceId
+      assertMsg
+        (label <> " cannot use its balance security as a resulting security: " <> balanceId)
+        (balanceId `notElem` resultingSecurityIds)
+    None -> pure ()
+
+successorSecurityIdsFor : Optional Text -> [Text] -> [Text]
+successorSecurityIdsFor balanceSecurityId resultingSecurityIds =
+  case balanceSecurityId of
+    Some balanceId -> balanceId :: resultingSecurityIds
+    None -> resultingSecurityIds
+
+validateGlobalSuccessorSecurityIdUniqueness : CapTableMaps -> Update ()
+validateGlobalSuccessorSecurityIdUniqueness maps = do
+  stockTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    []
+    (Map.values maps.stock_transfers)
+  stockCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    stockTransferIds
+    (Map.values maps.stock_cancellations)
+  stockRepurchaseIds <- foldlA
+    (\securityIds repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (successorSecurityIdsFor repurchase.repurchase_data.balance_security_id [] ++ securityIds))
+    stockCancellationIds
+    (Map.values maps.stock_repurchases)
+  stockConversionIds <- foldlA
+    (\securityIds conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
+    stockRepurchaseIds
+    (Map.values maps.stock_conversions)
+  stockReissuanceIds <- foldlA
+    (\securityIds reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (reissuance.reissuance_data.resulting_security_ids ++ securityIds))
+    stockConversionIds
+    (Map.values maps.stock_reissuances)
+  stockConsolidationIds <- foldlA
+    (\securityIds consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      pure (consolidation.consolidation_data.resulting_security_id :: securityIds))
+    stockReissuanceIds
+    (Map.values maps.stock_consolidations)
+  warrantTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    stockConsolidationIds
+    (Map.values maps.warrant_transfers)
+  warrantCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    warrantTransferIds
+    (Map.values maps.warrant_cancellations)
+  warrantExerciseIds <- foldlA
+    (\securityIds exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
+    warrantCancellationIds
+    (Map.values maps.warrant_exercises)
+  convertibleTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    warrantExerciseIds
+    (Map.values maps.convertible_transfers)
+  convertibleCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    convertibleTransferIds
+    (Map.values maps.convertible_cancellations)
+  convertibleConversionIds <- foldlA
+    (\securityIds conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
+    convertibleCancellationIds
+    (Map.values maps.convertible_conversions)
+  equityCompensationTransferIds <- foldlA
+    (\securityIds transferCid -> do
+      transfer <- fetch transferCid
+      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
+    convertibleConversionIds
+    (Map.values maps.equity_compensation_transfers)
+  equityCompensationCancellationIds <- foldlA
+    (\securityIds cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
+    equityCompensationTransferIds
+    (Map.values maps.equity_compensation_cancellations)
+  equityCompensationExerciseIds <- foldlA
+    (\securityIds exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
+    equityCompensationCancellationIds
+    (Map.values maps.equity_compensation_exercises)
+  allSuccessorIds <- foldlA
+    (\securityIds releaseCid -> do
+      release <- fetch releaseCid
+      pure (release.release_data.resulting_security_ids ++ securityIds))
+    equityCompensationExerciseIds
+    (Map.values maps.equity_compensation_releases)
+  assertMsg
+    "Each successor security ID may be produced by only one lifecycle transaction"
+    (not (VT.hasDuplicateTexts allSuccessorIds))
+
+validateSuccessorSecurityIdUniqueness : CapTableMaps -> Update ()
+validateSuccessorSecurityIdUniqueness maps = do
+  validateGlobalSuccessorSecurityIdUniqueness maps
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateSuccessorSecurityIds
+        ("Stock transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids)
+    (Map.values maps.stock_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateSuccessorSecurityIds
+        ("Stock cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        [])
+    (Map.values maps.stock_cancellations)
+  mapA_
+    (\repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      validateSuccessorSecurityIds
+        ("Stock repurchase " <> repurchase.repurchase_data.id)
+        repurchase.repurchase_data.security_id
+        repurchase.repurchase_data.balance_security_id
+        [])
+    (Map.values maps.stock_repurchases)
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      validateSuccessorSecurityIds
+        ("Stock conversion " <> conversion.conversion_data.id)
+        conversion.conversion_data.security_id
+        conversion.conversion_data.balance_security_id
+        conversion.conversion_data.resulting_security_ids)
+    (Map.values maps.stock_conversions)
+  mapA_
+    (\reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      validateSuccessorSecurityIds
+        ("Stock reissuance " <> reissuance.reissuance_data.id)
+        reissuance.reissuance_data.security_id
+        None
+        reissuance.reissuance_data.resulting_security_ids)
+    (Map.values maps.stock_reissuances)
+  mapA_
+    (\consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      mapA_
+        (\sourceSecurityId ->
+          assertSuccessorSecurityIdDistinct
+            ("Stock consolidation " <> consolidation.consolidation_data.id)
+            sourceSecurityId
+            consolidation.consolidation_data.resulting_security_id)
+        consolidation.consolidation_data.security_ids)
+    (Map.values maps.stock_consolidations)
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateSuccessorSecurityIds
+        ("Warrant transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids)
+    (Map.values maps.warrant_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateSuccessorSecurityIds
+        ("Warrant cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        [])
+    (Map.values maps.warrant_cancellations)
+  mapA_
+    (\exerciseCid -> do
+      exercise <- fetch exerciseCid
+      validateSuccessorSecurityIds
+        ("Warrant exercise " <> exercise.exercise_data.id)
+        exercise.exercise_data.security_id
+        None
+        exercise.exercise_data.resulting_security_ids)
+    (Map.values maps.warrant_exercises)
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateSuccessorSecurityIds
+        ("Convertible transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids)
+    (Map.values maps.convertible_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateSuccessorSecurityIds
+        ("Convertible cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        [])
+    (Map.values maps.convertible_cancellations)
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      validateSuccessorSecurityIds
+        ("Convertible conversion " <> conversion.conversion_data.id)
+        conversion.conversion_data.security_id
+        conversion.conversion_data.balance_security_id
+        conversion.conversion_data.resulting_security_ids)
+    (Map.values maps.convertible_conversions)
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateSuccessorSecurityIds
+        ("Equity compensation transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids)
+    (Map.values maps.equity_compensation_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateSuccessorSecurityIds
+        ("Equity compensation cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        [])
+    (Map.values maps.equity_compensation_cancellations)
+  mapA_
+    (\exerciseCid -> do
+      exercise <- fetch exerciseCid
+      validateSuccessorSecurityIds
+        ("Equity compensation exercise " <> exercise.exercise_data.id)
+        exercise.exercise_data.security_id
+        None
+        exercise.exercise_data.resulting_security_ids)
+    (Map.values maps.equity_compensation_exercises)
+  mapA_
+    (\releaseCid -> do
+      release <- fetch releaseCid
+      validateSuccessorSecurityIds
+        ("Equity compensation release " <> release.release_data.id)
+        release.release_data.security_id
+        None
+        release.release_data.resulting_security_ids)
+    (Map.values maps.equity_compensation_releases)
+
 data AuthorizedSharesCeiling
   = AuthorizedSharesFinite Decimal
   | AuthorizedSharesUnlimited
@@ -5012,6 +5287,7 @@ template CapTable
           sortedCreates
 
         validateFinalSecurityIdUniqueness finalMaps
+        validateSuccessorSecurityIdUniqueness finalMaps
         validateDocumentRelatedObjects finalMaps newIssuerCid
         validateStockClassConversionRightReferences finalMaps
         validateConvertibleIssuanceReferences finalMaps
