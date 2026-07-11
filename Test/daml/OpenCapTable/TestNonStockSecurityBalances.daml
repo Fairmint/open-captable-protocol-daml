@@ -11,10 +11,11 @@ import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantRetraction (WarrantRetractionOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantTransfer (WarrantTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingConditionPortion(..), OcfVestingTrigger(..))
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..))
-import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfVesting(..))
 import OpenCapTable.Setup
 import OpenCapTable.TestHelpers
 import qualified DA.Date as DA
@@ -400,22 +401,37 @@ testWarrantSecurityBalance_TransferResultsPreserveQuantityDateAndTerms = script 
   let resultSecurityId = transferId <> "_RESULT"
   let balanceSecurityId = "WSEC_TRANSFER_CONTINUITY_BALANCE"
   let sourceTrigger = warrantFixedExerciseTrigger "TRANSFER_TRIGGER" stockClassId 25.0
+  let sourceVesting = OcfVesting with date = jan04, amount = 100.0
   let sourceIssuance = (warrantIssuance "TX_W_TRANSFER_CONTINUITY_SOURCE" sourceSecurityId stakeholderId 100.0) with
         exercise_triggers = [sourceTrigger]
+        vestings = [sourceVesting]
   let transfer = (warrantTransfer transferId sourceSecurityId 40.0 jan02) with
         balance_security_id = Some balanceSecurityId
   let validResult = (warrantIssuance "TX_W_TRANSFER_CONTINUITY_RESULT" resultSecurityId stakeholderId 40.0) with
         date = jan02
         exercise_triggers = [warrantFixedExerciseTrigger "TRANSFER_TRIGGER" stockClassId 10.0]
+        vestings = [sourceVesting with amount = 40.0]
   let validBalance = (warrantIssuance "TX_W_TRANSFER_CONTINUITY_BALANCE" balanceSecurityId stakeholderId 60.0) with
         date = jan02
         exercise_triggers = [warrantFixedExerciseTrigger "TRANSFER_TRIGGER" stockClassId 15.0]
+        vestings = [sourceVesting with amount = 60.0]
 
   submitMustFail issuer do
     exerciseCmd capTableReady CT.UpdateCapTable with
       creates =
         [ CT.OcfCreateWarrantIssuance sourceIssuance
         , CT.OcfCreateWarrantIssuance (validResult with quantity = Some 41.0)
+        , CT.OcfCreateWarrantIssuance validBalance
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance sourceIssuance
+        , CT.OcfCreateWarrantIssuance (validResult with vestings = [sourceVesting])
         , CT.OcfCreateWarrantIssuance validBalance
         , CT.OcfCreateWarrantTransfer transfer
         ]
@@ -455,6 +471,137 @@ testWarrantSecurityBalance_TransferResultsPreserveQuantityDateAndTerms = script 
         ]
       edits = []
       deletes = []
+
+testWarrantSecurityBalance_FixedQuantityVestingTermsCannotBeReusedByPartialSuccessors = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  let sourceSecurityId = "WSEC_FIXED_VESTING_TERMS_SOURCE"
+  let transferId = "TX_W_FIXED_VESTING_TERMS_TRANSFER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "WSEC_FIXED_VESTING_TERMS_BALANCE"
+  let fixedTermsId = "VT_W_FIXED_QUANTITY"
+  let resultTermsId = "VT_W_FIXED_QUANTITY_RESULT"
+  let balanceTermsId = "VT_W_FIXED_QUANTITY_BALANCE"
+  let sourceCondition = defaultVestingCondition "start" OcfVestingStartTrigger []
+  let sourceTerms = (defaultVestingTerms fixedTermsId) with
+        vesting_conditions = [sourceCondition]
+  let resultTerms = sourceTerms with
+        id = resultTermsId
+        vesting_conditions = [sourceCondition with quantity = Some 40.0]
+  let balanceTerms = sourceTerms with
+        id = balanceTermsId
+        vesting_conditions = [sourceCondition with quantity = Some 60.0]
+  let fixedSource = (warrantIssuance "TX_W_FIXED_VESTING_TERMS_SOURCE" sourceSecurityId defaultStakeholderId 100.0) with
+        vesting_terms_id = Some fixedTermsId
+  let fixedResult = (warrantIssuance "TX_W_FIXED_VESTING_TERMS_RESULT" resultSecurityId defaultStakeholderId 40.0) with
+        date = jan02
+        vesting_terms_id = Some fixedTermsId
+  let fixedBalance = (warrantIssuance "TX_W_FIXED_VESTING_TERMS_BALANCE" balanceSecurityId defaultStakeholderId 60.0) with
+        date = jan02
+        vesting_terms_id = Some fixedTermsId
+  let transfer = (warrantTransfer transferId sourceSecurityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateVestingTerms sourceTerms
+        , CT.OcfCreateWarrantIssuance fixedSource
+        , CT.OcfCreateWarrantIssuance fixedResult
+        , CT.OcfCreateWarrantIssuance fixedBalance
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateVestingTerms sourceTerms
+        , CT.OcfCreateVestingTerms resultTerms
+        , CT.OcfCreateVestingTerms balanceTerms
+        , CT.OcfCreateWarrantIssuance fixedSource
+        , CT.OcfCreateWarrantIssuance (fixedResult with vesting_terms_id = Some resultTermsId)
+        , CT.OcfCreateWarrantIssuance (fixedBalance with vesting_terms_id = Some balanceTermsId)
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantSecurityBalance_ProportionalVestingTermsCanBeReusedByPartialSuccessors = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  let sourceSecurityId = "WSEC_PORTION_VESTING_TERMS_SOURCE"
+  let transferId = "TX_W_PORTION_VESTING_TERMS_TRANSFER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "WSEC_PORTION_VESTING_TERMS_BALANCE"
+  let portionTermsId = "VT_W_PORTION"
+  let portionCondition = (defaultVestingCondition "start" OcfVestingStartTrigger []) with
+        portion = Some (OcfVestingConditionPortion with numerator = 1.0, denominator = 1.0, remainder = False)
+        quantity = None
+  let portionTerms = defaultVestingTermsWithConditions portionTermsId [portionCondition]
+  let portionSource = (warrantIssuance "TX_W_PORTION_VESTING_TERMS_SOURCE" sourceSecurityId defaultStakeholderId 100.0) with
+        vesting_terms_id = Some portionTermsId
+  let portionResult = (warrantIssuance "TX_W_PORTION_VESTING_TERMS_RESULT" resultSecurityId defaultStakeholderId 40.0) with
+        date = jan02
+        vesting_terms_id = Some portionTermsId
+  let portionBalance = (warrantIssuance "TX_W_PORTION_VESTING_TERMS_BALANCE" balanceSecurityId defaultStakeholderId 60.0) with
+        date = jan02
+        vesting_terms_id = Some portionTermsId
+  let transfer = (warrantTransfer transferId sourceSecurityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateVestingTerms portionTerms
+        , CT.OcfCreateWarrantIssuance portionSource
+        , CT.OcfCreateWarrantIssuance portionResult
+        , CT.OcfCreateWarrantIssuance portionBalance
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testWarrantSecurityBalance_InlineVestingsOverrideReferencedTermsForSuccessors = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  let sourceSecurityId = "WSEC_INLINE_AND_TERMS_SOURCE"
+  let transferId = "TX_W_INLINE_AND_TERMS_TRANSFER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "WSEC_INLINE_AND_TERMS_BALANCE"
+  let termsId = "VT_W_IGNORED_FIXED_QUANTITY"
+  let sourceVesting = OcfVesting with date = jan03, amount = 100.0
+  let resultVesting = OcfVesting with date = jan03, amount = 40.0
+  let balanceVesting = OcfVesting with date = jan03, amount = 60.0
+  let sourceIssuance = (warrantIssuance "TX_W_INLINE_AND_TERMS_SOURCE" sourceSecurityId defaultStakeholderId 100.0) with
+        vesting_terms_id = Some termsId
+        vestings = [sourceVesting]
+  let resultIssuance = (warrantIssuance "TX_W_INLINE_AND_TERMS_RESULT" resultSecurityId defaultStakeholderId 40.0) with
+        date = jan02
+        vesting_terms_id = None
+        vestings = [resultVesting]
+  let balanceIssuance = (warrantIssuance "TX_W_INLINE_AND_TERMS_BALANCE" balanceSecurityId defaultStakeholderId 60.0) with
+        date = jan02
+        vesting_terms_id = None
+        vestings = [balanceVesting]
+  let transfer = (warrantTransfer transferId sourceSecurityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateVestingTerms (defaultVestingTerms termsId)
+        , CT.OcfCreateWarrantIssuance sourceIssuance
+        , CT.OcfCreateWarrantIssuance resultIssuance
+        , CT.OcfCreateWarrantIssuance balanceIssuance
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testWarrantSecurityBalance_UnknownQuantityTransferPreservesUnknownBalance = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -496,6 +643,40 @@ testWarrantSecurityBalance_UnknownQuantityTransferPreservesUnknownBalance = scri
       edits = []
       deletes = []
   pure ()
+
+testWarrantSecurityBalance_UnknownQuantityFixedAmountSuccessorsFail = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourceSecurityId = "WSEC_UNKNOWN_FIXED_TRANSFER_SOURCE"
+  let transferId = "TX_W_UNKNOWN_FIXED_TRANSFER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "WSEC_UNKNOWN_FIXED_TRANSFER_BALANCE"
+  let sourceTrigger = warrantFixedExerciseTrigger "UNKNOWN_FIXED_TRIGGER" stockClassId 25.0
+  let sourceIssuance = (warrantIssuance "TX_W_UNKNOWN_FIXED_TRANSFER_SOURCE" sourceSecurityId stakeholderId 100.0) with
+        quantity = None
+        quantity_source = None
+        exercise_triggers = [sourceTrigger]
+  let resultIssuance = (warrantIssuance "TX_W_UNKNOWN_FIXED_TRANSFER_RESULT" resultSecurityId stakeholderId 40.0) with
+        date = jan02
+        exercise_triggers = [sourceTrigger]
+  let balanceIssuance = (warrantIssuance "TX_W_UNKNOWN_FIXED_TRANSFER_BALANCE" balanceSecurityId stakeholderId 100.0) with
+        date = jan02
+        quantity = None
+        quantity_source = None
+        exercise_triggers = [sourceTrigger]
+  let transfer = (warrantTransfer transferId sourceSecurityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance sourceIssuance
+        , CT.OcfCreateWarrantIssuance resultIssuance
+        , CT.OcfCreateWarrantIssuance balanceIssuance
+        , CT.OcfCreateWarrantTransfer transfer
+        ]
+      edits = []
+      deletes = []
 
 testWarrantSecurityBalance_UnknownQuantityCancellationPreservesUnknownBalance = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -567,6 +748,46 @@ testEquityCompensationSecurityBalance_NegativeExerciseFails = script do
       creates =
         [ CT.OcfCreateEquityCompensationIssuance issuance
         , CT.OcfCreateEquityCompensationExercise (equityCompensationExercise "TX_E_NEGATIVE_EXERCISE" securityId (-1.0) jan02)
+        ]
+      edits = []
+      deletes = []
+
+testNonStockSecurityBalance_NegativeReductionsCannotIncreaseBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableReady <- addDefaultStakeholder issuer cap_table
+  let warrantSecurityId = "WSEC_BAL_NEGATIVE_CANCEL"
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateWarrantIssuance (warrantIssuance "TX_W_BAL_NEGATIVE_CANCEL" warrantSecurityId defaultStakeholderId 100.0)
+        , CT.OcfCreateWarrantCancellation (warrantCancellation "TX_W_CANCEL_NEGATIVE" warrantSecurityId (-1.0) jan02)
+        ]
+      edits = []
+      deletes = []
+
+  let equityCancellationSecurityId = "ESEC_BAL_NEGATIVE_CANCEL"
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance
+            (equityCompensationIssuance "TX_E_BAL_NEGATIVE_CANCEL" equityCancellationSecurityId defaultStakeholderId 100.0)
+        , CT.OcfCreateEquityCompensationCancellation
+            (equityCompensationCancellation "TX_E_CANCEL_NEGATIVE" equityCancellationSecurityId (-1.0) jan02)
+        ]
+      edits = []
+      deletes = []
+
+  let equityReleaseSecurityId = "ESEC_BAL_NEGATIVE_RELEASE"
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance
+            (equityCompensationIssuance "TX_E_BAL_NEGATIVE_RELEASE" equityReleaseSecurityId defaultStakeholderId 100.0)
+        , CT.OcfCreateEquityCompensationRelease
+            ((equityCompensationRelease "TX_E_RELEASE_NEGATIVE" equityReleaseSecurityId jan02 jan02 (-1.0)) with resulting_security_ids = [])
         ]
       edits = []
       deletes = []
