@@ -21,6 +21,7 @@ import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
@@ -507,42 +508,6 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
         False
       pure None
 
-convertibleConversionRight :
-  ConvertibleIssuanceOcfData ->
-  Text ->
-  Optional OcfConvertibleConversionRight
-convertibleConversionRight issuanceData triggerId =
-  foldl
-    (\matched trigger ->
-      case matched of
-        Some _ -> matched
-        None ->
-          if trigger.trigger_id == triggerId
-            then Some trigger.conversion_right
-            else None)
-    None
-    issuanceData.conversion_triggers
-
-convertibleConversionOutputQuantity :
-  ConvertibleIssuanceOcfData ->
-  ConvertibleConversionOcfData ->
-  OcfConvertibleConversionRight ->
-  Optional Decimal
-convertibleConversionOutputQuantity issuanceData conversionData conversionRight =
-  case conversionRight.conversion_mechanism of
-    OcfConvMechFixedAmount mechanism ->
-      case conversionData.quantity_converted of
-        Some quantity ->
-          if issuanceData.investment_amount.amount > 0.0
-            then Some (mechanism.converts_to_quantity * quantity / issuanceData.investment_amount.amount)
-            else None
-        None -> Some mechanism.converts_to_quantity
-    OcfConvMechRatio ratio ->
-      case conversionData.quantity_converted of
-        Some quantity -> Some (quantity * ratio.numerator / ratio.denominator)
-        None -> None
-    _ -> None
-
 warrantExerciseTrigger : WarrantIssuanceOcfData -> Text -> Optional OcfConversionTrigger
 warrantExerciseTrigger issuanceData triggerId =
   foldl
@@ -552,6 +517,93 @@ warrantExerciseTrigger issuanceData triggerId =
         None -> if trigger.trigger_id == triggerId then Some trigger else None)
     None
     issuanceData.exercise_triggers
+
+convertibleConversionTrigger : ConvertibleIssuanceOcfData -> Text -> Optional ConvertibleIssuance.OcfConvertibleConversionTrigger
+convertibleConversionTrigger issuanceData triggerId =
+  foldl
+    (\matched trigger ->
+      case matched of
+        Some _ -> matched
+        None -> if trigger.trigger_id == triggerId then Some trigger else None)
+    None
+    issuanceData.conversion_triggers
+
+convertibleConversionOutputQuantity :
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  OcfConvertibleConversionRight ->
+  Update (Optional Decimal)
+convertibleConversionOutputQuantity issuanceData conversionData conversionRight = do
+  let issuedUnits = issuanceData.investment_amount.amount
+  assertMsg
+    ("Convertible conversion source has no positive unit base: " <> issuanceData.security_id)
+    (issuedUnits > 0.0)
+  case (conversionData.balance_security_id, conversionData.quantity_converted) of
+    (Some _, None) ->
+      assertMsg
+        ("Partial convertible conversion requires quantity_converted: " <> conversionData.id)
+        False
+    _ -> pure ()
+  let convertedUnits = fromOptional issuedUnits conversionData.quantity_converted
+  assertMsg
+    ("Convertible conversion quantity exceeds source units for " <> conversionData.id <> ": converted " <> show convertedUnits <> " exceeds " <> show issuedUnits)
+    (convertedUnits > 0.0 && convertedUnits <= issuedUnits)
+  let outputQuantityOpt = case conversionRight.conversion_mechanism of
+        OcfConvMechFixedAmount fixedAmount ->
+          Some (fixedAmount.converts_to_quantity * convertedUnits / issuedUnits)
+        OcfConvMechRatio ratio ->
+          Some (convertedUnits * ratio.numerator / ratio.denominator)
+        _ -> None
+  case outputQuantityOpt of
+    Some outputQuantity -> do
+      assertNonNegativeQuantity
+        ("Convertible conversion output quantity for " <> conversionData.id)
+        outputQuantity
+      pure (Some outputQuantity)
+    None -> pure None
+
+convertibleConversionExpectedResult :
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  Update (Optional Text, Optional Decimal)
+convertibleConversionExpectedResult issuanceData conversionData =
+  case convertibleConversionTrigger issuanceData conversionData.trigger_id of
+    Some trigger -> do
+      quantityOpt <- convertibleConversionOutputQuantity issuanceData conversionData trigger.conversion_right
+      pure (trigger.conversion_right.converts_to_stock_class_id, quantityOpt)
+    None -> do
+      assertMsg
+        ("Convertible conversion trigger not found: " <> conversionData.trigger_id)
+        False
+      pure (None, None)
+
+convertibleConversionOutputShareLot :
+  Map Text StockClassOcfData ->
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  Update (Optional StockClassShareLot)
+convertibleConversionOutputShareLot stockClassIndex issuanceData conversionData = do
+  (stockClassIdOpt, quantityOpt) <- convertibleConversionExpectedResult issuanceData conversionData
+  case (stockClassIdOpt, quantityOpt) of
+    (Some stockClassId, Some quantity) -> do
+      assertMsg
+        ("Convertible conversion output references missing stock class: " <> stockClassId)
+        (isSome (Map.lookup stockClassId stockClassIndex))
+      pure (Some (StockClassShareLot with
+        stock_class_id = stockClassId
+        security_id = None
+        event_date = conversionData.date
+        quantity = quantity))
+    (None, _) -> do
+      assertMsg
+        ("Convertible conversion output cannot be reconstructed because trigger has no destination stock class: " <> conversionData.trigger_id)
+        False
+      pure None
+    (_, None) -> do
+      assertMsg
+        ("Convertible conversion output cannot be reconstructed for its conversion mechanism; resulting stock issuances are required: " <> conversionData.id)
+        False
+      pure None
 
 securityQuantityReductionEvent : Time -> Decimal -> Optional Text -> SecurityQuantityEvent
 securityQuantityReductionEvent eventDate quantity balanceSecurityId =
@@ -941,26 +993,6 @@ validateStockConversionResultIssuances maps conversionData expectedTerms = do
     None ->
       assertMsg ("Stock conversion has no resulting security: " <> conversionData.id) False
 
-validateConvertibleConversionResultIssuances :
-  CapTableMaps ->
-  ConvertibleIssuanceOcfData ->
-  ConvertibleConversionOcfData ->
-  Update ()
-validateConvertibleConversionResultIssuances maps issuanceData conversionData =
-  case convertibleConversionRight issuanceData conversionData.trigger_id of
-    Some conversionRight ->
-      validateStockResultIssuances
-        maps
-        ("Convertible conversion " <> conversionData.id)
-        conversionData.date
-        conversionRight.converts_to_stock_class_id
-        (convertibleConversionOutputQuantity issuanceData conversionData conversionRight)
-        conversionData.resulting_security_ids
-    None ->
-      assertMsg
-        ("Convertible conversion trigger not found: " <> conversionData.trigger_id)
-        False
-
 validateWarrantExerciseResultIssuances : CapTableMaps -> WarrantIssuanceOcfData -> WarrantExerciseOcfData -> Update ()
 validateWarrantExerciseResultIssuances maps issuanceData exerciseData =
   case warrantExerciseTrigger issuanceData exerciseData.trigger_id of
@@ -976,6 +1008,17 @@ validateWarrantExerciseResultIssuances maps issuanceData exerciseData =
           exerciseData.resulting_security_ids
       _ -> assertMsg ("Warrant exercise trigger is not a warrant conversion right: " <> exerciseData.trigger_id) False
     None -> assertMsg ("Warrant exercise trigger not found: " <> exerciseData.trigger_id) False
+
+validateConvertibleConversionResultIssuances : CapTableMaps -> ConvertibleIssuanceOcfData -> ConvertibleConversionOcfData -> Update ()
+validateConvertibleConversionResultIssuances maps issuanceData conversionData = do
+  (expectedStockClassIdOpt, expectedQuantityOpt) <- convertibleConversionExpectedResult issuanceData conversionData
+  validateStockResultIssuances
+    maps
+    ("Convertible conversion " <> conversionData.id)
+    conversionData.date
+    expectedStockClassIdOpt
+    expectedQuantityOpt
+    conversionData.resulting_security_ids
 
 validateEquityCompensationExerciseResultIssuances : CapTableMaps -> EquityCompensationIssuanceOcfData -> EquityCompensationExerciseOcfData -> Update ()
 validateEquityCompensationExerciseResultIssuances maps issuanceData exerciseData = do
@@ -1082,14 +1125,19 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
     (\index conversionCid -> do
       conversion <- fetch conversionCid
       let label = "Convertible conversion " <> conversion.conversion_data.id
-      assertAllResultingStockIssuancesExist label maps conversion.conversion_data.resulting_security_ids
+      assertNoPartialResultingStockIssuanceCoverage label maps conversion.conversion_data.resulting_security_ids
       case Map.lookup conversion.conversion_data.security_id maps.convertible_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          validateConvertibleConversionResultIssuances maps issuance.issuance_data conversion.conversion_data
-          pure index
+        Some sourceIssuanceCid -> do
+          sourceIssuance <- fetch sourceIssuanceCid
+          if allResultingStockIssuancesExist maps conversion.conversion_data.resulting_security_ids
+            then do
+              validateConvertibleConversionResultIssuances maps sourceIssuance.issuance_data conversion.conversion_data
+              pure index
+            else do
+              lotOpt <- convertibleConversionOutputShareLot stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
+              pure (addOptionalStockClassShareLot lotOpt index)
         None -> do
-          assertMsg (label <> " references missing convertible issuance: " <> conversion.conversion_data.security_id) False
+          assertMsg (label <> " references missing source convertible issuance: " <> conversion.conversion_data.security_id) False
           pure index)
     stockConversionLots
     (Map.values maps.convertible_conversions)
@@ -4224,6 +4272,65 @@ stockPlanSecurityEffectivePlanId successorIndex maps securityId =
       pure None
     (None, None) -> pure None
 
+stockPlanCrossPlanReturnedQuantityIndex : CapTableMaps -> Update (Map Text Decimal)
+stockPlanCrossPlanReturnedQuantityIndex maps = do
+  successorIndex <- stockPlanSuccessorIndex maps
+  foldlA
+    (\totals returnCid -> do
+      returnToPool <- fetch returnCid
+      sourcePlanIdOpt <- stockPlanSecurityEffectivePlanId successorIndex maps returnToPool.return_data.security_id
+      case sourcePlanIdOpt of
+        Some sourcePlanId ->
+          if sourcePlanId /= returnToPool.return_data.stock_plan_id
+            then do
+              returnedQuantityOpt <- stockPlanReturnToPoolQuantity maps returnToPool.return_data
+              case returnedQuantityOpt of
+                Some returnedQuantity -> do
+                  assertNonNegativeQuantity
+                    ("Cross-plan return-to-pool quantity for " <> returnToPool.return_data.id)
+                    returnedQuantity
+                  pure (addQuantityById returnToPool.return_data.stock_plan_id returnedQuantity totals)
+                None -> do
+                  assertMsg
+                    ("Cross-plan return-to-pool has an invalid quantity history for " <> returnToPool.return_data.id)
+                    False
+                  pure totals
+            else pure totals
+        None -> pure totals)
+    Map.empty
+    (Map.values maps.stock_plan_return_to_pools)
+
+stockPlanCrossPlanReturnedQuantityIndexAt : CapTableMaps -> Time -> Update (Map Text Decimal)
+stockPlanCrossPlanReturnedQuantityIndexAt maps asOf = do
+  successorIndex <- stockPlanSuccessorIndex maps
+  foldlA
+    (\totals returnCid -> do
+      returnToPool <- fetch returnCid
+      if returnToPool.return_data.date <= asOf
+        then do
+          sourcePlanIdOpt <- stockPlanSecurityEffectivePlanId successorIndex maps returnToPool.return_data.security_id
+          case sourcePlanIdOpt of
+            Some sourcePlanId ->
+              if sourcePlanId /= returnToPool.return_data.stock_plan_id
+                then do
+                  returnedQuantityOpt <- stockPlanReturnToPoolQuantityAt maps returnToPool.return_data asOf
+                  case returnedQuantityOpt of
+                    Some returnedQuantity -> do
+                      assertNonNegativeQuantity
+                        ("Cross-plan return-to-pool quantity for " <> returnToPool.return_data.id <> " on " <> show asOf)
+                        returnedQuantity
+                      pure (addQuantityById returnToPool.return_data.stock_plan_id returnedQuantity totals)
+                    None -> do
+                      assertMsg
+                        ("Cross-plan return-to-pool has an invalid quantity history for " <> returnToPool.return_data.id <> " on " <> show asOf)
+                        False
+                      pure totals
+                else pure totals
+            None -> pure totals
+        else pure totals)
+    Map.empty
+    (Map.values maps.stock_plan_return_to_pools)
+
 stockPlanSecurityRecordedStockClassId : CapTableMaps -> Text -> Update (Optional Text)
 stockPlanSecurityRecordedStockClassId maps securityId =
   case (Map.lookup securityId maps.stock_issuances_by_security_id, Map.lookup securityId maps.equity_compensation_issuances_by_security_id) of
@@ -4483,6 +4590,8 @@ validateStockPlanAllocationEffectiveDates maps = do
         None -> pure ())
     (Map.values maps.equity_compensation_issuances)
 
+validateStockPlanReturnToPoolEffectiveDates : CapTableMaps -> Update ()
+validateStockPlanReturnToPoolEffectiveDates maps =
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
@@ -4500,12 +4609,17 @@ validateStockPlanReservedShares :
   Update ()
 validateStockPlanReservedShares eventIndex maps adjustmentIndex = do
   netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndex eventIndex maps
+  crossPlanReturnedQuantityIndex <- stockPlanCrossPlanReturnedQuantityIndex maps
   validateStockPlanAllocationReferences maps netAllocatedQuantityIndex
   mapA_
     (\stockPlanCid -> do
       stockPlan <- fetch stockPlanCid
       let reservedShares = currentStockPlanReservedShares adjustmentIndex stockPlan.plan_data
       let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
+      let crossPlanReturnedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id crossPlanReturnedQuantityIndex)
+      assertMsg
+        ("Stock plan net allocated quantity for " <> stockPlan.plan_data.id <> " is below its validated cross-plan return credit")
+        (allocatedQuantity >= 0.0 - crossPlanReturnedQuantity)
       assertMsg
         ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
         (allocatedQuantity <= reservedShares))
@@ -4693,8 +4807,13 @@ validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
       mapA_
         (\asOf -> do
           netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndexAt eventIndex maps asOf
+          crossPlanReturnedQuantityIndex <- stockPlanCrossPlanReturnedQuantityIndexAt maps asOf
           validateStockPlanAllocationReferences maps netAllocatedQuantityIndex
           let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
+          let crossPlanReturnedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id crossPlanReturnedQuantityIndex)
+          assertMsg
+            ("Stock plan allocated quantity for " <> stockPlan.plan_data.id <> " on " <> show asOf <> " is below its validated cross-plan return credit")
+            (allocatedQuantity >= 0.0 - crossPlanReturnedQuantity)
           if stockPlanEffectiveOnOrBefore asOf stockPlan.plan_data
             then do
               let reservedShares = stockPlanReservedSharesAt adjustmentHistory stockPlan.plan_data asOf
@@ -4712,6 +4831,7 @@ validateStockPlanPoolCeilings eventIndex maps = do
   adjustmentHistory <- stockPlanPoolAdjustmentHistoryIndex maps
   validateStockPlanAllocationClasses maps
   validateStockPlanAllocationEffectiveDates maps
+  validateStockPlanReturnToPoolEffectiveDates maps
   validateStockPlanEquityCompensationSourceQuantities maps
   validateStockPlanReturnToPoolClasses maps
   validateStockPlanReturnToPoolQuantities maps
