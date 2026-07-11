@@ -1697,13 +1697,19 @@ stockSecurityShareEvents eventIndex issuanceData =
 
 validateStockSecurityBalanceEvent : Text -> Decimal -> StockClassShareEvent -> Update Decimal
 validateStockSecurityBalanceEvent securityId current event = case event of
-  StockClassShareDelta with quantity_delta -> do
+  StockClassShareDelta with event_priority; quantity_delta -> do
+    assertMsg
+      ("Stock security reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
+      (event_priority == 0 || quantity_delta <= 0.0)
     let next = current + quantity_delta
     assertMsg
       ("Stock security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
       (next >= 0.0)
     pure next
   StockClassShareTerminalDelta with quantity_delta -> do
+    assertMsg
+      ("Stock security terminal reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
+      (quantity_delta <= 0.0)
     let next = current + quantity_delta
     assertMsg
       ("Stock security terminal reduction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
@@ -1945,39 +1951,50 @@ assertSecurityQuantityEventsOnOrAfter securityId earliest events =
     events
 
 validateSecurityQuantityBalanceEvent : Text -> Optional Decimal -> SecurityQuantityEvent -> Update (Optional Decimal)
-validateSecurityQuantityBalanceEvent securityId currentOpt event = case currentOpt of
-  Some current -> case event of
-    SecurityQuantityDelta with quantity_delta -> do
-      let next = current + quantity_delta
+validateSecurityQuantityBalanceEvent securityId currentOpt event = do
+  case event of
+    SecurityQuantityDelta with event_priority; quantity_delta ->
       assertMsg
-        ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
-        (next >= 0.0)
-      pure (Some next)
-    SecurityQuantityTerminalDelta with quantity_delta -> do
-      let next = current + quantity_delta
+        ("Security reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
+        (event_priority == 0 || quantity_delta <= 0.0)
+    SecurityQuantityTerminalDelta with quantity_delta ->
       assertMsg
-        ("Security terminal reduction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
-        (current > 0.0)
-      assertMsg
-        ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
-        (next >= 0.0)
-      pure (Some 0.0)
-    SecurityQuantityMultiplier with ratio ->
-      pure (Some (current * ratio.numerator / ratio.denominator))
-    SecurityQuantityRetraction _ _ -> do
-      assertMsg
-        ("Security retraction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
-        (current > 0.0)
-      pure (Some 0.0)
-  None -> case event of
-    SecurityQuantityDelta {} ->
-      pure None
-    SecurityQuantityTerminalDelta {} ->
-      pure (Some 0.0)
-    SecurityQuantityMultiplier {} ->
-      pure None
-    SecurityQuantityRetraction _ _ ->
-      pure (Some 0.0)
+        ("Security terminal reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
+        (quantity_delta <= 0.0)
+    _ -> pure ()
+  case currentOpt of
+    Some current -> case event of
+      SecurityQuantityDelta with quantity_delta -> do
+        let next = current + quantity_delta
+        assertMsg
+          ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
+          (next >= 0.0)
+        pure (Some next)
+      SecurityQuantityTerminalDelta with quantity_delta -> do
+        let next = current + quantity_delta
+        assertMsg
+          ("Security terminal reduction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
+          (current > 0.0)
+        assertMsg
+          ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
+          (next >= 0.0)
+        pure (Some 0.0)
+      SecurityQuantityMultiplier with ratio ->
+        pure (Some (current * ratio.numerator / ratio.denominator))
+      SecurityQuantityRetraction _ _ -> do
+        assertMsg
+          ("Security retraction requires a positive balance for " <> securityId <> ": current balance is " <> show current)
+          (current > 0.0)
+        pure (Some 0.0)
+    None -> case event of
+      SecurityQuantityDelta {} ->
+        pure None
+      SecurityQuantityTerminalDelta {} ->
+        pure (Some 0.0)
+      SecurityQuantityMultiplier {} ->
+        pure None
+      SecurityQuantityRetraction _ _ ->
+        pure (Some 0.0)
 
 validateSecurityQuantityBalance : Text -> Optional Decimal -> [SecurityQuantityEvent] -> Update ()
 validateSecurityQuantityBalance securityId initialQuantity events = do
@@ -2324,6 +2341,30 @@ vestingConditionUsesPositiveFixedQuantity condition =
     Some quantity -> quantity > 0.0
     None -> False
 
+scaleWarrantSuccessorVestingCondition :
+  Decimal ->
+  Decimal ->
+  VT.OcfVestingCondition ->
+  VT.OcfVestingCondition
+scaleWarrantSuccessorVestingCondition sourceQuantity successorQuantity condition =
+  let scaledQuantity = case condition.quantity of
+        Some quantity -> Some (quantity * successorQuantity / sourceQuantity)
+        None -> None
+  in condition with quantity = scaledQuantity
+
+expectedWarrantSuccessorVestingTerms :
+  Text ->
+  Decimal ->
+  Decimal ->
+  VT.VestingTermsOcfData ->
+  VT.VestingTermsOcfData
+expectedWarrantSuccessorVestingTerms successorTermsId sourceQuantity successorQuantity sourceTerms =
+  sourceTerms with
+    id = successorTermsId
+    vesting_conditions = map
+      (scaleWarrantSuccessorVestingCondition sourceQuantity successorQuantity)
+      sourceTerms.vesting_conditions
+
 validateWarrantSuccessorVestingTerms :
   CapTableMaps ->
   Text ->
@@ -2331,26 +2372,51 @@ validateWarrantSuccessorVestingTerms :
   WarrantIssuanceOcfData ->
   Update ()
 validateWarrantSuccessorVestingTerms maps label sourceIssuanceData successorIssuanceData =
-  case sourceIssuanceData.vesting_terms_id of
-    Some vestingTermsId -> case Map.lookup vestingTermsId maps.vesting_terms of
-      Some vestingTermsCid -> do
-        vestingTerms <- fetch vestingTermsCid
-        if any vestingConditionUsesPositiveFixedQuantity vestingTerms.vesting_terms_data.vesting_conditions
-          then case (sourceIssuanceData.quantity, successorIssuanceData.quantity) of
-            (Some sourceQuantity, Some successorQuantity) ->
+  if not (null sourceIssuanceData.vestings)
+    then pure ()
+    else case sourceIssuanceData.vesting_terms_id of
+      Some sourceTermsId -> case Map.lookup sourceTermsId maps.vesting_terms of
+        Some sourceTermsCid -> do
+          sourceTerms <- fetch sourceTermsCid
+          if any vestingConditionUsesPositiveFixedQuantity sourceTerms.vesting_terms_data.vesting_conditions
+            then case (sourceIssuanceData.quantity, successorIssuanceData.quantity, successorIssuanceData.vesting_terms_id) of
+              (Some sourceQuantity, Some successorQuantity, Some successorTermsId) ->
+                if sourceQuantity > 0.0
+                  then case Map.lookup successorTermsId maps.vesting_terms of
+                    Some successorTermsCid -> do
+                      successorTerms <- fetch successorTermsCid
+                      let expectedTerms = expectedWarrantSuccessorVestingTerms
+                            successorTermsId
+                            sourceQuantity
+                            successorQuantity
+                            sourceTerms.vesting_terms_data
+                      assertMsg
+                        (label <> " successor fixed-quantity vesting terms are not scaled for " <> successorIssuanceData.security_id)
+                        (successorTerms.vesting_terms_data == expectedTerms)
+                    None ->
+                      assertMsg
+                        (label <> " successor warrant references missing VestingTerms: " <> successorTermsId)
+                        False
+                  else
+                    assertMsg
+                      (label <> " cannot scale fixed-quantity vesting terms from a non-positive source quantity for " <> successorIssuanceData.security_id)
+                      False
+              _ ->
+                assertMsg
+                  (label <> " cannot scale fixed-quantity vesting terms for successor " <> successorIssuanceData.security_id <> " without known source and successor quantities and successor terms")
+                  False
+            else
               assertMsg
-                (label <> " successor cannot reuse fixed-quantity vesting terms for " <> successorIssuanceData.security_id <> " unless source and successor quantities are equal")
-                (successorQuantity == sourceQuantity)
-            _ ->
-              assertMsg
-                (label <> " cannot prove fixed-quantity vesting terms are preserved for successor " <> successorIssuanceData.security_id <> " without known source and successor quantities")
-                False
-          else pure ()
+                (label <> " successor vesting terms mismatch for " <> successorIssuanceData.security_id)
+                (successorIssuanceData.vesting_terms_id == sourceIssuanceData.vesting_terms_id)
+        None ->
+          assertMsg
+            (label <> " source warrant references missing VestingTerms: " <> sourceTermsId)
+            False
       None ->
         assertMsg
-          (label <> " source warrant references missing VestingTerms: " <> vestingTermsId)
-          False
-    None -> pure ()
+          (label <> " successor adds vesting terms not present on source warrant " <> successorIssuanceData.security_id)
+          (isNone successorIssuanceData.vesting_terms_id)
 
 validateWarrantSuccessorTerms :
   CapTableMaps ->
@@ -2374,9 +2440,6 @@ validateWarrantSuccessorTerms maps label sourceIssuanceData successorIssuanceDat
   assertMsg
     (label <> " successor expiration date mismatch for " <> successorIssuanceData.security_id)
     (successorIssuanceData.warrant_expiration_date == sourceIssuanceData.warrant_expiration_date)
-  assertMsg
-    (label <> " successor vesting terms mismatch for " <> successorIssuanceData.security_id)
-    (successorIssuanceData.vesting_terms_id == sourceIssuanceData.vesting_terms_id)
   validateWarrantSuccessorVestingTerms maps label sourceIssuanceData successorIssuanceData
   case expectedWarrantSuccessorVestings sourceIssuanceData successorIssuanceData of
     Some expectedVestings ->
