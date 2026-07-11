@@ -89,6 +89,12 @@ data CapTableMaps = CapTableMaps with
     warrant_issuances_by_security_id: Map Text (ContractId WarrantIssuance)
   deriving (Eq, Show)
 
+data StockPlanValidationSnapshot = StockPlanValidationSnapshot with
+    classless_equity_successors: Map Text (Text, Text, Optional Text)
+    stock_plan_classes: Map Text [Text]
+    stock_plan_return_to_pool_cids: Map Text (ContractId StockPlanReturnToPool)
+  deriving (Eq, Show)
+
 -- | Extract maps from CapTable for processing
 toMaps : CapTable -> CapTableMaps
 toMaps ct = CapTableMaps with
@@ -1880,11 +1886,159 @@ equityCompensationSuccessorStockClassIds maps issuanceData =
       Some stockPlanId -> case Map.lookup stockPlanId maps.stock_plans of
         Some stockPlanCid -> do
           stockPlan <- fetch stockPlanCid
-          pure $ case stockPlan.plan_data.stock_class_ids of
-            [stockClassId] -> [None, Some stockClassId]
-            _ -> [None]
+          pure (None :: map Some stockPlan.plan_data.stock_class_ids)
         None -> pure [None]
       None -> pure [None]
+
+addClasslessEquitySuccessorHistory :
+  CapTableMaps ->
+  Map Text (Text, Text, Optional Text) ->
+  EquityCompensationIssuanceOcfData ->
+  [Text] ->
+  Update (Map Text (Text, Text, Optional Text))
+addClasslessEquitySuccessorHistory maps history sourceIssuanceData successorSecurityIds =
+  case (sourceIssuanceData.stock_class_id, sourceIssuanceData.stock_plan_id) of
+    (None, Some stockPlanId) ->
+      foldlA
+        (\updatedHistory successorSecurityId ->
+          case Map.lookup successorSecurityId maps.equity_compensation_issuances_by_security_id of
+            Some successorCid -> do
+              successor <- fetch successorCid
+              pure (Map.insert
+                successorSecurityId
+                (sourceIssuanceData.security_id, stockPlanId, successor.issuance_data.stock_class_id)
+                updatedHistory)
+            None -> pure updatedHistory)
+        history
+        successorSecurityIds
+    _ -> pure history
+
+classlessEquitySuccessorHistoryIndex : CapTableMaps -> Update (Map Text (Text, Text, Optional Text))
+classlessEquitySuccessorHistoryIndex maps = do
+  transferHistory <- foldlA
+    (\history transferCid -> do
+      transfer <- fetch transferCid
+      case Map.lookup transfer.transfer_data.security_id maps.equity_compensation_issuances_by_security_id of
+        Some sourceCid -> do
+          source <- fetch sourceCid
+          addClasslessEquitySuccessorHistory
+            maps
+            history
+            source.issuance_data
+            (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids)
+        None -> pure history)
+    Map.empty
+    (Map.values maps.equity_compensation_transfers)
+  foldlA
+    (\history cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      case (cancellation.cancellation_data.balance_security_id, Map.lookup cancellation.cancellation_data.security_id maps.equity_compensation_issuances_by_security_id) of
+        (Some balanceSecurityId, Some sourceCid) -> do
+          source <- fetch sourceCid
+          addClasslessEquitySuccessorHistory maps history source.issuance_data [balanceSecurityId]
+        _ -> pure history)
+    transferHistory
+    (Map.values maps.equity_compensation_cancellations)
+
+stockPlanClassIndex : CapTableMaps -> Update (Map Text [Text])
+stockPlanClassIndex maps =
+  foldlA
+    (\index stockPlanCid -> do
+      stockPlan <- fetch stockPlanCid
+      pure (Map.insert stockPlan.plan_data.id stockPlan.plan_data.stock_class_ids index))
+    Map.empty
+    (Map.values maps.stock_plans)
+
+stockPlanValidationSnapshot : CapTableMaps -> Update StockPlanValidationSnapshot
+stockPlanValidationSnapshot maps = do
+  classlessEquitySuccessors <- classlessEquitySuccessorHistoryIndex maps
+  stockPlanClasses <- stockPlanClassIndex maps
+  pure StockPlanValidationSnapshot with
+    classless_equity_successors = classlessEquitySuccessors
+    stock_plan_classes = stockPlanClasses
+    stock_plan_return_to_pool_cids = maps.stock_plan_return_to_pools
+
+validateNewClasslessEquitySuccessorStockClass :
+  StockPlanValidationSnapshot ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Text ->
+  Update ()
+validateNewClasslessEquitySuccessorStockClass snapshot maps label stockPlanId stockClassId =
+  case Map.lookup stockPlanId maps.stock_plans of
+    Some stockPlanCid -> do
+      stockPlan <- fetch stockPlanCid
+      let isCurrentSingleton = stockPlan.plan_data.stock_class_ids == [stockClassId]
+      let isPriorSingleton =
+            Map.lookup stockPlanId snapshot.stock_plan_classes == Some [stockClassId]
+              && stockClassId `elem` stockPlan.plan_data.stock_class_ids
+      assertMsg
+        (label <> " cannot assign stock class " <> stockClassId <> " without an unambiguous current or pre-update plan class")
+        (isCurrentSingleton || isPriorSingleton)
+    None -> assertMsg (label <> " references missing stock plan " <> stockPlanId) False
+
+validateClasslessEquitySuccessorStockClass :
+  StockPlanValidationSnapshot ->
+  CapTableMaps ->
+  Text ->
+  EquityCompensationIssuanceOcfData ->
+  Text ->
+  Update ()
+validateClasslessEquitySuccessorStockClass snapshot maps label sourceIssuanceData successorSecurityId =
+  case (sourceIssuanceData.stock_class_id, sourceIssuanceData.stock_plan_id) of
+    (None, Some stockPlanId) ->
+      case Map.lookup successorSecurityId maps.equity_compensation_issuances_by_security_id of
+        Some successorCid -> do
+          successor <- fetch successorCid
+          case successor.issuance_data.stock_class_id of
+            Some stockClassId ->
+              case Map.lookup successorSecurityId snapshot.classless_equity_successors of
+                Some (priorSourceSecurityId, priorStockPlanId, Some priorStockClassId) ->
+                  if priorSourceSecurityId == sourceIssuanceData.security_id
+                      && priorStockPlanId == stockPlanId
+                      && priorStockClassId == stockClassId
+                    then pure ()
+                    else validateNewClasslessEquitySuccessorStockClass snapshot maps label stockPlanId stockClassId
+                _ -> validateNewClasslessEquitySuccessorStockClass snapshot maps label stockPlanId stockClassId
+            None -> pure ()
+        None -> pure ()
+    _ -> pure ()
+
+validateClasslessEquitySuccessorStockClassHistory :
+  StockPlanValidationSnapshot ->
+  CapTableMaps ->
+  Update ()
+validateClasslessEquitySuccessorStockClassHistory snapshot maps = do
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      case Map.lookup transfer.transfer_data.security_id maps.equity_compensation_issuances_by_security_id of
+        Some sourceCid -> do
+          source <- fetch sourceCid
+          mapA_
+            (validateClasslessEquitySuccessorStockClass
+              snapshot
+              maps
+              ("Equity compensation transfer " <> transfer.transfer_data.id)
+              source.issuance_data)
+            (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids)
+        None -> pure ())
+    (Map.values maps.equity_compensation_transfers)
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      case (cancellation.cancellation_data.balance_security_id, Map.lookup cancellation.cancellation_data.security_id maps.equity_compensation_issuances_by_security_id) of
+        (Some balanceSecurityId, Some sourceCid) -> do
+          source <- fetch sourceCid
+          validateClasslessEquitySuccessorStockClass
+            snapshot
+            maps
+            ("Equity compensation cancellation " <> cancellation.cancellation_data.id)
+            source.issuance_data
+            balanceSecurityId
+        _ -> pure ())
+    (Map.values maps.equity_compensation_cancellations)
 
 equityCompensationIssuanceQuantityTotal :
   CapTableMaps ->
@@ -3065,26 +3219,43 @@ equityCompensationPlanAllocationIndex successorIndex maps =
     Map.empty
     (Map.values maps.equity_compensation_issuances)
 
-stockPlanReturnToPoolStockClassId : CapTableMaps -> Text -> Update (Optional Text)
-stockPlanReturnToPoolStockClassId maps securityId =
-  case (Map.lookup securityId maps.stock_issuances_by_security_id, Map.lookup securityId maps.equity_compensation_issuances_by_security_id) of
+stockPlanClassIds : CapTableMaps -> Text -> Update [Text]
+stockPlanClassIds maps stockPlanId =
+  case Map.lookup stockPlanId maps.stock_plans of
+    Some stockPlanCid -> do
+      stockPlan <- fetch stockPlanCid
+      pure stockPlan.plan_data.stock_class_ids
+    None -> pure []
+
+stockPlanReturnToPoolStockClassId : CapTableMaps -> StockPlanReturnToPoolOcfData -> Update (Optional Text)
+stockPlanReturnToPoolStockClassId maps returnData =
+  case (Map.lookup returnData.security_id maps.stock_issuances_by_security_id, Map.lookup returnData.security_id maps.equity_compensation_issuances_by_security_id) of
     (Some stockCid, None) -> do
       issuance <- fetch stockCid
       pure (Some issuance.issuance_data.stock_class_id)
     (None, Some equityCompensationCid) -> do
       issuance <- fetch equityCompensationCid
-      stockClassIds <- equityCompensationPlanStockClassIds maps issuance.issuance_data
-      case stockClassIds of
-        [stockClassId] -> pure (Some stockClassId)
-        _ -> pure None
+      case issuance.issuance_data.stock_class_id of
+        Some stockClassId -> pure (Some stockClassId)
+        None -> case issuance.issuance_data.stock_plan_id of
+          Some sourcePlanId -> do
+            sourceClassIds <- stockPlanClassIds maps sourcePlanId
+            case sourceClassIds of
+              [stockClassId] -> pure (Some stockClassId)
+              _ -> do
+                targetClassIds <- stockPlanClassIds maps returnData.stock_plan_id
+                case filter (`elem` targetClassIds) sourceClassIds of
+                  [stockClassId] -> pure (Some stockClassId)
+                  _ -> pure None
+          None -> pure None
     (Some _, Some _) -> do
-      assertMsg ("Stock plan return-to-pool security id is ambiguous: " <> securityId) False
+      assertMsg ("Stock plan return-to-pool security id is ambiguous: " <> returnData.security_id) False
       pure None
     (None, None) -> pure None
 
 stockPlanReturnToPoolEvents : CapTableMaps -> StockPlanReturnToPoolOcfData -> Update [StockClassShareEvent]
 stockPlanReturnToPoolEvents maps returnData = do
-  stockClassIdOpt <- stockPlanReturnToPoolStockClassId maps returnData.security_id
+  stockClassIdOpt <- stockPlanReturnToPoolStockClassId maps returnData
   splitEvents <- case stockClassIdOpt of
     Some stockClassId ->
       foldlA
@@ -3674,6 +3845,28 @@ stockPlanSecurityRecordedStockClassId maps securityId =
       pure None
     (None, None) -> pure None
 
+classlessStockPlanSourceClassId :
+  StockPlanValidationSnapshot ->
+  CapTableMaps ->
+  Text ->
+  Update (Optional Text)
+classlessStockPlanSourceClassId snapshot maps sourcePlanId = do
+  currentClassIds <- stockPlanClassIds maps sourcePlanId
+  pure $ case currentClassIds of
+    [stockClassId] -> Some stockClassId
+    _ -> case Map.lookup sourcePlanId snapshot.stock_plan_classes of
+      Some [stockClassId] ->
+        if stockClassId `elem` currentClassIds then Some stockClassId else None
+      _ -> None
+
+stockPlanReturnToPoolWasUnchanged :
+  StockPlanValidationSnapshot ->
+  StockPlanReturnToPoolOcfData ->
+  ContractId StockPlanReturnToPool ->
+  Bool
+stockPlanReturnToPoolWasUnchanged snapshot returnData returnCid =
+  Map.lookup returnData.id snapshot.stock_plan_return_to_pool_cids == Some returnCid
+
 validateStockPlanReturnToPoolQuantities : CapTableMaps -> Update ()
 validateStockPlanReturnToPoolQuantities maps = do
   successorIndex <- stockPlanSuccessorIndex maps
@@ -3687,15 +3880,15 @@ validateStockPlanReturnToPoolQuantities maps = do
         (returnedQuantity <= securityAllocation))
     (Map.values maps.stock_plan_return_to_pools)
 
-validateStockPlanReturnToPoolClasses : CapTableMaps -> Update ()
-validateStockPlanReturnToPoolClasses maps = do
+validateStockPlanReturnToPoolClasses : StockPlanValidationSnapshot -> CapTableMaps -> Update ()
+validateStockPlanReturnToPoolClasses snapshot maps = do
   successorIndex <- stockPlanSuccessorIndex maps
   mapA_
     (\returnCid -> do
       returnToPool <- fetch returnCid
-      stockClassIdOpt <- stockPlanSecurityRecordedStockClassId maps returnToPool.return_data.security_id
+      recordedStockClassIdOpt <- stockPlanSecurityRecordedStockClassId maps returnToPool.return_data.security_id
       sourcePlanIdOpt <- stockPlanSecurityEffectivePlanId successorIndex maps returnToPool.return_data.security_id
-      case stockClassIdOpt of
+      case recordedStockClassIdOpt of
         Some stockClassId ->
           assertStockPlanIncludesClass
             ("Stock plan return-to-pool " <> returnToPool.return_data.id)
@@ -3704,9 +3897,24 @@ validateStockPlanReturnToPoolClasses maps = do
             stockClassId
         None -> case sourcePlanIdOpt of
           Some sourcePlanId ->
-            assertMsg
-              ("Stock plan return-to-pool " <> returnToPool.return_data.id <> " cannot roll a security without a recorded stock class into a different stock plan")
-              (returnToPool.return_data.stock_plan_id == sourcePlanId)
+            if returnToPool.return_data.stock_plan_id == sourcePlanId
+              then pure ()
+              else do
+                inferredStockClassIdOpt <-
+                  if stockPlanReturnToPoolWasUnchanged snapshot returnToPool.return_data returnCid
+                    then stockPlanReturnToPoolStockClassId maps returnToPool.return_data
+                    else classlessStockPlanSourceClassId snapshot maps sourcePlanId
+                case inferredStockClassIdOpt of
+                  Some stockClassId ->
+                    assertStockPlanIncludesClass
+                      ("Stock plan return-to-pool " <> returnToPool.return_data.id)
+                      maps
+                      returnToPool.return_data.stock_plan_id
+                      stockClassId
+                  None ->
+                    assertMsg
+                      ("Stock plan return-to-pool " <> returnToPool.return_data.id <> " cannot roll a classless security into a different plan without an unambiguous historical class")
+                      False
           None ->
             assertMsg
               ("Stock plan return-to-pool " <> returnToPool.return_data.id <> " cannot determine the source stock plan")
@@ -4135,15 +4343,16 @@ validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
         (fromOptional [] (Map.lookup stockPlan.plan_data.id validationDates)))
     (Map.values maps.stock_plans)
 
-validateStockPlanPoolCeilings : StockClassShareEventIndex -> CapTableMaps -> Update ()
-validateStockPlanPoolCeilings eventIndex maps = do
+validateStockPlanPoolCeilings : StockPlanValidationSnapshot -> StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateStockPlanPoolCeilings snapshot eventIndex maps = do
   validateStockPlanPoolAdjustmentReferences maps
   adjustmentIndex <- stockPlanPoolAdjustmentIndex maps
   adjustmentHistory <- stockPlanPoolAdjustmentHistoryIndex maps
+  validateClasslessEquitySuccessorStockClassHistory snapshot maps
   validateStockPlanAllocationClasses maps
   validateStockPlanAllocationEffectiveDates maps
   validateStockPlanEquityCompensationSourceQuantities maps
-  validateStockPlanReturnToPoolClasses maps
+  validateStockPlanReturnToPoolClasses snapshot maps
   validateStockPlanReturnToPoolQuantities maps
   validateStockPlanReservedShares eventIndex maps adjustmentIndex
   validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory
@@ -4533,11 +4742,12 @@ validateSuccessorSecurityIdContinuity maps = do
     (Map.values maps.equity_compensation_releases)
 
 validateAuthorizedShareCeilings :
+  StockPlanValidationSnapshot ->
   CapTableMaps ->
   Map Text StockClassAuthorizedSharesAdjustmentOcfData ->
   ContractId Issuer ->
   Update ()
-validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
+validateAuthorizedShareCeilings stockPlanSnapshot maps adjustmentIndex issuerCid = do
   eventIndex <- stockClassShareEventIndex maps
   validateFinalSecurityIdUniqueness maps
   validateSuccessorSecurityIdContinuity maps
@@ -4563,7 +4773,7 @@ validateAuthorizedShareCeilings maps adjustmentIndex issuerCid = do
   validateStockClassAuthorizedSharesAtDates eventIndex stockClasses lotsByStockClass stockClassAdjustmentHistory stockClassValidationDates
   validateIssuerAuthorizedShares stockClasses maps adjustmentIndex issuerCid
   validateIssuerAuthorizedSharesAtDates stockClasses maps stockClassAdjustmentHistory issuerAdjustmentHistory issuerCid
-  validateStockPlanPoolCeilings eventIndex maps
+  validateStockPlanPoolCeilings stockPlanSnapshot eventIndex maps
 
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
@@ -4644,6 +4854,7 @@ template CapTable
       do
         -- Start with current maps
         let initialMaps = toMaps this
+        initialStockPlanValidation <- stockPlanValidationSnapshot initialMaps
 
         -- Process deletes first to free unique constraints (e.g., security_id)
         -- This allows object replacements (delete old + create new with same security_id)
@@ -4700,6 +4911,7 @@ template CapTable
 
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
         validateAuthorizedShareCeilings
+          initialStockPlanValidation
           finalMaps
           authorizedShareAdjustmentIndex
           newIssuerCid
