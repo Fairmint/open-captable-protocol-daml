@@ -544,47 +544,61 @@ convertibleConversionTrigger issuanceData triggerId =
     issuanceData.conversion_triggers
 
 convertibleConversionOutputQuantity :
+  CapTableMaps ->
   ConvertibleIssuanceOcfData ->
   ConvertibleConversionOcfData ->
   OcfConvertibleConversionRight ->
   Update (Optional Decimal)
-convertibleConversionOutputQuantity issuanceData conversionData conversionRight = do
-  let issuedUnits = issuanceData.investment_amount.amount
-  assertMsg
-    ("Convertible conversion source has no positive unit base: " <> issuanceData.security_id)
-    (issuedUnits > 0.0)
+convertibleConversionOutputQuantity maps issuanceData conversionData conversionRight = do
   case (conversionData.balance_security_id, conversionData.quantity_converted) of
     (Some _, None) ->
       assertMsg
         ("Partial convertible conversion requires quantity_converted: " <> conversionData.id)
         False
     _ -> pure ()
-  let convertedUnits = fromOptional issuedUnits conversionData.quantity_converted
-  assertMsg
-    ("Convertible conversion quantity exceeds source units for " <> conversionData.id <> ": converted " <> show convertedUnits <> " exceeds " <> show issuedUnits)
-    (convertedUnits > 0.0 && convertedUnits <= issuedUnits)
-  let outputQuantityOpt = case conversionRight.conversion_mechanism of
-        OcfConvMechFixedAmount fixedAmount ->
-          Some (fixedAmount.converts_to_quantity * convertedUnits / issuedUnits)
-        OcfConvMechRatio ratio ->
-          Some (convertedUnits * ratio.numerator / ratio.denominator)
-        _ -> None
-  case outputQuantityOpt of
+  case conversionData.quantity_converted of
     Some outputQuantity -> do
-      assertNonNegativeQuantity
-        ("Convertible conversion output quantity for " <> conversionData.id)
-        outputQuantity
+      assertMsg
+        ("Convertible conversion output quantity must be positive for " <> conversionData.id)
+        (outputQuantity > 0.0)
+      case conversionRight.conversion_mechanism of
+        OcfConvMechFixedAmount fixedAmount -> do
+          expectedOutputQuantity <- case conversionData.balance_security_id of
+            Some balanceSecurityId -> case Map.lookup balanceSecurityId maps.convertible_issuances_by_security_id of
+              Some balanceIssuanceCid -> do
+                balanceIssuance <- fetch balanceIssuanceCid
+                let sourceAmount = issuanceData.investment_amount.amount
+                    balanceAmount = balanceIssuance.issuance_data.investment_amount.amount
+                assertMsg
+                  ("Partial fixed convertible conversion requires a positive source principal for " <> conversionData.id)
+                  (sourceAmount > 0.0)
+                assertMsg
+                  ("Partial fixed convertible conversion balance must be positive and below the source principal for " <> conversionData.id)
+                  (balanceAmount > 0.0 && balanceAmount < sourceAmount)
+                pure (fixedAmount.converts_to_quantity * (sourceAmount - balanceAmount) / sourceAmount)
+              None -> do
+                assertMsg ("Convertible conversion balance security not found: " <> balanceSecurityId) False
+                pure fixedAmount.converts_to_quantity
+            None -> pure fixedAmount.converts_to_quantity
+          assertMsg
+            ("Fixed convertible conversion output quantity mismatch for " <> conversionData.id <> ": expected " <> show expectedOutputQuantity <> ", found " <> show outputQuantity)
+            (outputQuantity == expectedOutputQuantity)
+        _ -> pure ()
       pure (Some outputQuantity)
-    None -> pure None
+    None -> case conversionRight.conversion_mechanism of
+      OcfConvMechFixedAmount fixedAmount ->
+        pure (Some fixedAmount.converts_to_quantity)
+      _ -> pure None
 
 convertibleConversionExpectedResult :
+  CapTableMaps ->
   ConvertibleIssuanceOcfData ->
   ConvertibleConversionOcfData ->
   Update (Optional Text, Optional Decimal)
-convertibleConversionExpectedResult issuanceData conversionData =
+convertibleConversionExpectedResult maps issuanceData conversionData =
   case convertibleConversionTrigger issuanceData conversionData.trigger_id of
     Some trigger -> do
-      quantityOpt <- convertibleConversionOutputQuantity issuanceData conversionData trigger.conversion_right
+      quantityOpt <- convertibleConversionOutputQuantity maps issuanceData conversionData trigger.conversion_right
       pure (trigger.conversion_right.converts_to_stock_class_id, quantityOpt)
     None -> do
       assertMsg
@@ -593,12 +607,13 @@ convertibleConversionExpectedResult issuanceData conversionData =
       pure (None, None)
 
 convertibleConversionOutputShareLot :
+  CapTableMaps ->
   Map Text StockClassOcfData ->
   ConvertibleIssuanceOcfData ->
   ConvertibleConversionOcfData ->
   Update (Optional StockClassShareLot)
-convertibleConversionOutputShareLot stockClassIndex issuanceData conversionData = do
-  (stockClassIdOpt, quantityOpt) <- convertibleConversionExpectedResult issuanceData conversionData
+convertibleConversionOutputShareLot maps stockClassIndex issuanceData conversionData = do
+  (stockClassIdOpt, quantityOpt) <- convertibleConversionExpectedResult maps issuanceData conversionData
   case (stockClassIdOpt, quantityOpt) of
     (Some stockClassId, Some quantity) -> do
       assertMsg
@@ -925,7 +940,7 @@ validateWarrantExerciseResultIssuances maps issuanceData exerciseData =
 
 validateConvertibleConversionResultIssuances : CapTableMaps -> ConvertibleIssuanceOcfData -> ConvertibleConversionOcfData -> Update ()
 validateConvertibleConversionResultIssuances maps issuanceData conversionData = do
-  (expectedStockClassIdOpt, expectedQuantityOpt) <- convertibleConversionExpectedResult issuanceData conversionData
+  (expectedStockClassIdOpt, expectedQuantityOpt) <- convertibleConversionExpectedResult maps issuanceData conversionData
   validateStockResultIssuances
     maps
     ("Convertible conversion " <> conversionData.id)
@@ -1037,7 +1052,7 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
               validateConvertibleConversionResultIssuances maps sourceIssuance.issuance_data conversion.conversion_data
               pure index
             else do
-              lotOpt <- convertibleConversionOutputShareLot stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
+              lotOpt <- convertibleConversionOutputShareLot maps stockClassIndex sourceIssuance.issuance_data conversion.conversion_data
               pure (addOptionalStockClassShareLot lotOpt index)
         None -> do
           assertMsg (label <> " references missing source convertible issuance: " <> conversion.conversion_data.security_id) False
