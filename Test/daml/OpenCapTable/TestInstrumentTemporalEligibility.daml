@@ -3,8 +3,10 @@ module OpenCapTable.TestInstrumentTemporalEligibility where
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..))
 import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation (EquityCompensationCancellationOcfData(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationTransfer (EquityCompensationTransferOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
 import Fairmint.OpenCapTable.Types.Conversion
@@ -156,6 +158,27 @@ equityCompensationExercise transactionId securityId date = EquityCompensationExe
   quantity = 10.0
   resulting_security_ids = []
   consideration_text = None
+  comments = []
+
+equityCompensationTransfer : Text -> Text -> Text -> Time -> Decimal -> EquityCompensationTransferOcfData
+equityCompensationTransfer transactionId securityId resultingSecurityId date quantity = EquityCompensationTransferOcfData with
+  id = transactionId
+  date = date
+  security_id = securityId
+  quantity = quantity
+  resulting_security_ids = [resultingSecurityId]
+  balance_security_id = None
+  consideration_text = None
+  comments = []
+
+equityCompensationCancellation : Text -> Text -> Text -> Time -> Decimal -> EquityCompensationCancellationOcfData
+equityCompensationCancellation transactionId securityId balanceSecurityId date quantity = EquityCompensationCancellationOcfData with
+  id = transactionId
+  date = date
+  security_id = securityId
+  quantity = quantity
+  balance_security_id = Some balanceSecurityId
+  reason_text = "Partial cancellation"
   comments = []
 
 testInstrumentTemporalEligibility_ReversedTriggerRangesFail = script do
@@ -523,4 +546,101 @@ testInstrumentTemporalEligibility_EditCannotExpireExercisedEquityCompensation = 
     exerciseCmd exerciseResult.updatedCapTableCid CT.UpdateCapTable with
       creates = []
       edits = [CT.OcfEditEquityCompensationIssuance (sourceIssuance with expiration_date = Some jan01)]
+      deletes = []
+
+testInstrumentTemporalEligibility_EquityCompensationSuccessorsPreserveExpiration = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTable <- addPrerequisites issuer cap_table
+  let sourceIssuance = equityCompensationIssuance "TX-EC-TRANSFER-SOURCE" "SEC-EC-TRANSFER-SOURCE" (Some jan03)
+      successorIssuance = (equityCompensationIssuance "TX-EC-TRANSFER-SUCCESSOR" "SEC-EC-TRANSFER-SUCCESSOR" (Some jan03)) with date = jan02
+      transfer = equityCompensationTransfer
+        "TX-EC-TRANSFER-PRESERVED-EXPIRATION"
+        sourceIssuance.security_id
+        successorIssuance.security_id
+        jan02
+        100.0
+  sourceResult <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationIssuance sourceIssuance]
+      edits = []
+      deletes = []
+  transferResult <- submit issuer do
+    exerciseCmd sourceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance successorIssuance
+        , CT.OcfCreateEquityCompensationTransfer transfer
+        ]
+      edits = []
+      deletes = []
+  exerciseResult <- submit issuer do
+    exerciseCmd transferResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationExercise (equityCompensationExercise "TX-EC-SUCCESSOR-EXPIRATION-EXACT" successorIssuance.security_id jan03)]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd exerciseResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditEquityCompensationIssuance (successorIssuance with expiration_date = Some jan04)]
+      deletes = []
+
+testInstrumentTemporalEligibility_EquityCompensationSuccessorExpirationCannotChange = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTable <- addPrerequisites issuer cap_table
+  let missingSource = equityCompensationIssuance "TX-EC-MISSING-EXPIRATION-SOURCE" "SEC-EC-MISSING-EXPIRATION-SOURCE" (Some jan03)
+      extendedSource = equityCompensationIssuance "TX-EC-EXTENDED-EXPIRATION-SOURCE" "SEC-EC-EXTENDED-EXPIRATION-SOURCE" (Some jan03)
+      cancelledSource = equityCompensationIssuance "TX-EC-CANCELLED-EXPIRATION-SOURCE" "SEC-EC-CANCELLED-EXPIRATION-SOURCE" (Some jan03)
+      missingSuccessor = (equityCompensationIssuance "TX-EC-MISSING-EXPIRATION-SUCCESSOR" "SEC-EC-MISSING-EXPIRATION-SUCCESSOR" None) with date = jan02
+      extendedSuccessor = (equityCompensationIssuance "TX-EC-EXTENDED-EXPIRATION-SUCCESSOR" "SEC-EC-EXTENDED-EXPIRATION-SUCCESSOR" (Some jan04)) with date = jan02
+      cancellationBalance = ((equityCompensationIssuance "TX-EC-CANCELLED-EXPIRATION-BALANCE" "SEC-EC-CANCELLED-EXPIRATION-BALANCE" (Some jan04)) with
+        date = jan02
+        quantity = 90.0)
+  sourceResult <- submit issuer do
+    exerciseCmd capTable CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance missingSource
+        , CT.OcfCreateEquityCompensationIssuance extendedSource
+        , CT.OcfCreateEquityCompensationIssuance cancelledSource
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd sourceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance missingSuccessor
+        , CT.OcfCreateEquityCompensationTransfer (equityCompensationTransfer
+            "TX-EC-MISSING-SUCCESSOR-EXPIRATION"
+            missingSource.security_id
+            missingSuccessor.security_id
+            jan02
+            100.0)
+        ]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd sourceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance extendedSuccessor
+        , CT.OcfCreateEquityCompensationTransfer (equityCompensationTransfer
+            "TX-EC-EXTENDED-SUCCESSOR-EXPIRATION"
+            extendedSource.security_id
+            extendedSuccessor.security_id
+            jan02
+            100.0)
+        ]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd sourceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance cancellationBalance
+        , CT.OcfCreateEquityCompensationCancellation (equityCompensationCancellation
+            "TX-EC-CANCELLATION-BALANCE-EXPIRATION"
+            cancelledSource.security_id
+            cancellationBalance.security_id
+            jan02
+            10.0)
+        ]
+      edits = []
       deletes = []
