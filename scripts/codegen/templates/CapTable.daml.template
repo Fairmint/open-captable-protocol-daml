@@ -960,22 +960,8 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
     (\index transferCid -> do
       transfer <- fetch transferCid
       let label = "Stock transfer " <> transfer.transfer_data.id
-      assertNoPartialResultingStockIssuanceCoverage label maps transfer.transfer_data.resulting_security_ids
-      if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
-        then pure index
-        else case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            pure (addStockClassShareLotByStockClass
-              (StockClassShareLot with
-                stock_class_id = sourceIssuance.issuance_data.stock_class_id
-                security_id = None
-                event_date = transfer.transfer_data.date
-                quantity = transfer.transfer_data.quantity)
-              index)
-          None -> do
-            assertMsg (label <> " references missing source stock issuance: " <> transfer.transfer_data.security_id) False
-            pure index)
+      assertAllResultingStockIssuancesExist label maps transfer.transfer_data.resulting_security_ids
+      pure index)
     stockIssuanceLots
     (Map.values maps.stock_transfers)
 
@@ -1318,13 +1304,6 @@ stockClassShareEventDate event = case event of
   StockClassShareMultiplier with event_date -> event_date
   StockClassShareRetraction with event_date -> event_date
 
-stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
-stockClassShareEventOnOrAfter earliest event = case event of
-  StockClassShareDelta with event_date -> event_date >= earliest
-  StockClassShareTerminalDelta with event_date -> event_date >= earliest
-  StockClassShareMultiplier with event_date -> event_date >= earliest
-  StockClassShareRetraction with event_date -> event_date >= earliest
-
 stockClassShareEventOnOrBefore : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrBefore latest event = case event of
   StockClassShareDelta with event_date -> event_date <= latest
@@ -1493,8 +1472,7 @@ stockClassShareEventIndex maps = do
       assertNoPartialResultingStockIssuanceCoverage ("Stock transfer " <> transfer.transfer_data.id) maps transfer.transfer_data.resulting_security_ids
       let shareEvents = stockSecurityReductionEvents transfer.transfer_data.date transfer.transfer_data.quantity transfer.transfer_data.balance_security_id
       let nextShareIndex =
-            if allResultingStockIssuancesExist maps transfer.transfer_data.resulting_security_ids
-                && stockBalanceSecurityIssuanceExists maps transfer.transfer_data.balance_security_id
+            if stockBalanceSecurityIssuanceExists maps transfer.transfer_data.balance_security_id
               then addStockClassShareEvents transfer.transfer_data.security_id shareEvents shareIndex
               else shareIndex
       pure
@@ -1706,9 +1684,10 @@ stockSecurityShareEvents : StockClassShareEventIndex -> StockIssuanceOcfData -> 
 stockSecurityShareEvents eventIndex issuanceData =
   let balanceEventsBySecurityId = fromOptional Map.empty eventIndex.stock_security_balance_events_by_security_id
       securityEvents = fromOptional [] (Map.lookup issuanceData.security_id balanceEventsBySecurityId)
+      splitCutoffSortKey = stockClassShareLotSplitCutoffSortKey eventIndex (stockIssuanceShareLot issuanceData)
       splitEvents =
         filter
-          (stockClassShareEventOnOrAfter issuanceData.date)
+          (\event -> stockClassShareEventSortKey event >= splitCutoffSortKey)
           (fromOptional [] (Map.lookup issuanceData.stock_class_id eventIndex.stock_class_split_events_by_stock_class_id))
   in (StockClassShareDelta with
       event_date = issuanceData.date
@@ -2557,21 +2536,90 @@ validateStockConsolidationShareNumberRanges :
   Update ()
 validateStockConsolidationShareNumberRanges label sourceIssuanceData resultIssuanceData =
   let sourceShareNumberRanges = concatMap (\source -> source.share_numbers_issued) sourceIssuanceData
-  in case sourceShareNumberRanges of
-    [] -> pure ()
-    _ ->
+      anyNumberedSource = any (\source -> not (null source.share_numbers_issued)) sourceIssuanceData
+      allSourcesNumbered = all (\source -> not (null source.share_numbers_issued)) sourceIssuanceData
+  in if not anyNumberedSource
+    then pure ()
+    else if allSourcesNumbered
+      then
+        assertMsg
+          (label <> " share numbers are outside the consolidated source ranges for " <> resultIssuanceData.security_id)
+          (not (null resultIssuanceData.share_numbers_issued) &&
+            all
+              (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+              resultIssuanceData.share_numbers_issued)
+      else
       assertMsg
-        (label <> " share numbers are outside the consolidated source ranges for " <> resultIssuanceData.security_id)
-        (not (null resultIssuanceData.share_numbers_issued) &&
-          all
-            (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
-            resultIssuanceData.share_numbers_issued)
+        (label <> " cannot assign share numbers because not every consolidated source has share number ranges")
+        (null resultIssuanceData.share_numbers_issued)
 
 stockReductionSortKey : Time -> Optional Text -> (Time, Int, Int)
 stockReductionSortKey eventDate balanceSecurityId =
   case balanceSecurityId of
     Some _ -> (eventDate, 2, 1)
     None -> (eventDate, 1, 0)
+
+validateNumberedStockPartialReduction :
+  StockClassShareEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Decimal ->
+  Optional Text ->
+  Update ()
+validateNumberedStockPartialReduction eventIndex maps label sourceSecurityId eventDate reductionQuantity balanceSecurityId =
+  case Map.lookup sourceSecurityId maps.stock_issuances_by_security_id of
+    Some sourceIssuanceCid -> do
+      sourceIssuance <- fetch sourceIssuanceCid
+      when (not (null sourceIssuance.issuance_data.share_numbers_issued) && isNone balanceSecurityId) do
+        currentQuantity <- stockSecurityQuantityBeforeEvent
+          eventIndex
+          maps
+          sourceIssuance.issuance_data
+          (stockReductionSortKey eventDate balanceSecurityId)
+        assertMsg
+          (label <> " partially reduces a numbered stock issuance without a balance security")
+          (reductionQuantity >= currentQuantity)
+    None -> pure ()
+
+validateNumberedStockPartialReductions : StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateNumberedStockPartialReductions eventIndex maps = do
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.quantity
+        cancellation.cancellation_data.balance_security_id)
+    (Map.values maps.stock_cancellations)
+
+  mapA_
+    (\repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock repurchase " <> repurchase.repurchase_data.id)
+        repurchase.repurchase_data.security_id repurchase.repurchase_data.date repurchase.repurchase_data.quantity
+        repurchase.repurchase_data.balance_security_id)
+    (Map.values maps.stock_repurchases)
+
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock conversion " <> conversion.conversion_data.id)
+        conversion.conversion_data.security_id conversion.conversion_data.date conversion.conversion_data.quantity_converted
+        conversion.conversion_data.balance_security_id)
+    (Map.values maps.stock_conversions)
+
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
+        transfer.transfer_data.balance_security_id)
+    (Map.values maps.stock_transfers)
 
 stockIssuanceQuantityAtSortKey : CapTableMaps -> StockIssuanceOcfData -> (Time, Int, Int) -> Update Decimal
 stockIssuanceQuantityAtSortKey maps issuanceData =
@@ -2689,6 +2737,9 @@ validateStockReissuanceResultIssuances eventIndex maps =
     (\reissuanceCid -> do
       reissuance <- fetch reissuanceCid
       let label = "Stock reissuance " <> reissuance.reissuance_data.id
+      assertMsg
+        (label <> " has no resulting stock issuance")
+        (not (null reissuance.reissuance_data.resulting_security_ids))
       assertNoPartialResultingStockIssuanceCoverage label maps reissuance.reissuance_data.resulting_security_ids
       case Map.lookup reissuance.reissuance_data.security_id maps.stock_issuances_by_security_id of
         Some sourceIssuanceCid ->
@@ -3325,6 +3376,7 @@ validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots =
 
 validateStockIssuanceShareNumberRanges : StockClassShareEventIndex -> CapTableMaps -> Update ()
 validateStockIssuanceShareNumberRanges eventIndex maps = do
+  validateNumberedStockPartialReductions eventIndex maps
   lots <- stockIssuanceShareNumberLots eventIndex maps
   validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots
 
