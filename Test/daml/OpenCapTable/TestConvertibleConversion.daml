@@ -3,11 +3,11 @@ module OpenCapTable.TestConvertibleConversion where
 import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.ConvertibleConversion
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Conversion (OcfConversionTriggerType(..), OcfConvertibleConversionRight(..), OcfConvertibleConversionMechanism(..), OcfSAFEConversionMechanism(..), OcfConvertibleType(..), OcfCapitalizationDefinition(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfConversionTriggerType(..), OcfConvertibleConversionRight(..), OcfConvertibleConversionMechanism(..), OcfFixedAmountConversionMechanism(..), OcfSAFEConversionMechanism(..), OcfConvertibleType(..), OcfCapitalizationDefinition(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, defaultStockClass, defaultStockPlan, stockSuccessorIssuance)
+import OpenCapTable.TestHelpers (addDefaultStakeholder, addPrerequisites, defaultStockClass, defaultStockPlan, stockSuccessorIssuance)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
@@ -36,14 +36,14 @@ addConversionStockPlan issuer capTableCid = do
   pure result.updatedCapTableCid
 
 -- Create a convertible issuance to convert (follows real workflow)
-createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount issuanceDate targetStockClassId =
+createConvertibleIssuanceWithMechanism issuer capTableCid securityId amount issuanceDate conversionMechanism targetStockClassId =
   submit issuer do
     exerciseCmd capTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
         id = "TX_CONV_ISS_" <> securityId
         date = issuanceDate
         security_id = securityId
-        custom_id = "SAFE-1"
+        custom_id = "CONVERTIBLE-1"
         stakeholder_id = "SH-1"
         board_approval_date = None
         stockholder_approval_date = None
@@ -53,14 +53,7 @@ createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount is
         investment_amount = OcfMonetary with amount = amount, currency = "USD"
         conversion_triggers = [OcfConvertibleConversionTrigger with
           conversion_right = OcfConvertibleConversionRight with
-            conversion_mechanism = OcfConvMechSAFE (OcfSAFEConversionMechanism with
-              capitalization_definition = None
-              capitalization_definition_rules = None
-              conversion_discount = Some 0.20
-              conversion_mfn = False
-              conversion_timing = None
-              conversion_valuation_cap = Some (OcfMonetary with amount = 16000000.0, currency = "USD")
-              exit_multiple = None)
+            conversion_mechanism = conversionMechanism
             converts_to_future_round = case targetStockClassId of
               Some _ -> None
               None -> Some True
@@ -79,6 +72,23 @@ createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount is
         comments = []]
       edits = []
       deletes = []
+
+createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount issuanceDate targetStockClassId =
+  createConvertibleIssuanceWithMechanism
+    issuer
+    capTableCid
+    securityId
+    amount
+    issuanceDate
+    (OcfConvMechSAFE (OcfSAFEConversionMechanism with
+      capitalization_definition = None
+      capitalization_definition_rules = None
+      conversion_discount = Some 0.20
+      conversion_mfn = False
+      conversion_timing = None
+      conversion_valuation_cap = Some (OcfMonetary with amount = 16000000.0, currency = "USD")
+      exit_multiple = None))
+    targetStockClassId
 
 createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
   createConvertibleIssuanceWithTargetClass issuer capTableCid securityId amount issuanceDate None
@@ -116,7 +126,7 @@ testConvertibleConversion_WithCapDefinition = script do
   capTableCid <- addPreferredStockClass issuer capTableCid
   capTableCid <- addConversionStockPlan issuer capTableCid
   let securityId = "CONV-SEC-002"
-  result <- createConvertibleIssuance issuer capTableCid securityId 250000.0 (DT.time (DA.date 2023 Mar 15) 0 0 0)
+  result <- createConvertibleIssuanceWithTargetClass issuer capTableCid securityId 250000.0 (DT.time (DA.date 2023 Mar 15) 0 0 0) (Some "SC_PREFERRED")
   _ <- submit issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = [stockSuccessorIssuance "STOCK-ISS-CONV-2" "SSEC-PREFERRED-001" "SH-1" "SC_PREFERRED" (DT.time (DA.date 2025 Dec 01) 0 0 0) 15625.0
@@ -134,7 +144,33 @@ testConvertibleConversion_WithCapDefinition = script do
           include_security_ids = []
           include_stock_class_ids = ["SC_COMMON", "SC_PREFERRED"]
           include_stock_plans_ids = ["ESOP-2024"])
-        quantity_converted = Some 15625.0]  -- $250K / $16 per share
+        quantity_converted = Some 250000.0]
+      edits = []
+      deletes = []
+  pure ()
+
+testConvertibleConversion_CapDefinitionMissingRefsFails = script do
+  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
+  capTableCid <- addDefaultStakeholder issuer cap_table
+  let securityId = "CONV-SEC-MISSING-CAP-REF"
+  result <- createConvertibleIssuance issuer capTableCid securityId 250000.0 (DT.time (DA.date 2023 Mar 15) 0 0 0)
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+        id = "TX_CONV_CONVERSION_MISSING_CAP_REF"
+        date = DT.time (DA.date 2025 Dec 01) 0 0 0
+        security_id = securityId
+        trigger_id = "equity-financing-trigger"
+        reason_text = "Conversion with an invalid capitalization definition"
+        resulting_security_ids = ["SSEC-PREFERRED-MISSING-CAP-REF"]
+        comments = []
+        balance_security_id = None
+        capitalization_definition = Some (OcfCapitalizationDefinition with
+          exclude_security_ids = []
+          include_security_ids = ["SEC-MISSING-CAP-REF"]
+          include_stock_class_ids = ["SC-MISSING-CAP-REF"]
+          include_stock_plans_ids = ["SP-MISSING-CAP-REF"])
+        quantity_converted = Some 15625.0]
       edits = []
       deletes = []
   pure ()
@@ -198,18 +234,19 @@ testConvertibleConversion_ResultStockClassMustMatchTrigger = script do
       edits = []
       deletes = []
 
-testConvertibleConversion_ResultQuantityMustMatchQuantityConverted = script do
+testConvertibleConversion_ResultQuantityMustMatchFixedAmountMechanism = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
   capTableCid <- addPrerequisites issuer cap_table
   capTableCid <- addPreferredStockClass issuer capTableCid
   let securityId = "CONV-SEC-RESULT-QUANTITY"
       conversionDate = DT.time (DA.date 2025 Nov 15) 0 0 0
-  result <- createConvertibleIssuanceWithTargetClass
+  result <- createConvertibleIssuanceWithMechanism
     issuer
     capTableCid
     securityId
     100000.0
     (DT.time (DA.date 2023 Mar 15) 0 0 0)
+    (OcfConvMechFixedAmount (OcfFixedAmountConversionMechanism with converts_to_quantity = 10000.0))
     (Some "SC_PREFERRED")
 
   submitMustFail issuer do

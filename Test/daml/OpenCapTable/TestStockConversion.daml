@@ -8,11 +8,46 @@ import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfStockClassType(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.HelpersTriggers (ocfTriggerElectiveAtWill)
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, defaultStockClass, stockClassConversionRightTo, stockSuccessorIssuance)
+import OpenCapTable.TestHelpers (addPrerequisites, defaultStockClass, defaultStockIssuance, stockSuccessorIssuance)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
 import Daml.Script
+
+stockClassConversionRightTo : Text -> OcfStockClassConversionRight
+stockClassConversionRightTo stockClassId =
+  OcfStockClassConversionRight with
+    ceiling_price_per_share = None
+    conversion_mechanism = OcfConversionMechanismRatioConversion
+    conversion_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
+    conversion_trigger = ocfTriggerElectiveAtWill
+    converts_to_future_round = None
+    converts_to_stock_class_id = stockClassId
+    custom_description = None
+    discount_rate = None
+    expires_at = None
+    floor_price_per_share = None
+    percent_of_capitalization = None
+    ratio = Some (OcfRatio with numerator = 1.0, denominator = 1.0)
+    reference_share_price = None
+    reference_valuation_price_per_share = None
+    type_ = "STOCK_CLASS_CONVERSION_RIGHT"
+    valuation_cap = None
+
+addPreferredStockClassWithRight : Party -> ContractId CT.CapTable -> OcfStockClassConversionRight -> Script (ContractId CT.CapTable)
+addPreferredStockClassWithRight issuer capTableCid conversionRight = do
+  result <- submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClass ((defaultStockClass "SC_PREF") with
+            class_type = OcfStockClassTypePreferred
+            default_id_prefix = "PS-"
+            seniority = 2.0
+            conversion_rights = [conversionRight])
+        ]
+      edits = []
+      deletes = []
+  pure result.updatedCapTableCid
 
 addPreferredStockClassWithConversionRights : Party -> ContractId CT.CapTable -> [OcfStockClassConversionRight] -> Script (ContractId CT.CapTable)
 addPreferredStockClassWithConversionRights issuer capTableCid conversionRights = do
@@ -31,7 +66,7 @@ addPreferredStockClassWithConversionRights issuer capTableCid conversionRights =
 
 addPreferredStockClass : Party -> ContractId CT.CapTable -> Script (ContractId CT.CapTable)
 addPreferredStockClass issuer capTableCid =
-  addPreferredStockClassWithConversionRights issuer capTableCid [stockClassConversionRightTo "SC_COMMON"]
+  addPreferredStockClassWithRight issuer capTableCid (stockClassConversionRightTo "SC_COMMON")
 
 -- Create a stock issuance to convert (follows real workflow)
 createStockIssuance issuer capTableCid securityId quantity issuanceDate =
@@ -84,6 +119,37 @@ testStockConversion_PreferredToCommon = script do
       deletes = []
   pure ()
 
+-- StockClassConversionRight has no conversion_trigger property in OCF. The
+-- Daml record still carries the field, so conversion calculations must ignore
+-- whichever placeholder value an importer supplies.
+testStockConversion_IgnoresNonOcfPlaceholderTrigger = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let placeholderTrigger = ocfTriggerElectiveAtWill with
+        type_ = OcfTriggerTypeTypeElectiveInRange
+        start_date = None
+        end_date = None
+  let conversionRight = (stockClassConversionRightTo "SC_COMMON") with
+        conversion_trigger = placeholderTrigger
+  capTableCid <- addPreferredStockClassWithRight issuer capTableCid conversionRight
+  let securityId = "SSEC-PREF-NON-OCF-TRIGGER"
+  result <- createStockIssuance issuer capTableCid securityId 100.0 (DT.time (DA.date 2023 Jan 01) 0 0 0)
+
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [stockSuccessorIssuance "STOCK-ISS-CONVERSION-NON-OCF-TRIGGER" "SSEC-COMMON-NON-OCF-TRIGGER" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Dec 15) 0 0 0) 100.0
+        , CT.OcfCreateStockConversion StockConversionOcfData with
+        id = "TX_STOCK_CONVERSION_NON_OCF_TRIGGER"
+        date = DT.time (DA.date 2025 Dec 15) 0 0 0
+        security_id = securityId
+        quantity_converted = 100.0
+        resulting_security_ids = ["SSEC-COMMON-NON-OCF-TRIGGER"]
+        comments = []
+        balance_security_id = None]
+      edits = []
+      deletes = []
+  pure ()
+
 -- Test 2: Partial conversion with balance security
 testStockConversion_PartialConversion = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
@@ -91,18 +157,27 @@ testStockConversion_PartialConversion = script do
   capTableCid <- addPreferredStockClass issuer capTableCid
   let securityId = "SSEC-PREF-002"
   result <- createStockIssuance issuer capTableCid securityId 50000.0 (DT.time (DA.date 2023 Jan 01) 0 0 0)
-  balanceResult <- createStockIssuance issuer result.updatedCapTableCid "SSEC-PREF-002-REMAIN" 20000.0 (DT.time (DA.date 2025 Nov 01) 0 0 0)
+  let conversionDate = DT.time (DA.date 2025 Nov 01) 0 0 0
+  let resultIssuance = (defaultStockIssuance "TX_STOCK_CONVERSION_2_RESULT" "SSEC-COMMON-002" "SH-1" "SC_COMMON") with
+        date = conversionDate
+        quantity = 30000.0
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_CONVERSION_2_BALANCE" "SSEC-PREF-002-REMAIN" "SH-1" "SC_PREF") with
+        date = conversionDate
+        quantity = 20000.0
   _ <- submit issuer do
-    exerciseCmd balanceResult.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-CONVERSION-2" "SSEC-COMMON-002" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Nov 01) 0 0 0) 30000.0
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance resultIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
         , CT.OcfCreateStockConversion StockConversionOcfData with
-        id = "TX_STOCK_CONVERSION_2"
-        date = DT.time (DA.date 2025 Nov 01) 0 0 0
-        security_id = securityId
-        quantity_converted = 30000.0
-        resulting_security_ids = ["SSEC-COMMON-002"]
-        comments = ["Elective partial conversion by investor"]
-        balance_security_id = Some "SSEC-PREF-002-REMAIN"]
+            id = "TX_STOCK_CONVERSION_2"
+            date = conversionDate
+            security_id = securityId
+            quantity_converted = 30000.0
+            resulting_security_ids = ["SSEC-COMMON-002"]
+            comments = ["Elective partial conversion by investor"]
+            balance_security_id = Some balanceIssuance.security_id
+        ]
       edits = []
       deletes = []
   pure ()
