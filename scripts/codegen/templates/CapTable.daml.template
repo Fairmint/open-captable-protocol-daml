@@ -21,7 +21,7 @@ import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..), validateOcfInterestRateSchedule)
-import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), ocfQuantityUpperBound, shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfVesting(..), validateOcfVestingsWithinQuantity)
 import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
@@ -4176,7 +4176,7 @@ validateInlineVestingQuantities maps = do
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
-      case issuance.issuance_data.quantity of
+      case ocfQuantityUpperBound issuance.issuance_data.quantity issuance.issuance_data.quantity_source of
         Some quantity ->
           assertMsg
             ("Warrant issuance " <> issuance.issuance_data.id <> " inline vestings exceed security quantity")
@@ -4184,77 +4184,184 @@ validateInlineVestingQuantities maps = do
         None -> pure ())
     (Map.values maps.warrant_issuances)
 
-vestingAccelerationQuantityAtIssuance :
-  CapTableMaps ->
-  VestingAccelerationOcfData ->
-  Update Decimal
-vestingAccelerationQuantityAtIssuance maps accelerationData =
-  case Map.lookup accelerationData.security_id maps.stock_issuances_by_security_id of
-    Some issuanceCid -> do
-      issuance <- fetch issuanceCid
-      stockClassQuantityAtSortKey
-        maps
-        issuance.issuance_data.stock_class_id
-        accelerationData.date
-        accelerationData.quantity
-        (issuance.issuance_data.date, 0, 0)
-    None -> case Map.lookup accelerationData.security_id maps.equity_compensation_issuances_by_security_id of
-      Some issuanceCid -> do
-        issuance <- fetch issuanceCid
-        case issuance.issuance_data.stock_class_id of
-          Some stockClassId ->
-            stockClassQuantityAtSortKey
-              maps
-              stockClassId
-              accelerationData.date
-              accelerationData.quantity
-              (issuance.issuance_data.date, 0, 0)
-          None -> pure accelerationData.quantity
-      None -> pure accelerationData.quantity
-
-vestingAccelerationTotals : CapTableMaps -> Update (Map Text Decimal)
-vestingAccelerationTotals maps =
+vestingAccelerationsBySecurityId : CapTableMaps -> Update (Map Text [VestingAccelerationOcfData])
+vestingAccelerationsBySecurityId maps =
   foldlA
-    (\totals accelerationCid -> do
+    (\index accelerationCid -> do
       acceleration <- fetch accelerationCid
-      normalizedQuantity <- vestingAccelerationQuantityAtIssuance maps acceleration.acceleration_data
-      pure (addQuantityById acceleration.acceleration_data.security_id normalizedQuantity totals))
+      let securityId = acceleration.acceleration_data.security_id
+      pure (Map.insert
+        securityId
+        (acceleration.acceleration_data :: fromOptional [] (Map.lookup securityId index))
+        index))
     Map.empty
     (Map.values maps.vesting_accelerations)
 
-validateVestingAccelerationTotal : CapTableMaps -> (Text, Decimal) -> Update ()
-validateVestingAccelerationTotal maps (securityId, acceleratedQuantity) =
+vestingAccelerationTotalAt : Time -> [VestingAccelerationOcfData] -> Decimal
+vestingAccelerationTotalAt latest =
+  foldl
+    (\total accelerationData ->
+      if accelerationData.date <= latest
+        then total + accelerationData.quantity
+        else total)
+    0.0
+
+-- Accelerations are evaluated after every applicable same-day security quantity event.
+vestingAccelerationEvaluationSortKey : Time -> (Time, Int, Int)
+vestingAccelerationEvaluationSortKey date = (date, 4, 0)
+
+stockVestingAccelerationTotalAt :
+  CapTableMaps ->
+  Text ->
+  (Time, Int, Int) ->
+  [VestingAccelerationOcfData] ->
+  Update Decimal
+stockVestingAccelerationTotalAt maps stockClassId targetSortKey accelerations =
+  let (targetDate, _, _) = targetSortKey
+  in foldlA
+    (\total accelerationData ->
+      if accelerationData.date <= targetDate
+        then do
+          adjustedQuantity <- stockClassQuantityAtSortKey
+            maps
+            stockClassId
+            accelerationData.date
+            accelerationData.quantity
+            targetSortKey
+          pure (total + adjustedQuantity)
+        else pure total)
+    0.0
+    accelerations
+
+validateStockVestingAccelerationQuantities :
+  StockClassShareEventIndex ->
+  CapTableMaps ->
+  StockIssuanceOcfData ->
+  [VestingAccelerationOcfData] ->
+  Update ()
+validateStockVestingAccelerationQuantities eventIndex maps issuanceData accelerations =
+  mapA_
+    (\accelerationData -> do
+      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationData.date
+      liveQuantity <- stockSecurityQuantityBeforeEvent eventIndex maps issuanceData targetSortKey
+      acceleratedQuantity <- stockVestingAccelerationTotalAt
+        maps
+        issuanceData.stock_class_id
+        targetSortKey
+        accelerations
+      assertMsg
+        ("Vesting accelerations exceed live stock security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+        (acceleratedQuantity <= liveQuantity))
+    accelerations
+
+validateEquityCompensationVestingAccelerationQuantities :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  EquityCompensationIssuanceOcfData ->
+  [VestingAccelerationOcfData] ->
+  Update ()
+validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceEventIndex maps issuanceData accelerations = do
+  stockClassIds <- equityCompensationPlanStockClassIds maps issuanceData
+  quantityEvents <- equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex maps issuanceData
+  mapA_
+    (\accelerationData -> do
+      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationData.date
+      liveQuantityOpt <- securityQuantityBeforeEvent
+        issuanceData.security_id
+        (Some 0.0)
+        ((SecurityQuantityDelta with
+            event_date = issuanceData.date
+            event_priority = 0
+            quantity_delta = issuanceData.quantity)
+          :: quantityEvents)
+        targetSortKey
+      liveQuantity <- case liveQuantityOpt of
+        Some quantity -> pure quantity
+        None -> do
+          assertMsg ("Equity compensation quantity unexpectedly became unknown: " <> issuanceData.security_id) False
+          pure 0.0
+      acceleratedQuantity <- case stockClassIds of
+        [stockClassId] -> stockVestingAccelerationTotalAt maps stockClassId targetSortKey accelerations
+        _ -> pure (vestingAccelerationTotalAt accelerationData.date accelerations)
+      assertMsg
+        ("Vesting accelerations exceed live equity compensation security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+        (acceleratedQuantity <= liveQuantity))
+    accelerations
+
+validateWarrantVestingAccelerationQuantities :
+  NonStockSecurityBalanceEventIndex ->
+  WarrantIssuanceOcfData ->
+  [VestingAccelerationOcfData] ->
+  Update ()
+validateWarrantVestingAccelerationQuantities eventIndex issuanceData accelerations =
+  case ocfQuantityUpperBound issuanceData.quantity issuanceData.quantity_source of
+    Some quantity -> do
+      let quantityEvents =
+            (SecurityQuantityDelta with
+              event_date = issuanceData.date
+              event_priority = 0
+              quantity_delta = quantity)
+            :: warrantSecurityQuantityEvents eventIndex issuanceData
+      mapA_
+        (\accelerationData -> do
+          liveQuantityOpt <- securityQuantityBeforeEvent
+            issuanceData.security_id
+            (Some 0.0)
+            quantityEvents
+            (vestingAccelerationEvaluationSortKey accelerationData.date)
+          liveQuantity <- case liveQuantityOpt of
+            Some currentQuantity -> pure currentQuantity
+            None -> do
+              assertMsg ("Warrant quantity unexpectedly became unknown: " <> issuanceData.security_id) False
+              pure 0.0
+          let acceleratedQuantity = vestingAccelerationTotalAt accelerationData.date accelerations
+          assertMsg
+            ("Vesting accelerations exceed live warrant security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+            (acceleratedQuantity <= liveQuantity))
+        accelerations
+    None -> pure ()
+
+validateVestingAccelerationQuantities :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  (Text, [VestingAccelerationOcfData]) ->
+  Update ()
+validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps (securityId, accelerations) =
   case Map.lookup securityId maps.stock_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
-      assertMsg
-        ("Vesting accelerations exceed stock security quantity for " <> securityId)
-        (acceleratedQuantity <= issuance.issuance_data.quantity)
+      validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data accelerations
     None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
       Some issuanceCid -> do
         issuance <- fetch issuanceCid
-        assertMsg
-          ("Vesting accelerations exceed equity compensation security quantity for " <> securityId)
-          (acceleratedQuantity <= issuance.issuance_data.quantity)
+        validateEquityCompensationVestingAccelerationQuantities
+          stockEventIndex
+          balanceEventIndex
+          maps
+          issuance.issuance_data
+          accelerations
       None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
-          case issuance.issuance_data.quantity of
-            Some quantity ->
-              assertMsg
-                ("Vesting accelerations exceed warrant security quantity for " <> securityId)
-                (acceleratedQuantity <= quantity)
-            None -> pure ()
+          validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data accelerations
         None ->
           assertMsg
             ("Vesting accelerations reference a missing or unsupported security: " <> securityId)
             False
 
-validateVestingQuantityIntegrity : CapTableMaps -> Update ()
-validateVestingQuantityIntegrity maps = do
+validateVestingQuantityIntegrity :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Update ()
+validateVestingQuantityIntegrity stockEventIndex balanceEventIndex maps = do
   validateInlineVestingQuantities maps
-  accelerationTotals <- vestingAccelerationTotals maps
-  mapA_ (validateVestingAccelerationTotal maps) (Map.toList accelerationTotals)
+  accelerationIndex <- vestingAccelerationsBySecurityId maps
+  mapA_
+    (validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps)
+    (Map.toList accelerationIndex)
 
 validateTransactionLifecycleDates : CapTableMaps -> Update ()
 validateTransactionLifecycleDates maps = do
@@ -7536,7 +7643,7 @@ template CapTable
         validateConfiguredReferences finalMaps
         validateFinalSecurityIdUniqueness finalMaps
         validateSuccessorSecurityIdContinuity finalMaps
-        validateVestingQuantityIntegrity finalMaps
+        validateVestingQuantityIntegrity stockEventIndex nonStockBalanceEventIndex finalMaps
         validateTransactionLifecycleDates finalMaps
         validateInstrumentTemporalEligibility finalMaps
         validateStockBalanceSuccessorQuantities stockEventIndex finalMaps
