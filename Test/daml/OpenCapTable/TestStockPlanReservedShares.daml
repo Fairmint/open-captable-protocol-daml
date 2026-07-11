@@ -2186,7 +2186,7 @@ testStockPlanReservedShares_CumulativeReturnsAreSplitAdjusted = script do
       edits = []
       deletes = []
 
-testStockPlanReservedShares_ClasslessSuccessorRemainsValidWhenPlanAddsClass = script do
+testStockPlanReservedShares_PlanAddClassRequiresSourceDisambiguation = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
   (capTableWithFirstClass, firstStockClassId) <- setupStockClassWithId issuer cap_table "SC_CLASSLESS_SUCCESSOR_PLAN_EDIT_FIRST"
   (capTableWithClasses, secondStockClassId) <- setupStockClassWithId issuer capTableWithFirstClass "SC_CLASSLESS_SUCCESSOR_PLAN_EDIT_SECOND"
@@ -2229,10 +2229,20 @@ testStockPlanReservedShares_ClasslessSuccessorRemainsValidWhenPlanAddsClass = sc
       deletes = []
 
   let editedPlan = plan with stock_class_ids = [firstStockClassId, secondStockClassId]
-  _ <- submit issuer do
+  submitMustFail issuer do
     exerciseCmd transferred.updatedCapTableCid CT.UpdateCapTable with
       creates = []
       edits = [CT.OcfEditStockPlan editedPlan]
+      deletes = []
+
+  let disambiguatedSourceIssuance = sourceIssuance with stock_class_id = Some firstStockClassId
+  _ <- submit issuer do
+    exerciseCmd transferred.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits =
+        [ CT.OcfEditStockPlan editedPlan
+        , CT.OcfEditEquityCompensationIssuance disambiguatedSourceIssuance
+        ]
       deletes = []
   pure ()
 
@@ -2278,6 +2288,71 @@ testStockPlanReservedShares_ClasslessSuccessorRejectsClassOutsidePlan = script d
       edits = []
       deletes = []
 
+testStockPlanReservedShares_MultiClassClasslessSourceRequiresClasslessSuccessor = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithFirstClass, firstStockClassId) <- setupStockClassWithId issuer cap_table "SC_MULTICLASS_CLASSLESS_SUCCESSOR_FIRST"
+  (capTableWithClasses, secondStockClassId) <- setupStockClassWithId issuer capTableWithFirstClass "SC_MULTICLASS_CLASSLESS_SUCCESSOR_SECOND"
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClasses "SH_MULTICLASS_CLASSLESS_SUCCESSOR" "Multi-Class Classless Successor Holder"
+  let stockPlanId = "PLAN_MULTICLASS_CLASSLESS_SUCCESSOR"
+  let sourceSecurityId = "SEC_MULTICLASS_CLASSLESS_SUCCESSOR_SOURCE"
+  let classedResultSecurityId = "SEC_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSED_RESULT"
+  let classlessResultSecurityId = "SEC_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSLESS_RESULT"
+  let plan = (defaultStockPlan stockPlanId firstStockClassId) with
+        initial_shares_reserved = 100.0
+        stock_class_ids = [firstStockClassId, secondStockClassId]
+  let sourceIssuance = (stockPlanEquityCompensationIssuance
+        "TX_MULTICLASS_CLASSLESS_SUCCESSOR_SOURCE"
+        sourceSecurityId
+        stakeholderId
+        firstStockClassId
+        stockPlanId
+        100.0) with stock_class_id = None
+  source <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan plan
+        , CT.OcfCreateEquityCompensationIssuance sourceIssuance
+        ]
+      edits = []
+      deletes = []
+
+  let classedResultIssuance = (stockPlanEquityCompensationIssuance
+        "TX_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSED_RESULT"
+        classedResultSecurityId
+        stakeholderId
+        firstStockClassId
+        stockPlanId
+        100.0) with stock_plan_id = None
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationTransfer
+            (planEquityCompensationTransfer "TX_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSED_TRANSFER" sourceSecurityId classedResultSecurityId 100.0)
+        , CT.OcfCreateEquityCompensationIssuance classedResultIssuance
+        ]
+      edits = []
+      deletes = []
+
+  let classlessResultIssuance = (stockPlanEquityCompensationIssuance
+        "TX_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSLESS_RESULT"
+        classlessResultSecurityId
+        stakeholderId
+        firstStockClassId
+        stockPlanId
+        100.0) with
+          stock_class_id = None
+          stock_plan_id = None
+  _ <- submit issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationTransfer
+            (planEquityCompensationTransfer "TX_MULTICLASS_CLASSLESS_SUCCESSOR_CLASSLESS_TRANSFER" sourceSecurityId classlessResultSecurityId 100.0)
+        , CT.OcfCreateEquityCompensationIssuance classlessResultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
 testStockPlanReservedShares_AmbiguousClasslessReturnStaysInSourcePlan = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
   (capTableWithFirstClass, firstStockClassId) <- setupStockClassWithId issuer cap_table "SC_AMBIGUOUS_CLASSLESS_RETURN_FIRST"
@@ -2310,48 +2385,69 @@ testStockPlanReservedShares_AmbiguousClasslessReturnStaysInSourcePlan = script d
       deletes = []
   pure ()
 
-testStockPlanReservedShares_AmbiguousClasslessReturnRejectsDifferentPlan = script do
+testStockPlanReservedShares_ClasslessCrossPlanReturnRequiresRecordedClass = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
-  (capTableWithFirstClass, firstStockClassId) <- setupStockClassWithId issuer cap_table "SC_AMBIGUOUS_CLASSLESS_ROLLOVER_FIRST"
-  (capTableWithSecondClass, secondStockClassId) <- setupStockClassWithId issuer capTableWithFirstClass "SC_AMBIGUOUS_CLASSLESS_ROLLOVER_SECOND"
-  (capTableWithClasses, targetStockClassId) <- setupStockClassWithId issuer capTableWithSecondClass "SC_AMBIGUOUS_CLASSLESS_ROLLOVER_TARGET"
-  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClasses "SH_AMBIGUOUS_CLASSLESS_ROLLOVER" "Ambiguous Classless Rollover Holder"
-  let sourcePlanId = "PLAN_AMBIGUOUS_CLASSLESS_ROLLOVER_SOURCE"
-  let targetPlanId = "PLAN_AMBIGUOUS_CLASSLESS_ROLLOVER_TARGET"
-  let sourceSecurityId = "SEC_AMBIGUOUS_CLASSLESS_ROLLOVER_SOURCE"
-  let sourcePlan = (defaultStockPlan sourcePlanId firstStockClassId) with
-        initial_shares_reserved = 100.0
-        stock_class_ids = [firstStockClassId, secondStockClassId]
-  let targetPlan = (defaultStockPlan targetPlanId targetStockClassId) with initial_shares_reserved = 100.0
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourcePlanId = "PLAN_CLASSLESS_ROLLOVER_SOURCE"
+  let targetPlanId = "PLAN_CLASSLESS_ROLLOVER_TARGET"
+  let sourceSecurityId = "SEC_CLASSLESS_ROLLOVER_SOURCE"
+  let sourcePlan = (defaultStockPlan sourcePlanId stockClassId) with initial_shares_reserved = 100.0
+  let targetPlan = (defaultStockPlan targetPlanId stockClassId) with initial_shares_reserved = 100.0
   let sourceIssuance = (stockPlanEquityCompensationIssuance
-        "TX_AMBIGUOUS_CLASSLESS_ROLLOVER_SOURCE"
+        "TX_CLASSLESS_ROLLOVER_SOURCE"
         sourceSecurityId
         stakeholderId
-        firstStockClassId
+        stockClassId
         sourcePlanId
         100.0) with stock_class_id = None
   let targetIssuance = stockPlanEquityCompensationIssuance
-        "TX_AMBIGUOUS_CLASSLESS_ROLLOVER_TARGET"
-        "SEC_AMBIGUOUS_CLASSLESS_ROLLOVER_TARGET"
+        "TX_CLASSLESS_ROLLOVER_TARGET"
+        "SEC_CLASSLESS_ROLLOVER_TARGET"
         stakeholderId
-        targetStockClassId
+        stockClassId
         targetPlanId
         200.0
-
-  submitMustFail issuer do
+  source <- submit issuer do
     exerciseCmd capTableReady CT.UpdateCapTable with
       creates =
         [ CT.OcfCreateStockPlan sourcePlan
         , CT.OcfCreateStockPlan targetPlan
         , CT.OcfCreateEquityCompensationIssuance sourceIssuance
-        , CT.OcfCreateEquityCompensationCancellation
-            (equityCompensationCancellation "TX_AMBIGUOUS_CLASSLESS_ROLLOVER_CANCEL" sourceSecurityId 100.0)
-        , CT.OcfCreateStockPlanReturnToPool
-            (stockPlanReturnToPool "TX_AMBIGUOUS_CLASSLESS_ROLLOVER_POOL" sourceSecurityId targetPlanId 100.0)
+        ]
+      edits = []
+      deletes = []
+
+  let cancellation = equityCompensationCancellation "TX_CLASSLESS_ROLLOVER_CANCEL" sourceSecurityId 100.0
+  let returnToPool = stockPlanReturnToPool "TX_CLASSLESS_ROLLOVER_POOL" sourceSecurityId targetPlanId 100.0
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationCancellation cancellation
+        , CT.OcfCreateStockPlanReturnToPool returnToPool
         , CT.OcfCreateEquityCompensationIssuance targetIssuance
         ]
       edits = []
       deletes = []
+
+  let disambiguatedSourceIssuance = sourceIssuance with stock_class_id = Some stockClassId
+  disambiguated <- submit issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditEquityCompensationIssuance disambiguatedSourceIssuance]
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd disambiguated.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationCancellation
+            cancellation
+        , CT.OcfCreateStockPlanReturnToPool
+            returnToPool
+        , CT.OcfCreateEquityCompensationIssuance targetIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testStockPlanReservedShares_ConsolidationAllowsSamePlanSources = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -2392,6 +2488,48 @@ testStockPlanReservedShares_ConsolidationAllowsSamePlanSources = script do
       edits = []
       deletes = []
   pure ()
+
+testStockPlanReservedShares_ConsolidationRejectsDifferentResultPlan = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourcePlanId = "PLAN_CONSOLIDATION_RESULT_SOURCE"
+  let resultPlanId = "PLAN_CONSOLIDATION_RESULT_TARGET"
+  let firstSourceSecurityId = "SEC_CONSOLIDATION_RESULT_FIRST"
+  let secondSourceSecurityId = "SEC_CONSOLIDATION_RESULT_SECOND"
+  let resultSecurityId = "SEC_CONSOLIDATION_RESULT_DIFFERENT_PLAN"
+  let sourcePlan = (defaultStockPlan sourcePlanId stockClassId) with initial_shares_reserved = 100.0
+  let resultPlan = (defaultStockPlan resultPlanId stockClassId) with initial_shares_reserved = 100.0
+  let firstSourceIssuance = (defaultStockIssuance "TX_CONSOLIDATION_RESULT_FIRST" firstSourceSecurityId stakeholderId stockClassId) with
+        stock_plan_id = Some sourcePlanId
+        quantity = 40.0
+  let secondSourceIssuance = (defaultStockIssuance "TX_CONSOLIDATION_RESULT_SECOND" secondSourceSecurityId stakeholderId stockClassId) with
+        stock_plan_id = Some sourcePlanId
+        quantity = 60.0
+  source <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockPlan sourcePlan
+        , CT.OcfCreateStockPlan resultPlan
+        , CT.OcfCreateStockIssuance firstSourceIssuance
+        , CT.OcfCreateStockIssuance secondSourceIssuance
+        ]
+      edits = []
+      deletes = []
+
+  let consolidationDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let resultIssuance = (defaultStockIssuance "TX_CONSOLIDATION_RESULT_DIFFERENT_PLAN" resultSecurityId stakeholderId stockClassId) with
+        date = consolidationDate
+        stock_plan_id = Some resultPlanId
+        quantity = 100.0
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation
+            (planStockConsolidation "TX_CONSOLIDATION_RESULT_DIFFERENT_PLAN" [firstSourceSecurityId, secondSourceSecurityId] resultSecurityId consolidationDate)
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
 
 testStockPlanReservedShares_ConsolidationRejectsMixedPlanSources = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
