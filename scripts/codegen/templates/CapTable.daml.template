@@ -556,6 +556,10 @@ convertibleConversionOutputQuantity maps issuanceData conversionData conversionR
         ("Partial convertible conversion requires quantity_converted: " <> conversionData.id)
         False
     _ -> pure ()
+  currentAmount <- convertiblePrincipalBeforeConversion maps issuanceData conversionData
+  assertMsg
+    ("Convertible conversion requires a positive current balance for " <> conversionData.id)
+    (currentAmount > 0.0)
   case conversionData.quantity_converted of
     Some outputQuantity -> do
       assertMsg
@@ -563,31 +567,35 @@ convertibleConversionOutputQuantity maps issuanceData conversionData conversionR
         (outputQuantity > 0.0)
       case conversionRight.conversion_mechanism of
         OcfConvMechFixedAmount fixedAmount -> do
+          let sourceAmount = issuanceData.investment_amount.amount
+          assertMsg
+            ("Fixed convertible conversion requires a positive source principal for " <> conversionData.id)
+            (sourceAmount > 0.0)
           expectedOutputQuantity <- case conversionData.balance_security_id of
             Some balanceSecurityId -> case Map.lookup balanceSecurityId maps.convertible_issuances_by_security_id of
               Some balanceIssuanceCid -> do
                 balanceIssuance <- fetch balanceIssuanceCid
-                let sourceAmount = issuanceData.investment_amount.amount
-                    balanceAmount = balanceIssuance.issuance_data.investment_amount.amount
+                let balanceAmount = balanceIssuance.issuance_data.investment_amount.amount
                 assertMsg
-                  ("Partial fixed convertible conversion requires a positive source principal for " <> conversionData.id)
-                  (sourceAmount > 0.0)
-                assertMsg
-                  ("Partial fixed convertible conversion balance must be positive and below the source principal for " <> conversionData.id)
-                  (balanceAmount > 0.0 && balanceAmount < sourceAmount)
-                pure (fixedAmount.converts_to_quantity * (sourceAmount - balanceAmount) / sourceAmount)
+                  ("Partial fixed convertible conversion balance must be positive and below the current principal for " <> conversionData.id)
+                  (balanceAmount > 0.0 && balanceAmount < currentAmount)
+                pure (fixedAmount.converts_to_quantity * (currentAmount - balanceAmount) / sourceAmount)
               None -> do
                 assertMsg ("Convertible conversion balance security not found: " <> balanceSecurityId) False
                 pure fixedAmount.converts_to_quantity
-            None -> pure fixedAmount.converts_to_quantity
+            None -> pure (fixedAmount.converts_to_quantity * currentAmount / sourceAmount)
           assertMsg
             ("Fixed convertible conversion output quantity mismatch for " <> conversionData.id <> ": expected " <> show expectedOutputQuantity <> ", found " <> show outputQuantity)
             (outputQuantity == expectedOutputQuantity)
         _ -> pure ()
       pure (Some outputQuantity)
     None -> case conversionRight.conversion_mechanism of
-      OcfConvMechFixedAmount fixedAmount ->
-        pure (Some fixedAmount.converts_to_quantity)
+      OcfConvMechFixedAmount fixedAmount -> do
+        let sourceAmount = issuanceData.investment_amount.amount
+        assertMsg
+          ("Fixed convertible conversion requires a positive source principal for " <> conversionData.id)
+          (sourceAmount > 0.0)
+        pure (Some (fixedAmount.converts_to_quantity * currentAmount / sourceAmount))
       _ -> pure None
 
 convertibleConversionExpectedResult :
@@ -2138,6 +2146,21 @@ convertibleBalanceEvents maps issuanceData = do
     (Map.values maps.convertible_retractions)
 
   pure (transferEvents ++ cancellationEvents ++ conversionEvents ++ retractionEvents)
+
+convertiblePrincipalBeforeConversion :
+  CapTableMaps ->
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  Update Decimal
+convertiblePrincipalBeforeConversion maps issuanceData conversionData = do
+  events <- convertibleBalanceEvents maps issuanceData
+  let targetSortKey = (conversionData.date, 3, "Convertible conversion " <> conversionData.id)
+  foldlA
+    (validateConvertibleBalanceEvent maps issuanceData)
+    issuanceData.investment_amount.amount
+    (filter
+      (\event -> convertibleBalanceEventSortKey event < targetSortKey)
+      (sortOn convertibleBalanceEventSortKey events))
 
 normalizeConvertibleConversionTrigger :
   ConvertibleIssuance.OcfConvertibleConversionTrigger ->
