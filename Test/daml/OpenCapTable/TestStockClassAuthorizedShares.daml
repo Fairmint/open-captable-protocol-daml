@@ -1,6 +1,8 @@
 module OpenCapTable.TestStockClassAuthorizedShares where
 
 import Fairmint.OpenCapTable.OCF.StockConversion
+import Fairmint.OpenCapTable.OCF.ConvertibleConversion
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance
 import Fairmint.OpenCapTable.OCF.StockConsolidation
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
@@ -47,6 +49,199 @@ stockConversion conversionId securityId quantity =
     resulting_security_ids = [conversionId <> "_RESULT"]
     balance_security_id = None
     comments = []
+
+convertibleConversion : Text -> Text -> Text -> Time -> ConvertibleConversionOcfData
+convertibleConversion conversionId securityId resultingSecurityId conversionDate =
+  ConvertibleConversionOcfData with
+    id = conversionId
+    date = conversionDate
+    security_id = securityId
+    trigger_id = "TRIGGER-1"
+    reason_text = "Converted into stock"
+    resulting_security_ids = [resultingSecurityId]
+    balance_security_id = None
+    capitalization_definition = None
+    quantity_converted = None
+    comments = []
+
+fixedConvertibleIssuance : Text -> Text -> Text -> Text -> Decimal -> ConvertibleIssuanceOcfData
+fixedConvertibleIssuance issuanceId securityId stakeholderId stockClassId outputQuantity =
+  ConvertibleIssuanceOcfData with
+    id = issuanceId
+    convertible_type = OcfConvertibleSafe
+    custom_id = "CV-" <> issuanceId
+    date = defaultTestDate
+    investment_amount = OcfMonetary with amount = 10_000.0, currency = "USD"
+    security_id = securityId
+    seniority = 1
+    stakeholder_id = stakeholderId
+    comments = []
+    conversion_triggers = [OcfConvertibleConversionTrigger with
+      conversion_right = OcfConvertibleConversionRight with
+        conversion_mechanism = OcfConvMechFixedAmount (OcfFixedAmountConversionMechanism with
+          converts_to_quantity = outputQuantity)
+        converts_to_future_round = None
+        converts_to_stock_class_id = Some stockClassId
+        type_ = "CONVERTIBLE_CONVERSION_RIGHT"
+      end_date = None
+      nickname = None
+      start_date = None
+      trigger_condition = None
+      trigger_date = None
+      trigger_description = None
+      trigger_id = "TRIGGER-1"
+      type_ = OcfTriggerTypeTypeUnspecified]
+    security_law_exemptions = []
+    board_approval_date = None
+    consideration_text = None
+    pro_rata = None
+    stockholder_approval_date = None
+
+testConvertibleConversionRequiresResultIssuanceForCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, _, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourceSecurityId = "SEC-CONVERTIBLE-MISSING-RESULT-SOURCE"
+  let resultSecurityId = "SEC-CONVERTIBLE-MISSING-RESULT"
+  let conversionDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  capTableWithSource <- addConvertibleIssuance
+    issuer
+    capTableReady
+    "TX-CONVERTIBLE-MISSING-RESULT-SOURCE"
+    sourceSecurityId
+    stakeholderId
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithSource CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion
+            (convertibleConversion
+              "TX-CONVERTIBLE-MISSING-RESULT"
+              sourceSecurityId
+              resultSecurityId
+              conversionDate)
+        ]
+      edits = []
+      deletes = []
+
+testConvertibleConversionResultCountsTowardClassCeiling = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let stockClassId = "SC-CONVERTIBLE-RESULT-CEILING"
+  (capTableWithClass, _) <- setupStockClassWith issuer cap_table (limitedStockClass stockClassId 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH-CONVERTIBLE-RESULT-CEILING" "Convertible Result Holder"
+  let sourceSecurityId = "SEC-CONVERTIBLE-RESULT-CEILING-SOURCE"
+  let resultSecurityId = "SEC-CONVERTIBLE-RESULT-CEILING"
+  let conversionDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  capTableWithSource <- addConvertibleIssuance
+    issuer
+    capTableReady
+    "TX-CONVERTIBLE-RESULT-CEILING-SOURCE"
+    sourceSecurityId
+    stakeholderId
+  let conversion = convertibleConversion
+        "TX-CONVERTIBLE-RESULT-CEILING"
+        sourceSecurityId
+        resultSecurityId
+        conversionDate
+  let resultIssuance quantity = (defaultStockIssuance
+        "TX-CONVERTIBLE-RESULT-CEILING-ISSUANCE"
+        resultSecurityId
+        stakeholderId
+        stockClassId) with
+          date = conversionDate
+          quantity = quantity
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithSource CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion conversion
+        , CT.OcfCreateStockIssuance (resultIssuance 101.0)
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithSource CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion conversion
+        , CT.OcfCreateStockIssuance (resultIssuance 100.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testConvertibleConversionResultMustMatchFixedConversionTerms = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let expectedClassId = "SC-CONVERTIBLE-FIXED-EXPECTED"
+  let wrongClassId = "SC-CONVERTIBLE-FIXED-WRONG"
+  (capTableWithExpectedClass, _) <- setupStockClassWith issuer cap_table (limitedStockClass expectedClassId 1_000.0)
+  (capTableWithClasses, _) <- setupStockClassWith issuer capTableWithExpectedClass (limitedStockClass wrongClassId 1_000.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClasses "SH-CONVERTIBLE-FIXED" "Fixed Convertible Holder"
+  let sourceSecurityId = "SEC-CONVERTIBLE-FIXED-SOURCE"
+  let resultSecurityId = "SEC-CONVERTIBLE-FIXED-RESULT"
+  let conversionDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  source <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleIssuance
+            (fixedConvertibleIssuance
+              "TX-CONVERTIBLE-FIXED-SOURCE"
+              sourceSecurityId
+              stakeholderId
+              expectedClassId
+              100.0)
+        ]
+      edits = []
+      deletes = []
+  let conversion = convertibleConversion
+        "TX-CONVERTIBLE-FIXED-CONVERSION"
+        sourceSecurityId
+        resultSecurityId
+        conversionDate
+  let resultIssuance stockClassId date quantity = (defaultStockIssuance
+        "TX-CONVERTIBLE-FIXED-RESULT"
+        resultSecurityId
+        stakeholderId
+        stockClassId) with
+          date = date
+          quantity = quantity
+
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion conversion
+        , CT.OcfCreateStockIssuance (resultIssuance expectedClassId conversionDate 99.0)
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion conversion
+        , CT.OcfCreateStockIssuance (resultIssuance wrongClassId conversionDate 100.0)
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion conversion
+        , CT.OcfCreateStockIssuance
+            (resultIssuance expectedClassId (DT.time (DA.date 2024 Jan 03) 0 0 0) 100.0)
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateConvertibleConversion (conversion with quantity_converted = Some 5_000.0)
+        , CT.OcfCreateStockIssuance (resultIssuance expectedClassId conversionDate 50.0)
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 stockRetraction : Text -> Text -> StockRetractionOcfData
 stockRetraction retractionId securityId =
