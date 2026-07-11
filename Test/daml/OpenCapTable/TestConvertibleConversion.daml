@@ -8,7 +8,7 @@ import Fairmint.OpenCapTable.Types.Conversion (OcfConversionTriggerType(..), Ocf
 import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, addPrerequisites, defaultStockClass, defaultStockPlan, stockSuccessorIssuance)
+import OpenCapTable.TestHelpers (addPrerequisites, defaultStockClass, defaultStockPlan, stockSuccessorIssuance)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
@@ -374,12 +374,13 @@ testConvertibleConversion_WithCapDefinition = script do
 
 testConvertibleConversion_CapDefinitionMissingRefsFails = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
+  capTableCid <- addPrerequisites issuer cap_table
   let securityId = "CONV-SEC-MISSING-CAP-REF"
   result <- createConvertibleIssuance issuer capTableCid securityId 250000.0 (DT.time (DA.date 2023 Mar 15) 0 0 0)
   submitMustFail issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+      creates = [stockSuccessorIssuance "STOCK-ISS-MISSING-CAP-REF" "SSEC-PREFERRED-MISSING-CAP-REF" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Dec 01) 0 0 0) 15625.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
         id = "TX_CONV_CONVERSION_MISSING_CAP_REF"
         date = DT.time (DA.date 2025 Dec 01) 0 0 0
         security_id = securityId
@@ -423,6 +424,82 @@ testConvertibleConversion_PartialConversion = script do
       edits = []
       deletes = []
   pure ()
+
+testConvertibleConversion_ChainedPartialBalancesRetireEachSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let rootSecurityId = "CONV-CHAIN-ROOT"
+      firstBalanceSecurityId = "CONV-CHAIN-BALANCE-1"
+      secondBalanceSecurityId = "CONV-CHAIN-BALANCE-2"
+      firstConversionDate = DT.time (DA.date 2025 Oct 01) 0 0 0
+      secondConversionDate = DT.time (DA.date 2025 Nov 01) 0 0 0
+      finalConversionDate = DT.time (DA.date 2025 Dec 01) 0 0 0
+      retiredSourceReuseDate = DT.time (DA.date 2026 Jan 01) 0 0 0
+  rootResult <- createConvertibleIssuance issuer capTableCid rootSecurityId 500000.0 (DT.time (DA.date 2023 Mar 15) 0 0 0)
+  firstBalanceResult <- createConvertibleIssuance issuer rootResult.updatedCapTableCid firstBalanceSecurityId 300000.0 firstConversionDate
+  secondBalanceResult <- createConvertibleIssuance issuer firstBalanceResult.updatedCapTableCid secondBalanceSecurityId 100000.0 secondConversionDate
+
+  chainedResult <- submit issuer do
+    exerciseCmd secondBalanceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ stockSuccessorIssuance "STOCK-ISS-CONV-CHAIN-1" "SSEC-CONV-CHAIN-1" "SH-1" "SC_COMMON" firstConversionDate 100.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+            id = "TX-CONV-CHAIN-1"
+            date = firstConversionDate
+            security_id = rootSecurityId
+            trigger_id = "equity-financing-trigger"
+            reason_text = "First partial conversion"
+            resulting_security_ids = ["SSEC-CONV-CHAIN-1"]
+            comments = []
+            balance_security_id = Some firstBalanceSecurityId
+            capitalization_definition = None
+            quantity_converted = Some 100.0
+        , stockSuccessorIssuance "STOCK-ISS-CONV-CHAIN-2" "SSEC-CONV-CHAIN-2" "SH-1" "SC_COMMON" secondConversionDate 200.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+            id = "TX-CONV-CHAIN-2"
+            date = secondConversionDate
+            security_id = firstBalanceSecurityId
+            trigger_id = "equity-financing-trigger"
+            reason_text = "Second partial conversion"
+            resulting_security_ids = ["SSEC-CONV-CHAIN-2"]
+            comments = []
+            balance_security_id = Some secondBalanceSecurityId
+            capitalization_definition = None
+            quantity_converted = Some 200.0
+        , stockSuccessorIssuance "STOCK-ISS-CONV-CHAIN-3" "SSEC-CONV-CHAIN-3" "SH-1" "SC_COMMON" finalConversionDate 300.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+            id = "TX-CONV-CHAIN-3"
+            date = finalConversionDate
+            security_id = secondBalanceSecurityId
+            trigger_id = "equity-financing-trigger"
+            reason_text = "Final conversion of the second balance"
+            resulting_security_ids = ["SSEC-CONV-CHAIN-3"]
+            comments = []
+            balance_security_id = None
+            capitalization_definition = None
+            quantity_converted = Some 300.0
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd chainedResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ stockSuccessorIssuance "STOCK-ISS-CONV-CHAIN-REUSE" "SSEC-CONV-CHAIN-REUSE" "SH-1" "SC_COMMON" retiredSourceReuseDate 1.0
+        , CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+            id = "TX-CONV-CHAIN-REUSE"
+            date = retiredSourceReuseDate
+            security_id = rootSecurityId
+            trigger_id = "equity-financing-trigger"
+            reason_text = "A retired source cannot convert again"
+            resulting_security_ids = ["SSEC-CONV-CHAIN-REUSE"]
+            comments = []
+            balance_security_id = None
+            capitalization_definition = None
+            quantity_converted = Some 1.0
+        ]
+      edits = []
+      deletes = []
 
 testConvertibleConversion_ResultStockClassMustMatchTrigger = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
