@@ -18,7 +18,7 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
@@ -1926,6 +1926,23 @@ validateStockResultShareNumberRanges maps label sourceIssuanceData resultSecurit
         None -> pure ())
     resultSecurityIds
 
+validateStockConsolidationShareNumberRanges :
+  Text ->
+  [StockIssuanceOcfData] ->
+  StockIssuanceOcfData ->
+  Update ()
+validateStockConsolidationShareNumberRanges label sourceIssuanceData resultIssuanceData =
+  let sourceShareNumberRanges = concatMap (\source -> source.share_numbers_issued) sourceIssuanceData
+  in case sourceShareNumberRanges of
+    [] -> pure ()
+    _ ->
+      assertMsg
+        (label <> " share numbers are outside the consolidated source ranges for " <> resultIssuanceData.security_id)
+        (not (null resultIssuanceData.share_numbers_issued) &&
+          all
+            (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+            resultIssuanceData.share_numbers_issued)
+
 stockReductionSortKey : Time -> Optional Text -> (Time, Int, Int)
 stockReductionSortKey eventDate balanceSecurityId =
   case balanceSecurityId of
@@ -2187,6 +2204,14 @@ validateStockReissuanceResultIssuances eventIndex maps =
           if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
             then do
               sourceIssuance <- fetch sourceIssuanceCid
+              case reissuance.reissuance_data.split_transaction_id of
+                Some _ -> pure ()
+                None ->
+                  validateStockResultShareNumberRanges
+                    maps
+                    label
+                    sourceIssuance.issuance_data
+                    reissuance.reissuance_data.resulting_security_ids
               let targetSortKey = (reissuance.reissuance_data.date, 3, 0)
               sourceQuantity <- stockSecurityQuantityBeforeEvent
                 eventIndex
@@ -2226,8 +2251,8 @@ validateStockConsolidationResultIssuances eventIndex maps =
             (label <> " result date mismatch for " <> consolidation.consolidation_data.resulting_security_id <> ": expected " <> show consolidation.consolidation_data.date <> ", found " <> show resultIssuance.issuance_data.date)
             (resultIssuance.issuance_data.date == consolidation.consolidation_data.date)
           let targetSortKey = (consolidation.consolidation_data.date, 3, 3)
-          sourceQuantity <- foldlA
-            (\total sourceSecurityId ->
+          (sourceQuantity, sourceIssuanceData) <- foldlA
+            (\(total, sourceData) sourceSecurityId ->
               case Map.lookup sourceSecurityId maps.stock_issuances_by_security_id of
                 Some sourceIssuanceCid -> do
                   sourceIssuance <- fetch sourceIssuanceCid
@@ -2239,12 +2264,16 @@ validateStockConsolidationResultIssuances eventIndex maps =
                     maps
                     sourceIssuance.issuance_data
                     targetSortKey
-                  pure (total + quantity)
+                  pure (total + quantity, sourceIssuance.issuance_data :: sourceData)
                 None -> do
                   assertMsg (label <> " source stock issuance not found: " <> sourceSecurityId) False
-                  pure total)
-            0.0
+                  pure (total, sourceData))
+            (0.0, [])
             consolidation.consolidation_data.security_ids
+          validateStockConsolidationShareNumberRanges
+            label
+            sourceIssuanceData
+            resultIssuance.issuance_data
           resultQuantity <- stockIssuanceQuantityAtSortKey maps resultIssuance.issuance_data targetSortKey
           assertMsg
             (label <> " resulting quantity mismatch: expected " <> show sourceQuantity <> ", found " <> show resultQuantity)
