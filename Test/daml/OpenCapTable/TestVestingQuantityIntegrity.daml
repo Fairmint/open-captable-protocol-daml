@@ -1,0 +1,372 @@
+module OpenCapTable.TestVestingQuantityIntegrity where
+
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+  ( addPrerequisites
+  , defaultEquityCompensationIssuance
+  , defaultStockIssuance
+  , defaultWarrantIssuance
+  , stockClassSplitOn
+  )
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+firstVestingDate : Time
+firstVestingDate = DT.time (DA.date 2025 Jan 01) 0 0 0
+
+secondVestingDate : Time
+secondVestingDate = DT.time (DA.date 2026 Jan 01) 0 0 0
+
+accelerationDate : Time
+accelerationDate = DT.time (DA.date 2025 Jun 01) 0 0 0
+
+splitDate : Time
+splitDate = DT.time (DA.date 2026 Jan 01) 0 0 0
+
+postSplitAccelerationDate : Time
+postSplitAccelerationDate = DT.time (DA.date 2026 Jun 01) 0 0 0
+
+vestingOn : Time -> Decimal -> OcfVesting
+vestingOn date amount = OcfVesting with
+  date = date
+  amount = amount
+
+acceleration : Text -> Text -> Decimal -> VestingAccelerationOcfData
+acceleration accelerationId securityId quantity = VestingAccelerationOcfData with
+  id = accelerationId
+  date = accelerationDate
+  security_id = securityId
+  quantity = quantity
+  reason_text = "Board-approved acceleration"
+  comments = []
+
+applyUpdate :
+  Party ->
+  ContractId CT.CapTable ->
+  [CT.OcfCreateData] ->
+  [CT.OcfEditData] ->
+  [CT.OcfDeleteData] ->
+  Script CT.UpdateCapTableResult
+applyUpdate issuer capTableCid creates edits deletes =
+  submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = creates
+      edits = edits
+      deletes = deletes
+
+assertAdditionalAccelerationRejected :
+  Party ->
+  ContractId CT.CapTable ->
+  Text ->
+  Decimal ->
+  Decimal ->
+  Script ()
+assertAdditionalAccelerationRejected issuer capTableCid securityId firstQuantity secondQuantity = do
+  firstResult <- applyUpdate
+    issuer
+    capTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-FIRST" securityId firstQuantity)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd firstResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration (acceleration "ACC-SECOND" securityId secondQuantity)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_InlinePartialExactAndUnknownWarrantAccepted = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let stockIssuance =
+        (defaultStockIssuance "TX-INLINE-STOCK" "SEC-INLINE-STOCK" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+          vestings = [vestingOn firstVestingDate 40.0, vestingOn secondVestingDate 60.0]
+  let equityCompensationIssuance =
+        (defaultEquityCompensationIssuance "TX-INLINE-EC" "SEC-INLINE-EC" "SH-1") with
+          quantity = 100.0
+          vestings = [vestingOn firstVestingDate 25.0]
+  let knownWarrantIssuance =
+        (defaultWarrantIssuance "TX-INLINE-WARRANT" "SEC-INLINE-WARRANT" "SH-1") with
+          quantity = Some 100.0
+          vestings = [vestingOn firstVestingDate 100.0]
+  let unknownWarrantIssuance =
+        (defaultWarrantIssuance "TX-INLINE-WARRANT-UNKNOWN" "SEC-INLINE-WARRANT-UNKNOWN" "SH-1") with
+          quantity = None
+          vestings = [vestingOn firstVestingDate 500.0]
+  _ <- applyUpdate
+    issuer
+    capTableCid
+    [ CT.OcfCreateStockIssuance stockIssuance
+    , CT.OcfCreateEquityCompensationIssuance equityCompensationIssuance
+    , CT.OcfCreateWarrantIssuance knownWarrantIssuance
+    , CT.OcfCreateWarrantIssuance unknownWarrantIssuance
+    ]
+    []
+    []
+  pure ()
+
+testVestingQuantityIntegrity_StockInlineOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultStockIssuance "TX-INLINE-STOCK-OVER" "SEC-INLINE-STOCK-OVER" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+          vestings = [vestingOn firstVestingDate 60.0, vestingOn secondVestingDate 50.0]
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuance]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_EquityCompensationInlineOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultEquityCompensationIssuance "TX-INLINE-EC-OVER" "SEC-INLINE-EC-OVER" "SH-1") with
+          quantity = 100.0
+          vestings = [vestingOn firstVestingDate 101.0]
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateEquityCompensationIssuance issuance]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_KnownWarrantInlineOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultWarrantIssuance "TX-INLINE-WARRANT-OVER" "SEC-INLINE-WARRANT-OVER" "SH-1") with
+          quantity = Some 100.0
+          vestings = [vestingOn firstVestingDate 101.0]
+  submitMustFail issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance issuance]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_InlineOversubscriptionEditRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultStockIssuance "TX-INLINE-EDIT" "SEC-INLINE-EDIT" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+          vestings = [vestingOn firstVestingDate 60.0]
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateStockIssuance issuance] [] []
+  let invalidEdit = issuance with
+        vestings = [vestingOn firstVestingDate 60.0, vestingOn secondVestingDate 50.0]
+  submitMustFail issuer do
+    exerciseCmd issuanceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditStockIssuance invalidEdit]
+      deletes = []
+
+testVestingQuantityIntegrity_AccelerationExactBoundariesAndUnknownWarrantAccepted = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let stockIssuance =
+        (defaultStockIssuance "TX-ACC-STOCK" "SEC-ACC-STOCK" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+  let equityCompensationIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-EC" "SEC-ACC-EC" "SH-1") with
+          quantity = 100.0
+  let knownWarrantIssuance =
+        (defaultWarrantIssuance "TX-ACC-WARRANT" "SEC-ACC-WARRANT" "SH-1") with
+          quantity = Some 100.0
+  let unknownWarrantIssuance =
+        (defaultWarrantIssuance "TX-ACC-WARRANT-UNKNOWN" "SEC-ACC-WARRANT-UNKNOWN" "SH-1") with
+          quantity = None
+  issuanceResult <- applyUpdate
+    issuer
+    capTableCid
+    [ CT.OcfCreateStockIssuance stockIssuance
+    , CT.OcfCreateEquityCompensationIssuance equityCompensationIssuance
+    , CT.OcfCreateWarrantIssuance knownWarrantIssuance
+    , CT.OcfCreateWarrantIssuance unknownWarrantIssuance
+    ]
+    []
+    []
+  _ <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [ CT.OcfCreateVestingAcceleration (acceleration "ACC-STOCK-1" "SEC-ACC-STOCK" 40.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-STOCK-2" "SEC-ACC-STOCK" 60.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-EC" "SEC-ACC-EC" 100.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-WARRANT-1" "SEC-ACC-WARRANT" 70.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-WARRANT-2" "SEC-ACC-WARRANT" 30.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-WARRANT-UNKNOWN" "SEC-ACC-WARRANT-UNKNOWN" 1000.0)
+    ]
+    []
+    []
+  pure ()
+
+testVestingQuantityIntegrity_StockAccelerationsNormalizeAcrossForwardSplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultStockIssuance "TX-ACC-STOCK-SPLIT" "SEC-ACC-STOCK-SPLIT" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateStockIssuance issuance] [] []
+  firstAccelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-STOCK-PRE-SPLIT" issuance.security_id 75.0)]
+    []
+    []
+  splitResult <- applyUpdate
+    issuer
+    firstAccelerationResult.updatedCapTableCid
+    [CT.OcfCreateStockClassSplit (stockClassSplitOn "SPLIT-STOCK-ACC" "SC_COMMON" 2.0 1.0 splitDate)]
+    []
+    []
+  _ <- applyUpdate
+    issuer
+    splitResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-STOCK-POST-SPLIT" issuance.security_id 50.0) with
+      date = postSplitAccelerationDate)]
+    []
+    []
+  pure ()
+
+testVestingQuantityIntegrity_EquityCompensationAccelerationsNormalizeAcrossReverseSplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultEquityCompensationIssuance "TX-ACC-EC-REVERSE-SPLIT" "SEC-ACC-EC-REVERSE-SPLIT" "SH-1") with
+          quantity = 100.0
+          stock_class_id = Some "SC_COMMON"
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance issuance] [] []
+  firstAccelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-EC-PRE-REVERSE-SPLIT" issuance.security_id 75.0)]
+    []
+    []
+  splitResult <- applyUpdate
+    issuer
+    firstAccelerationResult.updatedCapTableCid
+    [CT.OcfCreateStockClassSplit (stockClassSplitOn "REVERSE-SPLIT-EC-ACC" "SC_COMMON" 1.0 2.0 splitDate)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd splitResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EC-POST-REVERSE-SPLIT" issuance.security_id 20.0) with
+        date = postSplitAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_StockCumulativeAccelerationOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultStockIssuance "TX-ACC-STOCK-OVER" "SEC-ACC-STOCK-OVER" "SH-1" "SC_COMMON") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateStockIssuance issuance] [] []
+  assertAdditionalAccelerationRejected issuer issuanceResult.updatedCapTableCid issuance.security_id 60.0 50.0
+
+testVestingQuantityIntegrity_EquityCompensationCumulativeAccelerationOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultEquityCompensationIssuance "TX-ACC-EC-OVER" "SEC-ACC-EC-OVER" "SH-1") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance issuance] [] []
+  assertAdditionalAccelerationRejected issuer issuanceResult.updatedCapTableCid issuance.security_id 60.0 50.0
+
+testVestingQuantityIntegrity_KnownWarrantCumulativeAccelerationOversubscriptionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultWarrantIssuance "TX-ACC-WARRANT-OVER" "SEC-ACC-WARRANT-OVER" "SH-1") with
+          quantity = Some 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateWarrantIssuance issuance] [] []
+  assertAdditionalAccelerationRejected issuer issuanceResult.updatedCapTableCid issuance.security_id 60.0 50.0
+
+testVestingQuantityIntegrity_AccelerationOversubscriptionEditRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultEquityCompensationIssuance "TX-ACC-EDIT" "SEC-ACC-EDIT" "SH-1") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance issuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [ CT.OcfCreateVestingAcceleration (acceleration "ACC-EDIT-A" issuance.security_id 60.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-EDIT-B" issuance.security_id 30.0)
+    ]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditVestingAcceleration (acceleration "ACC-EDIT-A" issuance.security_id 80.0)]
+      deletes = []
+
+testVestingQuantityIntegrity_LoweringKnownQuantityBelowAccelerationsRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultWarrantIssuance "TX-ACC-LOWER" "SEC-ACC-LOWER" "SH-1") with
+          quantity = Some 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateWarrantIssuance issuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-LOWER" issuance.security_id 80.0)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditWarrantIssuance (issuance with quantity = Some 70.0)]
+      deletes = []
+
+testVestingQuantityIntegrity_UnknownWarrantBecomingKnownBelowAccelerationsRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultWarrantIssuance "TX-ACC-UNKNOWN-TO-KNOWN" "SEC-ACC-UNKNOWN-TO-KNOWN" "SH-1") with
+          quantity = None
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateWarrantIssuance issuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-UNKNOWN-TO-KNOWN" issuance.security_id 1000.0)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditWarrantIssuance (issuance with quantity = Some 100.0)]
+      deletes = []
+
+testVestingQuantityIntegrity_DeletingAccelerationReleasesCapacity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let issuance =
+        (defaultEquityCompensationIssuance "TX-ACC-DELETE" "SEC-ACC-DELETE" "SH-1") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance issuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-DELETE-OLD" issuance.security_id 80.0)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration (acceleration "ACC-DELETE-OVER" issuance.security_id 30.0)]
+      edits = []
+      deletes = []
+  _ <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-DELETE-REPLACEMENT" issuance.security_id 100.0)]
+    []
+    [CT.OcfDeleteVestingAcceleration "ACC-DELETE-OLD"]
+  pure ()
