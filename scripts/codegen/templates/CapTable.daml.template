@@ -15,7 +15,7 @@ import qualified DA.Map as Map
 import DA.List (sortOn, unique)
 import DA.Set (Set)
 import qualified DA.Set as Set
-import DA.Action (foldlA, when)
+import DA.Action (foldlA, unless, when)
 import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
@@ -208,6 +208,10 @@ data SecurityQuantityEvent
   | SecurityQuantityRetraction with
       event_date: Time
       event_priority: Int
+  | SecurityQuantityEarlyExercise with
+      event_date: Time
+      event_priority: Int
+      quantity: Decimal
   deriving (Eq, Show)
 
 data VestingAccelerationTimelineEvent
@@ -846,7 +850,7 @@ equityCompensationExerciseOutputShareLot :
   EquityCompensationExerciseOcfData ->
   Update (Optional StockClassShareLot)
 equityCompensationExerciseOutputShareLot maps issuanceData exerciseData = do
-  when (issuanceData.early_exercisable == Some True) do
+  when (hasEarlyExerciseVestingContinuity issuanceData) do
     assertMsg
       ("Early equity compensation exercise must materialize resulting stock so its vesting schedule remains in effect: " <> exerciseData.id)
       False
@@ -931,6 +935,15 @@ hasDeclaredVestingSchedule : Optional Text -> [OcfVesting] -> Bool
 hasDeclaredVestingSchedule vestingTermsId vestings =
   isSome vestingTermsId || not (null vestings)
 
+hasEarlyExerciseVestingContinuity : EquityCompensationIssuanceOcfData -> Bool
+hasEarlyExerciseVestingContinuity issuanceData =
+  issuanceData.early_exercisable == Some True &&
+    hasDeclaredVestingSchedule issuanceData.vesting_terms_id issuanceData.vestings
+
+scaledEarlyExerciseVestings : Decimal -> Decimal -> [OcfVesting] -> [OcfVesting]
+scaledEarlyExerciseVestings sourceQuantity resultQuantity =
+  map (\vesting -> vesting with amount = vesting.amount * resultQuantity / sourceQuantity)
+
 validateEarlyExerciseResultVestingSchedules :
   CapTableMaps ->
   Text ->
@@ -938,16 +951,24 @@ validateEarlyExerciseResultVestingSchedules :
   [Text] ->
   Update ()
 validateEarlyExerciseResultVestingSchedules maps label issuanceData securityIds =
-  when (issuanceData.early_exercisable == Some True) do
+  when (hasEarlyExerciseVestingContinuity issuanceData) do
+    assertMsg
+      (label <> " source must have a positive quantity for early-exercise vesting continuity")
+      (issuanceData.quantity > 0.0)
     mapA_
       (\securityId -> case Map.lookup securityId maps.stock_issuances_by_security_id of
         Some stockIssuanceCid -> do
           stockIssuance <- fetch stockIssuanceCid
           assertMsg
-            (label <> " result must retain a vesting schedule for early-exercisable grant: " <> securityId)
-            (hasDeclaredVestingSchedule
-              stockIssuance.issuance_data.vesting_terms_id
-              stockIssuance.issuance_data.vestings)
+            (label <> " result must retain the source vesting terms for early-exercisable grant: " <> securityId)
+            (stockIssuance.issuance_data.vesting_terms_id == issuanceData.vesting_terms_id)
+          assertMsg
+            (label <> " result must retain the source inline vesting schedule pro rata for early-exercisable grant: " <> securityId)
+            (stockIssuance.issuance_data.vestings ==
+              scaledEarlyExerciseVestings
+                issuanceData.quantity
+                stockIssuance.issuance_data.quantity
+                issuanceData.vestings)
         None -> pure ())
       securityIds
 
@@ -2069,6 +2090,7 @@ validateStockBalanceSuccessorQuantities eventIndex maps = do
 securityQuantityEventSortKey : SecurityQuantityEvent -> (Time, Int, Int)
 securityQuantityEventSortKey event = case event of
   SecurityQuantityDelta with event_date; event_priority -> (event_date, event_priority, 0)
+  SecurityQuantityEarlyExercise with event_date; event_priority -> (event_date, event_priority, 0)
   SecurityQuantityTerminalDelta with event_date; event_priority -> (event_date, event_priority, 1)
   SecurityQuantityMultiplier with event_date; event_priority -> (event_date, event_priority, 2)
   SecurityQuantityRetraction with event_date; event_priority -> (event_date, event_priority, 3)
@@ -2076,6 +2098,7 @@ securityQuantityEventSortKey event = case event of
 securityQuantityEventDate : SecurityQuantityEvent -> Time
 securityQuantityEventDate event = case event of
   SecurityQuantityDelta with event_date -> event_date
+  SecurityQuantityEarlyExercise with event_date -> event_date
   SecurityQuantityTerminalDelta with event_date -> event_date
   SecurityQuantityMultiplier with event_date -> event_date
   SecurityQuantityRetraction with event_date -> event_date
@@ -2096,6 +2119,10 @@ validateSecurityQuantityBalanceEvent securityId currentOpt event = do
       assertMsg
         ("Security reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
         (event_priority == 0 || quantity_delta <= 0.0)
+    SecurityQuantityEarlyExercise with quantity ->
+      assertMsg
+        ("Early exercise quantity cannot be negative for " <> securityId <> ": " <> show quantity)
+        (quantity >= 0.0)
     SecurityQuantityTerminalDelta with quantity_delta ->
       assertMsg
         ("Security terminal reduction quantity cannot be negative for " <> securityId <> ": derived delta is " <> show quantity_delta)
@@ -2107,6 +2134,12 @@ validateSecurityQuantityBalanceEvent securityId currentOpt event = do
         let next = current + quantity_delta
         assertMsg
           ("Security balance cannot be negative for " <> securityId <> ": applying delta " <> show quantity_delta <> " leaves " <> show next)
+          (next >= 0.0)
+        pure (Some next)
+      SecurityQuantityEarlyExercise with quantity -> do
+        let next = current - quantity
+        assertMsg
+          ("Security balance cannot be negative for " <> securityId <> ": applying early exercise " <> show quantity <> " leaves " <> show next)
           (next >= 0.0)
         pure (Some next)
       SecurityQuantityTerminalDelta with quantity_delta -> do
@@ -2127,6 +2160,8 @@ validateSecurityQuantityBalanceEvent securityId currentOpt event = do
         pure (Some 0.0)
     None -> case event of
       SecurityQuantityDelta {} ->
+        pure None
+      SecurityQuantityEarlyExercise {} ->
         pure None
       SecurityQuantityTerminalDelta {} ->
         pure (Some 0.0)
@@ -2560,12 +2595,26 @@ nonStockSecurityBalanceEventIndex maps = do
       assertNonNegativeQuantity
         ("Equity compensation exercise quantity for " <> exercise.exercise_data.id)
         exercise.exercise_data.quantity
-      pure (addSecurityQuantityEvent
-        exercise.exercise_data.security_id
-        (SecurityQuantityDelta with
+      event <- case Map.lookup exercise.exercise_data.security_id maps.equity_compensation_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          pure $
+            if hasEarlyExerciseVestingContinuity issuance.issuance_data
+              then SecurityQuantityEarlyExercise with
+                event_date = exercise.exercise_data.date
+                event_priority = 1
+                quantity = exercise.exercise_data.quantity
+              else SecurityQuantityDelta with
+                event_date = exercise.exercise_data.date
+                event_priority = 1
+                quantity_delta = 0.0 - exercise.exercise_data.quantity
+        None -> pure SecurityQuantityDelta with
           event_date = exercise.exercise_data.date
           event_priority = 1
-          quantity_delta = 0.0 - exercise.exercise_data.quantity)
+          quantity_delta = 0.0 - exercise.exercise_data.quantity
+      pure (addSecurityQuantityEvent
+        exercise.exercise_data.security_id
+        event
         index))
     equityCancellationEvents
     (Map.values maps.equity_compensation_exercises)
@@ -4455,8 +4504,8 @@ addEarlyExerciseStockVestingAccelerationPredecessors stockEventIndex balanceEven
   case Map.lookup exerciseData.security_id maps.equity_compensation_issuances_by_security_id of
     Some sourceIssuanceCid -> do
       sourceIssuance <- fetch sourceIssuanceCid
-      case sourceIssuance.issuance_data.early_exercisable of
-        Some True -> do
+      if hasEarlyExerciseVestingContinuity sourceIssuance.issuance_data
+        then do
           let label = "Equity compensation exercise " <> exerciseData.id
               sourceEventSortKey = (exerciseData.date, 1, 0)
           sourceQuantity <- equityCompensationSecurityQuantityBeforeSortKey
@@ -4484,7 +4533,7 @@ addEarlyExerciseStockVestingAccelerationPredecessors stockEventIndex balanceEven
                 None -> pure currentIndex)
             index
             exerciseData.resulting_security_ids
-        _ -> pure index
+        else pure index
     None -> pure index
 
 addStockConsolidationVestingAccelerationPredecessors :
@@ -4674,10 +4723,17 @@ vestingAccelerationTimelineEvents inheritedSeed accelerations =
         (vestingAccelerationBuckets accelerations)
   in case inheritedSeed of
     Some (seedSortKey, seedQuantity) ->
-      (VestingAccelerationQuantity with
-        event_sort_key = seedSortKey
-        quantity = seedQuantity
-        report_total = False) :: directEvents
+      let (seedDate, _, _) = seedSortKey
+      in
+        [ VestingAccelerationQuantity with
+            event_sort_key = seedSortKey
+            quantity = seedQuantity
+            report_total = False
+        , VestingAccelerationQuantity with
+            event_sort_key = vestingAccelerationEvaluationSortKey seedDate
+            quantity = 0.0
+            report_total = True
+        ] ++ directEvents
     None -> directEvents
 
 vestingAccelerationTimelineEventSortKey : VestingAccelerationTimelineEvent -> (Time, Int, Int)
@@ -4782,6 +4838,7 @@ securityVestingAccelerationTimelineEvents quantityEvents inheritedSeed accelerat
                 event_sort_key = (event_date, event_priority, 0)
                 quantity_delta]
               else []
+          SecurityQuantityEarlyExercise {} -> []
           SecurityQuantityTerminalDelta with event_date; event_priority ->
             [VestingAccelerationRetirement with
               event_sort_key = (event_date, event_priority, 1)]
@@ -4794,6 +4851,80 @@ securityVestingAccelerationTimelineEvents quantityEvents inheritedSeed accelerat
               event_sort_key = (event_date, event_priority, 3)])
         quantityEvents
   in securityEvents ++ vestingAccelerationTimelineEvents inheritedSeed accelerations
+
+securityQuantityEarlyExerciseBuckets : [SecurityQuantityEvent] -> [((Time, Int), Decimal)]
+securityQuantityEarlyExerciseBuckets events =
+  sortOn
+    fst
+    (Map.toList (Map.fromListWithR (+) (concatMap
+      (\event -> case event of
+        SecurityQuantityEarlyExercise with event_date; event_priority; quantity ->
+          [((event_date, event_priority), quantity)]
+        _ -> [])
+      events)))
+
+equityCompensationVestingAccelerationTimelineEvents :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  EquityCompensationIssuanceOcfData ->
+  Optional ((Time, Int, Int), Decimal) ->
+  [VestingAccelerationOcfData] ->
+  Update [VestingAccelerationTimelineEvent]
+equityCompensationVestingAccelerationTimelineEvents stockEventIndex balanceEventIndex maps issuanceData inheritedSeed accelerations = do
+  quantityEvents <- equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex maps issuanceData
+  earlyExerciseEvents <- foldlA
+    (\timelineEvents ((eventDate, eventPriority), exerciseQuantity) -> do
+      liveQuantityOpt <- securityQuantityBeforeEvent
+        issuanceData.security_id
+        (Some 0.0)
+        ((SecurityQuantityDelta with
+            event_date = issuanceData.date
+            event_priority = 0
+            quantity_delta = issuanceData.quantity)
+          :: quantityEvents)
+        (eventDate, eventPriority, 0)
+      liveQuantity <- case liveQuantityOpt of
+        Some quantity -> pure quantity
+        None -> do
+          assertMsg ("Equity compensation quantity unexpectedly became unknown: " <> issuanceData.security_id) False
+          pure 0.0
+      assertMsg
+        ("Early exercise requires a positive source quantity for vesting continuity: " <> issuanceData.security_id)
+        (liveQuantity > 0.0)
+      assertMsg
+        ("Early exercise quantity exceeds its source quantity for vesting continuity: " <> issuanceData.security_id)
+        (exerciseQuantity <= liveQuantity)
+      let ratio = OcfRatio with
+            numerator = liveQuantity - exerciseQuantity
+            denominator = liveQuantity
+          timelineEvent = VestingAccelerationSplit with
+            event_sort_key = (eventDate, eventPriority, 0)
+            ratio
+      pure (timelineEvent :: timelineEvents))
+    []
+    (securityQuantityEarlyExerciseBuckets quantityEvents)
+  let otherSecurityEvents = concatMap
+        (\event -> case event of
+          SecurityQuantityDelta with event_date; event_priority; quantity_delta ->
+            if quantity_delta < 0.0
+              then [VestingAccelerationReduction with
+                event_sort_key = (event_date, event_priority, 1)
+                quantity_delta]
+              else []
+          SecurityQuantityEarlyExercise {} -> []
+          SecurityQuantityTerminalDelta with event_date; event_priority ->
+            [VestingAccelerationRetirement with
+              event_sort_key = (event_date, event_priority, 2)]
+          SecurityQuantityMultiplier with event_date; event_priority; ratio ->
+            [VestingAccelerationSplit with
+              event_sort_key = (event_date, event_priority, 3)
+              ratio]
+          SecurityQuantityRetraction with event_date; event_priority ->
+            [VestingAccelerationRetirement with
+              event_sort_key = (event_date, event_priority, 4)])
+        quantityEvents
+  pure (earlyExerciseEvents ++ otherSecurityEvents ++ vestingAccelerationTimelineEvents inheritedSeed accelerations)
 
 vestingAccelerationInheritedSeed :
   StockClassShareEventIndex ->
@@ -4861,9 +4992,8 @@ vestingAccelerationQuantityBefore stockEventIndex balanceEventIndex maps acceler
     None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
       Some issuanceCid -> do
         issuance <- fetch issuanceCid
-        quantityEvents <- equityCompensationSecurityQuantityEvents
-          stockEventIndex balanceEventIndex maps issuance.issuance_data
-        let events = securityVestingAccelerationTimelineEvents quantityEvents inheritedSeed accelerations
+        events <- equityCompensationVestingAccelerationTimelineEvents
+          stockEventIndex balanceEventIndex maps issuance.issuance_data inheritedSeed accelerations
         pure (vestingAccelerationTimelineTotalBefore targetSortKey events)
       None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
         Some issuanceCid -> do
@@ -4877,6 +5007,13 @@ vestingAccelerationQuantityBefore stockEventIndex balanceEventIndex maps acceler
         None -> do
           assertMsg ("Vesting acceleration predecessor security not found: " <> securityId) False
           pure 0.0
+
+inlineVestingQuantityAfter : Time -> [OcfVesting] -> Decimal
+inlineVestingQuantityAfter date vestings =
+  foldl
+    (\total vesting -> if vesting.date > date then total + vesting.amount else total)
+    0.0
+    vestings
 
 validateStockVestingAccelerationQuantities :
   StockClassShareEventIndex ->
@@ -4892,7 +5029,17 @@ validateStockVestingAccelerationQuantities eventIndex maps issuanceData inherite
       liveQuantity <- stockSecurityQuantityBeforeEvent eventIndex maps issuanceData targetSortKey
       assertMsg
         ("Vesting accelerations exceed live stock security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
-        (acceleratedQuantity <= liveQuantity))
+        (acceleratedQuantity <= liveQuantity)
+      unless (null issuanceData.vestings) do
+        futureVestingQuantity <- stockClassQuantityAtSortKey
+          maps
+          issuanceData.stock_class_id
+          issuanceData.date
+          (inlineVestingQuantityAfter accelerationDate issuanceData.vestings)
+          targetSortKey
+        assertMsg
+          ("Vesting accelerations exceed stock quantity scheduled after " <> show accelerationDate <> " for " <> issuanceData.security_id)
+          (acceleratedQuantity <= futureVestingQuantity))
     (stockVestingAccelerationTotals eventIndex issuanceData inheritedSeed accelerations)
 
 validateEquityCompensationVestingAccelerationQuantities :
@@ -4905,8 +5052,9 @@ validateEquityCompensationVestingAccelerationQuantities :
   Update ()
 validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceEventIndex maps issuanceData inheritedSeed accelerations = do
   quantityEvents <- equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex maps issuanceData
-  let accelerationTotals = vestingAccelerationTimelineTotals
-        (securityVestingAccelerationTimelineEvents quantityEvents inheritedSeed accelerations)
+  timelineEvents <- equityCompensationVestingAccelerationTimelineEvents
+    stockEventIndex balanceEventIndex maps issuanceData inheritedSeed accelerations
+  let accelerationTotals = vestingAccelerationTimelineTotals timelineEvents
   mapA_
     (\(accelerationDate, acceleratedQuantity) -> do
       let targetSortKey = vestingAccelerationEvaluationSortKey accelerationDate
@@ -4926,7 +5074,30 @@ validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceE
           pure 0.0
       assertMsg
         ("Vesting accelerations exceed live equity compensation security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
-        (acceleratedQuantity <= liveQuantity))
+        (acceleratedQuantity <= liveQuantity)
+      unless (null issuanceData.vestings) do
+        let splitEvents = filter
+              (\event -> case event of
+                SecurityQuantityMultiplier {} -> True
+                _ -> False)
+              quantityEvents
+        futureVestingQuantityOpt <- securityQuantityBeforeEvent
+          issuanceData.security_id
+          (Some 0.0)
+          ((SecurityQuantityDelta with
+              event_date = issuanceData.date
+              event_priority = 0
+              quantity_delta = inlineVestingQuantityAfter accelerationDate issuanceData.vestings)
+            :: splitEvents)
+          targetSortKey
+        futureVestingQuantity <- case futureVestingQuantityOpt of
+          Some quantity -> pure quantity
+          None -> do
+            assertMsg ("Equity compensation inline vesting quantity unexpectedly became unknown: " <> issuanceData.security_id) False
+            pure 0.0
+        assertMsg
+          ("Vesting accelerations exceed equity compensation quantity scheduled after " <> show accelerationDate <> " for " <> issuanceData.security_id)
+          (acceleratedQuantity <= futureVestingQuantity))
     accelerationTotals
 
 validateWarrantVestingAccelerationQuantities :
@@ -4963,7 +5134,11 @@ validateWarrantVestingAccelerationQuantities eventIndex issuanceData inheritedSe
               pure 0.0
           assertMsg
             ("Vesting accelerations exceed live warrant security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
-            (acceleratedQuantity <= liveQuantity))
+            (acceleratedQuantity <= liveQuantity)
+          unless (null issuanceData.vestings) do
+            assertMsg
+              ("Vesting accelerations exceed warrant quantity scheduled after " <> show accelerationDate <> " for " <> issuanceData.security_id)
+              (acceleratedQuantity <= inlineVestingQuantityAfter accelerationDate issuanceData.vestings))
         accelerationTotals
     None -> pure ()
 
@@ -4978,37 +5153,41 @@ validateVestingAccelerationQuantities :
 validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex (securityId, accelerations) = do
   inheritedSeed <- vestingAccelerationInheritedSeed
     stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex Set.empty securityId
-  case Map.lookup securityId maps.stock_issuances_by_security_id of
-    Some issuanceCid -> do
-      issuance <- fetch issuanceCid
-      assertMsg
-        ("Vesting acceleration requires stock security to declare vesting terms or inline vestings: " <> securityId)
-        (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
-      validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data inheritedSeed accelerations
-    None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
+  let hasPositiveInheritedSeed = case inheritedSeed of
+        Some (_, quantity) -> quantity > 0.0
+        None -> False
+  when (not (null accelerations) || hasPositiveInheritedSeed) do
+    case Map.lookup securityId maps.stock_issuances_by_security_id of
       Some issuanceCid -> do
         issuance <- fetch issuanceCid
         assertMsg
-          ("Vesting acceleration requires equity compensation security to declare vesting terms or inline vestings: " <> securityId)
+          ("Vesting acceleration requires stock security to declare vesting terms or inline vestings: " <> securityId)
           (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
-        validateEquityCompensationVestingAccelerationQuantities
-          stockEventIndex
-          balanceEventIndex
-          maps
-          issuance.issuance_data
-          inheritedSeed
-          accelerations
-      None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
+        validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data inheritedSeed accelerations
+      None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
           assertMsg
-            ("Vesting acceleration requires warrant security to declare vesting terms or inline vestings: " <> securityId)
+            ("Vesting acceleration requires equity compensation security to declare vesting terms or inline vestings: " <> securityId)
             (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
-          validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data inheritedSeed accelerations
-        None ->
-          assertMsg
-            ("Vesting accelerations reference a missing or unsupported security: " <> securityId)
-            False
+          validateEquityCompensationVestingAccelerationQuantities
+            stockEventIndex
+            balanceEventIndex
+            maps
+            issuance.issuance_data
+            inheritedSeed
+            accelerations
+        None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
+          Some issuanceCid -> do
+            issuance <- fetch issuanceCid
+            assertMsg
+              ("Vesting acceleration requires warrant security to declare vesting terms or inline vestings: " <> securityId)
+              (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
+            validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data inheritedSeed accelerations
+          None ->
+            assertMsg
+              ("Vesting accelerations reference a missing or unsupported security: " <> securityId)
+              False
 
 validateVestingQuantityIntegrity :
   StockClassShareEventIndex ->
@@ -5019,9 +5198,19 @@ validateVestingQuantityIntegrity stockEventIndex balanceEventIndex maps = do
   validateInlineVestingQuantities maps
   accelerationIndex <- vestingAccelerationsBySecurityId maps
   predecessorIndex <- vestingAccelerationPredecessorIndex stockEventIndex balanceEventIndex maps
+  let securityIds = Map.keys (Map.fromList (map
+        (\securityId -> (securityId, True))
+        (Map.keys accelerationIndex ++ Map.keys predecessorIndex)))
   mapA_
-    (validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex)
-    (Map.toList accelerationIndex)
+    (\securityId ->
+      validateVestingAccelerationQuantities
+        stockEventIndex
+        balanceEventIndex
+        maps
+        accelerationIndex
+        predecessorIndex
+        (securityId, fromOptional [] (Map.lookup securityId accelerationIndex)))
+    securityIds
 
 validateTransactionLifecycleDates : CapTableMaps -> Update ()
 validateTransactionLifecycleDates maps = do

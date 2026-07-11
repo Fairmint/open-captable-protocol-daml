@@ -44,6 +44,7 @@ import OpenCapTable.TestStockConversion (addPreferredStockClass)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
+import DA.Foldable (mapA_)
 import Daml.Script
 
 accelerationVestingTermsId : Text
@@ -66,6 +67,14 @@ accelerationVestingTerms = VestingTermsOcfData with
       denominator = 1.0
       remainder = False)
     quantity = None]
+
+alternateAccelerationVestingTermsId : Text
+alternateAccelerationVestingTermsId = "VESTING-TERMS-ACCELERATION-ALTERNATE"
+
+alternateAccelerationVestingTerms : VestingTermsOcfData
+alternateAccelerationVestingTerms = accelerationVestingTerms with
+  id = alternateAccelerationVestingTermsId
+  name = "Alternate acceleration test vesting terms"
 
 defaultStockIssuance : Text -> Text -> Text -> Text -> StockIssuanceOcfData
 defaultStockIssuance issuanceId securityId stakeholderId stockClassId =
@@ -125,6 +134,9 @@ secondVestingDate = DT.time (DA.date 2026 Jan 01) 0 0 0
 
 accelerationDate : Time
 accelerationDate = DT.time (DA.date 2025 Jun 01) 0 0 0
+
+earlyExerciseDate : Time
+earlyExerciseDate = DT.time (DA.date 2025 Sep 01) 0 0 0
 
 splitDate : Time
 splitDate = DT.time (DA.date 2026 Jan 01) 0 0 0
@@ -1369,12 +1381,20 @@ testVestingQuantityIntegrity_EarlyExerciseRetainsScheduleAndAccelerationHistory 
   capTableCid <- addPrerequisites issuer cap_table
   let sourceSecurityId = "SEC-ACC-EARLY-EXERCISE-SOURCE"
       invalidResultSecurityId = "SEC-ACC-EARLY-EXERCISE-FULLY-VESTED"
+      mismatchedResultSecurityId = "SEC-ACC-EARLY-EXERCISE-MISMATCHED-SCHEDULE"
       resultSecurityId = "SEC-ACC-EARLY-EXERCISE-RESULT"
       sourceIssuance =
         (defaultEquityCompensationIssuance "TX-ACC-EARLY-EXERCISE-SOURCE" sourceSecurityId "SH-1") with
           early_exercisable = Some True
           stock_class_id = Some "SC_COMMON"
-  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance sourceIssuance] [] []
+  issuanceResult <- applyUpdate
+    issuer
+    capTableCid
+    [ CT.OcfCreateVestingTerms alternateAccelerationVestingTerms
+    , CT.OcfCreateEquityCompensationIssuance sourceIssuance
+    ]
+    []
+    []
   accelerationResult <- applyUpdate
     issuer
     issuanceResult.updatedCapTableCid
@@ -1414,6 +1434,28 @@ testVestingQuantityIntegrity_EarlyExerciseRetainsScheduleAndAccelerationHistory 
         ]
       edits = []
       deletes = []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance ((defaultStockIssuance
+            "TX-ACC-EARLY-EXERCISE-MISMATCHED-SCHEDULE"
+            mismatchedResultSecurityId
+            "SH-1"
+            "SC_COMMON") with
+              date = postSplitAccelerationDate
+              quantity = 40.0
+              vesting_terms_id = Some alternateAccelerationVestingTermsId)
+        , CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+            id = "TX-ACC-EARLY-EXERCISE-MISMATCHED-SCHEDULE"
+            date = postSplitAccelerationDate
+            security_id = sourceSecurityId
+            quantity = 40.0
+            consideration_text = None
+            resulting_security_ids = [mismatchedResultSecurityId]
+            comments = []
+        ]
+      edits = []
+      deletes = []
   exerciseResult <- applyUpdate
     issuer
     accelerationResult.updatedCapTableCid
@@ -1435,9 +1477,22 @@ testVestingQuantityIntegrity_EarlyExerciseRetainsScheduleAndAccelerationHistory 
     ]
     []
     []
-  exactResult <- applyUpdate
+  submitMustFail issuer do
+    exerciseCmd exerciseResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EARLY-EXERCISE-SOURCE-OVER" sourceSecurityId 25.0) with
+        date = successorAccelerationDate)]
+      edits = []
+      deletes = []
+  sourceExactResult <- applyUpdate
     issuer
     exerciseResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EARLY-EXERCISE-SOURCE-EXACT" sourceSecurityId 24.0) with
+      date = successorAccelerationDate)]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    sourceExactResult.updatedCapTableCid
     [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EARLY-EXERCISE-RESULT-EXACT" resultSecurityId 16.0) with
       date = successorAccelerationDate)]
     []
@@ -1447,6 +1502,177 @@ testVestingQuantityIntegrity_EarlyExerciseRetainsScheduleAndAccelerationHistory 
       creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EARLY-EXERCISE-RESULT-OVER" resultSecurityId 1.0) with
         date = finalSuccessorAccelerationDate)]
       edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_EarlyExerciseRetainsInlineScheduleProRata = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-EARLY-INLINE-SOURCE"
+      invalidResultSecurityId = "SEC-ACC-EARLY-INLINE-INVALID"
+      resultSecurityId = "SEC-ACC-EARLY-INLINE-RESULT"
+      sourceIssuance =
+        (TestHelpers.defaultEquityCompensationIssuance "TX-ACC-EARLY-INLINE-SOURCE" sourceSecurityId "SH-1") with
+          early_exercisable = Some True
+          stock_class_id = Some "SC_COMMON"
+          vestings = [vestingOn firstVestingDate 40.0, vestingOn secondVestingDate 60.0]
+      invalidResultIssuance =
+        (TestHelpers.defaultStockIssuance "TX-ACC-EARLY-INLINE-INVALID" invalidResultSecurityId "SH-1" "SC_COMMON") with
+          date = earlyExerciseDate
+          quantity = 40.0
+          vestings = [vestingOn firstVestingDate 20.0, vestingOn secondVestingDate 20.0]
+      resultIssuance =
+        (TestHelpers.defaultStockIssuance "TX-ACC-EARLY-INLINE-RESULT" resultSecurityId "SH-1" "SC_COMMON") with
+          date = earlyExerciseDate
+          quantity = 40.0
+          vestings = [vestingOn firstVestingDate 16.0, vestingOn secondVestingDate 24.0]
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-EARLY-INLINE-SOURCE" sourceSecurityId 60.0)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd accelerationResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance invalidResultIssuance
+        , CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+            id = "TX-ACC-EARLY-INLINE-INVALID"
+            date = earlyExerciseDate
+            security_id = sourceSecurityId
+            quantity = 40.0
+            consideration_text = None
+            resulting_security_ids = [invalidResultSecurityId]
+            comments = []
+        ]
+      edits = []
+      deletes = []
+  exerciseResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ CT.OcfCreateStockIssuance resultIssuance
+    , CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+        id = "TX-ACC-EARLY-INLINE"
+        date = earlyExerciseDate
+        security_id = sourceSecurityId
+        quantity = 40.0
+        consideration_text = None
+        resulting_security_ids = [resultSecurityId]
+        comments = []
+    ]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd exerciseResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EARLY-INLINE-RESULT-OVER" resultSecurityId 1.0) with
+        date = earlyExerciseDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_FullyVestedEarlyExercisableGrantCanSettleWithoutSchedule = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-FULLY-VESTED-EARLY-FLAG"
+      sourceIssuance =
+        (TestHelpers.defaultEquityCompensationIssuance "TX-ACC-FULLY-VESTED-EARLY-FLAG" sourceSecurityId "SH-1") with
+          early_exercisable = Some True
+          stock_class_id = Some "SC_COMMON"
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance sourceIssuance] [] []
+  _ <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+      id = "TX-ACC-FULLY-VESTED-EARLY-FLAG-EXERCISE"
+      date = postSplitAccelerationDate
+      security_id = sourceSecurityId
+      quantity = 100.0
+      consideration_text = None
+      resulting_security_ids = []
+      comments = []]
+    []
+    []
+  pure ()
+
+testVestingQuantityIntegrity_InlineAccelerationsCannotExceedFutureSchedule = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let stockIssuance =
+        (defaultStockIssuance "TX-ACC-INLINE-FUTURE-STOCK" "SEC-ACC-INLINE-FUTURE-STOCK" "SH-1" "SC_COMMON") with
+          vestings = [vestingOn firstVestingDate 40.0, vestingOn secondVestingDate 60.0]
+      equityCompensationIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-INLINE-FUTURE-EC" "SEC-ACC-INLINE-FUTURE-EC" "SH-1") with
+          stock_class_id = Some "SC_COMMON"
+          vestings = [vestingOn firstVestingDate 40.0, vestingOn secondVestingDate 60.0]
+      warrantIssuance =
+        (defaultWarrantIssuance "TX-ACC-INLINE-FUTURE-WARRANT" "SEC-ACC-INLINE-FUTURE-WARRANT" "SH-1") with
+          quantity = Some 100.0
+          quantity_source = Some OcfQuantityInstrumentFixed
+          vestings = [vestingOn firstVestingDate 40.0, vestingOn secondVestingDate 60.0]
+  issuanceResult <- applyUpdate
+    issuer
+    capTableCid
+    [ CT.OcfCreateStockIssuance stockIssuance
+    , CT.OcfCreateEquityCompensationIssuance equityCompensationIssuance
+    , CT.OcfCreateWarrantIssuance warrantIssuance
+    ]
+    []
+    []
+  mapA_
+    (\securityId -> submitMustFail issuer do
+      exerciseCmd issuanceResult.updatedCapTableCid CT.UpdateCapTable with
+        creates = [CT.OcfCreateVestingAcceleration (acceleration ("ACC-INLINE-FUTURE-OVER-" <> securityId) securityId 61.0)]
+        edits = []
+        deletes = [])
+    [stockIssuance.security_id, equityCompensationIssuance.security_id, warrantIssuance.security_id]
+  _ <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [ CT.OcfCreateVestingAcceleration (acceleration "ACC-INLINE-FUTURE-STOCK-EXACT" stockIssuance.security_id 60.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-INLINE-FUTURE-EC-EXACT" equityCompensationIssuance.security_id 60.0)
+    , CT.OcfCreateVestingAcceleration (acceleration "ACC-INLINE-FUTURE-WARRANT-EXACT" warrantIssuance.security_id 60.0)
+    ]
+    []
+    []
+  pure ()
+
+testVestingQuantityIntegrity_InheritedOnlySuccessorCannotDropSchedule = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-INHERITED-ONLY-SOURCE"
+      resultSecurityId = "SEC-ACC-INHERITED-ONLY-RESULT"
+      sourceIssuance = defaultStockIssuance "TX-ACC-INHERITED-ONLY-SOURCE" sourceSecurityId "SH-1" "SC_COMMON"
+      resultIssuance = (defaultStockIssuance "TX-ACC-INHERITED-ONLY-RESULT" resultSecurityId "SH-1" "SC_COMMON") with
+        date = postSplitAccelerationDate
+      fullyVestedResultIssuance = resultIssuance with
+        vesting_terms_id = None
+        vestings = []
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateStockIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-INHERITED-ONLY-SOURCE" sourceSecurityId 80.0)]
+    []
+    []
+  transferResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ CT.OcfCreateStockIssuance resultIssuance
+    , CT.OcfCreateStockTransfer StockTransferOcfData with
+        id = "TRANSFER-ACC-INHERITED-ONLY"
+        date = postSplitAccelerationDate
+        security_id = sourceSecurityId
+        quantity = 100.0
+        resulting_security_ids = [resultSecurityId]
+        balance_security_id = None
+        consideration_text = None
+        comments = []
+    ]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd transferResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditStockIssuance fullyVestedResultIssuance]
       deletes = []
 
 testVestingQuantityIntegrity_FullyVestedExerciseReleaseAndWarrantResultsCannotBeAccelerated = script do
@@ -1558,6 +1784,116 @@ testVestingQuantityIntegrity_FullyVestedExerciseReleaseAndWarrantResultsCannotBe
   submitMustFail issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-WARRANT-EXERCISE-RESULT" warrantResultSecurityId 1.0) with
+        date = finalSuccessorAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_PlanLinkedSuccessorIsNotDoubleScaledAcrossSameDaySplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let plan = defaultStockPlan "PLAN-ACC-SAME-DAY-SUCCESSOR" "SC_COMMON"
+      sourceSecurityId = "SEC-ACC-PLAN-SAME-DAY-SOURCE"
+      successorSecurityId = "SEC-ACC-PLAN-SAME-DAY-SUCCESSOR"
+      sourceIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-PLAN-SAME-DAY-SOURCE" sourceSecurityId "SH-1") with
+          quantity = 100.0
+          stock_plan_id = Some plan.id
+      successorIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-PLAN-SAME-DAY-SUCCESSOR" successorSecurityId "SH-1") with
+          date = splitDate
+          quantity = 20.0
+          stock_plan_id = Some plan.id
+  issuanceResult <- applyUpdate
+    issuer
+    capTableCid
+    [ CT.OcfCreateStockPlan plan
+    , CT.OcfCreateEquityCompensationIssuance sourceIssuance
+    ]
+    []
+    []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-PLAN-SAME-DAY-SOURCE" sourceSecurityId 50.0)]
+    []
+    []
+  successorResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ CT.OcfCreateStockClassSplit (stockClassSplitOn "SPLIT-ACC-PLAN-SAME-DAY" "SC_COMMON" 2.0 1.0 splitDate)
+    , CT.OcfCreateEquityCompensationIssuance successorIssuance
+    , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+        id = "CANCEL-ACC-PLAN-SAME-DAY"
+        date = splitDate
+        security_id = sourceSecurityId
+        quantity = 80.0
+        reason_text = "Partial cancellation after split"
+        balance_security_id = Some successorSecurityId
+        comments = []
+    ]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    successorResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-PLAN-SAME-DAY-SUCCESSOR-EXACT" successorSecurityId 20.0) with
+      date = successorAccelerationDate)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd exactResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-PLAN-SAME-DAY-SUCCESSOR-OVER" successorSecurityId 1.0) with
+        date = finalSuccessorAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_ScheduledOrdinaryExerciseResultHasIndependentAccelerationHistory = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-ORDINARY-EXERCISE-SOURCE"
+      resultSecurityId = "SEC-ACC-ORDINARY-EXERCISE-RESULT"
+      sourceIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-ORDINARY-EXERCISE-SOURCE" sourceSecurityId "SH-1") with
+          early_exercisable = Some False
+          stock_class_id = Some "SC_COMMON"
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-ORDINARY-EXERCISE-SOURCE" sourceSecurityId 60.0)]
+    []
+    []
+  exerciseResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ stockSuccessorIssuance
+        "TX-ACC-ORDINARY-EXERCISE-RESULT"
+        resultSecurityId
+        "SH-1"
+        "SC_COMMON"
+        postSplitAccelerationDate
+        100.0
+    , CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+        id = "TX-ACC-ORDINARY-EXERCISE"
+        date = postSplitAccelerationDate
+        security_id = sourceSecurityId
+        quantity = 100.0
+        consideration_text = None
+        resulting_security_ids = [resultSecurityId]
+        comments = []
+    ]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    exerciseResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-ORDINARY-EXERCISE-RESULT-EXACT" resultSecurityId 100.0) with
+      date = successorAccelerationDate)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd exactResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-ORDINARY-EXERCISE-RESULT-OVER" resultSecurityId 1.0) with
         date = finalSuccessorAccelerationDate)]
       edits = []
       deletes = []
