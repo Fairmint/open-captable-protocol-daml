@@ -1,7 +1,9 @@
 module OpenCapTable.TestVestingQuantityIntegrity where
 
 import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation (EquityCompensationCancellationOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantCancellation (WarrantCancellationOcfData(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
@@ -12,6 +14,7 @@ import OpenCapTable.TestHelpers
   , defaultStockIssuance
   , defaultStockPlan
   , defaultWarrantIssuance
+  , equityCompensationSuccessorIssuance
   , stockCancellationOn
   , stockClassSplitOn
   , stockSuccessorIssuance
@@ -35,6 +38,15 @@ splitDate = DT.time (DA.date 2026 Jan 01) 0 0 0
 
 postSplitAccelerationDate : Time
 postSplitAccelerationDate = DT.time (DA.date 2026 Jun 01) 0 0 0
+
+successorAccelerationDate : Time
+successorAccelerationDate = DT.time (DA.date 2027 Jan 01) 0 0 0
+
+chainedBalanceDate : Time
+chainedBalanceDate = DT.time (DA.date 2027 Jun 01) 0 0 0
+
+finalSuccessorAccelerationDate : Time
+finalSuccessorAccelerationDate = DT.time (DA.date 2028 Jan 01) 0 0 0
 
 vestingOn : Time -> Decimal -> OcfVesting
 vestingOn date amount = OcfVesting with
@@ -433,6 +445,174 @@ testVestingQuantityIntegrity_SameDayReverseSplitAccelerationCannotBeUndercounted
     exerciseCmd sameDayAccelerationResult.updatedCapTableCid CT.UpdateCapTable with
       creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-SAME-DAY-REVERSE-SPLIT-SECOND" issuance.security_id 30.0) with
         date = postSplitAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_StockBalanceSuccessorCarriesSplitAdjustedAccelerations = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-STOCK-LINEAGE-SOURCE"
+      successorSecurityId = "SEC-ACC-STOCK-LINEAGE-BALANCE"
+      sourceIssuance =
+        (defaultStockIssuance "TX-ACC-STOCK-LINEAGE-SOURCE" sourceSecurityId "SH-1" "SC_COMMON") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateStockIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-STOCK-LINEAGE-SOURCE" sourceSecurityId 50.0)]
+    []
+    []
+  balanceResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ CT.OcfCreateStockClassSplit (stockClassSplitOn "SPLIT-ACC-STOCK-LINEAGE" "SC_COMMON" 2.0 1.0 splitDate)
+    , stockSuccessorIssuance
+        "TX-ACC-STOCK-LINEAGE-BALANCE"
+        successorSecurityId
+        "SH-1"
+        "SC_COMMON"
+        splitDate
+        60.0
+    , CT.OcfCreateStockCancellation
+        ((stockCancellationOn "CANCEL-ACC-STOCK-LINEAGE" sourceSecurityId 40.0 splitDate) with
+          balance_security_id = Some successorSecurityId)
+    ]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    balanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-STOCK-LINEAGE-BALANCE-EXACT" successorSecurityId 60.0) with
+      date = postSplitAccelerationDate)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd exactResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-STOCK-LINEAGE-BALANCE-OVER" successorSecurityId 1.0) with
+        date = postSplitAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_EquityCompensationBalanceSuccessorCarriesAccelerations = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-EC-LINEAGE-SOURCE"
+      successorSecurityId = "SEC-ACC-EC-LINEAGE-BALANCE"
+      chainedSuccessorSecurityId = "SEC-ACC-EC-LINEAGE-BALANCE-2"
+      sourceIssuance =
+        (defaultEquityCompensationIssuance "TX-ACC-EC-LINEAGE-SOURCE" sourceSecurityId "SH-1") with
+          quantity = 100.0
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateEquityCompensationIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-EC-LINEAGE-SOURCE" sourceSecurityId 50.0)]
+    []
+    []
+  balanceResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ equityCompensationSuccessorIssuance
+        "TX-ACC-EC-LINEAGE-BALANCE"
+        successorSecurityId
+        "SH-1"
+        postSplitAccelerationDate
+        60.0
+        None
+    , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+        id = "CANCEL-ACC-EC-LINEAGE"
+        date = postSplitAccelerationDate
+        security_id = sourceSecurityId
+        quantity = 40.0
+        reason_text = "Partial cancellation"
+        balance_security_id = Some successorSecurityId
+        comments = []
+    ]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    balanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EC-LINEAGE-BALANCE-EXACT" successorSecurityId 30.0) with
+      date = successorAccelerationDate)]
+    []
+    []
+  chainedResult <- applyUpdate
+    issuer
+    exactResult.updatedCapTableCid
+    [ equityCompensationSuccessorIssuance
+        "TX-ACC-EC-LINEAGE-BALANCE-2"
+        chainedSuccessorSecurityId
+        "SH-1"
+        chainedBalanceDate
+        30.0
+        None
+    , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+        id = "CANCEL-ACC-EC-LINEAGE-2"
+        date = chainedBalanceDate
+        security_id = successorSecurityId
+        quantity = 30.0
+        reason_text = "Second partial cancellation"
+        balance_security_id = Some chainedSuccessorSecurityId
+        comments = []
+    ]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd chainedResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-EC-LINEAGE-BALANCE-OVER" chainedSuccessorSecurityId 1.0) with
+        date = finalSuccessorAccelerationDate)]
+      edits = []
+      deletes = []
+
+testVestingQuantityIntegrity_KnownWarrantBalanceSuccessorCarriesAccelerations = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceSecurityId = "SEC-ACC-WARRANT-LINEAGE-SOURCE"
+      successorSecurityId = "SEC-ACC-WARRANT-LINEAGE-BALANCE"
+      sourceIssuance =
+        (defaultWarrantIssuance "TX-ACC-WARRANT-LINEAGE-SOURCE" sourceSecurityId "SH-1") with
+          quantity = Some 100.0
+          quantity_source = Some OcfQuantityInstrumentFixed
+      successorIssuance =
+        (defaultWarrantIssuance "TX-ACC-WARRANT-LINEAGE-BALANCE" successorSecurityId "SH-1") with
+          date = postSplitAccelerationDate
+          quantity = Some 60.0
+          quantity_source = Some OcfQuantityInstrumentFixed
+  issuanceResult <- applyUpdate issuer capTableCid [CT.OcfCreateWarrantIssuance sourceIssuance] [] []
+  accelerationResult <- applyUpdate
+    issuer
+    issuanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration (acceleration "ACC-WARRANT-LINEAGE-SOURCE" sourceSecurityId 50.0)]
+    []
+    []
+  balanceResult <- applyUpdate
+    issuer
+    accelerationResult.updatedCapTableCid
+    [ CT.OcfCreateWarrantIssuance successorIssuance
+    , CT.OcfCreateWarrantCancellation WarrantCancellationOcfData with
+        id = "CANCEL-ACC-WARRANT-LINEAGE"
+        date = postSplitAccelerationDate
+        security_id = sourceSecurityId
+        quantity = 40.0
+        reason_text = "Partial cancellation"
+        balance_security_id = Some successorSecurityId
+        comments = []
+    ]
+    []
+    []
+  exactResult <- applyUpdate
+    issuer
+    balanceResult.updatedCapTableCid
+    [CT.OcfCreateVestingAcceleration ((acceleration "ACC-WARRANT-LINEAGE-BALANCE-EXACT" successorSecurityId 30.0) with
+      date = successorAccelerationDate)]
+    []
+    []
+  submitMustFail issuer do
+    exerciseCmd exactResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateVestingAcceleration ((acceleration "ACC-WARRANT-LINEAGE-BALANCE-OVER" successorSecurityId 1.0) with
+        date = successorAccelerationDate)]
       edits = []
       deletes = []
 

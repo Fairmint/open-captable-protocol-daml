@@ -212,11 +212,19 @@ data SecurityQuantityEvent
 
 data VestingAccelerationTimelineEvent
   = VestingAccelerationQuantity with
-      event_date: Time
+      event_sort_key: (Time, Int, Int)
       quantity: Decimal
+      report_total: Bool
   | VestingAccelerationSplit with
-      event_date: Time
+      event_sort_key: (Time, Int, Int)
       ratio: OcfRatio
+  deriving (Eq, Show)
+
+data VestingAccelerationPredecessor = VestingAccelerationPredecessor with
+    source_security_id: Text
+    source_event_sort_key: (Time, Int, Int)
+    successor_seed_sort_key: (Time, Int, Int)
+    successor_fraction: Decimal
   deriving (Eq, Show)
 
 data NonStockSecurityBalanceEventIndex = NonStockSecurityBalanceEventIndex with
@@ -4216,64 +4224,401 @@ vestingAccelerationsBySecurityId maps =
     Map.empty
     (Map.values maps.vesting_accelerations)
 
+insertVestingAccelerationPredecessor :
+  Text ->
+  Text ->
+  VestingAccelerationPredecessor ->
+  Map Text VestingAccelerationPredecessor ->
+  Update (Map Text VestingAccelerationPredecessor)
+insertVestingAccelerationPredecessor label successorSecurityId predecessor index = do
+  assertMsg
+    (label <> " gives vesting acceleration successor " <> successorSecurityId <> " multiple predecessors")
+    (isNone (Map.lookup successorSecurityId index))
+  pure (Map.insert successorSecurityId predecessor index)
+
+addStockBalanceVestingAccelerationPredecessor :
+  StockClassShareEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Optional Text ->
+  Map Text VestingAccelerationPredecessor ->
+  Update (Map Text VestingAccelerationPredecessor)
+addStockBalanceVestingAccelerationPredecessor eventIndex maps label sourceSecurityId eventDate balanceSecurityId index =
+  case balanceSecurityId of
+    Some successorSecurityId -> case
+        ( Map.lookup sourceSecurityId maps.stock_issuances_by_security_id
+        , Map.lookup successorSecurityId maps.stock_issuances_by_security_id
+        ) of
+      (Some sourceIssuanceCid, Some successorIssuanceCid) -> do
+        sourceIssuance <- fetch sourceIssuanceCid
+        successorIssuance <- fetch successorIssuanceCid
+        let eventSortKey = (eventDate, 2, 1)
+        sourceQuantity <- stockSecurityQuantityBeforeEvent eventIndex maps sourceIssuance.issuance_data eventSortKey
+        successorQuantity <- stockIssuanceQuantityAtSortKey maps successorIssuance.issuance_data eventSortKey
+        assertMsg (label <> " has a non-positive source quantity") (sourceQuantity > 0.0)
+        assertMsg
+          (label <> " has an invalid balance successor quantity for vesting acceleration continuity")
+          (successorQuantity > 0.0 && successorQuantity <= sourceQuantity)
+        insertVestingAccelerationPredecessor
+          label
+          successorSecurityId
+          (VestingAccelerationPredecessor with
+            source_security_id = sourceSecurityId
+            source_event_sort_key = eventSortKey
+            successor_seed_sort_key = eventSortKey
+            successor_fraction = successorQuantity / sourceQuantity)
+          index
+      _ -> pure index
+    None -> pure index
+
+addEquityCompensationBalanceVestingAccelerationPredecessor :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Optional Text ->
+  Map Text VestingAccelerationPredecessor ->
+  Update (Map Text VestingAccelerationPredecessor)
+addEquityCompensationBalanceVestingAccelerationPredecessor stockEventIndex balanceEventIndex maps label sourceSecurityId eventDate balanceSecurityId index =
+  case balanceSecurityId of
+    Some successorSecurityId -> case
+        ( Map.lookup sourceSecurityId maps.equity_compensation_issuances_by_security_id
+        , Map.lookup successorSecurityId maps.equity_compensation_issuances_by_security_id
+        ) of
+      (Some sourceIssuanceCid, Some successorIssuanceCid) -> do
+        sourceIssuance <- fetch sourceIssuanceCid
+        successorIssuance <- fetch successorIssuanceCid
+        let eventSortKey = (eventDate, 2, 1)
+        sourceQuantity <- equityCompensationSecurityQuantityBeforeTerminal
+          stockEventIndex balanceEventIndex maps sourceIssuance.issuance_data eventDate
+        successorQuantity <- equityCompensationIssuanceQuantityAtSortKey maps successorIssuance.issuance_data eventSortKey
+        assertMsg (label <> " has a non-positive source quantity") (sourceQuantity > 0.0)
+        assertMsg
+          (label <> " has an invalid balance successor quantity for vesting acceleration continuity")
+          (successorQuantity > 0.0 && successorQuantity <= sourceQuantity)
+        insertVestingAccelerationPredecessor
+          label
+          successorSecurityId
+          (VestingAccelerationPredecessor with
+            source_security_id = sourceSecurityId
+            source_event_sort_key = eventSortKey
+            successor_seed_sort_key = eventSortKey
+            successor_fraction = successorQuantity / sourceQuantity)
+          index
+      _ -> pure index
+    None -> pure index
+
+addWarrantBalanceVestingAccelerationPredecessor :
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Optional Text ->
+  Map Text VestingAccelerationPredecessor ->
+  Update (Map Text VestingAccelerationPredecessor)
+addWarrantBalanceVestingAccelerationPredecessor eventIndex maps label sourceSecurityId eventDate balanceSecurityId index =
+  case balanceSecurityId of
+    Some successorSecurityId -> case
+        ( Map.lookup sourceSecurityId maps.warrant_issuances_by_security_id
+        , Map.lookup successorSecurityId maps.warrant_issuances_by_security_id
+        ) of
+      (Some sourceIssuanceCid, Some successorIssuanceCid) -> do
+        sourceIssuance <- fetch sourceIssuanceCid
+        successorIssuance <- fetch successorIssuanceCid
+        sourceQuantityOpt <- warrantSecurityQuantityBeforeTerminal eventIndex sourceIssuance.issuance_data eventDate
+        let sourceCeilingOpt = ocfQuantityUpperBound sourceQuantityOpt sourceIssuance.issuance_data.quantity_source
+            successorCeilingOpt = ocfQuantityUpperBound successorIssuance.issuance_data.quantity successorIssuance.issuance_data.quantity_source
+            eventSortKey = (eventDate, 2, 1)
+        case (sourceCeilingOpt, successorCeilingOpt) of
+          (Some sourceQuantity, Some successorQuantity) -> do
+            assertMsg (label <> " has a non-positive source quantity") (sourceQuantity > 0.0)
+            assertMsg
+              (label <> " has an invalid balance successor quantity for vesting acceleration continuity")
+              (successorQuantity > 0.0 && successorQuantity <= sourceQuantity)
+            insertVestingAccelerationPredecessor
+              label
+              successorSecurityId
+              (VestingAccelerationPredecessor with
+                source_security_id = sourceSecurityId
+                source_event_sort_key = eventSortKey
+                successor_seed_sort_key = eventSortKey
+                successor_fraction = successorQuantity / sourceQuantity)
+              index
+          _ -> pure index
+      _ -> pure index
+    None -> pure index
+
+vestingAccelerationPredecessorIndex :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Update (Map Text VestingAccelerationPredecessor)
+vestingAccelerationPredecessorIndex stockEventIndex balanceEventIndex maps = do
+  stockCancellationIndex <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      addStockBalanceVestingAccelerationPredecessor
+        stockEventIndex maps ("Stock cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id index)
+    Map.empty
+    (Map.values maps.stock_cancellations)
+  stockRepurchaseIndex <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      addStockBalanceVestingAccelerationPredecessor
+        stockEventIndex maps ("Stock repurchase " <> repurchase.repurchase_data.id)
+        repurchase.repurchase_data.security_id repurchase.repurchase_data.date
+        repurchase.repurchase_data.balance_security_id index)
+    stockCancellationIndex
+    (Map.values maps.stock_repurchases)
+  stockTransferIndex <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      addStockBalanceVestingAccelerationPredecessor
+        stockEventIndex maps ("Stock transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id index)
+    stockRepurchaseIndex
+    (Map.values maps.stock_transfers)
+  stockConversionIndex <- foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      addStockBalanceVestingAccelerationPredecessor
+        stockEventIndex maps ("Stock conversion " <> conversion.conversion_data.id)
+        conversion.conversion_data.security_id conversion.conversion_data.date
+        conversion.conversion_data.balance_security_id index)
+    stockTransferIndex
+    (Map.values maps.stock_conversions)
+  equityCancellationIndex <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      addEquityCompensationBalanceVestingAccelerationPredecessor
+        stockEventIndex balanceEventIndex maps ("Equity compensation cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id index)
+    stockConversionIndex
+    (Map.values maps.equity_compensation_cancellations)
+  equityTransferIndex <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      addEquityCompensationBalanceVestingAccelerationPredecessor
+        stockEventIndex balanceEventIndex maps ("Equity compensation transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id index)
+    equityCancellationIndex
+    (Map.values maps.equity_compensation_transfers)
+  warrantCancellationIndex <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      addWarrantBalanceVestingAccelerationPredecessor
+        balanceEventIndex maps ("Warrant cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date
+        cancellation.cancellation_data.balance_security_id index)
+    equityTransferIndex
+    (Map.values maps.warrant_cancellations)
+  foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      addWarrantBalanceVestingAccelerationPredecessor
+        balanceEventIndex maps ("Warrant transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date
+        transfer.transfer_data.balance_security_id index)
+    warrantCancellationIndex
+    (Map.values maps.warrant_transfers)
+
 vestingAccelerationBuckets : [VestingAccelerationOcfData] -> [(Time, Decimal)]
 vestingAccelerationBuckets accelerations =
   sortOn
     fst
     (Map.toList (Map.fromListWithR (+) (map (\accelerationData -> (accelerationData.date, accelerationData.quantity)) accelerations)))
 
-vestingAccelerationTotals : [VestingAccelerationOcfData] -> [(Time, Decimal)]
-vestingAccelerationTotals accelerations =
-  let (_, reversedTotals) = foldl
-        (\(total, totals) (date, quantity) ->
-          let nextTotal = total + quantity
-          in (nextTotal, (date, nextTotal) :: totals))
-        (0.0, [])
-        (vestingAccelerationBuckets accelerations)
-  in reverse reversedTotals
-
 -- Accelerations are evaluated after every applicable same-day security quantity event.
 vestingAccelerationEvaluationSortKey : Time -> (Time, Int, Int)
 vestingAccelerationEvaluationSortKey date = (date, 4, 0)
 
-vestingAccelerationTimelineEventSortKey : VestingAccelerationTimelineEvent -> (Time, Int)
+vestingAccelerationTimelineEvents :
+  Optional ((Time, Int, Int), Decimal) ->
+  [VestingAccelerationOcfData] ->
+  [VestingAccelerationTimelineEvent]
+vestingAccelerationTimelineEvents inheritedSeed accelerations =
+  let directEvents = map
+        (\(date, quantity) -> VestingAccelerationQuantity with
+          event_sort_key = vestingAccelerationEvaluationSortKey date
+          quantity
+          report_total = True)
+        (vestingAccelerationBuckets accelerations)
+  in case inheritedSeed of
+    Some (seedSortKey, seedQuantity) ->
+      (VestingAccelerationQuantity with
+        event_sort_key = seedSortKey
+        quantity = seedQuantity
+        report_total = False) :: directEvents
+    None -> directEvents
+
+vestingAccelerationTimelineEventSortKey : VestingAccelerationTimelineEvent -> (Time, Int, Int)
 vestingAccelerationTimelineEventSortKey event = case event of
-  VestingAccelerationSplit with event_date -> (event_date, 0)
-  VestingAccelerationQuantity with event_date -> (event_date, 1)
+  VestingAccelerationSplit with event_sort_key -> event_sort_key
+  VestingAccelerationQuantity with event_sort_key -> event_sort_key
+
+applyVestingAccelerationTimelineEvent : Decimal -> VestingAccelerationTimelineEvent -> Decimal
+applyVestingAccelerationTimelineEvent total event = case event of
+  VestingAccelerationSplit with ratio ->
+    total * ratio.numerator / ratio.denominator
+  VestingAccelerationQuantity with quantity ->
+    total + quantity
+
+vestingAccelerationTimelineTotals : [VestingAccelerationTimelineEvent] -> [(Time, Decimal)]
+vestingAccelerationTimelineTotals events =
+  let (_, reversedTotals) = foldl
+        (\(total, totals) event ->
+          let nextTotal = applyVestingAccelerationTimelineEvent total event
+          in case event of
+            VestingAccelerationQuantity with event_sort_key; report_total ->
+              if report_total
+                then let (eventDate, _, _) = event_sort_key
+                     in (nextTotal, (eventDate, nextTotal) :: totals)
+                else (nextTotal, totals)
+            VestingAccelerationSplit _ _ -> (nextTotal, totals))
+        (0.0, [])
+        (sortOn vestingAccelerationTimelineEventSortKey events)
+  in reverse reversedTotals
+
+vestingAccelerationTimelineTotalBefore :
+  (Time, Int, Int) ->
+  [VestingAccelerationTimelineEvent] ->
+  Decimal
+vestingAccelerationTimelineTotalBefore targetSortKey events =
+  foldl
+    applyVestingAccelerationTimelineEvent
+    0.0
+    (filter
+      (\event ->
+        vestingAccelerationTimelineEventSortKey event < targetSortKey ||
+          (vestingAccelerationTimelineEventSortKey event == targetSortKey && case event of
+            VestingAccelerationQuantity with report_total -> not report_total
+            VestingAccelerationSplit _ _ -> False))
+      (sortOn vestingAccelerationTimelineEventSortKey events))
+
+vestingAccelerationTotals :
+  Optional ((Time, Int, Int), Decimal) ->
+  [VestingAccelerationOcfData] ->
+  [(Time, Decimal)]
+vestingAccelerationTotals inheritedSeed accelerations =
+  vestingAccelerationTimelineTotals (vestingAccelerationTimelineEvents inheritedSeed accelerations)
+
+stockVestingAccelerationTimelineEvents :
+  StockClassShareEventIndex ->
+  Text ->
+  Optional ((Time, Int, Int), Decimal) ->
+  [VestingAccelerationOcfData] ->
+  [VestingAccelerationTimelineEvent]
+stockVestingAccelerationTimelineEvents eventIndex stockClassId inheritedSeed accelerations =
+  let splitEvents = concatMap
+        (\event -> case event of
+          StockClassShareMultiplier with event_date; event_priority; ratio ->
+            [VestingAccelerationSplit with
+              event_sort_key = (event_date, event_priority, 2)
+              ratio]
+          _ -> [])
+        (fromOptional [] (Map.lookup stockClassId eventIndex.stock_class_split_events_by_stock_class_id))
+  in splitEvents ++ vestingAccelerationTimelineEvents inheritedSeed accelerations
 
 stockVestingAccelerationTotals :
   StockClassShareEventIndex ->
   Text ->
+  Optional ((Time, Int, Int), Decimal) ->
   [VestingAccelerationOcfData] ->
   [(Time, Decimal)]
-stockVestingAccelerationTotals eventIndex stockClassId accelerations =
-  let accelerationEvents = map
-        (\(date, quantity) -> VestingAccelerationQuantity with event_date = date; quantity)
-        (vestingAccelerationBuckets accelerations)
-      splitEvents = concatMap
-        (\event -> case event of
-          StockClassShareMultiplier with event_date; ratio ->
-            [VestingAccelerationSplit with event_date; ratio]
-          _ -> [])
-        (fromOptional [] (Map.lookup stockClassId eventIndex.stock_class_split_events_by_stock_class_id))
-      (_, reversedTotals) = foldl
-        (\(total, totals) event -> case event of
-          VestingAccelerationSplit with ratio ->
-            (total * ratio.numerator / ratio.denominator, totals)
-          VestingAccelerationQuantity with event_date; quantity ->
-            let nextTotal = total + quantity
-            in (nextTotal, (event_date, nextTotal) :: totals))
-        (0.0, [])
-        (sortOn vestingAccelerationTimelineEventSortKey (splitEvents ++ accelerationEvents))
-  in reverse reversedTotals
+stockVestingAccelerationTotals eventIndex stockClassId inheritedSeed accelerations =
+  vestingAccelerationTimelineTotals
+    (stockVestingAccelerationTimelineEvents eventIndex stockClassId inheritedSeed accelerations)
+
+vestingAccelerationInheritedSeed :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Map Text [VestingAccelerationOcfData] ->
+  Map Text VestingAccelerationPredecessor ->
+  Set Text ->
+  Text ->
+  Update (Optional ((Time, Int, Int), Decimal))
+vestingAccelerationInheritedSeed stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex visited securityId =
+  if Set.member securityId visited
+    then do
+      assertMsg ("Vesting acceleration successor lineage contains a cycle at " <> securityId) False
+      pure None
+    else case Map.lookup securityId predecessorIndex of
+      Some predecessor -> do
+        sourceTotal <- vestingAccelerationQuantityBefore
+          stockEventIndex
+          balanceEventIndex
+          maps
+          accelerationIndex
+          predecessorIndex
+          (Set.insert securityId visited)
+          predecessor.source_security_id
+          predecessor.source_event_sort_key
+        pure (Some
+          ( predecessor.successor_seed_sort_key
+          , sourceTotal * predecessor.successor_fraction
+          ))
+      None -> pure None
+
+vestingAccelerationQuantityBefore :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  Map Text [VestingAccelerationOcfData] ->
+  Map Text VestingAccelerationPredecessor ->
+  Set Text ->
+  Text ->
+  (Time, Int, Int) ->
+  Update Decimal
+vestingAccelerationQuantityBefore stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex visited securityId targetSortKey = do
+  inheritedSeed <- vestingAccelerationInheritedSeed
+    stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex visited securityId
+  let accelerations = fromOptional [] (Map.lookup securityId accelerationIndex)
+  case Map.lookup securityId maps.stock_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      pure (vestingAccelerationTimelineTotalBefore
+        targetSortKey
+        (stockVestingAccelerationTimelineEvents
+          stockEventIndex
+          issuance.issuance_data.stock_class_id
+          inheritedSeed
+          accelerations))
+    None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
+      Some issuanceCid -> do
+        issuance <- fetch issuanceCid
+        stockClassIds <- equityCompensationPlanStockClassIds maps issuance.issuance_data
+        let events = case stockClassIds of
+              [stockClassId] -> stockVestingAccelerationTimelineEvents stockEventIndex stockClassId inheritedSeed accelerations
+              _ -> vestingAccelerationTimelineEvents inheritedSeed accelerations
+        pure (vestingAccelerationTimelineTotalBefore targetSortKey events)
+      None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
+        Some _ ->
+          pure (vestingAccelerationTimelineTotalBefore
+            targetSortKey
+            (vestingAccelerationTimelineEvents inheritedSeed accelerations))
+        None -> do
+          assertMsg ("Vesting acceleration predecessor security not found: " <> securityId) False
+          pure 0.0
 
 validateStockVestingAccelerationQuantities :
   StockClassShareEventIndex ->
   CapTableMaps ->
   StockIssuanceOcfData ->
+  Optional ((Time, Int, Int), Decimal) ->
   [VestingAccelerationOcfData] ->
   Update ()
-validateStockVestingAccelerationQuantities eventIndex maps issuanceData accelerations =
+validateStockVestingAccelerationQuantities eventIndex maps issuanceData inheritedSeed accelerations =
   mapA_
     (\(accelerationDate, acceleratedQuantity) -> do
       let targetSortKey = vestingAccelerationEvaluationSortKey accelerationDate
@@ -4281,21 +4626,22 @@ validateStockVestingAccelerationQuantities eventIndex maps issuanceData accelera
       assertMsg
         ("Vesting accelerations exceed live stock security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
         (acceleratedQuantity <= liveQuantity))
-    (stockVestingAccelerationTotals eventIndex issuanceData.stock_class_id accelerations)
+    (stockVestingAccelerationTotals eventIndex issuanceData.stock_class_id inheritedSeed accelerations)
 
 validateEquityCompensationVestingAccelerationQuantities :
   StockClassShareEventIndex ->
   NonStockSecurityBalanceEventIndex ->
   CapTableMaps ->
   EquityCompensationIssuanceOcfData ->
+  Optional ((Time, Int, Int), Decimal) ->
   [VestingAccelerationOcfData] ->
   Update ()
-validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceEventIndex maps issuanceData accelerations = do
+validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceEventIndex maps issuanceData inheritedSeed accelerations = do
   stockClassIds <- equityCompensationPlanStockClassIds maps issuanceData
   quantityEvents <- equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex maps issuanceData
   let accelerationTotals = case stockClassIds of
-        [stockClassId] -> stockVestingAccelerationTotals stockEventIndex stockClassId accelerations
-        _ -> vestingAccelerationTotals accelerations
+        [stockClassId] -> stockVestingAccelerationTotals stockEventIndex stockClassId inheritedSeed accelerations
+        _ -> vestingAccelerationTotals inheritedSeed accelerations
   mapA_
     (\(accelerationDate, acceleratedQuantity) -> do
       let targetSortKey = vestingAccelerationEvaluationSortKey accelerationDate
@@ -4321,9 +4667,10 @@ validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceE
 validateWarrantVestingAccelerationQuantities :
   NonStockSecurityBalanceEventIndex ->
   WarrantIssuanceOcfData ->
+  Optional ((Time, Int, Int), Decimal) ->
   [VestingAccelerationOcfData] ->
   Update ()
-validateWarrantVestingAccelerationQuantities eventIndex issuanceData accelerations =
+validateWarrantVestingAccelerationQuantities eventIndex issuanceData inheritedSeed accelerations =
   case ocfQuantityUpperBound issuanceData.quantity issuanceData.quantity_source of
     Some quantity -> do
       let quantityEvents =
@@ -4347,20 +4694,24 @@ validateWarrantVestingAccelerationQuantities eventIndex issuanceData acceleratio
           assertMsg
             ("Vesting accelerations exceed live warrant security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
             (acceleratedQuantity <= liveQuantity))
-        (vestingAccelerationTotals accelerations)
+        (vestingAccelerationTotals inheritedSeed accelerations)
     None -> pure ()
 
 validateVestingAccelerationQuantities :
   StockClassShareEventIndex ->
   NonStockSecurityBalanceEventIndex ->
   CapTableMaps ->
+  Map Text [VestingAccelerationOcfData] ->
+  Map Text VestingAccelerationPredecessor ->
   (Text, [VestingAccelerationOcfData]) ->
   Update ()
-validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps (securityId, accelerations) =
+validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex (securityId, accelerations) = do
+  inheritedSeed <- vestingAccelerationInheritedSeed
+    stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex Set.empty securityId
   case Map.lookup securityId maps.stock_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
-      validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data accelerations
+      validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data inheritedSeed accelerations
     None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
       Some issuanceCid -> do
         issuance <- fetch issuanceCid
@@ -4369,11 +4720,12 @@ validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps (se
           balanceEventIndex
           maps
           issuance.issuance_data
+          inheritedSeed
           accelerations
       None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
-          validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data accelerations
+          validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data inheritedSeed accelerations
         None ->
           assertMsg
             ("Vesting accelerations reference a missing or unsupported security: " <> securityId)
@@ -4387,8 +4739,9 @@ validateVestingQuantityIntegrity :
 validateVestingQuantityIntegrity stockEventIndex balanceEventIndex maps = do
   validateInlineVestingQuantities maps
   accelerationIndex <- vestingAccelerationsBySecurityId maps
+  predecessorIndex <- vestingAccelerationPredecessorIndex stockEventIndex balanceEventIndex maps
   mapA_
-    (validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps)
+    (validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps accelerationIndex predecessorIndex)
     (Map.toList accelerationIndex)
 
 validateTransactionLifecycleDates : CapTableMaps -> Update ()
