@@ -2217,27 +2217,92 @@ validateEquityCompensationSecurityBalances stockEventIndex balanceEventIndex map
       validateEquityCompensationSecurityBalance stockEventIndex balanceEventIndex maps issuance.issuance_data)
     (Map.values maps.equity_compensation_issuances)
 
-validateWarrantBalanceSuccessorQuantity :
+validateWarrantSuccessorTerms :
+  Text ->
+  WarrantIssuanceOcfData ->
+  WarrantIssuanceOcfData ->
+  Update ()
+validateWarrantSuccessorTerms label sourceIssuanceData successorIssuanceData = do
+  assertMsg
+    (label <> " successor exercise price mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.exercise_price == sourceIssuanceData.exercise_price)
+  assertMsg
+    (label <> " successor exercise triggers mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.exercise_triggers == sourceIssuanceData.exercise_triggers)
+  assertMsg
+    (label <> " successor expiration date mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.warrant_expiration_date == sourceIssuanceData.warrant_expiration_date)
+  assertMsg
+    (label <> " successor vesting terms mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.vesting_terms_id == sourceIssuanceData.vesting_terms_id)
+  assertMsg
+    (label <> " successor vestings mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.vestings == sourceIssuanceData.vestings)
+
+fetchValidatedWarrantSuccessor :
   CapTableMaps ->
   Text ->
+  WarrantIssuanceOcfData ->
   Time ->
-  Decimal ->
   Text ->
-  Update ()
-validateWarrantBalanceSuccessorQuantity maps label eventDate expectedQuantity securityId =
+  Update WarrantIssuanceOcfData
+fetchValidatedWarrantSuccessor maps label sourceIssuanceData eventDate securityId =
   case Map.lookup securityId maps.warrant_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
       assertMsg
-        (label <> " balance result date mismatch for " <> securityId <> ": expected " <> show eventDate <> ", found " <> show issuance.issuance_data.date)
+        (label <> " successor date mismatch for " <> securityId <> ": expected " <> show eventDate <> ", found " <> show issuance.issuance_data.date)
         (issuance.issuance_data.date == eventDate)
-      case issuance.issuance_data.quantity of
-        Some actualQuantity ->
-          assertMsg
-            (label <> " balance quantity mismatch for " <> securityId <> ": expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
-            (actualQuantity == expectedQuantity)
-        None -> assertMsg (label <> " balance warrant quantity is missing for " <> securityId) False
-    None -> assertMsg (label <> " balance warrant issuance not found: " <> securityId) False
+      validateWarrantSuccessorTerms label sourceIssuanceData issuance.issuance_data
+      pure issuance.issuance_data
+    None -> do
+      assertMsg (label <> " successor warrant issuance not found: " <> securityId) False
+      pure sourceIssuanceData
+
+validateWarrantBalanceSuccessorQuantity :
+  CapTableMaps ->
+  Text ->
+  WarrantIssuanceOcfData ->
+  Time ->
+  Optional Decimal ->
+  Text ->
+  Update ()
+validateWarrantBalanceSuccessorQuantity maps label sourceIssuanceData eventDate expectedQuantityOpt securityId = do
+  successorIssuanceData <- fetchValidatedWarrantSuccessor maps label sourceIssuanceData eventDate securityId
+  case (expectedQuantityOpt, successorIssuanceData.quantity) of
+    (Some expectedQuantity, Some actualQuantity) ->
+      assertMsg
+        (label <> " balance quantity mismatch for " <> securityId <> ": expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+        (actualQuantity == expectedQuantity)
+    (Some _, None) -> assertMsg (label <> " balance warrant quantity is missing for " <> securityId) False
+    (None, Some actualQuantity) ->
+      assertMsg
+        (label <> " balance warrant quantity must remain unknown for " <> securityId <> ", found " <> show actualQuantity)
+        False
+    (None, None) -> pure ()
+
+validateWarrantTransferResultIssuances :
+  CapTableMaps ->
+  Text ->
+  WarrantIssuanceOcfData ->
+  Time ->
+  Decimal ->
+  [Text] ->
+  Update ()
+validateWarrantTransferResultIssuances maps label sourceIssuanceData eventDate expectedQuantity securityIds = do
+  actualQuantity <- foldlA
+    (\total securityId -> do
+      successorIssuanceData <- fetchValidatedWarrantSuccessor maps label sourceIssuanceData eventDate securityId
+      case successorIssuanceData.quantity of
+        Some quantity -> pure (total + quantity)
+        None -> do
+          assertMsg (label <> " resulting warrant quantity is missing for " <> securityId) False
+          pure total)
+    0.0
+    securityIds
+  assertMsg
+    (label <> " resulting warrant quantity mismatch: expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
+    (actualQuantity == expectedQuantity)
 
 validateWarrantTerminalBalanceSuccessor :
   NonStockSecurityBalanceEventIndex ->
@@ -2258,8 +2323,9 @@ validateWarrantTerminalBalanceSuccessor eventIndex maps label sourceSecurityId e
           Some currentQuantity -> do
             let expectedQuantity = currentQuantity - reductionQuantity
             assertMsg (label <> " balance successor requires a positive remainder") (expectedQuantity > 0.0)
-            validateWarrantBalanceSuccessorQuantity maps label eventDate expectedQuantity securityId
-          None -> assertMsg (label <> " balance successor cannot be validated because the source warrant quantity is unknown") False
+            validateWarrantBalanceSuccessorQuantity maps label sourceIssuance.issuance_data eventDate (Some expectedQuantity) securityId
+          None ->
+            validateWarrantBalanceSuccessorQuantity maps label sourceIssuance.issuance_data eventDate None securityId
       None -> assertMsg (label <> " source warrant issuance not found: " <> sourceSecurityId) False
     None -> pure ()
 
@@ -2324,10 +2390,18 @@ validateNonStockBalanceSuccessorQuantities stockEventIndex balanceEventIndex map
   mapA_
     (\transferCid -> do
       transfer <- fetch transferCid
-      validateWarrantTerminalBalanceSuccessor
-        balanceEventIndex maps ("Warrant transfer " <> transfer.transfer_data.id)
-        transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
-        transfer.transfer_data.balance_security_id)
+      let label = "Warrant transfer " <> transfer.transfer_data.id
+      case Map.lookup transfer.transfer_data.security_id maps.warrant_issuances_by_security_id of
+        Some sourceIssuanceCid -> do
+          sourceIssuance <- fetch sourceIssuanceCid
+          validateWarrantTransferResultIssuances
+            maps label sourceIssuance.issuance_data transfer.transfer_data.date
+            transfer.transfer_data.quantity transfer.transfer_data.resulting_security_ids
+          validateWarrantTerminalBalanceSuccessor
+            balanceEventIndex maps label
+            transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
+            transfer.transfer_data.balance_security_id
+        None -> assertMsg (label <> " source warrant issuance not found: " <> transfer.transfer_data.security_id) False)
     (Map.values maps.warrant_transfers)
   mapA_
     (\cancellationCid -> do
