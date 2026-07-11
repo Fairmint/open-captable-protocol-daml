@@ -18,7 +18,7 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
@@ -498,6 +498,42 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
         False
       pure None
 
+convertibleConversionRight :
+  ConvertibleIssuanceOcfData ->
+  Text ->
+  Optional OcfConvertibleConversionRight
+convertibleConversionRight issuanceData triggerId =
+  foldl
+    (\matched trigger ->
+      case matched of
+        Some _ -> matched
+        None ->
+          if trigger.trigger_id == triggerId
+            then Some trigger.conversion_right
+            else None)
+    None
+    issuanceData.conversion_triggers
+
+convertibleConversionOutputQuantity :
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  OcfConvertibleConversionRight ->
+  Optional Decimal
+convertibleConversionOutputQuantity issuanceData conversionData conversionRight =
+  case conversionRight.conversion_mechanism of
+    OcfConvMechFixedAmount mechanism ->
+      case conversionData.quantity_converted of
+        Some quantity ->
+          if issuanceData.investment_amount.amount > 0.0
+            then Some (mechanism.converts_to_quantity * quantity / issuanceData.investment_amount.amount)
+            else None
+        None -> Some mechanism.converts_to_quantity
+    OcfConvMechRatio ratio ->
+      case conversionData.quantity_converted of
+        Some quantity -> Some (quantity * ratio.numerator / ratio.denominator)
+        None -> None
+    _ -> None
+
 warrantExerciseTrigger : WarrantIssuanceOcfData -> Text -> Optional OcfConversionTrigger
 warrantExerciseTrigger issuanceData triggerId =
   foldl
@@ -788,6 +824,26 @@ validateStockConversionResultIssuances maps conversionData expectedTerms = do
     None ->
       assertMsg ("Stock conversion has no resulting security: " <> conversionData.id) False
 
+validateConvertibleConversionResultIssuances :
+  CapTableMaps ->
+  ConvertibleIssuanceOcfData ->
+  ConvertibleConversionOcfData ->
+  Update ()
+validateConvertibleConversionResultIssuances maps issuanceData conversionData =
+  case convertibleConversionRight issuanceData conversionData.trigger_id of
+    Some conversionRight ->
+      validateStockResultIssuances
+        maps
+        ("Convertible conversion " <> conversionData.id)
+        conversionData.date
+        conversionRight.converts_to_stock_class_id
+        (convertibleConversionOutputQuantity issuanceData conversionData conversionRight)
+        conversionData.resulting_security_ids
+    None ->
+      assertMsg
+        ("Convertible conversion trigger not found: " <> conversionData.trigger_id)
+        False
+
 validateWarrantExerciseResultIssuances : CapTableMaps -> WarrantIssuanceOcfData -> WarrantExerciseOcfData -> Update ()
 validateWarrantExerciseResultIssuances maps issuanceData exerciseData =
   case warrantExerciseTrigger issuanceData exerciseData.trigger_id of
@@ -905,6 +961,22 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
     stockTransferLots
     (Map.values maps.stock_conversions)
 
+  convertibleConversionLots <- foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      let label = "Convertible conversion " <> conversion.conversion_data.id
+      assertAllResultingStockIssuancesExist label maps conversion.conversion_data.resulting_security_ids
+      case Map.lookup conversion.conversion_data.security_id maps.convertible_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          validateConvertibleConversionResultIssuances maps issuance.issuance_data conversion.conversion_data
+          pure index
+        None -> do
+          assertMsg (label <> " references missing convertible issuance: " <> conversion.conversion_data.security_id) False
+          pure index)
+    stockConversionLots
+    (Map.values maps.convertible_conversions)
+
   warrantExerciseLots <- foldlA
     (\index exerciseCid -> do
       exercise <- fetch exerciseCid
@@ -926,7 +998,7 @@ stockClassShareLotsByStockClass maps stockClassIndex = do
           None -> do
             assertMsg ("Warrant exercise references missing warrant issuance: " <> exercise.exercise_data.security_id) False
             pure index)
-    stockConversionLots
+    convertibleConversionLots
     (Map.values maps.warrant_exercises)
 
   equityExerciseLots <- foldlA
@@ -2344,6 +2416,23 @@ validateStockResultShareNumberRanges maps label sourceIssuanceData resultSecurit
         None -> pure ())
     resultSecurityIds
 
+validateStockConsolidationShareNumberRanges :
+  Text ->
+  [StockIssuanceOcfData] ->
+  StockIssuanceOcfData ->
+  Update ()
+validateStockConsolidationShareNumberRanges label sourceIssuanceData resultIssuanceData =
+  let sourceShareNumberRanges = concatMap (\source -> source.share_numbers_issued) sourceIssuanceData
+  in case sourceShareNumberRanges of
+    [] -> pure ()
+    _ ->
+      assertMsg
+        (label <> " share numbers are outside the consolidated source ranges for " <> resultIssuanceData.security_id)
+        (not (null resultIssuanceData.share_numbers_issued) &&
+          all
+            (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+            resultIssuanceData.share_numbers_issued)
+
 stockReductionSortKey : Time -> Optional Text -> (Time, Int, Int)
 stockReductionSortKey eventDate balanceSecurityId =
   case balanceSecurityId of
@@ -2472,6 +2561,14 @@ validateStockReissuanceResultIssuances eventIndex maps =
           if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
             then do
               sourceIssuance <- fetch sourceIssuanceCid
+              case reissuance.reissuance_data.split_transaction_id of
+                Some _ -> pure ()
+                None ->
+                  validateStockResultShareNumberRanges
+                    maps
+                    label
+                    sourceIssuance.issuance_data
+                    reissuance.reissuance_data.resulting_security_ids
               let targetSortKey = (reissuance.reissuance_data.date, 3, 0)
               sourceQuantity <- stockSecurityQuantityBeforeEvent
                 eventIndex
@@ -2511,8 +2608,8 @@ validateStockConsolidationResultIssuances eventIndex maps =
             (label <> " result date mismatch for " <> consolidation.consolidation_data.resulting_security_id <> ": expected " <> show consolidation.consolidation_data.date <> ", found " <> show resultIssuance.issuance_data.date)
             (resultIssuance.issuance_data.date == consolidation.consolidation_data.date)
           let targetSortKey = (consolidation.consolidation_data.date, 3, 3)
-          sourceQuantity <- foldlA
-            (\total sourceSecurityId ->
+          (sourceQuantity, sourceIssuanceData) <- foldlA
+            (\(total, sourceData) sourceSecurityId ->
               case Map.lookup sourceSecurityId maps.stock_issuances_by_security_id of
                 Some sourceIssuanceCid -> do
                   sourceIssuance <- fetch sourceIssuanceCid
@@ -2524,12 +2621,16 @@ validateStockConsolidationResultIssuances eventIndex maps =
                     maps
                     sourceIssuance.issuance_data
                     targetSortKey
-                  pure (total + quantity)
+                  pure (total + quantity, sourceIssuance.issuance_data :: sourceData)
                 None -> do
                   assertMsg (label <> " source stock issuance not found: " <> sourceSecurityId) False
-                  pure total)
-            0.0
+                  pure (total, sourceData))
+            (0.0, [])
             consolidation.consolidation_data.security_ids
+          validateStockConsolidationShareNumberRanges
+            label
+            sourceIssuanceData
+            resultIssuance.issuance_data
           resultQuantity <- stockIssuanceQuantityAtSortKey maps resultIssuance.issuance_data targetSortKey
           assertMsg
             (label <> " resulting quantity mismatch: expected " <> show sourceQuantity <> ", found " <> show resultQuantity)
@@ -4909,6 +5010,16 @@ validateStockPlanAllocationEffectiveDates maps = do
         None -> pure ())
     (Map.values maps.equity_compensation_issuances)
 
+  mapA_
+    (\returnCid -> do
+      returnToPool <- fetch returnCid
+      assertStockPlanEffectiveForAllocation
+        ("Stock plan return-to-pool " <> returnToPool.return_data.id)
+        maps
+        returnToPool.return_data.stock_plan_id
+        returnToPool.return_data.date)
+    (Map.values maps.stock_plan_return_to_pools)
+
 validateStockPlanReservedShares :
   StockClassShareEventIndex ->
   CapTableMaps ->
@@ -4922,7 +5033,6 @@ validateStockPlanReservedShares eventIndex maps adjustmentIndex = do
       stockPlan <- fetch stockPlanCid
       let reservedShares = currentStockPlanReservedShares adjustmentIndex stockPlan.plan_data
       let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
-      assertNonNegativeQuantity ("Stock plan net allocated quantity for " <> stockPlan.plan_data.id) allocatedQuantity
       assertMsg
         ("Stock plan reserved shares exceeded for " <> stockPlan.plan_data.id <> ": allocated " <> show allocatedQuantity <> " exceeds reserved " <> show reservedShares)
         (allocatedQuantity <= reservedShares))
@@ -5112,9 +5222,6 @@ validateStockPlanReservedSharesAtDates eventIndex maps adjustmentHistory = do
           netAllocatedQuantityIndex <- stockPlanNetAllocatedQuantityIndexAt eventIndex maps asOf
           validateStockPlanAllocationReferences maps netAllocatedQuantityIndex
           let allocatedQuantity = fromOptional 0.0 (Map.lookup stockPlan.plan_data.id netAllocatedQuantityIndex)
-          assertNonNegativeQuantity
-            ("Stock plan allocated quantity for " <> stockPlan.plan_data.id <> " on " <> show asOf)
-            allocatedQuantity
           if stockPlanEffectiveOnOrBefore asOf stockPlan.plan_data
             then do
               let reservedShares = stockPlanReservedSharesAt adjustmentHistory stockPlan.plan_data asOf
