@@ -20,7 +20,7 @@ import DA.Optional (fromOptional, isNone, isSome)
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
-import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfVesting(..))
 import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
@@ -2273,19 +2273,50 @@ scaleWarrantSuccessorTrigger sourceQuantity successorQuantity trigger =
         _ -> trigger
     _ -> trigger
 
+warrantTriggerRequiresQuantityScaling : OcfConversionTrigger -> Bool
+warrantTriggerRequiresQuantityScaling trigger =
+  case trigger.conversion_right of
+    OcfRightWarrant conversionRight ->
+      case conversionRight.conversion_mechanism of
+        OcfWarrantMechanismFixedAmount {} -> True
+        _ -> False
+    _ -> False
+
 expectedWarrantSuccessorTriggers :
   WarrantIssuanceOcfData ->
   WarrantIssuanceOcfData ->
-  [OcfConversionTrigger]
+  Optional [OcfConversionTrigger]
 expectedWarrantSuccessorTriggers sourceIssuanceData successorIssuanceData =
-  case (sourceIssuanceData.quantity, successorIssuanceData.quantity) of
-    (Some sourceQuantity, Some successorQuantity) ->
-      if sourceQuantity > 0.0
-        then map
-          (scaleWarrantSuccessorTrigger sourceQuantity successorQuantity)
-          sourceIssuanceData.exercise_triggers
-        else sourceIssuanceData.exercise_triggers
-    _ -> sourceIssuanceData.exercise_triggers
+  if any warrantTriggerRequiresQuantityScaling sourceIssuanceData.exercise_triggers
+    then case (sourceIssuanceData.quantity, successorIssuanceData.quantity) of
+      (Some sourceQuantity, Some successorQuantity) ->
+        if sourceQuantity > 0.0
+          then Some (map
+            (scaleWarrantSuccessorTrigger sourceQuantity successorQuantity)
+            sourceIssuanceData.exercise_triggers)
+          else None
+      _ -> None
+    else Some sourceIssuanceData.exercise_triggers
+
+scaleWarrantSuccessorVesting : Decimal -> Decimal -> OcfVesting -> OcfVesting
+scaleWarrantSuccessorVesting sourceQuantity successorQuantity vesting =
+  vesting with amount = vesting.amount * successorQuantity / sourceQuantity
+
+expectedWarrantSuccessorVestings :
+  WarrantIssuanceOcfData ->
+  WarrantIssuanceOcfData ->
+  Optional [OcfVesting]
+expectedWarrantSuccessorVestings sourceIssuanceData successorIssuanceData =
+  if null sourceIssuanceData.vestings
+    then Some []
+    else case (sourceIssuanceData.quantity, successorIssuanceData.quantity) of
+      (Some sourceQuantity, Some successorQuantity) ->
+        if sourceQuantity > 0.0
+          then Some (map
+            (scaleWarrantSuccessorVesting sourceQuantity successorQuantity)
+            sourceIssuanceData.vestings)
+          else None
+      _ -> None
 
 validateWarrantSuccessorTerms :
   Text ->
@@ -2296,18 +2327,30 @@ validateWarrantSuccessorTerms label sourceIssuanceData successorIssuanceData = d
   assertMsg
     (label <> " successor exercise price mismatch for " <> successorIssuanceData.security_id)
     (successorIssuanceData.exercise_price == sourceIssuanceData.exercise_price)
-  assertMsg
-    (label <> " successor exercise triggers mismatch for " <> successorIssuanceData.security_id)
-    (successorIssuanceData.exercise_triggers == expectedWarrantSuccessorTriggers sourceIssuanceData successorIssuanceData)
+  case expectedWarrantSuccessorTriggers sourceIssuanceData successorIssuanceData of
+    Some expectedTriggers ->
+      assertMsg
+        (label <> " successor exercise triggers mismatch for " <> successorIssuanceData.security_id)
+        (successorIssuanceData.exercise_triggers == expectedTriggers)
+    None ->
+      assertMsg
+        (label <> " cannot scale fixed-amount exercise triggers for successor " <> successorIssuanceData.security_id <> " without known positive source and successor quantities")
+        False
   assertMsg
     (label <> " successor expiration date mismatch for " <> successorIssuanceData.security_id)
     (successorIssuanceData.warrant_expiration_date == sourceIssuanceData.warrant_expiration_date)
   assertMsg
     (label <> " successor vesting terms mismatch for " <> successorIssuanceData.security_id)
     (successorIssuanceData.vesting_terms_id == sourceIssuanceData.vesting_terms_id)
-  assertMsg
-    (label <> " successor vestings mismatch for " <> successorIssuanceData.security_id)
-    (successorIssuanceData.vestings == sourceIssuanceData.vestings)
+  case expectedWarrantSuccessorVestings sourceIssuanceData successorIssuanceData of
+    Some expectedVestings ->
+      assertMsg
+        (label <> " successor vestings mismatch for " <> successorIssuanceData.security_id)
+        (successorIssuanceData.vestings == expectedVestings)
+    None ->
+      assertMsg
+        (label <> " cannot scale inline vestings for successor " <> successorIssuanceData.security_id <> " without known positive source and successor quantities")
+        False
 
 fetchValidatedWarrantSuccessor :
   CapTableMaps ->
