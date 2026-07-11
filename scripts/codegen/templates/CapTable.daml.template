@@ -1835,6 +1835,9 @@ validateStockBalanceSuccessorQuantity maps label sourceIssuanceData eventDate ta
       assertMsg
         (label <> " balance stock class mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stock_class_id <> ", found " <> issuance.issuance_data.stock_class_id)
         (issuance.issuance_data.stock_class_id == sourceIssuanceData.stock_class_id)
+      assertMsg
+        (label <> " balance stakeholder mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stakeholder_id <> ", found " <> issuance.issuance_data.stakeholder_id)
+        (issuance.issuance_data.stakeholder_id == sourceIssuanceData.stakeholder_id)
       actualQuantity <- stockClassQuantityAtSortKey
         maps
         issuance.issuance_data.stock_class_id
@@ -2121,72 +2124,151 @@ convertibleBalanceEvents maps issuanceData = do
 
   pure (transferEvents ++ cancellationEvents ++ conversionEvents ++ retractionEvents)
 
+normalizeConvertibleConversionTrigger :
+  ConvertibleIssuance.OcfConvertibleConversionTrigger ->
+  ConvertibleIssuance.OcfConvertibleConversionTrigger
+normalizeConvertibleConversionTrigger trigger = trigger with trigger_id = ""
+
+scaleConvertibleSuccessorTrigger :
+  Decimal ->
+  Decimal ->
+  ConvertibleIssuance.OcfConvertibleConversionTrigger ->
+  ConvertibleIssuance.OcfConvertibleConversionTrigger
+scaleConvertibleSuccessorTrigger sourceAmount successorAmount trigger =
+  let conversionRight = trigger.conversion_right
+  in case conversionRight.conversion_mechanism of
+    OcfConvMechFixedAmount fixedAmount ->
+      trigger with
+        conversion_right = (conversionRight with
+          conversion_mechanism = OcfConvMechFixedAmount (fixedAmount with
+            converts_to_quantity = fixedAmount.converts_to_quantity * successorAmount / sourceAmount))
+    _ -> trigger
+
+expectedConvertibleSuccessorTriggers :
+  ConvertibleIssuanceOcfData ->
+  ConvertibleIssuanceOcfData ->
+  [ConvertibleIssuance.OcfConvertibleConversionTrigger]
+expectedConvertibleSuccessorTriggers sourceIssuanceData successorIssuanceData =
+  if sourceIssuanceData.investment_amount.amount > 0.0
+    then map
+      (scaleConvertibleSuccessorTrigger
+        sourceIssuanceData.investment_amount.amount
+        successorIssuanceData.investment_amount.amount)
+      sourceIssuanceData.conversion_triggers
+    else sourceIssuanceData.conversion_triggers
+
+expectedConvertibleSuccessorProRata :
+  ConvertibleIssuanceOcfData ->
+  ConvertibleIssuanceOcfData ->
+  Optional Decimal
+expectedConvertibleSuccessorProRata sourceIssuanceData successorIssuanceData =
+  case sourceIssuanceData.pro_rata of
+    Some proRata ->
+      if sourceIssuanceData.investment_amount.amount > 0.0
+        then Some (proRata * successorIssuanceData.investment_amount.amount / sourceIssuanceData.investment_amount.amount)
+        else Some proRata
+    None -> None
+
+validateConvertibleSuccessorTerms :
+  Text ->
+  ConvertibleIssuanceOcfData ->
+  ConvertibleIssuanceOcfData ->
+  Update ()
+validateConvertibleSuccessorTerms label sourceIssuanceData successorIssuanceData = do
+  assertMsg
+    (label <> " successor convertible type mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.convertible_type == sourceIssuanceData.convertible_type)
+  assertMsg
+    (label <> " successor currency mismatch for " <> successorIssuanceData.security_id <> ": expected " <> sourceIssuanceData.investment_amount.currency <> ", found " <> successorIssuanceData.investment_amount.currency)
+    (successorIssuanceData.investment_amount.currency == sourceIssuanceData.investment_amount.currency)
+  assertMsg
+    (label <> " successor seniority mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.seniority == sourceIssuanceData.seniority)
+  assertMsg
+    (label <> " successor conversion terms mismatch for " <> successorIssuanceData.security_id)
+    (map normalizeConvertibleConversionTrigger successorIssuanceData.conversion_triggers ==
+      map normalizeConvertibleConversionTrigger (expectedConvertibleSuccessorTriggers sourceIssuanceData successorIssuanceData))
+  assertMsg
+    (label <> " successor pro rata terms mismatch for " <> successorIssuanceData.security_id)
+    (successorIssuanceData.pro_rata == expectedConvertibleSuccessorProRata sourceIssuanceData successorIssuanceData)
+
+fetchValidatedConvertibleSuccessor :
+  CapTableMaps ->
+  Text ->
+  ConvertibleIssuanceOcfData ->
+  Time ->
+  Text ->
+  Update ConvertibleIssuanceOcfData
+fetchValidatedConvertibleSuccessor maps label sourceIssuanceData eventDate securityId =
+  case Map.lookup securityId maps.convertible_issuances_by_security_id of
+    Some issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        (label <> " successor date mismatch for " <> securityId <> ": expected " <> show eventDate <> ", found " <> show issuance.issuance_data.date)
+        (issuance.issuance_data.date == eventDate)
+      validateConvertibleSuccessorTerms label sourceIssuanceData issuance.issuance_data
+      pure issuance.issuance_data
+    None -> do
+      assertMsg (label <> " successor convertible issuance not found: " <> securityId) False
+      pure sourceIssuanceData
+
 convertibleResultingInvestmentAmount :
   CapTableMaps ->
   Text ->
-  Text ->
+  ConvertibleIssuanceOcfData ->
+  Time ->
   [Text] ->
   Update Decimal
-convertibleResultingInvestmentAmount maps label expectedCurrency securityIds =
+convertibleResultingInvestmentAmount maps label sourceIssuanceData eventDate securityIds =
   foldlA
-    (\total securityId ->
-      case Map.lookup securityId maps.convertible_issuances_by_security_id of
-        Some issuanceCid -> do
-          issuance <- fetch issuanceCid
-          assertMsg
-            (label <> " result currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
-            (issuance.issuance_data.investment_amount.currency == expectedCurrency)
-          pure (total + issuance.issuance_data.investment_amount.amount)
-        None -> do
-          assertMsg (label <> " result security not found: " <> securityId) False
-          pure total)
+    (\total securityId -> do
+      successorIssuanceData <- fetchValidatedConvertibleSuccessor
+        maps label sourceIssuanceData eventDate securityId
+      pure (total + successorIssuanceData.investment_amount.amount))
     0.0
     securityIds
 
 validateConvertibleBalanceSuccessor :
   CapTableMaps ->
   Text ->
-  Text ->
+  ConvertibleIssuanceOcfData ->
+  Time ->
   Decimal ->
   Text ->
   Update ()
-validateConvertibleBalanceSuccessor maps label expectedCurrency expectedAmount securityId =
-  case Map.lookup securityId maps.convertible_issuances_by_security_id of
-    Some issuanceCid -> do
-      issuance <- fetch issuanceCid
-      assertMsg
-        (label <> " balance currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
-        (issuance.issuance_data.investment_amount.currency == expectedCurrency)
-      assertMsg
-        (label <> " balance amount mismatch for " <> securityId <> ": expected " <> show expectedAmount <> ", found " <> show issuance.issuance_data.investment_amount.amount)
-        (issuance.issuance_data.investment_amount.amount == expectedAmount)
-    None ->
-      assertMsg (label <> " balance security not found: " <> securityId) False
+validateConvertibleBalanceSuccessor maps label sourceIssuanceData eventDate expectedAmount securityId = do
+  successorIssuanceData <- fetchValidatedConvertibleSuccessor
+    maps label sourceIssuanceData eventDate securityId
+  assertMsg
+    (label <> " balance stakeholder mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stakeholder_id <> ", found " <> successorIssuanceData.stakeholder_id)
+    (successorIssuanceData.stakeholder_id == sourceIssuanceData.stakeholder_id)
+  assertMsg
+    (label <> " balance amount mismatch for " <> securityId <> ": expected " <> show expectedAmount <> ", found " <> show successorIssuanceData.investment_amount.amount)
+    (successorIssuanceData.investment_amount.amount == expectedAmount)
 
 validateConvertiblePartialConversionBalance :
   CapTableMaps ->
   Text ->
-  Text ->
+  ConvertibleIssuanceOcfData ->
+  Time ->
   Decimal ->
   Text ->
   Update ()
 -- OCF quantity_converted is resulting security units, not convertible principal.
--- Without a monetary reduction field, only currency continuity and a strict decrease are computable.
-validateConvertiblePartialConversionBalance maps label expectedCurrency currentAmount securityId =
-  case Map.lookup securityId maps.convertible_issuances_by_security_id of
-    Some issuanceCid -> do
-      issuance <- fetch issuanceCid
-      assertMsg
-        (label <> " balance currency mismatch for " <> securityId <> ": expected " <> expectedCurrency <> ", found " <> issuance.issuance_data.investment_amount.currency)
-        (issuance.issuance_data.investment_amount.currency == expectedCurrency)
-      assertMsg
-        (label <> " balance amount must be positive for " <> securityId)
-        (issuance.issuance_data.investment_amount.amount > 0.0)
-      assertMsg
-        (label <> " balance amount must be less than the current source balance for " <> securityId)
-        (issuance.issuance_data.investment_amount.amount < currentAmount)
-    None ->
-      assertMsg (label <> " balance security not found: " <> securityId) False
+-- Without a monetary reduction field, only a positive strict principal decrease is computable;
+-- the shared successor helper still enforces date, holder, currency, and instrument-term continuity.
+validateConvertiblePartialConversionBalance maps label sourceIssuanceData eventDate currentAmount securityId = do
+  successorIssuanceData <- fetchValidatedConvertibleSuccessor
+    maps label sourceIssuanceData eventDate securityId
+  assertMsg
+    (label <> " balance stakeholder mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stakeholder_id <> ", found " <> successorIssuanceData.stakeholder_id)
+    (successorIssuanceData.stakeholder_id == sourceIssuanceData.stakeholder_id)
+  assertMsg
+    (label <> " balance amount must be positive for " <> securityId)
+    (successorIssuanceData.investment_amount.amount > 0.0)
+  assertMsg
+    (label <> " balance amount must be less than the current source balance for " <> securityId)
+    (successorIssuanceData.investment_amount.amount < currentAmount)
 
 validateConvertibleBalanceEvent :
   CapTableMaps ->
@@ -2195,7 +2277,7 @@ validateConvertibleBalanceEvent :
   ConvertibleBalanceEvent ->
   Update Decimal
 validateConvertibleBalanceEvent maps issuanceData currentAmount event = case event of
-  ConvertibleMonetaryReduction with event_label; amount; currency; balance_security_id; resulting_security_ids; validate_resulting_amount -> do
+  ConvertibleMonetaryReduction with event_label; event_date; amount; currency; balance_security_id; resulting_security_ids; validate_resulting_amount -> do
     assertMsg
       (event_label <> " amount must be positive: " <> show amount)
       (amount > 0.0)
@@ -2211,7 +2293,8 @@ validateConvertibleBalanceEvent maps issuanceData currentAmount event = case eve
         resultingAmount <- convertibleResultingInvestmentAmount
           maps
           event_label
-          issuanceData.investment_amount.currency
+          issuanceData
+          event_date
           resulting_security_ids
         assertMsg
           (event_label <> " resulting amount mismatch: expected " <> show amount <> ", found " <> show resultingAmount)
@@ -2225,12 +2308,13 @@ validateConvertibleBalanceEvent maps issuanceData currentAmount event = case eve
         validateConvertibleBalanceSuccessor
           maps
           event_label
-          issuanceData.investment_amount.currency
+          issuanceData
+          event_date
           remainingAmount
           balanceSecurityId
         pure 0.0
       None -> pure remainingAmount
-  ConvertibleRetirement with event_label; balance_security_id -> do
+  ConvertibleRetirement with event_label; event_date; balance_security_id -> do
     assertMsg
       (event_label <> " requires a positive source balance for " <> issuanceData.security_id)
       (currentAmount > 0.0)
@@ -2239,7 +2323,8 @@ validateConvertibleBalanceEvent maps issuanceData currentAmount event = case eve
         validateConvertiblePartialConversionBalance
           maps
           event_label
-          issuanceData.investment_amount.currency
+          issuanceData
+          event_date
           currentAmount
           balanceSecurityId
       None -> pure ()
@@ -2745,6 +2830,9 @@ validateWarrantBalanceSuccessorQuantity :
   Update ()
 validateWarrantBalanceSuccessorQuantity maps label sourceIssuanceData eventDate expectedQuantityOpt securityId = do
   successorIssuanceData <- fetchValidatedWarrantSuccessor maps label sourceIssuanceData eventDate securityId
+  assertMsg
+    (label <> " balance stakeholder mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stakeholder_id <> ", found " <> successorIssuanceData.stakeholder_id)
+    (successorIssuanceData.stakeholder_id == sourceIssuanceData.stakeholder_id)
   case (expectedQuantityOpt, successorIssuanceData.quantity) of
     (Some expectedQuantity, Some actualQuantity) ->
       assertMsg
@@ -2824,6 +2912,9 @@ validateEquityCompensationSecurityBalanceSuccessorQuantity maps label sourceIssu
       assertMsg
         (label <> " balance stock class mismatch for " <> securityId)
         (issuance.issuance_data.stock_class_id `elem` expectedStockClassIds)
+      assertMsg
+        (label <> " balance stakeholder mismatch for " <> securityId <> ": expected " <> sourceIssuanceData.stakeholder_id <> ", found " <> issuance.issuance_data.stakeholder_id)
+        (issuance.issuance_data.stakeholder_id == sourceIssuanceData.stakeholder_id)
       let targetSortKey = (eventDate, 2, 1)
       actualQuantity <- case issuance.issuance_data.stock_class_id of
         Some stockClassId -> stockClassQuantityAtSortKey maps stockClassId issuance.issuance_data.date issuance.issuance_data.quantity targetSortKey
@@ -3174,9 +3265,6 @@ validateStockReissuanceResultIssuances eventIndex maps =
     (\reissuanceCid -> do
       reissuance <- fetch reissuanceCid
       let label = "Stock reissuance " <> reissuance.reissuance_data.id
-      assertMsg
-        (label <> " has no resulting stock issuance")
-        (not (null reissuance.reissuance_data.resulting_security_ids))
       assertNoPartialResultingStockIssuanceCoverage label maps reissuance.reissuance_data.resulting_security_ids
       case Map.lookup reissuance.reissuance_data.security_id maps.stock_issuances_by_security_id of
         Some sourceIssuanceCid ->
