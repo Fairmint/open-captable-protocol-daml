@@ -846,6 +846,10 @@ equityCompensationExerciseOutputShareLot :
   EquityCompensationExerciseOcfData ->
   Update (Optional StockClassShareLot)
 equityCompensationExerciseOutputShareLot maps issuanceData exerciseData = do
+  when (issuanceData.early_exercisable == Some True) do
+    assertMsg
+      ("Early equity compensation exercise must materialize resulting stock so its vesting schedule remains in effect: " <> exerciseData.id)
+      False
   stockClassIdOpt <- equityCompensationOutputStockClassId
     maps
     ("Equity compensation exercise " <> exerciseData.id)
@@ -922,6 +926,30 @@ validateStockResultIssuances maps label expectedDate expectedStockClassIdOpt exp
         (label <> " resulting quantity mismatch: expected " <> show expectedQuantity <> ", found " <> show actualQuantity)
         (actualQuantity == expectedQuantity)
     None -> pure ()
+
+hasDeclaredVestingSchedule : Optional Text -> [OcfVesting] -> Bool
+hasDeclaredVestingSchedule vestingTermsId vestings =
+  isSome vestingTermsId || not (null vestings)
+
+validateEarlyExerciseResultVestingSchedules :
+  CapTableMaps ->
+  Text ->
+  EquityCompensationIssuanceOcfData ->
+  [Text] ->
+  Update ()
+validateEarlyExerciseResultVestingSchedules maps label issuanceData securityIds =
+  when (issuanceData.early_exercisable == Some True) do
+    mapA_
+      (\securityId -> case Map.lookup securityId maps.stock_issuances_by_security_id of
+        Some stockIssuanceCid -> do
+          stockIssuance <- fetch stockIssuanceCid
+          assertMsg
+            (label <> " result must retain a vesting schedule for early-exercisable grant: " <> securityId)
+            (hasDeclaredVestingSchedule
+              stockIssuance.issuance_data.vesting_terms_id
+              stockIssuance.issuance_data.vestings)
+        None -> pure ())
+      securityIds
 
 validateStockConversionResultIssuances :
   CapTableMaps ->
@@ -1003,6 +1031,11 @@ validateEquityCompensationExerciseResultIssuances maps issuanceData exerciseData
         exerciseData.date
         expectedStockClassId
         (Some exerciseData.quantity)
+        exerciseData.resulting_security_ids
+      validateEarlyExerciseResultVestingSchedules
+        maps
+        label
+        issuanceData
         exerciseData.resulting_security_ids
 
 validateEquityCompensationReleaseResultIssuances : CapTableMaps -> EquityCompensationIssuanceOcfData -> EquityCompensationReleaseOcfData -> Update ()
@@ -4411,6 +4444,49 @@ addWarrantVestingAccelerationPredecessors eventIndex maps label sourceSecurityId
           None -> pure index
       None -> pure index
 
+addEarlyExerciseStockVestingAccelerationPredecessors :
+  StockClassShareEventIndex ->
+  NonStockSecurityBalanceEventIndex ->
+  CapTableMaps ->
+  EquityCompensationExerciseOcfData ->
+  VestingAccelerationPredecessorIndex ->
+  Update VestingAccelerationPredecessorIndex
+addEarlyExerciseStockVestingAccelerationPredecessors stockEventIndex balanceEventIndex maps exerciseData index =
+  case Map.lookup exerciseData.security_id maps.equity_compensation_issuances_by_security_id of
+    Some sourceIssuanceCid -> do
+      sourceIssuance <- fetch sourceIssuanceCid
+      case sourceIssuance.issuance_data.early_exercisable of
+        Some True -> do
+          let label = "Equity compensation exercise " <> exerciseData.id
+              sourceEventSortKey = (exerciseData.date, 1, 0)
+          sourceQuantity <- equityCompensationSecurityQuantityBeforeSortKey
+            stockEventIndex balanceEventIndex maps sourceIssuance.issuance_data sourceEventSortKey
+          assertMsg (label <> " has a non-positive source quantity") (sourceQuantity > 0.0)
+          foldlA
+            (\currentIndex successorSecurityId ->
+              case Map.lookup successorSecurityId maps.stock_issuances_by_security_id of
+                Some successorIssuanceCid -> do
+                  successorIssuance <- fetch successorIssuanceCid
+                  successorQuantity <- stockIssuanceQuantityAtSortKey
+                    maps successorIssuance.issuance_data sourceEventSortKey
+                  assertMsg
+                    (label <> " has an invalid successor quantity for vesting acceleration continuity")
+                    (successorQuantity > 0.0 && successorQuantity <= sourceQuantity)
+                  insertVestingAccelerationPredecessor
+                    label
+                    successorSecurityId
+                    (VestingAccelerationPredecessor with
+                      source_security_id = exerciseData.security_id
+                      source_event_sort_key = sourceEventSortKey
+                      successor_seed_sort_key = (exerciseData.date, 0, 0)
+                      successor_fraction = successorQuantity / sourceQuantity)
+                    currentIndex
+                None -> pure currentIndex)
+            index
+            exerciseData.resulting_security_ids
+        _ -> pure index
+    None -> pure index
+
 addStockConsolidationVestingAccelerationPredecessors :
   StockClassShareEventIndex ->
   CapTableMaps ->
@@ -4531,6 +4607,13 @@ vestingAccelerationPredecessorIndex stockEventIndex balanceEventIndex maps = do
         index)
     stockReissuanceIndex
     (Map.values maps.stock_consolidations)
+  earlyExerciseIndex <- foldlA
+    (\index exerciseCid -> do
+      exercise <- fetch exerciseCid
+      addEarlyExerciseStockVestingAccelerationPredecessors
+        stockEventIndex balanceEventIndex maps exercise.exercise_data index)
+    stockConsolidationIndex
+    (Map.values maps.equity_compensation_exercises)
   equityCancellationIndex <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -4538,7 +4621,7 @@ vestingAccelerationPredecessorIndex stockEventIndex balanceEventIndex maps = do
         stockEventIndex balanceEventIndex maps ("Equity compensation cancellation " <> cancellation.cancellation_data.id)
         cancellation.cancellation_data.security_id cancellation.cancellation_data.date
         cancellation.cancellation_data.balance_security_id [] index)
-    stockConsolidationIndex
+    earlyExerciseIndex
     (Map.values maps.equity_compensation_cancellations)
   equityTransferIndex <- foldlA
     (\index transferCid -> do
@@ -4898,10 +4981,16 @@ validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps acc
   case Map.lookup securityId maps.stock_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
+      assertMsg
+        ("Vesting acceleration requires stock security to declare vesting terms or inline vestings: " <> securityId)
+        (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
       validateStockVestingAccelerationQuantities stockEventIndex maps issuance.issuance_data inheritedSeed accelerations
     None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
       Some issuanceCid -> do
         issuance <- fetch issuanceCid
+        assertMsg
+          ("Vesting acceleration requires equity compensation security to declare vesting terms or inline vestings: " <> securityId)
+          (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
         validateEquityCompensationVestingAccelerationQuantities
           stockEventIndex
           balanceEventIndex
@@ -4912,6 +5001,9 @@ validateVestingAccelerationQuantities stockEventIndex balanceEventIndex maps acc
       None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
         Some issuanceCid -> do
           issuance <- fetch issuanceCid
+          assertMsg
+            ("Vesting acceleration requires warrant security to declare vesting terms or inline vestings: " <> securityId)
+            (hasDeclaredVestingSchedule issuance.issuance_data.vesting_terms_id issuance.issuance_data.vestings)
           validateWarrantVestingAccelerationQuantities balanceEventIndex issuance.issuance_data inheritedSeed accelerations
         None ->
           assertMsg
