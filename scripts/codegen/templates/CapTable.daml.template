@@ -210,6 +210,15 @@ data SecurityQuantityEvent
       event_priority: Int
   deriving (Eq, Show)
 
+data VestingAccelerationTimelineEvent
+  = VestingAccelerationQuantity with
+      event_date: Time
+      quantity: Decimal
+  | VestingAccelerationSplit with
+      event_date: Time
+      ratio: OcfRatio
+  deriving (Eq, Show)
+
 data NonStockSecurityBalanceEventIndex = NonStockSecurityBalanceEventIndex with
     warrant_events_by_security_id: Map Text [SecurityQuantityEvent]
     equity_compensation_events_by_security_id: Map Text [SecurityQuantityEvent]
@@ -4207,41 +4216,56 @@ vestingAccelerationsBySecurityId maps =
     Map.empty
     (Map.values maps.vesting_accelerations)
 
-vestingAccelerationTotalAt : Time -> [VestingAccelerationOcfData] -> Decimal
-vestingAccelerationTotalAt latest =
-  foldl
-    (\total accelerationData ->
-      if accelerationData.date <= latest
-        then total + accelerationData.quantity
-        else total)
-    0.0
+vestingAccelerationBuckets : [VestingAccelerationOcfData] -> [(Time, Decimal)]
+vestingAccelerationBuckets accelerations =
+  sortOn
+    fst
+    (Map.toList (Map.fromListWithR (+) (map (\accelerationData -> (accelerationData.date, accelerationData.quantity)) accelerations)))
+
+vestingAccelerationTotals : [VestingAccelerationOcfData] -> [(Time, Decimal)]
+vestingAccelerationTotals accelerations =
+  let (_, reversedTotals) = foldl
+        (\(total, totals) (date, quantity) ->
+          let nextTotal = total + quantity
+          in (nextTotal, (date, nextTotal) :: totals))
+        (0.0, [])
+        (vestingAccelerationBuckets accelerations)
+  in reverse reversedTotals
 
 -- Accelerations are evaluated after every applicable same-day security quantity event.
 vestingAccelerationEvaluationSortKey : Time -> (Time, Int, Int)
 vestingAccelerationEvaluationSortKey date = (date, 4, 0)
 
-stockVestingAccelerationTotalAt :
-  CapTableMaps ->
+vestingAccelerationTimelineEventSortKey : VestingAccelerationTimelineEvent -> (Time, Int)
+vestingAccelerationTimelineEventSortKey event = case event of
+  VestingAccelerationSplit with event_date -> (event_date, 0)
+  VestingAccelerationQuantity with event_date -> (event_date, 1)
+
+stockVestingAccelerationTotals :
+  StockClassShareEventIndex ->
   Text ->
-  (Time, Int, Int) ->
   [VestingAccelerationOcfData] ->
-  Update Decimal
-stockVestingAccelerationTotalAt maps stockClassId targetSortKey accelerations =
-  let (targetDate, _, _) = targetSortKey
-  in foldlA
-    (\total accelerationData ->
-      if accelerationData.date <= targetDate
-        then do
-          adjustedQuantity <- stockClassQuantityBetweenSortKeys
-            maps
-            stockClassId
-            (vestingAccelerationEvaluationSortKey accelerationData.date)
-            accelerationData.quantity
-            targetSortKey
-          pure (total + adjustedQuantity)
-        else pure total)
-    0.0
-    accelerations
+  [(Time, Decimal)]
+stockVestingAccelerationTotals eventIndex stockClassId accelerations =
+  let accelerationEvents = map
+        (\(date, quantity) -> VestingAccelerationQuantity with event_date = date; quantity)
+        (vestingAccelerationBuckets accelerations)
+      splitEvents = concatMap
+        (\event -> case event of
+          StockClassShareMultiplier with event_date; ratio ->
+            [VestingAccelerationSplit with event_date; ratio]
+          _ -> [])
+        (fromOptional [] (Map.lookup stockClassId eventIndex.stock_class_split_events_by_stock_class_id))
+      (_, reversedTotals) = foldl
+        (\(total, totals) event -> case event of
+          VestingAccelerationSplit with ratio ->
+            (total * ratio.numerator / ratio.denominator, totals)
+          VestingAccelerationQuantity with event_date; quantity ->
+            let nextTotal = total + quantity
+            in (nextTotal, (event_date, nextTotal) :: totals))
+        (0.0, [])
+        (sortOn vestingAccelerationTimelineEventSortKey (splitEvents ++ accelerationEvents))
+  in reverse reversedTotals
 
 validateStockVestingAccelerationQuantities :
   StockClassShareEventIndex ->
@@ -4251,18 +4275,13 @@ validateStockVestingAccelerationQuantities :
   Update ()
 validateStockVestingAccelerationQuantities eventIndex maps issuanceData accelerations =
   mapA_
-    (\accelerationData -> do
-      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationData.date
+    (\(accelerationDate, acceleratedQuantity) -> do
+      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationDate
       liveQuantity <- stockSecurityQuantityBeforeEvent eventIndex maps issuanceData targetSortKey
-      acceleratedQuantity <- stockVestingAccelerationTotalAt
-        maps
-        issuanceData.stock_class_id
-        targetSortKey
-        accelerations
       assertMsg
-        ("Vesting accelerations exceed live stock security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+        ("Vesting accelerations exceed live stock security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
         (acceleratedQuantity <= liveQuantity))
-    accelerations
+    (stockVestingAccelerationTotals eventIndex issuanceData.stock_class_id accelerations)
 
 validateEquityCompensationVestingAccelerationQuantities :
   StockClassShareEventIndex ->
@@ -4274,9 +4293,12 @@ validateEquityCompensationVestingAccelerationQuantities :
 validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceEventIndex maps issuanceData accelerations = do
   stockClassIds <- equityCompensationPlanStockClassIds maps issuanceData
   quantityEvents <- equityCompensationSecurityQuantityEvents stockEventIndex balanceEventIndex maps issuanceData
+  let accelerationTotals = case stockClassIds of
+        [stockClassId] -> stockVestingAccelerationTotals stockEventIndex stockClassId accelerations
+        _ -> vestingAccelerationTotals accelerations
   mapA_
-    (\accelerationData -> do
-      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationData.date
+    (\(accelerationDate, acceleratedQuantity) -> do
+      let targetSortKey = vestingAccelerationEvaluationSortKey accelerationDate
       liveQuantityOpt <- securityQuantityBeforeEvent
         issuanceData.security_id
         (Some 0.0)
@@ -4291,13 +4313,10 @@ validateEquityCompensationVestingAccelerationQuantities stockEventIndex balanceE
         None -> do
           assertMsg ("Equity compensation quantity unexpectedly became unknown: " <> issuanceData.security_id) False
           pure 0.0
-      acceleratedQuantity <- case stockClassIds of
-        [stockClassId] -> stockVestingAccelerationTotalAt maps stockClassId targetSortKey accelerations
-        _ -> pure (vestingAccelerationTotalAt accelerationData.date accelerations)
       assertMsg
-        ("Vesting accelerations exceed live equity compensation security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+        ("Vesting accelerations exceed live equity compensation security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
         (acceleratedQuantity <= liveQuantity))
-    accelerations
+    accelerationTotals
 
 validateWarrantVestingAccelerationQuantities :
   NonStockSecurityBalanceEventIndex ->
@@ -4314,22 +4333,21 @@ validateWarrantVestingAccelerationQuantities eventIndex issuanceData acceleratio
               quantity_delta = quantity)
             :: warrantSecurityQuantityEvents eventIndex issuanceData
       mapA_
-        (\accelerationData -> do
+        (\(accelerationDate, acceleratedQuantity) -> do
           liveQuantityOpt <- securityQuantityBeforeEvent
             issuanceData.security_id
             (Some 0.0)
             quantityEvents
-            (vestingAccelerationEvaluationSortKey accelerationData.date)
+            (vestingAccelerationEvaluationSortKey accelerationDate)
           liveQuantity <- case liveQuantityOpt of
             Some currentQuantity -> pure currentQuantity
             None -> do
               assertMsg ("Warrant quantity unexpectedly became unknown: " <> issuanceData.security_id) False
               pure 0.0
-          let acceleratedQuantity = vestingAccelerationTotalAt accelerationData.date accelerations
           assertMsg
-            ("Vesting accelerations exceed live warrant security quantity for " <> issuanceData.security_id <> " at " <> show accelerationData.date)
+            ("Vesting accelerations exceed live warrant security quantity for " <> issuanceData.security_id <> " at " <> show accelerationDate)
             (acceleratedQuantity <= liveQuantity))
-        accelerations
+        (vestingAccelerationTotals accelerations)
     None -> pure ()
 
 validateVestingAccelerationQuantities :
