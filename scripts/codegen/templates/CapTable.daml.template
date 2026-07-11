@@ -13,6 +13,8 @@ module Fairmint.OpenCapTable.CapTable where
 import DA.Map (Map)
 import qualified DA.Map as Map
 import DA.List (sortOn, unique)
+import DA.Set (Set)
+import qualified DA.Set as Set
 import DA.Action (foldlA, when)
 import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
@@ -232,6 +234,12 @@ data ConvertibleBalanceEvent
 
 type StockSuccessorEdge = (Text, Time, [Text])
 type StockSuccessorEdgeIndex = Map Text [(Time, [Text])]
+type SuccessorSecurityEdge = (Text, Text)
+
+data SuccessorSecurityCycleCheckResult = SuccessorSecurityCycleCheckResult with
+    has_cycle: Bool
+    checked: Set Text
+  deriving (Eq, Show)
 
 data StockPlanSuccessorIndex = StockPlanSuccessorIndex with
     stock_successors_by_security_id: Map Text (Time, Optional Text)
@@ -1546,13 +1554,18 @@ stockClassShareEventIndex maps = do
       let event = StockClassShareRetraction with
               event_date = reissuance.reissuance_data.date
               event_priority = 3
+      let hasMaterializedResults = allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
       let nextShareIndex =
-            if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
+            if hasMaterializedResults
               then addStockClassShareEvent reissuance.reissuance_data.security_id event shareIndex
               else shareIndex
+      let nextBalanceIndex =
+            if hasMaterializedResults
+              then addStockClassShareEvent reissuance.reissuance_data.security_id event balanceIndex
+              else balanceIndex
       pure
         ( nextShareIndex
-        , addStockClassShareEvent reissuance.reissuance_data.security_id event balanceIndex
+        , nextBalanceIndex
         ))
     (transferEventsBySecurityId, transferBalanceEventsBySecurityId)
     (Map.values maps.stock_reissuances)
@@ -6758,111 +6771,243 @@ successorSecurityIdsFor balanceSecurityId resultingSecurityIds =
     Some balanceId -> balanceId :: resultingSecurityIds
     None -> resultingSecurityIds
 
-validateGlobalSuccessorSecurityIdUniqueness : CapTableMaps -> Update ()
-validateGlobalSuccessorSecurityIdUniqueness maps = do
-  stockTransferIds <- foldlA
-    (\securityIds transferCid -> do
+addSuccessorSecurityReferences :
+  Text ->
+  Optional Text ->
+  [Text] ->
+  ([Text], [SuccessorSecurityEdge]) ->
+  ([Text], [SuccessorSecurityEdge])
+addSuccessorSecurityReferences sourceSecurityId balanceSecurityId resultingSecurityIds (securityIds, edges) =
+  let successorSecurityIds = successorSecurityIdsFor balanceSecurityId resultingSecurityIds
+  in
+    ( successorSecurityIds ++ securityIds
+    , map (\successorSecurityId -> (sourceSecurityId, successorSecurityId)) successorSecurityIds ++ edges
+    )
+
+successorSecurityEdgeIndex : [SuccessorSecurityEdge] -> Map Text [Text]
+successorSecurityEdgeIndex =
+  foldl
+    (\index (sourceSecurityId, successorSecurityId) ->
+      Map.insert
+        sourceSecurityId
+        (successorSecurityId :: fromOptional [] (Map.lookup sourceSecurityId index))
+        index)
+    Map.empty
+
+successorSecurityCycleCheck :
+  Map Text [Text] ->
+  Set Text ->
+  Set Text ->
+  Text ->
+  SuccessorSecurityCycleCheckResult
+successorSecurityCycleCheck edgeIndex visiting checked securityId
+  | Set.member securityId visiting =
+      SuccessorSecurityCycleCheckResult with has_cycle = True; checked = checked
+  | Set.member securityId checked =
+      SuccessorSecurityCycleCheckResult with has_cycle = False; checked = checked
+  | otherwise =
+      let result = foldl
+            (\current successorSecurityId ->
+              if current.has_cycle
+                then current
+                else successorSecurityCycleCheck
+                  edgeIndex
+                  (Set.insert securityId visiting)
+                  current.checked
+                  successorSecurityId)
+            (SuccessorSecurityCycleCheckResult with has_cycle = False; checked = checked)
+            (fromOptional [] (Map.lookup securityId edgeIndex))
+      in if result.has_cycle
+          then result
+          else result with checked = Set.insert securityId result.checked
+
+successorSecurityGraphHasCycle : [SuccessorSecurityEdge] -> Bool
+successorSecurityGraphHasCycle edges =
+  let edgeIndex = successorSecurityEdgeIndex edges
+      result = foldl
+        (\current securityId ->
+          if current.has_cycle
+            then current
+            else successorSecurityCycleCheck edgeIndex Set.empty current.checked securityId)
+        (SuccessorSecurityCycleCheckResult with has_cycle = False; checked = Set.empty)
+        (Map.keys edgeIndex)
+  in result.has_cycle
+
+validateGlobalSuccessorSecurityGraph : CapTableMaps -> Update ()
+validateGlobalSuccessorSecurityGraph maps = do
+  stockTransferReferences <- foldlA
+    (\references transferCid -> do
       transfer <- fetch transferCid
-      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
-    []
+      pure (addSuccessorSecurityReferences
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids
+        references))
+    ([], [])
     (Map.values maps.stock_transfers)
-  stockCancellationIds <- foldlA
-    (\securityIds cancellationCid -> do
+  stockCancellationReferences <- foldlA
+    (\references cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
-    stockTransferIds
+      pure (addSuccessorSecurityReferences
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        []
+        references))
+    stockTransferReferences
     (Map.values maps.stock_cancellations)
-  stockRepurchaseIds <- foldlA
-    (\securityIds repurchaseCid -> do
+  stockRepurchaseReferences <- foldlA
+    (\references repurchaseCid -> do
       repurchase <- fetch repurchaseCid
-      pure (successorSecurityIdsFor repurchase.repurchase_data.balance_security_id [] ++ securityIds))
-    stockCancellationIds
+      pure (addSuccessorSecurityReferences
+        repurchase.repurchase_data.security_id
+        repurchase.repurchase_data.balance_security_id
+        []
+        references))
+    stockCancellationReferences
     (Map.values maps.stock_repurchases)
-  stockConversionIds <- foldlA
-    (\securityIds conversionCid -> do
+  stockConversionReferences <- foldlA
+    (\references conversionCid -> do
       conversion <- fetch conversionCid
-      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
-    stockRepurchaseIds
+      pure (addSuccessorSecurityReferences
+        conversion.conversion_data.security_id
+        conversion.conversion_data.balance_security_id
+        conversion.conversion_data.resulting_security_ids
+        references))
+    stockRepurchaseReferences
     (Map.values maps.stock_conversions)
-  stockReissuanceIds <- foldlA
-    (\securityIds reissuanceCid -> do
+  stockReissuanceReferences <- foldlA
+    (\references reissuanceCid -> do
       reissuance <- fetch reissuanceCid
-      pure (reissuance.reissuance_data.resulting_security_ids ++ securityIds))
-    stockConversionIds
+      pure (addSuccessorSecurityReferences
+        reissuance.reissuance_data.security_id
+        None
+        reissuance.reissuance_data.resulting_security_ids
+        references))
+    stockConversionReferences
     (Map.values maps.stock_reissuances)
-  stockConsolidationIds <- foldlA
-    (\securityIds consolidationCid -> do
+  stockConsolidationReferences <- foldlA
+    (\(securityIds, edges) consolidationCid -> do
       consolidation <- fetch consolidationCid
-      pure (consolidation.consolidation_data.resulting_security_id :: securityIds))
-    stockReissuanceIds
+      pure
+        ( consolidation.consolidation_data.resulting_security_id :: securityIds
+        , map
+            (\sourceSecurityId -> (sourceSecurityId, consolidation.consolidation_data.resulting_security_id))
+            consolidation.consolidation_data.security_ids
+            ++ edges
+        ))
+    stockReissuanceReferences
     (Map.values maps.stock_consolidations)
-  warrantTransferIds <- foldlA
-    (\securityIds transferCid -> do
+  warrantTransferReferences <- foldlA
+    (\references transferCid -> do
       transfer <- fetch transferCid
-      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
-    stockConsolidationIds
+      pure (addSuccessorSecurityReferences
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids
+        references))
+    stockConsolidationReferences
     (Map.values maps.warrant_transfers)
-  warrantCancellationIds <- foldlA
-    (\securityIds cancellationCid -> do
+  warrantCancellationReferences <- foldlA
+    (\references cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
-    warrantTransferIds
+      pure (addSuccessorSecurityReferences
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        []
+        references))
+    warrantTransferReferences
     (Map.values maps.warrant_cancellations)
-  warrantExerciseIds <- foldlA
-    (\securityIds exerciseCid -> do
+  warrantExerciseReferences <- foldlA
+    (\references exerciseCid -> do
       exercise <- fetch exerciseCid
-      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
-    warrantCancellationIds
+      pure (addSuccessorSecurityReferences
+        exercise.exercise_data.security_id
+        None
+        exercise.exercise_data.resulting_security_ids
+        references))
+    warrantCancellationReferences
     (Map.values maps.warrant_exercises)
-  convertibleTransferIds <- foldlA
-    (\securityIds transferCid -> do
+  convertibleTransferReferences <- foldlA
+    (\references transferCid -> do
       transfer <- fetch transferCid
-      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
-    warrantExerciseIds
+      pure (addSuccessorSecurityReferences
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids
+        references))
+    warrantExerciseReferences
     (Map.values maps.convertible_transfers)
-  convertibleCancellationIds <- foldlA
-    (\securityIds cancellationCid -> do
+  convertibleCancellationReferences <- foldlA
+    (\references cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
-    convertibleTransferIds
+      pure (addSuccessorSecurityReferences
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        []
+        references))
+    convertibleTransferReferences
     (Map.values maps.convertible_cancellations)
-  convertibleConversionIds <- foldlA
-    (\securityIds conversionCid -> do
+  convertibleConversionReferences <- foldlA
+    (\references conversionCid -> do
       conversion <- fetch conversionCid
-      pure (successorSecurityIdsFor conversion.conversion_data.balance_security_id conversion.conversion_data.resulting_security_ids ++ securityIds))
-    convertibleCancellationIds
+      pure (addSuccessorSecurityReferences
+        conversion.conversion_data.security_id
+        conversion.conversion_data.balance_security_id
+        conversion.conversion_data.resulting_security_ids
+        references))
+    convertibleCancellationReferences
     (Map.values maps.convertible_conversions)
-  equityCompensationTransferIds <- foldlA
-    (\securityIds transferCid -> do
+  equityCompensationTransferReferences <- foldlA
+    (\references transferCid -> do
       transfer <- fetch transferCid
-      pure (successorSecurityIdsFor transfer.transfer_data.balance_security_id transfer.transfer_data.resulting_security_ids ++ securityIds))
-    convertibleConversionIds
+      pure (addSuccessorSecurityReferences
+        transfer.transfer_data.security_id
+        transfer.transfer_data.balance_security_id
+        transfer.transfer_data.resulting_security_ids
+        references))
+    convertibleConversionReferences
     (Map.values maps.equity_compensation_transfers)
-  equityCompensationCancellationIds <- foldlA
-    (\securityIds cancellationCid -> do
+  equityCompensationCancellationReferences <- foldlA
+    (\references cancellationCid -> do
       cancellation <- fetch cancellationCid
-      pure (successorSecurityIdsFor cancellation.cancellation_data.balance_security_id [] ++ securityIds))
-    equityCompensationTransferIds
+      pure (addSuccessorSecurityReferences
+        cancellation.cancellation_data.security_id
+        cancellation.cancellation_data.balance_security_id
+        []
+        references))
+    equityCompensationTransferReferences
     (Map.values maps.equity_compensation_cancellations)
-  equityCompensationExerciseIds <- foldlA
-    (\securityIds exerciseCid -> do
+  equityCompensationExerciseReferences <- foldlA
+    (\references exerciseCid -> do
       exercise <- fetch exerciseCid
-      pure (exercise.exercise_data.resulting_security_ids ++ securityIds))
-    equityCompensationCancellationIds
+      pure (addSuccessorSecurityReferences
+        exercise.exercise_data.security_id
+        None
+        exercise.exercise_data.resulting_security_ids
+        references))
+    equityCompensationCancellationReferences
     (Map.values maps.equity_compensation_exercises)
-  allSuccessorIds <- foldlA
-    (\securityIds releaseCid -> do
+  allSuccessorReferences <- foldlA
+    (\references releaseCid -> do
       release <- fetch releaseCid
-      pure (release.release_data.resulting_security_ids ++ securityIds))
-    equityCompensationExerciseIds
+      pure (addSuccessorSecurityReferences
+        release.release_data.security_id
+        None
+        release.release_data.resulting_security_ids
+        references))
+    equityCompensationExerciseReferences
     (Map.values maps.equity_compensation_releases)
+  let (allSuccessorIds, allSuccessorEdges) = allSuccessorReferences
   assertMsg
     "Each successor security ID may be produced by only one lifecycle transaction"
     (unique allSuccessorIds)
+  assertMsg
+    "Successor security references cannot contain a cycle"
+    (not (successorSecurityGraphHasCycle allSuccessorEdges))
 
 validateSuccessorSecurityIdContinuity : CapTableMaps -> Update ()
 validateSuccessorSecurityIdContinuity maps = do
-  validateGlobalSuccessorSecurityIdUniqueness maps
+  validateGlobalSuccessorSecurityGraph maps
   let stockUnexpectedIssuanceIds =
         Map.keys maps.warrant_issuances_by_security_id
         ++ Map.keys maps.convertible_issuances_by_security_id
