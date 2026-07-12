@@ -472,45 +472,58 @@ testStockClassDeleteWithAuthorizedSharesAdjustmentFailsForCeiling = script do
       edits = []
       deletes = [CT.OcfDeleteStockClass stockClassId]
 
-testSameDateLowerStockClassAuthorizedSharesAdjustmentWins = script do
+testConflictingSameOcfDateStockClassAuthorizedSharesAdjustmentsFail = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
-
   (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_SAME_DATE" 100.0)
-  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_SAME_DATE" "Same Date Holder"
-  result <- submit issuer do
-    exerciseCmd capTableReady CT.UpdateCapTable with
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
       creates =
-        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_HIGH" stockClassId 200.0)
-        , CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_LOW" stockClassId 100.0)
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment ((stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_HIGH" stockClassId 200.0) with date = morning)
+        , CT.OcfCreateStockClassAuthorizedSharesAdjustment ((stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_LOW" stockClassId 100.0) with date = evening)
         ]
       edits = []
       deletes = []
 
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_SAME_DATE_ISSUED" "SEC_SAME_DATE_ISSUED" stakeholderId stockClassId) with quantity = 150.0)]
-      edits = []
-      deletes = []
-
-testSameDateLowerStockClassAuthorizedSharesAdjustmentWinsWithReversedCreateOrder = script do
+testIdenticalSameOcfDateStockClassAuthorizedSharesAdjustmentsSucceed = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
-
   (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_SAME_DATE_REVERSED" 100.0)
-  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_SAME_DATE_REVERSED" "Same Date Reversed Holder"
-  result <- submit issuer do
-    exerciseCmd capTableReady CT.UpdateCapTable with
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithClass CT.UpdateCapTable with
       creates =
-        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_LOW_FIRST" stockClassId 100.0)
-        , CT.OcfCreateStockClassAuthorizedSharesAdjustment (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_HIGH_SECOND" stockClassId 200.0)
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment ((stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_FIRST" stockClassId 200.0) with date = morning)
+        , CT.OcfCreateStockClassAuthorizedSharesAdjustment ((stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_DATE_SECOND" stockClassId 200.0) with date = evening)
         ]
       edits = []
       deletes = []
+  pure ()
 
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance ((defaultStockIssuance "TX_SAME_DATE_REVERSED_ISSUED" "SEC_SAME_DATE_REVERSED_ISSUED" stakeholderId stockClassId) with quantity = 150.0)]
+testStockClassAuthorizedAdjustmentAppliesForEntireOcfDate = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithClass, stockClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_AUTH_SAME_OCF_DATE" 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_AUTH_SAME_OCF_DATE" "Same OCF Date Holder"
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
+  let adjustment = (stockClassAuthorizedSharesAdjustment "TX_AUTH_SAME_OCF_DATE" stockClassId 200.0) with
+        date = evening
+  let issuance = (defaultStockIssuance "TX_ISSUANCE_SAME_OCF_DATE" "SEC_ISSUANCE_SAME_OCF_DATE" stakeholderId stockClassId) with
+        date = morning
+        quantity = 150.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassAuthorizedSharesAdjustment adjustment
+        , CT.OcfCreateStockIssuance issuance
+        ]
       edits = []
       deletes = []
+  pure ()
 
 testStockClassSplitCannotLeaveIssuedSharesAboveAuthorizedShares = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
@@ -1190,27 +1203,76 @@ testStockConversionUsesRatioAdjustmentForDestinationCeiling = script do
       edits = []
       deletes = []
 
-testSameDateHigherStockConversionRatioAdjustmentWinsForCeiling = script do
+testStockConversionRatioAdjustmentAppliesForEntireOcfDate = script do
   TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_RATIO_SAME_DATE_COMMON" 200.0)
+  let preferredClassId = "SC_CONVERSION_RATIO_SAME_DATE_SOURCE"
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [successorStockClassConversionRightTo commonClassId]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_RATIO_SAME_DATE" "Same OCF Date Conversion Holder"
+  capTableIssued <- createStockIssuanceWith issuer capTableReady
+    ((defaultStockIssuance "TX_CONVERSION_RATIO_SAME_DATE_ISSUED" "SEC_CONVERSION_RATIO_SAME_DATE" stakeholderId preferredClassId) with quantity = 75.0)
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
+  let conversionId = "TX_CONVERSION_RATIO_SAME_DATE"
 
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassConversionRatioAdjustment
+            ((stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_SAME_DATE_ADJUSTMENT" preferredClassId 2.0) with date = evening)
+        , stockSuccessorIssuance
+            "TX_CONVERSION_RATIO_SAME_DATE_OUTPUT"
+            (conversionId <> "_RESULT")
+            stakeholderId
+            commonClassId
+            morning
+            150.0
+        , CT.OcfCreateStockConversion ((stockConversion conversionId "SEC_CONVERSION_RATIO_SAME_DATE" 75.0) with date = morning)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testConflictingSameOcfDateStockClassConversionRatioAdjustmentsFail = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
   (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_RATIO_TIE_COMMON" 100.0)
   let preferredClassId = "SC_CONVERSION_RATIO_TIE_SOURCE"
   let preferredClass = (limitedStockClass preferredClassId 200.0) with
         conversion_rights = [successorStockClassConversionRightTo commonClassId]
   (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
-  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithPreferred "SH_CONVERSION_RATIO_TIE" "Conversion Ratio Tie Holder"
-  capTableIssued <- createStockIssuanceWith issuer capTableReady ((defaultStockIssuance "TX_CONVERSION_RATIO_TIE_ISSUED" "SEC_CONVERSION_RATIO_TIE" stakeholderId preferredClassId) with quantity = 75.0)
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
 
   submitMustFail issuer do
-    exerciseCmd capTableIssued CT.UpdateCapTable with
+    exerciseCmd capTableWithPreferred CT.UpdateCapTable with
       creates =
-        [ CT.OcfCreateStockClassConversionRatioAdjustment (stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_TIE_LOW" preferredClassId 1.0)
-        , CT.OcfCreateStockClassConversionRatioAdjustment (stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_TIE_HIGH" preferredClassId 2.0)
-        , stockSuccessorIssuance "TX_CONVERSION_RATIO_TIE_OUTPUT" "TX_CONVERSION_RATIO_TIE_RESULT" stakeholderId commonClassId defaultTestDate 150.0
-        , CT.OcfCreateStockConversion (stockConversion "TX_CONVERSION_RATIO_TIE" "SEC_CONVERSION_RATIO_TIE" 75.0)
+        [ CT.OcfCreateStockClassConversionRatioAdjustment ((stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_TIE_LOW" preferredClassId 1.0) with date = morning)
+        , CT.OcfCreateStockClassConversionRatioAdjustment ((stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_TIE_HIGH" preferredClassId 2.0) with date = evening)
         ]
       edits = []
       deletes = []
+
+testIdenticalSameOcfDateStockClassConversionRatioAdjustmentsSucceed = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithCommon, commonClassId) <- setupStockClassWith issuer cap_table (limitedStockClass "SC_CONVERSION_RATIO_IDENTICAL_COMMON" 100.0)
+  let preferredClassId = "SC_CONVERSION_RATIO_IDENTICAL_SOURCE"
+  let preferredClass = (limitedStockClass preferredClassId 200.0) with
+        conversion_rights = [successorStockClassConversionRightTo commonClassId]
+  (capTableWithPreferred, _) <- setupStockClassWith issuer capTableWithCommon preferredClass
+  let morning = DT.time (DA.date 2024 Jan 01) 9 0 0
+  let evening = DT.time (DA.date 2024 Jan 01) 17 0 0
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithPreferred CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassConversionRatioAdjustment ((stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_IDENTICAL_FIRST" preferredClassId 2.0) with date = morning)
+        , CT.OcfCreateStockClassConversionRatioAdjustment ((stockClassConversionRatioAdjustment "TX_CONVERSION_RATIO_IDENTICAL_SECOND" preferredClassId 2.0) with date = evening)
+        ]
+      edits = []
+      deletes = []
+  pure ()
 
 testStockClassWithNonRatioConversionRightRejected = script do
   TestOcp{issuer, cap_table} <- setupTestOcp

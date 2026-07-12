@@ -13,6 +13,7 @@ module Fairmint.OpenCapTable.CapTable where
 import DA.Map (Map)
 import qualified DA.Map as Map
 import DA.List (sortOn, unique)
+import qualified DA.Date as Date
 import DA.Set (Set)
 import qualified DA.Set as Set
 import DA.Action (foldlA, unless, when)
@@ -289,46 +290,62 @@ issuerAuthorizedSharesLimit : Optional OcfInitialSharesAuthorized -> Optional De
 issuerAuthorizedSharesLimit initialSharesAuthorized =
   authorizedSharesLimit =<< initialSharesAuthorized
 
+-- OCF Date is date-only; the DAML Time transport must not introduce ordering
+-- between declarations that occur on the same calendar date.
+ocfDate : Time -> Date
+ocfDate = Date.toDateUTC
+
+ocfDateOnOrBefore : Time -> Time -> Bool
+ocfDateOnOrBefore candidate asOf = ocfDate candidate <= ocfDate asOf
+
+-- Adjustments declare absolute state as of their OCF date. Repeated declarations
+-- may agree, but conflicting state on one date has no deterministic OCF meaning.
+recordAdjustmentState :
+  Eq a =>
+  Text ->
+  Text ->
+  Time ->
+  a ->
+  Map Text (Map Date (Text, a)) ->
+  Update (Map Text (Map Date (Text, a)))
+recordAdjustmentState label targetId adjustmentDate state index = do
+  let dateKey = ocfDate adjustmentDate
+  let targetHistory = fromOptional Map.empty (Map.lookup targetId index)
+  case Map.lookup dateKey targetHistory of
+    Some (existingLabel, existingState) ->
+      assertMsg
+        (label <> " conflicts with " <> existingLabel <> " for " <> targetId <> " on OCF date " <> show dateKey)
+        (state == existingState)
+    None -> pure ()
+  pure (Map.insert targetId (Map.insert dateKey (label, state) targetHistory) index)
+
 stockClassAuthorizedAdjustmentTakesPrecedence :
   StockClassAuthorizedSharesAdjustmentOcfData ->
   StockClassAuthorizedSharesAdjustmentOcfData ->
   Bool
 stockClassAuthorizedAdjustmentTakesPrecedence candidate current =
-  candidate.date > current.date ||
-    (candidate.date == current.date && candidate.new_shares_authorized < current.new_shares_authorized)
+  ocfDate candidate.date > ocfDate current.date
 
 issuerAuthorizedAdjustmentTakesPrecedence :
   IssuerAuthorizedSharesAdjustmentOcfData ->
   IssuerAuthorizedSharesAdjustmentOcfData ->
   Bool
 issuerAuthorizedAdjustmentTakesPrecedence candidate current =
-  candidate.date > current.date ||
-    (candidate.date == current.date && candidate.new_shares_authorized < current.new_shares_authorized)
+  ocfDate candidate.date > ocfDate current.date
 
 stockPlanPoolAdjustmentTakesPrecedence :
   StockPlanPoolAdjustmentOcfData ->
   StockPlanPoolAdjustmentOcfData ->
   Bool
 stockPlanPoolAdjustmentTakesPrecedence candidate current =
-  candidate.date > current.date ||
-    (candidate.date == current.date && candidate.shares_reserved < current.shares_reserved)
+  ocfDate candidate.date > ocfDate current.date
 
 stockClassConversionRatioAdjustmentTakesPrecedence :
   StockClassConversionRatioAdjustmentOcfData ->
   StockClassConversionRatioAdjustmentOcfData ->
   Bool
 stockClassConversionRatioAdjustmentTakesPrecedence candidate current =
-  candidate.date > current.date ||
-    (candidate.date == current.date && stockClassConversionRatioAdjustmentIncreasesShares candidate current)
-
-stockClassConversionRatioAdjustmentIncreasesShares :
-  StockClassConversionRatioAdjustmentOcfData ->
-  StockClassConversionRatioAdjustmentOcfData ->
-  Bool
-stockClassConversionRatioAdjustmentIncreasesShares candidate current =
-  let candidateRatio = candidate.new_ratio_conversion_mechanism.ratio in
-  let currentRatio = current.new_ratio_conversion_mechanism.ratio in
-  candidateRatio.numerator * currentRatio.denominator > currentRatio.numerator * candidateRatio.denominator
+  ocfDate candidate.date > ocfDate current.date
 
 addDateById : Text -> Time -> Map Text [Time] -> Map Text [Time]
 addDateById key date index =
@@ -476,7 +493,7 @@ stockClassConversionRatioAdjustmentAsOf maps stockClassId asOf =
     (\latest adjustmentCid -> do
       adjustment <- fetch adjustmentCid
       let candidate = adjustment.adjustment_data
-      if candidate.stock_class_id == stockClassId && candidate.date <= asOf
+      if candidate.stock_class_id == stockClassId && ocfDateOnOrBefore candidate.date asOf
         then case latest of
           Some current ->
             if stockClassConversionRatioAdjustmentTakesPrecedence candidate current
@@ -1259,7 +1276,7 @@ stockClassAuthorizedAdjustmentAsOf :
 stockClassAuthorizedAdjustmentAsOf adjustmentHistory stockClassId asOf =
   foldl
     (\latest candidate ->
-      if candidate.date <= asOf
+      if ocfDateOnOrBefore candidate.date asOf
         then case latest of
           Some current ->
             if stockClassAuthorizedAdjustmentTakesPrecedence candidate current
@@ -1341,7 +1358,7 @@ issuerAuthorizedAdjustmentAsOf :
 issuerAuthorizedAdjustmentAsOf adjustmentHistory issuerId asOf =
   foldl
     (\latest candidate ->
-      if candidate.date <= asOf
+      if ocfDateOnOrBefore candidate.date asOf
         then case latest of
           Some current ->
             if issuerAuthorizedAdjustmentTakesPrecedence candidate current
@@ -1393,7 +1410,7 @@ stockPlanPoolAdjustmentAsOf :
 stockPlanPoolAdjustmentAsOf adjustmentHistory stockPlanId asOf =
   foldl
     (\latest candidate ->
-      if candidate.date <= asOf
+      if ocfDateOnOrBefore candidate.date asOf
         then case latest of
           Some current ->
             if stockPlanPoolAdjustmentTakesPrecedence candidate current
@@ -3797,6 +3814,92 @@ validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid = do
         ("Issuer authorized shares adjustment references another issuer: " <> adjustment.adjustment_data.id)
         (adjustment.adjustment_data.issuer_id == issuerContract.issuer_data.id))
     (Map.values maps.issuer_authorized_shares_adjustments)
+
+validateIssuerAuthorizedAdjustmentStates : CapTableMaps -> Update ()
+validateIssuerAuthorizedAdjustmentStates maps = do
+  _ <- foldlA
+    (\index adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let data_ = adjustment.adjustment_data
+      recordAdjustmentState
+        ("Issuer authorized shares adjustment " <> data_.id)
+        data_.issuer_id
+        data_.date
+        data_.new_shares_authorized
+        index)
+    Map.empty
+    (Map.values maps.issuer_authorized_shares_adjustments)
+  pure ()
+
+validateStockClassAuthorizedAdjustmentStates : CapTableMaps -> Update ()
+validateStockClassAuthorizedAdjustmentStates maps = do
+  _ <- foldlA
+    (\index adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let data_ = adjustment.adjustment_data
+      recordAdjustmentState
+        ("Stock class authorized shares adjustment " <> data_.id)
+        data_.stock_class_id
+        data_.date
+        data_.new_shares_authorized
+        index)
+    Map.empty
+    (Map.values maps.stock_class_authorized_shares_adjustments)
+  pure ()
+
+validateStockPlanPoolAdjustmentStates : CapTableMaps -> Update ()
+validateStockPlanPoolAdjustmentStates maps = do
+  _ <- foldlA
+    (\index adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let data_ = adjustment.adjustment_data
+      recordAdjustmentState
+        ("Stock plan pool adjustment " <> data_.id)
+        data_.stock_plan_id
+        data_.date
+        data_.shares_reserved
+        index)
+    Map.empty
+    (Map.values maps.stock_plan_pool_adjustments)
+  pure ()
+
+stockClassHasRatioConversionRight : StockClassOcfData -> Bool
+stockClassHasRatioConversionRight stockClassData =
+  any
+    (\right -> case right.conversion_mechanism of
+      OcfConversionMechanismRatioConversion -> True
+      _ -> False)
+    stockClassData.conversion_rights
+
+validateStockClassConversionRatioAdjustmentStates : CapTableMaps -> Update ()
+validateStockClassConversionRatioAdjustmentStates maps = do
+  _ <- foldlA
+    (\index adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let data_ = adjustment.adjustment_data
+      case Map.lookup data_.stock_class_id maps.stock_classes of
+        Some stockClassCid -> do
+          stockClass <- fetch stockClassCid
+          assertMsg
+            ("Stock class conversion ratio adjustment " <> data_.id <> " targets a stock class without a ratio conversion right: " <> data_.stock_class_id)
+            (stockClassHasRatioConversionRight stockClass.stock_class_data)
+        None -> pure ()
+      recordAdjustmentState
+        ("Stock class conversion ratio adjustment " <> data_.id)
+        data_.stock_class_id
+        data_.date
+        data_.new_ratio_conversion_mechanism
+        index)
+    Map.empty
+    (Map.values maps.stock_class_conversion_ratio_adjustments)
+  pure ()
+
+validateAdjustmentStateIntegrity : CapTableMaps -> Update ()
+validateAdjustmentStateIntegrity maps = do
+  validateIssuerAuthorizedAdjustmentStates maps
+  validateStockClassAuthorizedAdjustmentStates maps
+  validateStockPlanPoolAdjustmentStates maps
+  validateStockClassConversionRatioAdjustmentStates maps
 
 validateIssuerReference : ContractId Issuer -> Text -> Update ()
 validateIssuerReference issuerCid issuerId = do
@@ -8466,6 +8569,7 @@ template CapTable
 
         validateDocumentRelatedObjects finalMaps newIssuerCid
         validateStockClassConversionRightReferences finalMaps
+        validateAdjustmentStateIntegrity finalMaps
         validateConvertibleIssuanceReferences finalMaps
         validateConvertibleConversionRightReferences finalMaps
         validateWarrantConversionRightReferences finalMaps
