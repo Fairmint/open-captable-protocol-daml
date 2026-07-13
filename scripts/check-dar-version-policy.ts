@@ -16,6 +16,7 @@ import {
   assertDarsLockSchema,
   assertDevnetMarkerIdentity,
   classifyCandidateOnlyBackups,
+  getExactLiveProviderNames,
   getNetworkMarkerAdditions,
 } from './dar-marker-policy';
 import { inspectDarPackageId } from './dar-package-id';
@@ -38,7 +39,7 @@ interface DamlMetadata {
 }
 
 interface Args {
-  allowMainnetMarkerAdditions: boolean;
+  authorizedMainnetMarkerLockKey?: string;
   auditAll: boolean;
   baseRef: string;
   candidateRoot: string;
@@ -55,7 +56,7 @@ function parseArgs(): Args {
     return index >= 0 ? args[index + 1] : undefined;
   };
   return {
-    allowMainnetMarkerAdditions: args.includes('--allow-mainnet-marker-additions'),
+    authorizedMainnetMarkerLockKey: valueAfter('--authorized-mainnet-marker-lock-key'),
     auditAll: args.includes('--audit-all'),
     baseRef: valueAfter('--base') ?? 'origin/main',
     candidateRoot: path.resolve(valueAfter('--candidate-root') ?? ROOT_DIR),
@@ -193,6 +194,7 @@ async function validateBaseLockRetention(
   candidateLock: DarsLock,
   candidateRoot: string,
   currentCandidateKeys: ReadonlySet<string>,
+  liveBaselineKeys: ReadonlySet<string>,
   getPreferences: (packageName: string) => Promise<DevnetPackagePreference[]>
 ): Promise<void> {
   let recordedRetained = 0;
@@ -229,7 +231,7 @@ async function validateBaseLockRetention(
         JSON.stringify(lockEntryWithoutNetworks(candidateEntry)) ===
         JSON.stringify(lockEntryWithoutNetworks(baseEntry));
       if (!metadataMatches) {
-        if (!currentCandidateKeys.has(lockKey)) {
+        if (!currentCandidateKeys.has(lockKey) && !liveBaselineKeys.has(lockKey)) {
           throw new Error(
             `Historical unrecorded DAR ${lockKey} cannot be replaced in place; remove it through the exact live-ID ` +
               'safety check and add the new current candidate separately.'
@@ -263,7 +265,7 @@ async function validateBaseLockRetention(
 }
 
 async function main(): Promise<void> {
-  const { allowMainnetMarkerAdditions, auditAll, baseRef, candidateRoot } = parseArgs();
+  const { authorizedMainnetMarkerLockKey, auditAll, baseRef, candidateRoot } = parseArgs();
   if (!fs.lstatSync(candidateRoot).isDirectory()) {
     throw new Error(`Candidate root is not a directory: ${candidateRoot}`);
   }
@@ -273,26 +275,13 @@ async function main(): Promise<void> {
     throw new Error(`Unable to read dars/dars.lock from ${baseRef}. Fetch the base branch first.`);
   }
   const baseLock = JSON.parse(baseLockText) as DarsLock;
+  assertDarsLockSchema(baseLock, 'Trusted dars.lock');
   const candidateLock = loadCandidateLock(candidateRoot);
   const packages = findCandidatePackages(candidateRoot);
   const currentCandidateKeys = new Set(
     packages.map(({ metadata }) => getDarLockKey(metadata.name, metadata.version, metadata.name))
   );
-  const hasCandidateOnlyRecordedEntry = Object.entries(candidateLock.packages).some(
-    ([lockKey, entry]) => !Object.prototype.hasOwnProperty.call(baseLock.packages, lockKey) && entry.networks.length > 0
-  );
-  const candidateOnly = classifyCandidateOnlyBackups(
-    baseLock,
-    candidateLock,
-    currentCandidateKeys,
-    hasCandidateOnlyRecordedEntry ? loadHistoricalLocks(baseRef) : []
-  );
-  const markerAdditions = getNetworkMarkerAdditions(baseLock, candidateLock, {
-    allowMainnetMarkerAdditions,
-    allowSameCandidateMainnet: true,
-    currentCandidateKeys,
-    restoredRecordedKeys: new Set(candidateOnly.restoredRecordedKeys),
-  });
+  const currentPackageNames = new Set(packages.map(({ metadata }) => metadata.name));
   const preferenceCache = new Map<string, Promise<DevnetPackagePreference[]>>();
   const getPreferences = async (packageName: string): Promise<DevnetPackagePreference[]> => {
     let pending = preferenceCache.get(packageName);
@@ -302,6 +291,60 @@ async function main(): Promise<void> {
     }
     return pending;
   };
+  const liveBaselineKeys = new Set<string>();
+  for (const [lockKey, candidateEntry] of Object.entries(candidateLock.packages)) {
+    if (candidateEntry.networks.length > 0 || currentCandidateKeys.has(lockKey)) continue;
+    const baseEntry = Object.prototype.hasOwnProperty.call(baseLock.packages, lockKey)
+      ? baseLock.packages[lockKey]
+      : undefined;
+    if (
+      baseEntry &&
+      JSON.stringify(lockEntryWithoutNetworks(candidateEntry)) === JSON.stringify(lockEntryWithoutNetworks(baseEntry))
+    ) {
+      continue;
+    }
+
+    const [packageName, packageVersion] = lockKey.split('/');
+    if (!currentPackageNames.has(packageName)) continue;
+    const darPath = verifyLockedDar(candidateRoot, candidateLock, lockKey);
+    const savedSecrets = removeDevnetSecrets();
+    let packageId: string;
+    try {
+      packageId = inspectDarPackageId(darPath, packageName, packageVersion);
+    } finally {
+      restoreDevnetSecrets(savedSecrets);
+    }
+    const preferences = await getPreferences(packageName);
+    assertDevnetPreferencesConsistent(preferences);
+    const exactProviders = getExactLiveProviderNames({ packageId, packageName, packageVersion }, preferences);
+    if (exactProviders.length > 0) {
+      liveBaselineKeys.add(lockKey);
+      console.log(
+        `🛟 ${lockKey}: preserving exact live baseline ${packageId} from ${exactProviders.join(', ')} DevNet`
+      );
+    }
+  }
+  const hasCandidateOnlyRecordedEntry = Object.entries(candidateLock.packages).some(
+    ([lockKey, entry]) => !Object.prototype.hasOwnProperty.call(baseLock.packages, lockKey) && entry.networks.length > 0
+  );
+  const candidateOnly = classifyCandidateOnlyBackups(
+    baseLock,
+    candidateLock,
+    currentCandidateKeys,
+    hasCandidateOnlyRecordedEntry ? loadHistoricalLocks(baseRef) : [],
+    liveBaselineKeys
+  );
+  const baselineRecoveryPackageNames = new Set([
+    ...[...liveBaselineKeys].map((lockKey) => lockKey.split('/')[0]),
+    ...candidateOnly.candidateOnlyKeys.map((lockKey) => lockKey.split('/')[0]),
+  ]);
+  const markerAdditions = getNetworkMarkerAdditions(baseLock, candidateLock, {
+    authorizedMainnetMarkerLockKey,
+    allowSameCandidateMainnet: true,
+    currentCandidateKeys,
+    liveBaselineKeys,
+    restoredRecordedKeys: new Set(candidateOnly.restoredRecordedKeys),
+  });
   let checked = 0;
   let failures = 0;
 
@@ -321,12 +364,21 @@ async function main(): Promise<void> {
     }
     const classification = candidateOnly.restoredRecordedKeys.includes(lockKey)
       ? 'restored recorded history'
-      : 'current mutable candidate';
+      : liveBaselineKeys.has(lockKey)
+        ? 'exact live partial-upload baseline'
+        : 'current mutable candidate';
     console.log(`✅ ${lockKey}: ${classification} verified (${packageId})`);
   }
   if (candidateOnly.candidateOnlyKeys.length > 0) console.log();
 
-  await validateBaseLockRetention(baseLock, candidateLock, candidateRoot, currentCandidateKeys, getPreferences);
+  await validateBaseLockRetention(
+    baseLock,
+    candidateLock,
+    candidateRoot,
+    currentCandidateKeys,
+    liveBaselineKeys,
+    getPreferences
+  );
 
   for (const addition of markerAdditions) {
     if (addition.network === 'mainnet') {
@@ -371,6 +423,7 @@ async function main(): Promise<void> {
         JSON.stringify(baseEntry ? lockEntryWithoutNetworks(baseEntry) : null) !==
           JSON.stringify(candidateEntry ? lockEntryWithoutNetworks(candidateEntry) : null);
     }
+    if (baselineRecoveryPackageNames.has(metadata.name)) changed = true;
 
     if (!auditAll && !changed) {
       console.log(`⏭️  ${metadata.name} ${metadata.version}: candidate bytes unchanged from ${baseRef}`);

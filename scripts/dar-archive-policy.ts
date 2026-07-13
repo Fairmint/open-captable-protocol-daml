@@ -1,4 +1,5 @@
 import * as fs from 'fs';
+import { inflateRawSync } from 'node:zlib';
 
 const EOCD_SIGNATURE = 0x06054b50;
 const CENTRAL_FILE_SIGNATURE = 0x02014b50;
@@ -21,6 +22,16 @@ const MAX_EOCD_SEARCH_BYTES = 22 + 0xffff;
 const MAX_CENTRAL_DIRECTORY_BYTES = 8 * 1024 * 1024;
 const ALLOWED_GENERAL_PURPOSE_FLAGS = 0x0008 | 0x0800;
 const ALLOWED_COMPRESSION_METHODS = new Set([0, 8]);
+const INFLATE_CHUNK_BYTES = 64 * 1024;
+
+const CRC32_TABLE = new Uint32Array(256);
+for (let value = 0; value < CRC32_TABLE.length; value++) {
+  let remainder = value;
+  for (let bit = 0; bit < 8; bit++) {
+    remainder = (remainder & 1) !== 0 ? 0xedb88320 ^ (remainder >>> 1) : remainder >>> 1;
+  }
+  CRC32_TABLE[value] = remainder >>> 0;
+}
 
 export interface DarArchiveSummary {
   entryCount: number;
@@ -31,6 +42,43 @@ interface ArchiveInterval {
   end: number;
   name: string;
   start: number;
+}
+
+interface InflateRawInfo {
+  buffer: Buffer;
+  engine: { bytesWritten: number };
+}
+
+function crc32(bytes: Buffer): number {
+  let checksum = 0xffffffff;
+  for (const byte of bytes) checksum = CRC32_TABLE[(checksum ^ byte) & 0xff] ^ (checksum >>> 8);
+  return (checksum ^ 0xffffffff) >>> 0;
+}
+
+function inflateRawBounded(name: string, compressed: Buffer, maximumBytes: number): Buffer {
+  try {
+    // Node's native inflater processes the stream incrementally and enforces maxOutputLength while producing output,
+    // so a forged central-directory size cannot make it allocate beyond the remaining entry/aggregate budget.
+    const result = inflateRawSync(compressed, {
+      chunkSize: INFLATE_CHUNK_BYTES,
+      info: true,
+      maxOutputLength: Math.max(1, maximumBytes),
+    }) as unknown as InflateRawInfo;
+    if (result.engine.bytesWritten !== compressed.length) {
+      throw new Error(`Unsafe DAR ZIP: deflated entry has trailing compressed bytes: ${name}`);
+    }
+    if (result.buffer.length > maximumBytes) {
+      throw new Error(`Unsafe DAR ZIP: actual expansion exceeds the remaining bounded size: ${name}`);
+    }
+    return result.buffer;
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith('Unsafe DAR ZIP:')) throw error;
+    if ((error as NodeJS.ErrnoException).code === 'ERR_BUFFER_TOO_LARGE') {
+      throw new Error(`Unsafe DAR ZIP: actual expansion exceeds the remaining bounded size: ${name}`);
+    }
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Malformed DAR ZIP: invalid deflate stream for ${name}: ${detail}`);
+  }
 }
 
 function readExactly(fd: number, length: number, position: number, label: string): Buffer {
@@ -126,8 +174,8 @@ function assertSafeFlags(flags: number, name: string): void {
 }
 
 /**
- * Validate a DAR as a conservative, bounded ZIP before any external DAML tool parses it. This reads only ZIP metadata;
- * it never inflates candidate-controlled entries.
+ * Validate a DAR as a conservative, bounded ZIP before any external DAML tool parses it. Deflated entries are inflated
+ * under hard actual-output limits, then checked against their declared sizes and CRC-32 values.
  */
 export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
   const stats = fs.lstatSync(darPath);
@@ -169,11 +217,43 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
     }
 
     const central = readExactly(fd, centralDirectorySize, centralDirectoryOffset, 'central directory');
+    let declaredCursor = 0;
+    let declaredTotalUncompressedBytes = 0;
+    for (let entryIndex = 0; entryIndex < totalEntries; entryIndex++) {
+      if (declaredCursor + 46 > central.length || central.readUInt32LE(declaredCursor) !== CENTRAL_FILE_SIGNATURE) {
+        throw new Error(`Malformed DAR ZIP: invalid central header at entry ${entryIndex + 1}`);
+      }
+      const uncompressedSize = central.readUInt32LE(declaredCursor + 24);
+      if (uncompressedSize > MAX_DAR_ENTRY_UNCOMPRESSED_BYTES) {
+        throw new Error(
+          `Unsafe DAR ZIP: entry ${entryIndex + 1} declares ${uncompressedSize} uncompressed bytes; maximum is ${MAX_DAR_ENTRY_UNCOMPRESSED_BYTES}`
+        );
+      }
+      declaredTotalUncompressedBytes += uncompressedSize;
+      if (declaredTotalUncompressedBytes > MAX_DAR_TOTAL_UNCOMPRESSED_BYTES) {
+        throw new Error(
+          `Unsafe DAR ZIP: aggregate uncompressed size exceeds ${MAX_DAR_TOTAL_UNCOMPRESSED_BYTES} bytes`
+        );
+      }
+      const headerLength =
+        46 +
+        central.readUInt16LE(declaredCursor + 28) +
+        central.readUInt16LE(declaredCursor + 30) +
+        central.readUInt16LE(declaredCursor + 32);
+      if (declaredCursor + headerLength > central.length) {
+        throw new Error(`Malformed DAR ZIP: central entry ${entryIndex + 1} exceeds directory bounds`);
+      }
+      declaredCursor += headerLength;
+    }
+    if (declaredCursor !== central.length) {
+      throw new Error('Malformed DAR ZIP: unparsed central-directory bytes remain');
+    }
+
     const names = new Set<string>();
     const localOffsets = new Set<number>();
     const intervals: ArchiveInterval[] = [];
     let cursor = 0;
-    let totalUncompressedBytes = 0;
+    let actualTotalUncompressedBytes = 0;
 
     for (let entryIndex = 0; entryIndex < totalEntries; entryIndex++) {
       if (cursor + 46 > central.length || central.readUInt32LE(cursor) !== CENTRAL_FILE_SIGNATURE) {
@@ -182,6 +262,7 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
       const versionNeeded = central.readUInt16LE(cursor + 6);
       const flags = central.readUInt16LE(cursor + 8);
       const method = central.readUInt16LE(cursor + 10);
+      const expectedCrc32 = central.readUInt32LE(cursor + 16);
       const compressedSize = central.readUInt32LE(cursor + 20);
       const uncompressedSize = central.readUInt32LE(cursor + 24);
       const nameLength = central.readUInt16LE(cursor + 28);
@@ -224,18 +305,6 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
         throw new Error(`Unsafe DAR ZIP: duplicate local header offset: ${localOffset}`);
       names.add(name);
       localOffsets.add(localOffset);
-      if (uncompressedSize > MAX_DAR_ENTRY_UNCOMPRESSED_BYTES) {
-        throw new Error(
-          `Unsafe DAR ZIP: ${name} declares ${uncompressedSize} uncompressed bytes; maximum is ${MAX_DAR_ENTRY_UNCOMPRESSED_BYTES}`
-        );
-      }
-      totalUncompressedBytes += uncompressedSize;
-      if (totalUncompressedBytes > MAX_DAR_TOTAL_UNCOMPRESSED_BYTES) {
-        throw new Error(
-          `Unsafe DAR ZIP: aggregate uncompressed size exceeds ${MAX_DAR_TOTAL_UNCOMPRESSED_BYTES} bytes`
-        );
-      }
-
       assertRange(localOffset, 30, centralDirectoryOffset, `local header for ${name}`);
       const local = readExactly(fd, 30, localOffset, `local header for ${name}`);
       if (local.readUInt32LE(0) !== LOCAL_FILE_SIGNATURE) {
@@ -244,6 +313,7 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
       const localVersionNeeded = local.readUInt16LE(4);
       const localFlags = local.readUInt16LE(6);
       const localMethod = local.readUInt16LE(8);
+      const localCrc32 = local.readUInt32LE(14);
       const localCompressedSize = local.readUInt32LE(18);
       const localUncompressedSize = local.readUInt32LE(22);
       const localNameLength = local.readUInt16LE(26);
@@ -267,14 +337,39 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
         compressedSize,
         uncompressedSize,
       });
-      if (
-        (flags & 0x0008) === 0 &&
-        (localCompressedSize !== compressedSize || localUncompressedSize !== uncompressedSize)
+      if ((flags & 0x0008) === 0) {
+        if (
+          localCrc32 !== expectedCrc32 ||
+          localCompressedSize !== compressedSize ||
+          localUncompressedSize !== uncompressedSize
+        ) {
+          throw new Error(`Malformed DAR ZIP: local/central CRC or size mismatch: ${name}`);
+        }
+      } else if (
+        (localCrc32 !== 0 && localCrc32 !== expectedCrc32) ||
+        (localCompressedSize !== 0 && localCompressedSize !== compressedSize) ||
+        (localUncompressedSize !== 0 && localUncompressedSize !== uncompressedSize)
       ) {
-        throw new Error(`Malformed DAR ZIP: local/central size mismatch: ${name}`);
+        throw new Error(`Malformed DAR ZIP: data-descriptor metadata mismatch: ${name}`);
       }
       const dataStart = localOffset + 30 + localVariableLength;
       assertRange(dataStart, compressedSize, centralDirectoryOffset, `compressed data for ${name}`);
+      const compressed = readExactly(fd, compressedSize, dataStart, `compressed data for ${name}`);
+      const remainingAggregateBytes = MAX_DAR_TOTAL_UNCOMPRESSED_BYTES - actualTotalUncompressedBytes;
+      const maximumActualBytes = Math.min(MAX_DAR_ENTRY_UNCOMPRESSED_BYTES, remainingAggregateBytes);
+      const expanded = method === 0 ? compressed : inflateRawBounded(name, compressed, maximumActualBytes);
+      if (expanded.length > maximumActualBytes) {
+        throw new Error(`Unsafe DAR ZIP: actual expansion exceeds the remaining bounded size: ${name}`);
+      }
+      if (expanded.length !== uncompressedSize) {
+        throw new Error(
+          `Malformed DAR ZIP: actual uncompressed size ${expanded.length} disagrees with declared size ${uncompressedSize}: ${name}`
+        );
+      }
+      if (crc32(expanded) !== expectedCrc32) {
+        throw new Error(`Malformed DAR ZIP: CRC-32 mismatch: ${name}`);
+      }
+      actualTotalUncompressedBytes += expanded.length;
       intervals.push({ end: dataStart + compressedSize, name, start: localOffset });
       cursor += headerLength;
     }
@@ -289,7 +384,7 @@ export function assertDarArchiveSafe(darPath: string): DarArchiveSummary {
       }
     }
 
-    return { entryCount: totalEntries, totalUncompressedBytes };
+    return { entryCount: totalEntries, totalUncompressedBytes: actualTotalUncompressedBytes };
   } finally {
     fs.closeSync(fd);
   }

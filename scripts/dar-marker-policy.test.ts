@@ -14,6 +14,7 @@ import {
   assertDarsLockSchema,
   assertDevnetMarkerIdentity,
   classifyCandidateOnlyBackups,
+  getExactLiveProviderNames,
   getNetworkMarkerAdditions,
 } from './dar-marker-policy';
 import { verifyLockedDar } from './devnet-dar-policy';
@@ -71,6 +72,7 @@ void describe('DAR network marker policy', () => {
     assert.doesNotThrow(() =>
       getNetworkMarkerAdditions(base, candidate, { currentCandidateKeys: new Set([LOCK_KEY]) })
     );
+    assert.doesNotThrow(() => getNetworkMarkerAdditions(base, candidate, { liveBaselineKeys: new Set([LOCK_KEY]) }));
   });
 
   void it('rejects malformed candidate lock entry fields', () => {
@@ -107,7 +109,7 @@ void describe('DAR network marker policy', () => {
     );
     assert.deepEqual(
       getNetworkMarkerAdditions(lock(entry(['devnet'])), lock(entry(['devnet', 'mainnet'])), {
-        allowMainnetMarkerAdditions: true,
+        authorizedMainnetMarkerLockKey: LOCK_KEY,
       }),
       [
         {
@@ -122,14 +124,14 @@ void describe('DAR network marker policy', () => {
     assert.throws(
       () =>
         getNetworkMarkerAdditions(lock(entry()), lock(entry(['mainnet'])), {
-          allowMainnetMarkerAdditions: true,
+          authorizedMainnetMarkerLockKey: LOCK_KEY,
           allowSameCandidateMainnet: true,
         }),
       /mainnet requires a trusted-base devnet marker or a devnet marker proven in this candidate/
     );
     assert.deepEqual(
       getNetworkMarkerAdditions(lock(entry()), lock(entry(['mainnet', 'devnet'])), {
-        allowMainnetMarkerAdditions: true,
+        authorizedMainnetMarkerLockKey: LOCK_KEY,
         allowSameCandidateMainnet: true,
       }),
       [
@@ -148,6 +150,35 @@ void describe('DAR network marker policy', () => {
           packageVersion: '1.2.3',
         },
       ]
+    );
+  });
+
+  void it('scopes Mainnet provenance to exactly the attested lock key', () => {
+    const otherLockKey = 'Other-v01/1.2.3/Other-v01.dar';
+    const base: DarsLock = {
+      version: 1,
+      packages: { [LOCK_KEY]: entry(['devnet']), [otherLockKey]: entry(['devnet'], 'b'.repeat(64)) },
+    };
+    const candidate: DarsLock = {
+      version: 1,
+      packages: {
+        [LOCK_KEY]: entry(['devnet', 'mainnet']),
+        [otherLockKey]: entry(['devnet', 'mainnet'], 'b'.repeat(64)),
+      },
+    };
+    assert.throws(
+      () =>
+        getNetworkMarkerAdditions(base, candidate, {
+          authorizedMainnetMarkerLockKey: LOCK_KEY,
+        }),
+      new RegExp(`verified attestation authorizes only ${LOCK_KEY.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`)
+    );
+    assert.throws(
+      () =>
+        getNetworkMarkerAdditions(base, base, {
+          authorizedMainnetMarkerLockKey: LOCK_KEY,
+        }),
+      /must authorize exactly that one marker addition/
     );
   });
 
@@ -235,6 +266,35 @@ void describe('DAR network marker policy', () => {
     assert.deepEqual(classifyCandidateOnlyBackups(lock(), candidate, new Set([LOCK_KEY]), []), {
       candidateOnlyKeys: [LOCK_KEY],
       currentCandidateKeys: [LOCK_KEY],
+      restoredRecordedKeys: [],
+    });
+  });
+
+  void it('preserves non-current B only when one split provider proves B is the exact live baseline', () => {
+    const liveIdentity = { packageId: 'partial-live', packageName: 'Example-v01', packageVersion: '1.2.3' };
+    const splitPreferences: DevnetPackagePreference[] = [
+      { ...liveIdentity, provider: 'intellect' },
+      {
+        packageId: 'older-live',
+        packageName: 'Example-v01',
+        packageVersion: '1.2.2',
+        provider: '5n',
+      },
+    ];
+    assert.deepEqual(getExactLiveProviderNames(liveIdentity, splitPreferences), ['intellect']);
+    assert.deepEqual(
+      getExactLiveProviderNames({ ...liveIdentity, packageId: 'stale-base-candidate' }, splitPreferences),
+      []
+    );
+
+    const candidate = lock(entry());
+    assert.throws(
+      () => classifyCandidateOnlyBackups(lock(), candidate, new Set(), []),
+      /candidate-only unrecorded DAR must be the canonical current candidate/
+    );
+    assert.deepEqual(classifyCandidateOnlyBackups(lock(), candidate, new Set(), [], new Set([LOCK_KEY])), {
+      candidateOnlyKeys: [LOCK_KEY],
+      currentCandidateKeys: [],
       restoredRecordedKeys: [],
     });
   });

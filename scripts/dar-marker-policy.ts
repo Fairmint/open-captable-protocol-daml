@@ -21,9 +21,10 @@ export interface NetworkMarkerAddition {
 }
 
 export interface NetworkMarkerPolicyOptions {
-  allowMainnetMarkerAdditions?: boolean;
+  authorizedMainnetMarkerLockKey?: string;
   allowSameCandidateMainnet?: boolean;
   currentCandidateKeys?: ReadonlySet<string>;
+  liveBaselineKeys?: ReadonlySet<string>;
   restoredRecordedKeys?: ReadonlySet<string>;
 }
 
@@ -99,6 +100,21 @@ function recordedIdentityMatches(left: DarsLockEntry, right: DarsLockEntry): boo
   );
 }
 
+/** Identify providers which prove an unmarked backup is an exact live compatibility baseline. */
+export function getExactLiveProviderNames(
+  identity: DarMarkerIdentity,
+  preferences: DevnetPackagePreference[]
+): string[] {
+  return preferences
+    .filter(
+      (preference) =>
+        preference.packageName === identity.packageName &&
+        preference.packageVersion === identity.packageVersion &&
+        preference.packageId === identity.packageId
+    )
+    .map((preference) => preference.provider);
+}
+
 /**
  * Classify entries newly introduced relative to the trusted base. An unrecorded entry may only be the canonical active
  * candidate for a discovered top-level package. A recorded alias is accepted only when trusted default-branch history
@@ -108,7 +124,8 @@ export function classifyCandidateOnlyBackups(
   base: DarsLock,
   candidate: DarsLock,
   currentCandidateKeys: ReadonlySet<string>,
-  historicalLocks: DarsLock[]
+  historicalLocks: DarsLock[],
+  liveBaselineKeys: ReadonlySet<string> = new Set()
 ): CandidateOnlyBackupClassification {
   assertDarsLockSchema(base, 'Trusted dars.lock');
   assertDarsLockSchema(candidate, 'Candidate dars.lock');
@@ -121,12 +138,12 @@ export function classifyCandidateOnlyBackups(
     if (Object.prototype.hasOwnProperty.call(base.packages, lockKey)) continue;
     candidateOnlyKeys.push(lockKey);
     if (entry.networks.length === 0) {
-      if (!currentCandidateKeys.has(lockKey)) {
+      if (!currentCandidateKeys.has(lockKey) && !liveBaselineKeys.has(lockKey)) {
         throw new Error(
           `${lockKey}: candidate-only unrecorded DAR must be the canonical current candidate for its package line`
         );
       }
-      activeKeys.push(lockKey);
+      if (currentCandidateKeys.has(lockKey)) activeKeys.push(lockKey);
       continue;
     }
 
@@ -169,7 +186,9 @@ export function getNetworkMarkerAdditions(
   assertDarsLockSchema(base, 'Trusted dars.lock');
   assertDarsLockSchema(candidate, 'Candidate dars.lock');
   const currentCandidateKeys = options.currentCandidateKeys ?? new Set<string>();
+  const liveBaselineKeys = options.liveBaselineKeys ?? new Set<string>();
   const restoredRecordedKeys = options.restoredRecordedKeys ?? new Set<string>();
+  if (options.authorizedMainnetMarkerLockKey) parseLockKey(options.authorizedMainnetMarkerLockKey);
 
   for (const [lockKey, baseEntry] of Object.entries(base.packages)) {
     const candidateEntry = Object.prototype.hasOwnProperty.call(candidate.packages, lockKey)
@@ -193,7 +212,7 @@ export function getNetworkMarkerAdditions(
           throw new Error(`${lockKey}: recorded DAR metadata ${field} cannot change`);
         }
       }
-      if (!currentCandidateKeys.has(lockKey)) {
+      if (!currentCandidateKeys.has(lockKey) && !liveBaselineKeys.has(lockKey)) {
         throw new Error(
           `${lockKey}: historical unrecorded DAR metadata cannot be replaced in place; remove it through the live-ID ` +
             'safety check and add the new current candidate separately'
@@ -214,8 +233,11 @@ export function getNetworkMarkerAdditions(
       if (network !== 'devnet' && network !== 'mainnet') {
         throw new Error(`${lockKey}: unknown network marker: ${network}`);
       }
-      if (network === 'mainnet' && !options.allowMainnetMarkerAdditions) {
-        throw new Error(`${lockKey}: new mainnet marker requires explicit trusted workflow provenance`);
+      if (network === 'mainnet' && lockKey !== options.authorizedMainnetMarkerLockKey) {
+        const scope = options.authorizedMainnetMarkerLockKey
+          ? `; the verified attestation authorizes only ${options.authorizedMainnetMarkerLockKey}`
+          : '';
+        throw new Error(`${lockKey}: new mainnet marker requires explicit trusted workflow provenance${scope}`);
       }
       if (
         network === 'mainnet' &&
@@ -229,6 +251,15 @@ export function getNetworkMarkerAdditions(
       }
       additions.push({ ...coordinates, lockKey, network });
     }
+  }
+  const mainnetAdditions = additions.filter((addition) => addition.network === 'mainnet');
+  if (
+    options.authorizedMainnetMarkerLockKey &&
+    (mainnetAdditions.length !== 1 || mainnetAdditions[0]?.lockKey !== options.authorizedMainnetMarkerLockKey)
+  ) {
+    throw new Error(
+      `Verified Mainnet attestation for ${options.authorizedMainnetMarkerLockKey} must authorize exactly that one marker addition`
+    );
   }
   return additions.sort((left, right) => {
     if (left.network === right.network) return 0;
