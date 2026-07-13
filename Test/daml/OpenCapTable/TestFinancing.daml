@@ -1,0 +1,165 @@
+module OpenCapTable.TestFinancing where
+
+import Fairmint.OpenCapTable.OCF.Financing
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+import Daml.Script
+import DA.Optional (isNone, isSome)
+
+financingData : Text -> [Text] -> FinancingOcfData
+financingData financingId issuanceIds = FinancingOcfData with
+  id = financingId
+  date = defaultTestDate
+  name = "Series A"
+  comments = []
+  issuance_ids = issuanceIds
+
+testFinancing_AllIssuanceTypesRoundTrip = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let financing = financingData "FIN_ALL_TYPES" ["STOCK_FIN", "CONVERTIBLE_FIN", "EQUITY_FIN", "WARRANT_FIN"]
+
+  prerequisites <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN")
+        ]
+      edits = []
+      deletes = []
+  withStock <- addStockIssuance issuer prerequisites.updatedCapTableCid "STOCK_FIN" "SEC_STOCK_FIN" "SH_FIN" "SC_FIN"
+  withConvertible <- addConvertibleIssuance issuer withStock "CONVERTIBLE_FIN" "SEC_CONVERTIBLE_FIN" "SH_FIN"
+  withEquity <- addEquityCompensationIssuance issuer withConvertible "EQUITY_FIN" "SEC_EQUITY_FIN" "SH_FIN"
+  withWarrant <- addWarrantIssuance issuer withEquity "WARRANT_FIN" "SEC_WARRANT_FIN" "SH_FIN"
+
+  result <- submit issuer do
+    exerciseCmd withWarrant CT.UpdateCapTable with
+      creates = [CT.OcfCreateFinancing financing]
+      edits = []
+      deletes = []
+
+  let financingCids = [cid | CT.CidFinancing cid <- result.createdCids]
+  case financingCids of
+    [financingCid] -> do
+      financingOpt <- queryContractId issuer financingCid
+      let Some financingContract = financingOpt
+      assertMsg "Financing payload must round-trip unchanged" (financingContract.financing_data == financing)
+    _ -> assertFail "Expected exactly one Financing contract"
+
+  capTableOpt <- queryContractId issuer result.updatedCapTableCid
+  let Some capTableData = capTableOpt
+  assertMsg "Financing map must be present after the first Financing write" (isSome capTableData.financings)
+
+testFinancing_MissingIssuanceFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateFinancing (financingData "FIN_MISSING" ["ISSUANCE_MISSING"])]
+      edits = []
+      deletes = []
+
+testFinancing_EmptyIssuanceIdsFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateFinancing (financingData "FIN_EMPTY" [])]
+      edits = []
+      deletes = []
+
+testFinancing_DuplicateIssuanceIdsRemainSchemaValid = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN_DUP" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN_DUP")
+        , CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_DUP" "SEC_STOCK_FIN_DUP" "SH_FIN_DUP" "SC_FIN_DUP")
+        , CT.OcfCreateFinancing (financingData "FIN_DUP" ["STOCK_FIN_DUP", "STOCK_FIN_DUP"])
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testFinancing_EmptyNameAndCommentStringsRemainSchemaValid = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN_EMPTY_TEXT" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN_EMPTY_TEXT")
+        , CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_EMPTY_TEXT" "SEC_STOCK_FIN_EMPTY_TEXT" "SH_FIN_EMPTY_TEXT" "SC_FIN_EMPTY_TEXT")
+        , CT.OcfCreateFinancing ((financingData "FIN_EMPTY_TEXT" ["STOCK_FIN_EMPTY_TEXT"]) with name = "", comments = [""])
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testFinancing_EditCanReferenceSameBatchIssuance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  initial <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN_EDIT" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN_EDIT")
+        , CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_EDIT" "SEC_STOCK_FIN_EDIT" "SH_FIN_EDIT" "SC_FIN_EDIT")
+        , CT.OcfCreateFinancing (financingData "FIN_EDIT" ["STOCK_FIN_EDIT"])
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd initial.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_EDIT_2" "SEC_STOCK_FIN_EDIT_2" "SH_FIN_EDIT" "SC_FIN_EDIT")]
+      edits = [CT.OcfEditFinancing (financingData "FIN_EDIT" ["STOCK_FIN_EDIT", "STOCK_FIN_EDIT_2"])]
+      deletes = []
+  pure ()
+
+testFinancing_DeleteReferencedIssuanceFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  initial <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN_DELETE" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN_DELETE")
+        , CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_DELETE" "SEC_STOCK_FIN_DELETE" "SH_FIN_DELETE" "SC_FIN_DELETE")
+        , CT.OcfCreateFinancing (financingData "FIN_DELETE" ["STOCK_FIN_DELETE"])
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd initial.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance "STOCK_FIN_DELETE"]
+
+testFinancing_DeleteLastFinancingCollapsesMapToNone = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  initialCapTableOpt <- queryContractId issuer cap_table
+  let Some initialCapTable = initialCapTableOpt
+  assertMsg "New CapTables must represent no financings as None" (isNone initialCapTable.financings)
+
+  created <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SH_FIN_COLLAPSE" "Financing Holder")
+        , CT.OcfCreateStockClass (defaultStockClass "SC_FIN_COLLAPSE")
+        , CT.OcfCreateStockIssuance (defaultStockIssuance "STOCK_FIN_COLLAPSE" "SEC_STOCK_FIN_COLLAPSE" "SH_FIN_COLLAPSE" "SC_FIN_COLLAPSE")
+        , CT.OcfCreateFinancing (financingData "FIN_COLLAPSE" ["STOCK_FIN_COLLAPSE"])
+        ]
+      edits = []
+      deletes = []
+
+  deleted <- submit issuer do
+    exerciseCmd created.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockIssuance "STOCK_FIN_COLLAPSE", CT.OcfDeleteFinancing "FIN_COLLAPSE"]
+
+  finalCapTableOpt <- queryContractId issuer deleted.updatedCapTableCid
+  let Some finalCapTable = finalCapTableOpt
+  assertMsg "Deleting the last Financing must restore the downgrade-compatible None representation" (isNone finalCapTable.financings)

@@ -51,6 +51,8 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  // Types introduced after v0.0.2 must be appended to upgrade-sensitive records and variants.
+  is_upgrade_append: boolean;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
 }
@@ -219,6 +221,7 @@ function discoverTypes(config: Config): TypeDef[] {
           error: `${toTitleCase(fieldSpec)} not found`,
         };
       }),
+      is_upgrade_append: name === 'Financing',
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
@@ -284,6 +287,11 @@ function generate(): void {
   // Alphabetically sorted (for most sections)
   const types_alpha = [...types].sort((a, b) => a.name.localeCompare(b.name));
 
+  // DAML upgrades preserve constructor and record-field order. Keep the v0.0.2 surface stable and append types that
+  // were added later, even when that differs from alphabetical order.
+  const types_existing = types_alpha.filter((type) => !type.is_upgrade_append);
+  const types_appended = types_alpha.filter((type) => type.is_upgrade_append);
+
   // Tier-then-alphabetically sorted (for processCreate)
   const types_tier = [...types].sort((a, b) => {
     if (a.tier !== b.tier) return a.tier - b.tier;
@@ -293,6 +301,8 @@ function generate(): void {
   console.log('Rendering template...');
   const output = template({
     types_alpha,
+    types_existing,
+    types_appended,
     types_tier,
   });
 
