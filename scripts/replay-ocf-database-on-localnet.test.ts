@@ -10,6 +10,7 @@ import {
   preparePortal,
   ReplayPhaseError,
   resolveDatabaseUrl,
+  toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
   type DatabaseOcfRow,
@@ -85,6 +86,7 @@ function run(): void {
   assert.equal(portal.issuer.entityType, 'issuer');
   assert.equal(portal.creates.length, 1);
   assert.equal(portal.creates[0].entityType, 'stakeholder');
+  expectReplayPhase(() => toOcfCreateOperation(portal.issuer), 'mapping');
 
   const invalidSchemaRows: DatabaseOcfRow[] = [
     {
@@ -130,6 +132,30 @@ function run(): void {
     },
   ]);
   assert.equal(planSecurityPortal.creates[0].entityType, 'equityCompensationIssuance');
+  const planSecurityOperation = toOcfCreateOperation(planSecurityPortal.creates[0]);
+  assert.equal(planSecurityOperation.type, 'equityCompensationIssuance');
+  assert.equal(planSecurityOperation.data.object_type, 'TX_EQUITY_COMPENSATION_ISSUANCE');
+
+  const financingPortal = preparePortal([
+    validRows[0],
+    {
+      portalId: PORTAL_ID,
+      type: 'FINANCING',
+      subtype: null,
+      data: {
+        object_type: 'FINANCING',
+        id: 'financing-1',
+        name: 'Series A',
+        issuance_ids: ['stock-issuance-1'],
+        date: '2024-01-02',
+      },
+    },
+  ]);
+  assert.equal(financingPortal.creates[0].entityType, 'financing');
+  const financingOperation = toOcfCreateOperation(financingPortal.creates[0]);
+  assert.equal(financingOperation.type, 'financing');
+  assert.equal(financingOperation.data.object_type, 'FINANCING');
+  assert.deepEqual(financingOperation.data.issuance_ids, ['stock-issuance-1']);
 
   assert.equal(
     matchesLedgerTemplateId(
