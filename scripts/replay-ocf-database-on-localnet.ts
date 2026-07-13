@@ -27,6 +27,7 @@ import {
   ReplayPhaseError,
   replayUsage,
   resolveDatabaseUrl,
+  toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
   type DatabaseOcfRow,
@@ -396,7 +397,7 @@ async function replayPortal(context: ReplayLedgerContext, portal: PreparedPortal
 
   for (const item of portal.creates) {
     try {
-      batch.create(item.entityType, item.data as never);
+      batch.createOperation(toOcfCreateOperation(item));
     } catch (error) {
       throw new ReplayPhaseError('conversion', 'OCF-to-DAML conversion failed', {
         entityType: item.entityType,
