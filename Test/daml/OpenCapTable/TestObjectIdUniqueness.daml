@@ -1,0 +1,85 @@
+module OpenCapTable.TestObjectIdUniqueness where
+
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import qualified Fairmint.OpenCapTable.OCF.Document as Document
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers (defaultStakeholder, setupStakeholderWithId)
+import qualified DA.Map as Map
+import Daml.Script
+
+documentData : Text -> Document.DocumentOcfData
+documentData objectId = Document.DocumentOcfData with
+  id = objectId
+  md5 = "0123456789abcdef0123456789abcdef"
+  comments = []
+  related_objects = []
+  path = Some ("documents/" <> objectId <> ".pdf")
+  uri = None
+
+testObjectIdUniqueness_SameBatchCrossTypeDuplicateFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "DUPLICATE-OBJECT-ID" "Duplicate Holder")
+        , CT.OcfCreateDocument (documentData "DUPLICATE-OBJECT-ID")
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_PriorBatchCrossTypeDuplicateFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithStakeholder, _) <- setupStakeholderWithId issuer cap_table "PRIOR-OBJECT-ID" "Prior Holder"
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithStakeholder CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "PRIOR-OBJECT-ID")]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_IssuerIdCannotBeReused = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "ISSUER_1")]
+      edits = []
+      deletes = []
+  pure ()
+
+-- Validate fetched object data rather than trusting map keys on cap tables
+-- upgraded from a package that did not enforce global object-id uniqueness.
+testObjectIdUniqueness_CorruptedFinalStateFails = script do
+  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
+  (capTableWithStakeholder, _) <- setupStakeholderWithId issuer cap_table "UPGRADED-DUPLICATE-ID" "Existing Holder"
+  capTableDataOpt <- queryContractId issuer capTableWithStakeholder
+  let Some capTableData = capTableDataOpt
+
+  duplicateDocumentCid <- submit (actAs issuer <> actAs system_operator) $ createCmd $ Document.Document with
+    context = ctx
+    document_data = documentData "UPGRADED-DUPLICATE-ID"
+
+  let corruptedCapTable = capTableData with
+        documents = Map.insert "CORRUPTED-DOCUMENT-MAP-KEY" duplicateDocumentCid capTableData.documents
+  corruptedCapTableCid <- submit (actAs issuer <> actAs system_operator) $ createCmd corruptedCapTable
+
+  submitMustFail issuer do
+    exerciseCmd corruptedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_DeleteThenReuseAcrossTypesSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithStakeholder, _) <- setupStakeholderWithId issuer cap_table "REUSED-OBJECT-ID" "Replaced Holder"
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithStakeholder CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "REUSED-OBJECT-ID")]
+      edits = []
+      deletes = [CT.OcfDeleteStakeholder "REUSED-OBJECT-ID"]
+  pure ()
