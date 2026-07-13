@@ -12,7 +12,7 @@ on:
         type: string
 
 concurrency:
-  group: package-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  group: package-release-ocp
   cancel-in-progress: false
 
 jobs:
@@ -47,6 +47,9 @@ jobs:
         run: |
           git lfs install
           git lfs pull
+
+      - name: Fetch deployment tags
+        run: git fetch --tags origin
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -114,12 +117,21 @@ jobs:
         run: scripts/install-dpm-sdks.sh
 
       - name: Validate npm package version
+        id: npm_version
         run: |
           PACKAGE_NAME=$(node -p "require('./package.json').name")
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published. Bump package.json before creating a package release tag."
-            exit 1
+            devnet_tag="dar-deploy/devnet/${{ steps.release_tag.outputs.package }}/v${{ steps.release_tag.outputs.version }}"
+            mainnet_tag="dar-deploy/mainnet/${{ steps.release_tag.outputs.package }}/v${{ steps.release_tag.outputs.version }}"
+            if ! git show-ref --verify --quiet "refs/tags/${devnet_tag}" || ! git show-ref --verify --quiet "refs/tags/${mainnet_tag}"; then
+              echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published without both deployment success tags. Refusing a new release over an existing npm version."
+              exit 1
+            fi
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} and both deployment tags already exist; resuming post-publish finalization."
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Validate release tag is current main
@@ -134,7 +146,8 @@ jobs:
       - name: Build and validate package
         run: |
           npm run build
-          npm run backup-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --version "${{ steps.release_tag.outputs.version }}"
+          npm run test:dar-version-policy
+          npm run check:dar-version-policy -- --all
           npm run lint
           npm run format
           npm run lint:daml
@@ -143,11 +156,45 @@ jobs:
           npm run verify-package
           npm run test
 
+      - name: Check DevNet deployment
+        id: devnet_gate
+        run: npm run check:dar-deployment -- --package "${{ steps.release_tag.outputs.package_key }}" --network devnet
+
       - name: Upload DAR to devnet
+        if: steps.devnet_gate.outputs.tag_exists != 'true'
         run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network devnet
 
+      - name: Record DevNet deployment tag
+        if: steps.devnet_gate.outputs.tag_exists != 'true'
+        env:
+          PACKAGE_NAME: ${{ steps.release_tag.outputs.package }}
+          PACKAGE_VERSION: ${{ steps.release_tag.outputs.version }}
+        run: |
+          tag="dar-deploy/devnet/${PACKAGE_NAME}/v${PACKAGE_VERSION}"
+          sha=$(node -e 'const l=require("./dars/dars.lock"); console.log(l.packages[`${process.env.PACKAGE_NAME}/${process.env.PACKAGE_VERSION}/${process.env.PACKAGE_NAME}.dar`].sha256)')
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to DevNet (${sha})"
+          git push --no-verify origin "refs/tags/$tag"
+
+      - name: Check Mainnet deployment
+        id: mainnet_gate
+        run: npm run check:dar-deployment -- --package "${{ steps.release_tag.outputs.package_key }}" --network mainnet
+
       - name: Upload DAR to mainnet
+        if: steps.mainnet_gate.outputs.tag_exists != 'true'
         run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network mainnet
+
+      - name: Record Mainnet deployment tag
+        if: steps.mainnet_gate.outputs.tag_exists != 'true'
+        env:
+          PACKAGE_NAME: ${{ steps.release_tag.outputs.package }}
+          PACKAGE_VERSION: ${{ steps.release_tag.outputs.version }}
+        run: |
+          tag="dar-deploy/mainnet/${PACKAGE_NAME}/v${PACKAGE_VERSION}"
+          sha=$(node -e 'const l=require("./dars/dars.lock"); console.log(l.packages[`${process.env.PACKAGE_NAME}/${process.env.PACKAGE_VERSION}/${process.env.PACKAGE_NAME}.dar`].sha256)')
+          git tag -a "$tag" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to Mainnet (${sha})"
+          git push --no-verify origin "refs/tags/$tag"
 
       - name: Detect factory state
         id: factory
@@ -176,6 +223,7 @@ jobs:
         run: npm run package:manifest
 
       - name: Publish npm package
+        if: steps.npm_version.outputs.already_published != 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: npm publish
@@ -191,8 +239,11 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          if ! git diff --quiet -- dars || ! git diff --cached --quiet -- dars; then
+            echo "::error::Release mutated committed DAR backups; refusing to continue."
+            exit 1
+          fi
           for path in \
-            dars \
             generated/ocp-factory-contract-id.json \
             generated/ocp-factory-contract-id.json.d.ts \
             generated/npm-manifest.txt \
@@ -210,4 +261,4 @@ jobs:
           fi
 
           git commit -m "chore: record release artifacts for ${RELEASE_TAG} [skip ci]"
-          git push origin HEAD:main
+          git push --no-verify origin HEAD:main
