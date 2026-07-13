@@ -10,6 +10,7 @@ import {
   preparePortal,
   ReplayPhaseError,
   resolveDatabaseUrl,
+  toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
   type DatabaseOcfRow,
@@ -85,6 +86,7 @@ function run(): void {
   assert.equal(portal.issuer.entityType, 'issuer');
   assert.equal(portal.creates.length, 1);
   assert.equal(portal.creates[0].entityType, 'stakeholder');
+  expectReplayPhase(() => toOcfCreateOperation(portal.issuer), 'mapping');
 
   const invalidSchemaRows: DatabaseOcfRow[] = [
     {
@@ -130,6 +132,9 @@ function run(): void {
     },
   ]);
   assert.equal(planSecurityPortal.creates[0].entityType, 'equityCompensationIssuance');
+  const planSecurityOperation = toOcfCreateOperation(planSecurityPortal.creates[0]);
+  assert.equal(planSecurityOperation.type, 'equityCompensationIssuance');
+  assert.equal(planSecurityOperation.data.object_type, 'TX_EQUITY_COMPENSATION_ISSUANCE');
 
   assert.equal(
     matchesLedgerTemplateId(

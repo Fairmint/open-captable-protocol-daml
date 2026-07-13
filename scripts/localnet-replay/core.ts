@@ -4,12 +4,16 @@ import path from 'path';
 import {
   ENTITY_OBJECT_TYPE_MAP,
   getOcfSchema,
+  isOcfCreatableEntityType,
   mapCategorizedTypeToEntityType,
   mapOcfObjectTypeToEntityType,
   matchesTemplateIdentity,
   normalizeEntityType,
   normalizeObjectType,
+  parseOcfEntityInput,
+  parseOcfObject,
   sortTransactions,
+  type OcfCreateOperation,
   type OcfEntityType,
 } from '@open-captable-protocol/canton';
 
@@ -332,6 +336,19 @@ function prepareRow(row: DatabaseOcfRow, portalAlias: string): PreparedOcfObject
 function isTransaction(item: PreparedOcfObject): boolean {
   const objectType = item.data['object_type'];
   return typeof objectType === 'string' && (objectType.startsWith('TX_') || objectType.startsWith('CE_'));
+}
+
+export function toOcfCreateOperation(item: PreparedOcfObject): OcfCreateOperation {
+  if (!isOcfCreatableEntityType(item.entityType)) {
+    throw new ReplayPhaseError('mapping', `Entity ${item.entityType} cannot be created through a CapTable batch`, {
+      entityType: item.entityType,
+      objectAlias: item.objectAlias,
+    });
+  }
+
+  // Preserve raw OCF compatibility at ingestion, then cross the typed SDK boundary with canonical data.
+  const data = parseOcfEntityInput(item.entityType, parseOcfObject(item.data));
+  return { type: item.entityType, data } as OcfCreateOperation;
 }
 
 function orderCreates(items: PreparedOcfObject[]): PreparedOcfObject[] {
