@@ -18,8 +18,8 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfShareNumberRange(..), shareNumberRangeCoveredByRanges, shareNumberRangesOverlap)
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
@@ -480,20 +480,6 @@ stockClassConversionOutputQuantity maps sourceStockClass conversionRight convers
         None -> pure None
     _ -> pure None
 
-stockClassConversionRightDateEligible : Time -> OcfStockClassConversionRight -> Bool
-stockClassConversionRightDateEligible conversionDate conversionRight =
-  let trigger = conversionRight.conversion_trigger
-      beforeExpiration = case conversionRight.expires_at of
-        Some expiresAt -> conversionDate <= expiresAt
-        None -> True
-      triggerDateEligible = case trigger.type_ of
-        OcfTriggerTypeTypeAutomaticOnDate -> trigger.trigger_date == Some conversionDate
-        OcfTriggerTypeTypeElectiveInRange -> case (trigger.start_date, trigger.end_date) of
-          (Some startDate, Some endDate) -> startDate <= conversionDate && conversionDate <= endDate
-          _ -> False
-        _ -> True
-  in beforeExpiration && triggerDateEligible
-
 stockConversionResultTerms :
   CapTableMaps ->
   Map Text StockClassOcfData ->
@@ -504,24 +490,23 @@ stockConversionResultTerms maps stockClassIndex sourceIssuanceData conversionDat
   case Map.lookup sourceIssuanceData.stock_class_id stockClassIndex of
     Some sourceStockClass -> do
       terms <- foldlA
-        (\resultTerms conversionRight ->
-          if stockClassConversionRightDateEligible conversionData.date conversionRight
-            then do
-              quantityOpt <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
-              case quantityOpt of
-                Some quantity -> do
-                  assertMsg
-                    ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
-                    (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
-                  pure ((StockConversionResultTerm with
-                    stock_class_id = conversionRight.converts_to_stock_class_id
-                    quantity = quantity) :: resultTerms)
-                None -> pure resultTerms
-            else pure resultTerms)
+        (\resultTerms conversionRight -> do
+          -- OCF StockClassConversionRight defines no trigger or expiration;
+          -- every schema-valid right is eligible for quantity calculation.
+          quantityOpt <- stockClassConversionOutputQuantity maps sourceStockClass conversionRight conversionData
+          case quantityOpt of
+            Some quantity -> do
+              assertMsg
+                ("Stock conversion output references missing stock class: " <> conversionRight.converts_to_stock_class_id)
+                (isSome (Map.lookup conversionRight.converts_to_stock_class_id stockClassIndex))
+              pure ((StockConversionResultTerm with
+                stock_class_id = conversionRight.converts_to_stock_class_id
+                quantity = quantity) :: resultTerms)
+            None -> pure resultTerms)
         []
         sourceStockClass.conversion_rights
       assertMsg
-        ("Stock conversion has no computable date-eligible conversion right: " <> conversionData.id)
+        ("Stock conversion has no computable conversion right: " <> conversionData.id)
         (not (null terms))
       pure terms
     None -> do
@@ -545,7 +530,7 @@ stockConversionOutputShareLot maps stockClassIndex sourceIssuanceData conversion
     [] -> pure None
     _ -> do
       assertMsg
-        ("Stock conversion output cannot be reconstructed without explicit results because multiple conversion rights are date-eligible: " <> conversionData.id)
+        ("Stock conversion output cannot be reconstructed without explicit results because multiple conversion rights are computable: " <> conversionData.id)
         False
       pure None
 
@@ -1025,7 +1010,7 @@ validateStockConversionResultIssuances maps conversionData expectedTerms = do
   case actualStockClassIdOpt of
     Some actualStockClassId ->
       assertMsg
-        ("Stock conversion results do not match any date-eligible conversion right for " <> conversionData.id <> ": found class " <> actualStockClassId <> " and quantity " <> show actualQuantity)
+        ("Stock conversion results do not match any conversion right for " <> conversionData.id <> ": found class " <> actualStockClassId <> " and quantity " <> show actualQuantity)
         (any
           (\expectedTerm ->
             expectedTerm.stock_class_id == actualStockClassId &&
@@ -1468,6 +1453,13 @@ stockClassShareEventSortKey event = case event of
   StockClassShareTerminalDelta with event_date; event_priority -> (event_date, event_priority, 1)
   StockClassShareMultiplier with event_date; event_priority -> (event_date, event_priority, 2)
   StockClassShareRetraction with event_date; event_priority -> (event_date, event_priority, 3)
+
+stockClassShareEventDate : StockClassShareEvent -> Time
+stockClassShareEventDate event = case event of
+  StockClassShareDelta with event_date -> event_date
+  StockClassShareTerminalDelta with event_date -> event_date
+  StockClassShareMultiplier with event_date -> event_date
+  StockClassShareRetraction with event_date -> event_date
 
 stockClassShareEventOnOrAfter : Time -> StockClassShareEvent -> Bool
 stockClassShareEventOnOrAfter earliest event = case event of
@@ -1988,11 +1980,132 @@ stockSecurityQuantityBeforeTerminal :
 stockSecurityQuantityBeforeTerminal eventIndex maps issuanceData eventDate =
   stockSecurityQuantityBeforeEvent eventIndex maps issuanceData (eventDate, 2, 1)
 
+validateStockSuccessorShareNumberRanges :
+  Text ->
+  StockIssuanceOcfData ->
+  StockIssuanceOcfData ->
+  Update ()
+validateStockSuccessorShareNumberRanges label sourceIssuanceData successorIssuanceData =
+  case sourceIssuanceData.share_numbers_issued of
+    [] -> pure ()
+    sourceShareNumberRanges ->
+      assertMsg
+        (label <> " share numbers are outside the source issuance range for " <> successorIssuanceData.security_id)
+        (not (null successorIssuanceData.share_numbers_issued) &&
+          all
+            (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+            successorIssuanceData.share_numbers_issued)
+
+validateStockResultShareNumberRanges :
+  CapTableMaps ->
+  Text ->
+  StockIssuanceOcfData ->
+  [Text] ->
+  Update ()
+validateStockResultShareNumberRanges maps label sourceIssuanceData resultSecurityIds =
+  mapA_
+    (\resultSecurityId ->
+      case Map.lookup resultSecurityId maps.stock_issuances_by_security_id of
+        Some resultIssuanceCid -> do
+          resultIssuance <- fetch resultIssuanceCid
+          validateStockSuccessorShareNumberRanges label sourceIssuanceData resultIssuance.issuance_data
+        -- OCF lifecycle transactions may be imported without materializing
+        -- their resulting StockIssuance objects. Partial materialization is
+        -- rejected by the existing result-coverage validation.
+        None -> pure ())
+    resultSecurityIds
+
+validateStockConsolidationShareNumberRanges :
+  Text ->
+  [StockIssuanceOcfData] ->
+  StockIssuanceOcfData ->
+  Update ()
+validateStockConsolidationShareNumberRanges label sourceIssuanceData resultIssuanceData =
+  let sourceShareNumberRanges = concatMap (\source -> source.share_numbers_issued) sourceIssuanceData
+      anyNumberedSource = any (\source -> not (null source.share_numbers_issued)) sourceIssuanceData
+      allSourcesNumbered = all (\source -> not (null source.share_numbers_issued)) sourceIssuanceData
+  in if not anyNumberedSource
+    then pure ()
+    else if allSourcesNumbered
+      then
+        assertMsg
+          (label <> " share numbers are outside the consolidated source ranges for " <> resultIssuanceData.security_id)
+          (not (null resultIssuanceData.share_numbers_issued) &&
+            all
+              (shareNumberRangeCoveredByRanges sourceShareNumberRanges)
+              resultIssuanceData.share_numbers_issued)
+      else
+      assertMsg
+        (label <> " cannot assign share numbers because not every consolidated source has share number ranges")
+        (null resultIssuanceData.share_numbers_issued)
+
 stockReductionSortKey : Time -> Optional Text -> (Time, Int, Int)
 stockReductionSortKey eventDate balanceSecurityId =
   case balanceSecurityId of
     Some _ -> (eventDate, 2, 1)
     None -> (eventDate, 1, 0)
+
+validateNumberedStockPartialReduction :
+  StockClassShareEventIndex ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  Time ->
+  Decimal ->
+  Optional Text ->
+  Update ()
+validateNumberedStockPartialReduction eventIndex maps label sourceSecurityId eventDate reductionQuantity balanceSecurityId =
+  case Map.lookup sourceSecurityId maps.stock_issuances_by_security_id of
+    Some sourceIssuanceCid -> do
+      sourceIssuance <- fetch sourceIssuanceCid
+      when (not (null sourceIssuance.issuance_data.share_numbers_issued) && isNone balanceSecurityId) do
+        currentQuantity <- stockSecurityQuantityBeforeEvent
+          eventIndex
+          maps
+          sourceIssuance.issuance_data
+          (stockReductionSortKey eventDate balanceSecurityId)
+        assertMsg
+          (label <> " partially reduces a numbered stock issuance without a balance security")
+          (reductionQuantity >= currentQuantity)
+    None -> pure ()
+
+validateNumberedStockPartialReductions : StockClassShareEventIndex -> CapTableMaps -> Update ()
+validateNumberedStockPartialReductions eventIndex maps = do
+  mapA_
+    (\cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock cancellation " <> cancellation.cancellation_data.id)
+        cancellation.cancellation_data.security_id cancellation.cancellation_data.date cancellation.cancellation_data.quantity
+        cancellation.cancellation_data.balance_security_id)
+    (Map.values maps.stock_cancellations)
+
+  mapA_
+    (\repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock repurchase " <> repurchase.repurchase_data.id)
+        repurchase.repurchase_data.security_id repurchase.repurchase_data.date repurchase.repurchase_data.quantity
+        repurchase.repurchase_data.balance_security_id)
+    (Map.values maps.stock_repurchases)
+
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock conversion " <> conversion.conversion_data.id)
+        conversion.conversion_data.security_id conversion.conversion_data.date conversion.conversion_data.quantity_converted
+        conversion.conversion_data.balance_security_id)
+    (Map.values maps.stock_conversions)
+
+  mapA_
+    (\transferCid -> do
+      transfer <- fetch transferCid
+      validateNumberedStockPartialReduction
+        eventIndex maps ("Stock transfer " <> transfer.transfer_data.id)
+        transfer.transfer_data.security_id transfer.transfer_data.date transfer.transfer_data.quantity
+        transfer.transfer_data.balance_security_id)
+    (Map.values maps.stock_transfers)
 
 stockClassQuantityAtSortKey :
   CapTableMaps ->
@@ -2121,6 +2234,7 @@ validateStockBalanceSuccessor maps label sourceIssuanceData eventDate expectedQu
       assertMsg
         (label <> " balance quantity mismatch for " <> balanceSecurityId <> ": expected " <> show expectedQuantity <> ", found " <> show balanceIssuance.issuance_data.quantity)
         (balanceIssuance.issuance_data.quantity == expectedQuantity)
+      validateStockSuccessorShareNumberRanges label sourceIssuanceData balanceIssuance.issuance_data
     None ->
       assertMsg (label <> " balance stock issuance not found: " <> balanceSecurityId) False
 
@@ -2194,16 +2308,20 @@ validateStockBalanceSuccessors eventIndex maps = do
   mapA_
     (\transferCid -> do
       transfer <- fetch transferCid
-      case transfer.transfer_data.balance_security_id of
-        Some _ -> case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
-          Some sourceIssuanceCid -> do
-            sourceIssuance <- fetch sourceIssuanceCid
-            validateStockTerminalBalanceSuccessor
-              eventIndex maps ("Stock transfer " <> transfer.transfer_data.id)
-              sourceIssuance.issuance_data transfer.transfer_data.date transfer.transfer_data.quantity
-              transfer.transfer_data.balance_security_id
-          None -> assertMsg ("Stock transfer source issuance not found: " <> transfer.transfer_data.security_id) False
-        None -> pure ())
+      case Map.lookup transfer.transfer_data.security_id maps.stock_issuances_by_security_id of
+        Some sourceIssuanceCid -> do
+          sourceIssuance <- fetch sourceIssuanceCid
+          let label = "Stock transfer " <> transfer.transfer_data.id
+          validateStockResultShareNumberRanges
+            maps label sourceIssuance.issuance_data transfer.transfer_data.resulting_security_ids
+          case transfer.transfer_data.balance_security_id of
+            Some _ ->
+              validateStockTerminalBalanceSuccessor
+                eventIndex maps label
+                sourceIssuance.issuance_data transfer.transfer_data.date transfer.transfer_data.quantity
+                transfer.transfer_data.balance_security_id
+            None -> pure ()
+        None -> assertMsg ("Stock transfer source issuance not found: " <> transfer.transfer_data.security_id) False)
     (Map.values maps.stock_transfers)
 
 validateStockTransferResultIssuances : CapTableMaps -> Update ()
@@ -2238,12 +2356,23 @@ validateStockReissuanceResultIssuances eventIndex maps =
     (\reissuanceCid -> do
       reissuance <- fetch reissuanceCid
       let label = "Stock reissuance " <> reissuance.reissuance_data.id
+      assertMsg
+        (label <> " has no resulting stock issuance")
+        (not (null reissuance.reissuance_data.resulting_security_ids))
       assertNoPartialResultingStockIssuanceCoverage label maps reissuance.reissuance_data.resulting_security_ids
       case Map.lookup reissuance.reissuance_data.security_id maps.stock_issuances_by_security_id of
         Some sourceIssuanceCid ->
           if allResultingStockIssuancesExist maps reissuance.reissuance_data.resulting_security_ids
             then do
               sourceIssuance <- fetch sourceIssuanceCid
+              case reissuance.reissuance_data.split_transaction_id of
+                Some _ -> pure ()
+                None ->
+                  validateStockResultShareNumberRanges
+                    maps
+                    label
+                    sourceIssuance.issuance_data
+                    reissuance.reissuance_data.resulting_security_ids
               let targetSortKey = (reissuance.reissuance_data.date, 3, 0)
               sourceQuantity <- stockSecurityQuantityBeforeEvent
                 eventIndex
@@ -2283,8 +2412,8 @@ validateStockConsolidationResultIssuances eventIndex maps =
             (label <> " result date mismatch for " <> consolidation.consolidation_data.resulting_security_id <> ": expected " <> show consolidation.consolidation_data.date <> ", found " <> show resultIssuance.issuance_data.date)
             (resultIssuance.issuance_data.date == consolidation.consolidation_data.date)
           let targetSortKey = (consolidation.consolidation_data.date, 3, 3)
-          sourceQuantity <- foldlA
-            (\total sourceSecurityId ->
+          (sourceQuantity, sourceIssuanceData) <- foldlA
+            (\(total, sourceData) sourceSecurityId ->
               case Map.lookup sourceSecurityId maps.stock_issuances_by_security_id of
                 Some sourceIssuanceCid -> do
                   sourceIssuance <- fetch sourceIssuanceCid
@@ -2296,12 +2425,16 @@ validateStockConsolidationResultIssuances eventIndex maps =
                     maps
                     sourceIssuance.issuance_data
                     targetSortKey
-                  pure (total + quantity)
+                  pure (total + quantity, sourceIssuance.issuance_data :: sourceData)
                 None -> do
                   assertMsg (label <> " source stock issuance not found: " <> sourceSecurityId) False
-                  pure total)
-            0.0
+                  pure (total, sourceData))
+            (0.0, [])
             consolidation.consolidation_data.security_ids
+          validateStockConsolidationShareNumberRanges
+            label
+            sourceIssuanceData
+            resultIssuance.issuance_data
           resultQuantity <- stockIssuanceQuantityAtSortKey maps resultIssuance.issuance_data targetSortKey
           assertMsg
             (label <> " resulting quantity mismatch: expected " <> show sourceQuantity <> ", found " <> show resultQuantity)
@@ -2668,9 +2801,10 @@ validateAnyConversionRightStockClassReferences label maps conversionRight = case
     validateOptionalStockClassReference (label <> " convertible conversion target") maps convertibleRight.converts_to_stock_class_id
   OcfRightWarrant warrantRight ->
     validateOptionalStockClassReference (label <> " warrant conversion target") maps warrantRight.converts_to_stock_class_id
-  OcfRightStockClass stockClassRight -> do
+  -- The DAML stock-class right carries a placeholder trigger that is absent
+  -- from the OCF schema, so only the actual stock-class target is meaningful.
+  OcfRightStockClass stockClassRight ->
     validateStockClassReference (label <> " stock class conversion target") maps stockClassRight.converts_to_stock_class_id
-    validateAnyConversionRightStockClassReferences (label <> " stock class nested trigger") maps stockClassRight.conversion_trigger.conversion_right
 
 validateConvertibleConversionRightReferences : CapTableMaps -> Update ()
 validateConvertibleConversionRightReferences maps =
@@ -2736,6 +2870,135 @@ validateStockIssuanceReferences maps =
         issuance.issuance_data.stock_legend_ids
       validateOptionalReference "Stock issuance vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
     (Map.values maps.stock_issuances)
+
+data StockIssuanceShareNumberLot = StockIssuanceShareNumberLot with
+    stock_class_id: Text
+    issuance_id: Text
+    share_lot: StockClassShareLot
+    share_number_range: OcfShareNumberRange
+  deriving (Eq, Show)
+
+stockIssuanceShareNumberLots : StockClassShareEventIndex -> CapTableMaps -> Update [StockIssuanceShareNumberLot]
+stockIssuanceShareNumberLots eventIndex maps =
+  foldlA
+    (\lots issuanceCid -> do
+      issuance <- fetch issuanceCid
+      let shareLot = stockIssuanceShareLot issuance.issuance_data
+      case stockClassShareLotCurrentQuantity eventIndex shareLot of
+        Some _ -> do
+          let issuanceLots =
+                map
+                  (\shareNumberRange -> StockIssuanceShareNumberLot with
+                    stock_class_id = issuance.issuance_data.stock_class_id
+                    issuance_id = issuance.issuance_data.id
+                    share_lot = shareLot
+                    share_number_range = shareNumberRange)
+                  issuance.issuance_data.share_numbers_issued
+          pure (issuanceLots ++ lots)
+        None -> do
+          assertMsg ("Stock issuance share number ranges cannot be validated because stock quantity history is invalid for " <> issuance.issuance_data.id) False
+          pure lots)
+    []
+    (Map.values maps.stock_issuances)
+
+validateStockIssuanceShareNumberLotDoesNotOverlap :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  Update ()
+validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex lot other =
+  when (lot.issuance_id /= other.issuance_id && lot.stock_class_id == other.stock_class_id && shareNumberRangesOverlap lot.share_number_range other.share_number_range) do
+    overlapsWhileActive <- stockIssuanceShareNumberLotsOverlapWhileActive eventIndex lot other
+    when overlapsWhileActive do
+      assertMsg
+        ("Stock issuance share number ranges overlap for stock class " <> lot.stock_class_id <> ": " <> lot.issuance_id <> " overlaps " <> other.issuance_id)
+        False
+
+addStockIssuanceShareNumberLot : StockIssuanceShareNumberLot -> Map Text [StockIssuanceShareNumberLot] -> Map Text [StockIssuanceShareNumberLot]
+addStockIssuanceShareNumberLot lot index =
+  Map.insert lot.stock_class_id (lot :: fromOptional [] (Map.lookup lot.stock_class_id index)) index
+
+stockIssuanceShareNumberLotIndex : [StockIssuanceShareNumberLot] -> Map Text [StockIssuanceShareNumberLot]
+stockIssuanceShareNumberLotIndex lots =
+  foldl (\index lot -> addStockIssuanceShareNumberLot lot index) Map.empty lots
+
+stockIssuanceShareNumberLotRelevantDates :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  [Time]
+stockIssuanceShareNumberLotRelevantDates eventIndex lot other =
+  map
+    stockClassShareEventDate
+    (stockClassShareLotEvents eventIndex lot.share_lot ++ stockClassShareLotEvents eventIndex other.share_lot)
+
+stockIssuanceShareNumberLotActiveAt :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  Time ->
+  Optional Bool
+stockIssuanceShareNumberLotActiveAt eventIndex lot asOf =
+  case stockClassShareLotQuantityAt eventIndex lot.share_lot asOf of
+    Some quantity -> Some (quantity > 0.0)
+    None -> None
+
+stockIssuanceShareNumberLotsOverlapOnDate :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  Time ->
+  Update Bool
+stockIssuanceShareNumberLotsOverlapOnDate eventIndex lot other asOf =
+  case (stockIssuanceShareNumberLotActiveAt eventIndex lot asOf, stockIssuanceShareNumberLotActiveAt eventIndex other asOf) of
+    (Some lotActive, Some otherActive) -> pure (lotActive && otherActive)
+    _ -> do
+      assertMsg ("Stock issuance share number ranges cannot be validated because stock quantity history is invalid for " <> lot.issuance_id <> " or " <> other.issuance_id) False
+      pure False
+
+stockIssuanceShareNumberLotsOverlapWhileActive :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  StockIssuanceShareNumberLot ->
+  Update Bool
+stockIssuanceShareNumberLotsOverlapWhileActive eventIndex lot other =
+  foldlA
+    (\overlaps asOf ->
+      if overlaps
+        then pure True
+        else stockIssuanceShareNumberLotsOverlapOnDate eventIndex lot other asOf)
+    False
+    (stockIssuanceShareNumberLotRelevantDates eventIndex lot other)
+
+validateStockIssuanceShareNumberLotAgainstRest :
+  StockClassShareEventIndex ->
+  StockIssuanceShareNumberLot ->
+  [StockIssuanceShareNumberLot] ->
+  Update ()
+validateStockIssuanceShareNumberLotAgainstRest eventIndex lot lots =
+  mapA_ (validateStockIssuanceShareNumberLotDoesNotOverlap eventIndex lot) lots
+
+validateStockClassShareNumberLotsDoNotOverlap :
+  StockClassShareEventIndex ->
+  [StockIssuanceShareNumberLot] ->
+  Update ()
+validateStockClassShareNumberLotsDoNotOverlap eventIndex lots = case lots of
+  lot :: rest -> do
+    validateStockIssuanceShareNumberLotAgainstRest eventIndex lot rest
+    validateStockClassShareNumberLotsDoNotOverlap eventIndex rest
+  _ -> pure ()
+
+validateStockIssuanceShareNumberLotsDoNotOverlap : StockClassShareEventIndex -> [StockIssuanceShareNumberLot] -> Update ()
+validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots =
+  mapA_
+    (validateStockClassShareNumberLotsDoNotOverlap eventIndex)
+    (Map.values (stockIssuanceShareNumberLotIndex lots))
+
+validateStockIssuanceShareNumberRanges : CapTableMaps -> Update ()
+validateStockIssuanceShareNumberRanges maps = do
+  eventIndex <- stockClassShareEventIndex maps
+  validateNumberedStockPartialReductions eventIndex maps
+  lots <- stockIssuanceShareNumberLots eventIndex maps
+  validateStockIssuanceShareNumberLotsDoNotOverlap eventIndex lots
 
 validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
 validateEquityCompensationIssuanceReferences maps =
@@ -5473,6 +5736,7 @@ template CapTable
         validateValuationStockClassReferences finalMaps
         validateStockPlanReferences finalMaps
         validateStockIssuanceReferences finalMaps
+        validateStockIssuanceShareNumberRanges finalMaps
         validateEquityCompensationIssuanceReferences finalMaps
         validateWarrantIssuanceReferences finalMaps
         validateVestingTransactionConditionReferences finalMaps

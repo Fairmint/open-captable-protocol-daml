@@ -1,6 +1,11 @@
 module OpenCapTable.TestStockIssuance where
 
 import Fairmint.OpenCapTable.OCF.StockIssuance
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
 import OpenCapTable.TestHelpers
@@ -11,6 +16,11 @@ import Daml.Script
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfSecurityExemption(..), OcfShareNumberRange(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+
+shareRange : Decimal -> Decimal -> OcfShareNumberRange
+shareRange start end = OcfShareNumberRange with
+  starting_share_number = start
+  ending_share_number = end
 
 -- Test creating a basic stock issuance using helpers
 testCreateStockIssuance = script do
@@ -80,4 +90,595 @@ testStockIssuance_OptionalsSome = script do
         comments = ["Initial issuance"]
 
   _ <- createStockIssuanceWith issuer referenceResult.updatedCapTableCid issuance
+  pure ()
+
+testStockIssuance_InvalidCostBasisRejectedOnCreate = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let issuance = (defaultStockIssuance "TX_STOCK_INVALID_COST_BASIS_CREATE" "SEC-STOCK-INVALID-COST-BASIS-CREATE" stakeholderId classId) with
+        cost_basis = Some (OcfMonetary with amount = 100.0, currency = "usd")
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuance]
+      edits = []
+      deletes = []
+
+testStockIssuance_InvalidCostBasisRejectedOnEdit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let issuance = (defaultStockIssuance "TX_STOCK_INVALID_COST_BASIS_EDIT" "SEC-STOCK-INVALID-COST-BASIS-EDIT" stakeholderId classId) with
+        cost_basis = Some (OcfMonetary with amount = 100.0, currency = "USD")
+  capTableIssued <- createStockIssuanceWith issuer capTableReady issuance
+
+  submitMustFail issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates = []
+      edits = [CT.OcfEditStockIssuance (issuance with
+        cost_basis = Some (OcfMonetary with amount = -1.0, currency = "USD"))]
+      deletes = []
+
+testStockIssuanceShareNumberRangesCanMatchQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let issuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_OK" "SEC-SHARE-NUMBERS-OK" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 5.0, shareRange 10.0 14.0]
+
+  _ <- createStockIssuanceWith issuer cap_table' issuance
+  pure ()
+
+testStockIssuanceShareNumberRangesMustMatchQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let issuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_SHORT" "SEC-SHARE-NUMBERS-SHORT" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 9.0]
+
+  submitMustFail issuer do
+    exerciseCmd cap_table' CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuance]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCannotOverlap = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let issuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_OVERLAP" "SEC-SHARE-NUMBERS-OVERLAP" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 5.0, shareRange 5.0 9.0]
+
+  submitMustFail issuer do
+    exerciseCmd cap_table' CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance issuance]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCannotOverlapAcrossIssuances = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_FIRST" "SEC-SHARE-NUMBERS-FIRST" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' firstIssuance
+
+  let secondIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_SECOND" "SEC-SHARE-NUMBERS-SECOND" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 5.0 14.0]
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance secondIssuance]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCanReuseRetractedRange = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_RETRACTED" "SEC-SHARE-NUMBERS-RETRACTED" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' firstIssuance
+
+  let retraction = StockRetractionOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_RETRACT"
+        date = defaultTestDate
+        security_id = firstIssuance.security_id
+        reason_text = "Retracted stock issuance for replacement"
+        comments = []
+  let replacementIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_REPLACEMENT" "SEC-SHARE-NUMBERS-REPLACEMENT" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockRetraction retraction
+        , CT.OcfCreateStockIssuance replacementIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCanReuseFullyCancelledRange = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CANCELLED" "SEC-SHARE-NUMBERS-CANCELLED" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' firstIssuance
+
+  let cancellation = StockCancellationOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_CANCEL"
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        quantity = 10.0
+        reason_text = "Cancelled before replacement"
+        security_id = firstIssuance.security_id
+        comments = []
+        balance_security_id = None
+  let replacementIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_AFTER_CANCEL" "SEC-SHARE-NUMBERS-AFTER-CANCEL" stakeholderId classId) with
+        date = DT.time (DA.date 2024 Jan 03) 0 0 0
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockIssuance replacementIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesRequireBalanceForPartialCancellation = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_PARTIAL_CANCEL_SOURCE" "SEC-SHARE-NUMBERS-PARTIAL-CANCEL-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_PARTIAL_CANCEL"
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        quantity = 40.0
+        reason_text = "Partial cancellation without a traceable remainder"
+        security_id = sourceIssuance.security_id
+        comments = []
+        balance_security_id = None]
+      edits = []
+      deletes = []
+
+testStockIssuanceShareNumberRangesFollowPartialTransferBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_TRANSFER_SOURCE" "SEC-SHARE-NUMBERS-TRANSFER-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let recipientIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_TRANSFER_RECIPIENT" "SEC-SHARE-NUMBERS-TRANSFER-RECIPIENT" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_TRANSFER_BALANCE" "SEC-SHARE-NUMBERS-TRANSFER-BALANCE" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 51.0 100.0]
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_PARTIAL_TRANSFER"
+        date = transferDate
+        quantity = 50.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = [recipientIssuance.security_id]
+        comments = []
+        balance_security_id = Some balanceIssuance.security_id
+        consideration_text = None
+
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance recipientIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesAllowMaterializedTransferResults = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_UNMATERIALIZED_SOURCE" "SEC-SHARE-NUMBERS-UNMATERIALIZED-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_UNMATERIALIZED_TRANSFER"
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        quantity = 100.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = ["SEC-SHARE-NUMBERS-UNMATERIALIZED-RESULT"]
+        comments = []
+        balance_security_id = None
+        consideration_text = None
+  let resultIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_UNMATERIALIZED_RESULT" "SEC-SHARE-NUMBERS-UNMATERIALIZED-RESULT" stakeholderId classId) with
+        date = transfer.date
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesRejectOutOfLineagePartialTransferBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_LINEAGE_SOURCE" "SEC-SHARE-NUMBERS-LINEAGE-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let recipientIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_LINEAGE_RECIPIENT" "SEC-SHARE-NUMBERS-LINEAGE-RECIPIENT" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_LINEAGE_BALANCE" "SEC-SHARE-NUMBERS-LINEAGE-BALANCE" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1_001.0 1_050.0]
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_LINEAGE_TRANSFER"
+        date = transferDate
+        quantity = 50.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = [recipientIssuance.security_id]
+        comments = []
+        balance_security_id = Some balanceIssuance.security_id
+        consideration_text = None
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance recipientIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+
+testStockIssuanceShareNumberRangesRejectOutOfLineagePartialTransferResult = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_RESULT_LINEAGE_SOURCE" "SEC-SHARE-NUMBERS-RESULT-LINEAGE-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let recipientIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_RESULT_LINEAGE_RECIPIENT" "SEC-SHARE-NUMBERS-RESULT-LINEAGE-RECIPIENT" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1_001.0 1_050.0]
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_RESULT_LINEAGE_BALANCE" "SEC-SHARE-NUMBERS-RESULT-LINEAGE-BALANCE" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 51.0 100.0]
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_RESULT_LINEAGE_TRANSFER"
+        date = transferDate
+        quantity = 50.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = [recipientIssuance.security_id]
+        comments = []
+        balance_security_id = Some balanceIssuance.security_id
+        consideration_text = None
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance recipientIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+
+testStockIssuanceShareNumberRangesRejectUnnumberedPartialTransferBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_EMPTY_BALANCE_SOURCE" "SEC-SHARE-NUMBERS-EMPTY-BALANCE-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let recipientIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_EMPTY_BALANCE_RECIPIENT" "SEC-SHARE-NUMBERS-EMPTY-BALANCE-RECIPIENT" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_EMPTY_BALANCE" "SEC-SHARE-NUMBERS-EMPTY-BALANCE" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_EMPTY_BALANCE_TRANSFER"
+        date = transferDate
+        quantity = 50.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = [recipientIssuance.security_id]
+        comments = []
+        balance_security_id = Some balanceIssuance.security_id
+        consideration_text = None
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance recipientIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesRejectUntrackedPartialTransferRemainder = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_UNTRACKED_SOURCE" "SEC-SHARE-NUMBERS-UNTRACKED-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+
+  let transferDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let recipientIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_UNTRACKED_RECIPIENT" "SEC-SHARE-NUMBERS-UNTRACKED-RECIPIENT" stakeholderId classId) with
+        date = transferDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let transfer = StockTransferOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_UNTRACKED_TRANSFER"
+        date = transferDate
+        quantity = 50.0
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = [recipientIssuance.security_id]
+        comments = []
+        balance_security_id = None
+        consideration_text = None
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance recipientIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesPreservedAcrossReissuance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourceIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_REISSUANCE_SOURCE" "SEC-SHARE-NUMBERS-REISSUANCE-SOURCE" stakeholderId classId) with
+        quantity = 100.0
+        share_numbers_issued = [shareRange 1.0 100.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' sourceIssuance
+  let reissuanceDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let reissuance = StockReissuanceOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_REISSUANCE"
+        date = reissuanceDate
+        security_id = sourceIssuance.security_id
+        resulting_security_ids = ["SEC-SHARE-NUMBERS-REISSUANCE-FIRST", "SEC-SHARE-NUMBERS-REISSUANCE-SECOND"]
+        comments = []
+        reason_text = Some "Replacement certificates"
+        split_transaction_id = None
+  let firstResult = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_REISSUANCE_FIRST" "SEC-SHARE-NUMBERS-REISSUANCE-FIRST" stakeholderId classId) with
+        date = reissuanceDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let invalidSecondResult = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_REISSUANCE_SECOND" "SEC-SHARE-NUMBERS-REISSUANCE-SECOND" stakeholderId classId) with
+        date = reissuanceDate
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1_001.0 1_050.0]
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance reissuance
+        , CT.OcfCreateStockIssuance firstResult
+        , CT.OcfCreateStockIssuance invalidSecondResult
+        ]
+      edits = []
+      deletes = []
+
+  let validSecondResult = invalidSecondResult with share_numbers_issued = [shareRange 51.0 100.0]
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockReissuance reissuance
+        , CT.OcfCreateStockIssuance firstResult
+        , CT.OcfCreateStockIssuance validSecondResult
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesPreservedAcrossConsolidation = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let firstSource = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CONSOLIDATION_FIRST" "SEC-SHARE-NUMBERS-CONSOLIDATION-FIRST" stakeholderId classId) with
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let secondSource = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CONSOLIDATION_SECOND" "SEC-SHARE-NUMBERS-CONSOLIDATION-SECOND" stakeholderId classId) with
+        quantity = 50.0
+        share_numbers_issued = [shareRange 51.0 100.0]
+  sources <- submit issuer do
+    exerciseCmd cap_table' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance firstSource
+        , CT.OcfCreateStockIssuance secondSource
+        ]
+      edits = []
+      deletes = []
+  let consolidationDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+  let resultSecurityId = "SEC-SHARE-NUMBERS-CONSOLIDATED"
+  let consolidation = StockConsolidationOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_CONSOLIDATION"
+        date = consolidationDate
+        security_ids = [firstSource.security_id, secondSource.security_id]
+        resulting_security_id = resultSecurityId
+        comments = []
+        reason_text = Some "Combined certificates"
+  let resultIssuance ranges = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CONSOLIDATED" resultSecurityId stakeholderId classId) with
+        date = consolidationDate
+        quantity = 100.0
+        share_numbers_issued = ranges
+
+  submitMustFail issuer do
+    exerciseCmd sources.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation consolidation
+        , CT.OcfCreateStockIssuance (resultIssuance [shareRange 1_001.0 1_100.0])
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd sources.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation consolidation
+        , CT.OcfCreateStockIssuance (resultIssuance [shareRange 1.0 100.0])
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesAllowMixedConsolidationAsUnnumbered = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let numberedSource = (defaultStockIssuance "TX_STOCK_MIXED_CONSOLIDATION_NUMBERED" "SEC-STOCK-MIXED-CONSOLIDATION-NUMBERED" stakeholderId classId) with
+        quantity = 50.0
+        share_numbers_issued = [shareRange 1.0 50.0]
+  let unnumberedSource = (defaultStockIssuance "TX_STOCK_MIXED_CONSOLIDATION_UNNUMBERED" "SEC-STOCK-MIXED-CONSOLIDATION-UNNUMBERED" stakeholderId classId) with
+        quantity = 50.0
+        share_numbers_issued = []
+  sources <- submit issuer do
+    exerciseCmd cap_table' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance numberedSource
+        , CT.OcfCreateStockIssuance unnumberedSource
+        ]
+      edits = []
+      deletes = []
+
+  let consolidationDate = DT.time (DA.date 2024 Jan 02) 0 0 0
+      resultSecurityId = "SEC-STOCK-MIXED-CONSOLIDATION-RESULT"
+      consolidation = StockConsolidationOcfData with
+        id = "TX_STOCK_MIXED_CONSOLIDATION"
+        date = consolidationDate
+        security_ids = [numberedSource.security_id, unnumberedSource.security_id]
+        resulting_security_id = resultSecurityId
+        comments = []
+        reason_text = Some "Combine numbered and unnumbered certificates"
+      resultIssuance ranges = (defaultStockIssuance "TX_STOCK_MIXED_CONSOLIDATION-RESULT" resultSecurityId stakeholderId classId) with
+        date = consolidationDate
+        quantity = 100.0
+        share_numbers_issued = ranges
+
+  submitMustFail issuer do
+    exerciseCmd sources.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation consolidation
+        , CT.OcfCreateStockIssuance (resultIssuance [shareRange 1.0 100.0])
+        ]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd sources.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockConsolidation consolidation
+        , CT.OcfCreateStockIssuance (resultIssuance [])
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCannotOverlapBeforeRetraction = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_HISTORICAL_FIRST" "SEC-SHARE-NUMBERS-HISTORICAL-FIRST" stakeholderId classId) with
+        date = DT.time (DA.date 2024 Jan 01) 0 0 0
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+  cap_table'' <- createStockIssuanceWith issuer cap_table' firstIssuance
+
+  let secondIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_HISTORICAL_SECOND" "SEC-SHARE-NUMBERS-HISTORICAL-SECOND" stakeholderId classId) with
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        quantity = 10.0
+        share_numbers_issued = [shareRange 5.0 14.0]
+  let laterRetraction = StockRetractionOcfData with
+        id = "TX_STOCK_SHARE_NUMBERS_HISTORICAL_RETRACT"
+        date = DT.time (DA.date 2024 Jan 03) 0 0 0
+        security_id = firstIssuance.security_id
+        reason_text = "Retracted after the overlapping issuance date"
+        comments = []
+
+  submitMustFail issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance secondIssuance
+        , CT.OcfCreateStockRetraction laterRetraction
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockIssuanceShareNumberRangesCanRepeatAcrossStockClasses = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (cap_table', classId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  (cap_table'', secondClassId) <- setupStockClassWithId issuer cap_table' "SC_SHARE_NUMBER_OTHER"
+
+  let firstIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CLASS_ONE" "SEC-SHARE-NUMBERS-CLASS-ONE" stakeholderId classId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+  let secondIssuance = (defaultStockIssuance "TX_STOCK_SHARE_NUMBERS_CLASS_TWO" "SEC-SHARE-NUMBERS-CLASS-TWO" stakeholderId secondClassId) with
+        quantity = 10.0
+        share_numbers_issued = [shareRange 1.0 10.0]
+
+  _ <- submit issuer do
+    exerciseCmd cap_table'' CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance firstIssuance
+        , CT.OcfCreateStockIssuance secondIssuance
+        ]
+      edits = []
+      deletes = []
   pure ()
