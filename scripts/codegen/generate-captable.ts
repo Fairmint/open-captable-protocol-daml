@@ -221,6 +221,8 @@ function discoverTypes(config: Config): TypeDef[] {
           error: `${toTitleCase(fieldSpec)} not found`,
         };
       }),
+      // Financing is the first type absent from the v0.0.2 baseline. Add every future post-v0.0.2 type here so its
+      // constructors and Optional map stay appended instead of being inserted by alphabetical codegen ordering.
       is_upgrade_append: name === 'Financing',
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
