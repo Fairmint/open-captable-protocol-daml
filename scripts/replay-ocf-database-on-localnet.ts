@@ -27,7 +27,6 @@ import {
   ReplayPhaseError,
   replayUsage,
   resolveDatabaseUrl,
-  resolveReplayRevisionContext,
   toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
@@ -448,16 +447,14 @@ function buildReport(params: {
   results: PortalReplayResult[];
   fatalFailure?: ReplayFailure;
 }): ReplayReport {
-  const revision = resolveReplayRevisionContext();
   const finishedAt = new Date();
   const passedPortalCount = params.results.filter((result) => result.success).length;
   const failedPortalCount = params.results.filter((result) => !result.success).length;
   const status = params.fatalFailure || failedPortalCount > 0 ? 'failed' : 'passed';
   return {
     database: params.options.database,
-    gitRef: revision.gitRef,
-    gitSha: revision.workflowSha,
-    contractSha: revision.contractSha,
+    gitRef: process.env['GITHUB_REF_NAME'] ?? null,
+    gitSha: process.env['GITHUB_SHA'] ?? null,
     startedAt: params.startedAt.toISOString(),
     finishedAt: finishedAt.toISOString(),
     durationMs: finishedAt.getTime() - params.startedAt.getTime(),

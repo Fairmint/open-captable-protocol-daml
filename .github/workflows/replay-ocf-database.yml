@@ -1,5 +1,5 @@
 name: Replay OCF Database on LocalNet
-run-name: OCF ${{ inputs.database }} replay of PR #${{ inputs.pr_number }} at ${{ inputs.target_sha }}
+run-name: OCF LocalNet replay (${{ inputs.database }}) at ${{ inputs.target_sha }}
 
 on:
   workflow_dispatch:
@@ -12,17 +12,13 @@ on:
         options:
           - dev
           - production
-      pr_number:
-        description: Open pull request whose exact head commit will be tested
-        required: true
-        type: number
       target_sha:
-        description: Exact 40-character pull request head commit SHA to test
+        description: Exact contract commit SHA to test
         required: true
         type: string
 
-# No implicit token access. Each job grants only the read permissions it needs.
-permissions: {}
+permissions:
+  contents: read
 
 concurrency:
   group: ocf-localnet-replay-${{ inputs.database }}
@@ -31,165 +27,26 @@ concurrency:
 jobs:
   validate-request:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      target-sha: ${{ steps.verify-pr.outputs.target-sha }}
     steps:
-      - name: Require the trusted default-branch workflow
+      - name: Validate request
         env:
           EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
-        run: |
-          if [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
-            echo "::error::Database replays may only be dispatched from the repository default branch."
-            exit 1
-          fi
-
-      - name: Verify the exact live pull request head
-        id: verify-pr
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
-        env:
-          PR_NUMBER: ${{ inputs.pr_number }}
           TARGET_SHA: ${{ inputs.target_sha }}
-        with:
-          script: |
-            const prNumber = Number(process.env.PR_NUMBER);
-            const targetSha = process.env.TARGET_SHA?.toLowerCase() ?? '';
-            if (!Number.isSafeInteger(prNumber) || prNumber <= 0) {
-              core.setFailed('pr_number must be a positive integer');
-              return;
-            }
-            if (!/^[0-9a-f]{40}$/.test(targetSha)) {
-              core.setFailed('target_sha must be an exact 40-character Git commit SHA');
-              return;
-            }
-
-            const { owner, repo } = context.repo;
-            const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
-            if (pull.state !== 'open') {
-              core.setFailed(`PR #${prNumber} is not open`);
-              return;
-            }
-            if (pull.head.repo?.full_name !== `${owner}/${repo}`) {
-              core.setFailed(`PR #${prNumber} must use a branch in ${owner}/${repo}`);
-              return;
-            }
-            if (pull.head.sha.toLowerCase() !== targetSha) {
-              core.setFailed(`PR #${prNumber} head is ${pull.head.sha}, not requested SHA ${targetSha}`);
-              return;
-            }
-            core.setOutput('target-sha', targetSha);
-            core.info(`Validated open PR #${prNumber} at exact head ${targetSha}`);
-
-  build-target-dar:
-    needs: validate-request
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    permissions:
-      contents: read
-    outputs:
-      dar_sha256: ${{ steps.package-dar.outputs.sha256 }}
-      dar_size: ${{ steps.package-dar.outputs.size }}
-      artifact_id: ${{ steps.upload-dar.outputs.artifact-id }}
-    steps:
-      # This is the only job that executes code from the target commit. It has no protected environment, no secrets,
-      # no write permission, and checkout removes its read-only credential before target code runs.
-      - name: Checkout the pinned contract commit
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-        with:
-          ref: ${{ needs.validate-request.outputs.target-sha }}
-          fetch-depth: 1
-          lfs: false
-          persist-credentials: false
-          submodules: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
-        with:
-          node-version: '22'
-
-      - name: Setup Java
-        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
-        with:
-          distribution: temurin
-          java-version: '23'
-
-      - name: Install target build dependencies without lifecycle scripts
-        run: npm ci --ignore-scripts
-
-      - name: Fetch the pinned public Splice dependency
         run: |
-          splice_sha=$(git ls-tree HEAD libs/splice | awk '$2 == "commit" { print $3 }')
-          if ! [[ "$splice_sha" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::Target commit does not pin libs/splice to an exact Git commit."
+          if [ "${{ inputs.database }}" = "production" ] && [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::Production database replays may only run from the repository default branch."
             exit 1
           fi
-          rm -rf libs/splice
-          git init libs/splice
-          git -C libs/splice remote add origin https://github.com/hyperledger-labs/splice.git
-          git -C libs/splice fetch --depth 1 origin "$splice_sha"
-          git -C libs/splice checkout --detach FETCH_HEAD
-
-      - name: Install the target Daml SDK
-        run: |
-          sdk_version=$(awk '/^sdk-version:/ { print $2; exit }' OpenCapTable-v34/daml.yaml)
-          if ! [[ "$sdk_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "::error::Target OpenCapTable package has an invalid Daml SDK version."
+          if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_sha must be an exact lowercase 40-character Git commit SHA."
             exit 1
           fi
-          curl --fail --silent --show-error --location https://get.digitalasset.com/install/install.sh | sh -s "$sdk_version"
-          echo "$HOME/.dpm/bin" >> "$GITHUB_PATH"
-
-      - name: Generate and build only the target OpenCapTable DAR
-        run: |
-          ./node_modules/.bin/tsx scripts/codegen/generate-captable.ts
-          cd OpenCapTable-v34
-          dpm build
-
-      - name: Package the single DAR artifact
-        id: package-dar
-        env:
-          TARGET_SHA: ${{ needs.validate-request.outputs.target-sha }}
-        run: |
-          mapfile -t built_dars < <(find OpenCapTable-v34/.daml/dist -maxdepth 1 -type f -name 'OpenCapTable-v34-*.dar' -print)
-          if [ "${#built_dars[@]}" -ne 1 ]; then
-            echo "::error::Expected exactly one built OpenCapTable DAR; found ${#built_dars[@]}."
-            exit 1
-          fi
-          mkdir target-dar-artifact
-          install -m 0644 "${built_dars[0]}" target-dar-artifact/OpenCapTable.dar
-          dar_size=$(stat -c '%s' target-dar-artifact/OpenCapTable.dar)
-          dar_sha256=$(sha256sum target-dar-artifact/OpenCapTable.dar | awk '{ print $1 }')
-          artifact_name="ocp-target-dar-${GITHUB_RUN_ID}-${TARGET_SHA}"
-          {
-            echo "size=$dar_size"
-            echo "sha256=$dar_sha256"
-            echo "artifact_name=$artifact_name"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Upload the single target DAR
-        id: upload-dar
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
-        with:
-          name: ${{ steps.package-dar.outputs.artifact_name }}
-          path: target-dar-artifact/OpenCapTable.dar
-          if-no-files-found: error
-          retention-days: 1
 
   replay:
-    needs:
-      - validate-request
-      - build-target-dar
-    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    needs: validate-request
     runs-on: ubuntu-latest
     timeout-minutes: 240
-    permissions:
-      actions: read
-      contents: read
-    # Both environments must require approval and expose only a dedicated database_ro connection. The protected job
-    # always runs the trusted workflow commit; it never checks out or executes JavaScript or shell from the target PR.
+    # Both environments require approval and expose only a dedicated database_ro connection.
     environment:
       name: ${{ inputs.database == 'production' && 'production-data' || 'development-data' }}
     env:
@@ -200,13 +57,25 @@ jobs:
       DISABLE_FILE_LOGGER: 'true'
 
     steps:
-      - name: Checkout the trusted replay harness
+      - name: Checkout contracts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.target_sha }}
           lfs: true
           persist-credentials: false
           submodules: false
+
+      - name: Record tested contract commit
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          actual_sha=$(git rev-parse HEAD)
+          if [ "$actual_sha" != "$TARGET_SHA" ]; then
+            echo "::error::Checked out $actual_sha instead of requested $TARGET_SHA."
+            exit 1
+          fi
+          echo "OCP_REPLAY_TARGET_SHA=$actual_sha" >> "$GITHUB_ENV"
+          echo "Tested contract SHA: \`$actual_sha\`" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Setup Git LFS
         run: |
@@ -233,10 +102,10 @@ jobs:
           distribution: temurin
           java-version: '23'
 
-      - name: Install trusted npm dependencies
+      - name: Install npm dependencies
         run: npm install
 
-      - name: Initialize trusted contract submodules
+      - name: Initialize contract submodules
         run: git submodule update --init --recursive --depth 1 libs/splice
 
       - name: Restore Daml SDK cache
@@ -247,105 +116,21 @@ jobs:
           restore-keys: |
             dpm-sdk-${{ runner.os }}-
 
-      - name: Install trusted Daml SDKs
+      - name: Install Daml SDKs
         run: scripts/install-dpm-sdks.sh
 
-      - name: Build trusted replay harness and bindings
+      - name: Build selected contracts and bindings
         run: npm run codegen
 
-      - name: Test trusted replay planner and generated package
+      - name: Test replay planner and generated package
         run: npm run verify-package
-
-      - name: Download the pinned target DAR
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
-        with:
-          artifact-ids: ${{ needs.build-target-dar.outputs.artifact_id }}
-          path: target-dar
-          digest-mismatch: error
-
-      - name: Validate and install the pinned DAR
-        env:
-          EXPECTED_DAR_SHA256: ${{ needs.build-target-dar.outputs.dar_sha256 }}
-          EXPECTED_DAR_SIZE: ${{ needs.build-target-dar.outputs.dar_size }}
-        run: |
-          if ! [[ "$EXPECTED_DAR_SHA256" =~ ^[0-9a-f]{64}$ ]]; then
-            echo "::error::The target build did not provide a valid DAR digest."
-            exit 1
-          fi
-          if ! [[ "$EXPECTED_DAR_SIZE" =~ ^[0-9]+$ ]]; then
-            echo "::error::The target build did not provide a valid DAR size."
-            exit 1
-          fi
-
-          mapfile -t artifact_entries < <(find target-dar -mindepth 1 -print)
-          if [ "${#artifact_entries[@]}" -ne 1 ] || [ "${artifact_entries[0]}" != 'target-dar/OpenCapTable.dar' ]; then
-            echo "::error::The downloaded artifact must contain only OpenCapTable.dar."
-            exit 1
-          fi
-          if [ ! -f target-dar/OpenCapTable.dar ] || [ -L target-dar/OpenCapTable.dar ]; then
-            echo "::error::OpenCapTable.dar must be a regular, non-symlink file."
-            exit 1
-          fi
-
-          actual_size=$(stat -c '%s' target-dar/OpenCapTable.dar)
-          if [ "$actual_size" -ne "$EXPECTED_DAR_SIZE" ] || [ "$actual_size" -lt 1024 ] || [ "$actual_size" -gt 52428800 ]; then
-            echo "::error::OpenCapTable.dar has an unexpected size."
-            exit 1
-          fi
-          actual_sha256=$(sha256sum target-dar/OpenCapTable.dar | awk '{ print $1 }')
-          if [ "$actual_sha256" != "$EXPECTED_DAR_SHA256" ]; then
-            echo "::error::OpenCapTable.dar failed digest verification."
-            exit 1
-          fi
-
-          dpm damlc inspect-dar target-dar/OpenCapTable.dar --json > "$RUNNER_TEMP/ocp-target-dar.json"
-          node - "$RUNNER_TEMP/ocp-target-dar.json" <<'NODE'
-          const fs = require('node:fs');
-          const inspected = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
-          function findExpectedMainPackage(value) {
-            if (!value || typeof value !== 'object') return false;
-            if (Array.isArray(value)) return value.some(findExpectedMainPackage);
-            const packages = value.packages;
-            const mainId = value.main_package_id ?? value.mainPackageId;
-            if (mainId && packages && typeof packages === 'object') {
-              const metadata = packages[mainId];
-              const name = metadata?.name ?? metadata?.packageName ?? metadata?.package_name;
-              if (name === 'OpenCapTable-v34') return true;
-            }
-            const name = value.name ?? value.packageName ?? value.package_name;
-            const packageId = value.packageId ?? value.package_id;
-            if (name === 'OpenCapTable-v34' && typeof packageId === 'string') return true;
-            return Object.values(value).some(findExpectedMainPackage);
-          }
-          if (!findExpectedMainPackage(inspected)) {
-            throw new Error('DAR inspection did not identify OpenCapTable-v34 as its main package');
-          }
-          NODE
-
-          dpm damlc inspect target-dar/OpenCapTable.dar --detail 1 > "$RUNNER_TEMP/ocp-target-interface.txt"
-          required_interfaces=(
-            "module Fairmint.OpenCapTable.OcpFactory where|def \$fHasToAnyTemplateOcpFactory"
-            "module Fairmint.OpenCapTable.IssuerAuthorization where|def \$fHasToAnyTemplateIssuerAuthorization"
-            "module Fairmint.OpenCapTable.CapTable where|def \$fHasToAnyTemplateCapTable"
-          )
-          for required_interface in "${required_interfaces[@]}"; do
-            module_name=${required_interface%%|*}
-            template_marker=${required_interface#*|}
-            if ! grep -Fqx "$module_name" "$RUNNER_TEMP/ocp-target-interface.txt" || \
-              ! grep -Fq "$template_marker" "$RUNNER_TEMP/ocp-target-interface.txt"; then
-              echo "::error::Target DAR is incompatible with the trusted replay bindings: missing $module_name."
-              exit 1
-            fi
-          done
-
-          install -m 0644 target-dar/OpenCapTable.dar published-dars/OpenCapTable.dar
 
       - name: Validate environment-scoped database secret
         env:
           OCP_REPLAY_DATABASE_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
         run: |
           if [ -z "$OCP_REPLAY_DATABASE_URL" ]; then
-            echo "::error::The selected protected GitHub environment must define OCP_REPLAY_DATABASE_URL for its dedicated database_ro role."
+            echo "::error::The selected protected GitHub environment must define an OCP_REPLAY_DATABASE_URL secret for a dedicated read-only role."
             exit 1
           fi
 
@@ -367,12 +152,18 @@ jobs:
       - name: Replay every committed OCF object
         id: replay
         env:
-          OCP_REPLAY_CONTRACT_SHA: ${{ needs.validate-request.outputs.target-sha }}
           POSTGRES_DB_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
           POSTGRES_SSL_CA: ${{ secrets.OCP_REPLAY_SSL_CA }}
-        # Keep raw runtime output out of the Actions log and uploaded artifacts. The replay always writes a separate,
-        # payload-free public report for diagnosis.
-        run: npm run replay-ocf:localnet -- --database "${{ inputs.database }}" > "$RUNNER_TEMP/ocf-replay.log" 2>&1
+        run: |
+          set +e
+          GITHUB_SHA="$OCP_REPLAY_TARGET_SHA" npm run replay-ocf:localnet -- --database "${{ inputs.database }}" \
+            > "$RUNNER_TEMP/ocf-replay.log" 2>&1
+          replay_status=$?
+          set -e
+          if [ "$replay_status" -ne 0 ]; then
+            echo "::error::OCF replay failed. See the sanitized replay report artifact for details."
+          fi
+          exit "$replay_status"
         timeout-minutes: 120
 
       # Canton command logs may contain submitted OCF payloads. Only inspect them when replay never started.
@@ -384,7 +175,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ocf-localnet-replay-${{ inputs.database }}-${{ needs.validate-request.outputs.target-sha }}-${{ github.run_id }}
+          name: ocf-localnet-replay-${{ inputs.database }}-${{ github.run_id }}
           path: artifacts/ocf-localnet-replay/
           if-no-files-found: warn
           retention-days: 7
