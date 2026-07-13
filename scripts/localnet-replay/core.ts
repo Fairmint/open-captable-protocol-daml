@@ -77,7 +77,10 @@ export interface PortalReplayResult {
 export interface ReplayReport {
   database: DatabaseSource;
   gitRef: string | null;
+  /** Trusted workflow commit that executed the replay harness. */
   gitSha: string | null;
+  /** Exact contract commit whose DAR was uploaded to LocalNet. */
+  contractSha: string | null;
   startedAt: string;
   finishedAt: string;
   durationMs: number;
@@ -94,7 +97,10 @@ export interface ReplayReport {
 export interface PublicReplayReport {
   database: DatabaseSource;
   gitRef: string | null;
+  /** Trusted workflow commit that executed the replay harness. */
   gitSha: string | null;
+  /** Exact contract commit whose DAR was uploaded to LocalNet. */
+  contractSha: string | null;
   startedAt: string;
   finishedAt: string;
   durationMs: number;
@@ -124,7 +130,32 @@ export class ReplayPhaseError extends Error {
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const GIT_SHA_REGEX = /^[0-9a-f]{40}$/i;
 const RUN_ALIAS_KEY = randomBytes(32);
+
+export interface ReplayRevisionContext {
+  gitRef: string | null;
+  workflowSha: string | null;
+  contractSha: string | null;
+}
+
+function readOptionalGitSha(name: 'GITHUB_SHA' | 'OCP_REPLAY_CONTRACT_SHA', env: NodeJS.ProcessEnv): string | null {
+  const value = env[name]?.trim();
+  if (!value) return null;
+  if (!GIT_SHA_REGEX.test(value)) {
+    throw new ReplayPhaseError('infrastructure', `${name} must be an exact 40-character Git commit SHA`);
+  }
+  return value.toLowerCase();
+}
+
+export function resolveReplayRevisionContext(env: NodeJS.ProcessEnv = process.env): ReplayRevisionContext {
+  const workflowSha = readOptionalGitSha('GITHUB_SHA', env);
+  return {
+    gitRef: env['GITHUB_REF_NAME']?.trim() ?? null,
+    workflowSha,
+    contractSha: readOptionalGitSha('OCP_REPLAY_CONTRACT_SHA', env) ?? workflowSha,
+  };
+}
 
 export function replayUsage(): string {
   return `
@@ -436,6 +467,8 @@ export function renderReplayMarkdown(report: ReplayReport): string {
     `- Status: **${report.status.toUpperCase()}**`,
     `- Source: **${report.database}** database (read-only snapshot)`,
     `- Ref: \`${report.gitRef ?? 'local'}\``,
+    `- Trusted workflow SHA: \`${report.gitSha ?? 'local'}\``,
+    `- Tested contract SHA: \`${report.contractSha ?? 'local'}\``,
     `- Duration: ${(report.durationMs / 1000).toFixed(1)}s`,
     '',
   ];
@@ -471,6 +504,7 @@ export function toPublicReplayReport(report: ReplayReport): PublicReplayReport {
     database: report.database,
     gitRef: report.gitRef,
     gitSha: report.gitSha,
+    contractSha: report.contractSha,
     startedAt: report.startedAt,
     finishedAt: report.finishedAt,
     durationMs: report.durationMs,
