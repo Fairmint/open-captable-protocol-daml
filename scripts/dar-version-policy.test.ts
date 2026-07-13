@@ -1,209 +1,136 @@
 import assert from 'node:assert/strict';
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import test from 'node:test';
 
-import { getDarLockKey, type DarsLock, type DarsLockEntry } from './dar-utils';
+import { ensureBackupFile } from './backup-dar';
+import { computeSha256, type DarsLock, type DarsLockEntry } from './dar-utils';
 import {
   assertDeploymentUpload,
   assertHistoryRetention,
   assertPackagePolicy,
   deploymentTagName,
+  expectedCandidateVersion,
   nextPatch,
-  parseDeploymentTagName,
   planCandidateBackup,
-  selectCandidateAnchor,
+  type DeploymentState,
   type DeploymentTag,
 } from './dar-version-policy';
-import type { PackageConfig } from './packages';
 import type { ContractNetwork } from './types';
 
 const NAME = 'OpenCapTable-v34';
-const HASH_A = 'a'.repeat(64);
-const HASH_B = 'b'.repeat(64);
-const HASH_C = 'c'.repeat(64);
-
-function pkg(version: string): PackageConfig {
-  return { name: NAME, darName: NAME, sourceDir: NAME, version };
-}
+const A = 'a'.repeat(64);
+const B = 'b'.repeat(64);
+const C = 'c'.repeat(64);
 
 function entry(sha256: string, networks: string[] = []): DarsLockEntry {
   return { sha256, size: 10, sdkVersion: '3.4.10', uploadedAt: '2026-01-01T00:00:00.000Z', networks };
 }
 
-function lock(...items: Array<[version: string, sha256: string, networks?: string[], file?: string]>): DarsLock {
+function lock(...items: Array<[string, string, string[]?]>): DarsLock {
   return {
     version: 1,
     packages: Object.fromEntries(
-      items.map(([version, sha256, networks = [], file = `${NAME}.dar`]) => [
-        `${NAME}/${version}/${file}`,
-        entry(sha256, networks),
-      ])
+      items.map(([version, hash, networks = []]) => [`${NAME}/${version}/${NAME}.dar`, entry(hash, networks)])
     ),
   };
 }
 
-function tag(network: ContractNetwork, version: string, sha256: string): DeploymentTag {
-  return {
-    name: deploymentTagName(network, NAME, version),
-    network,
-    packageName: NAME,
-    version,
-    sha256,
-    entry: entry(sha256),
-  };
+function tag(network: ContractNetwork, version: string, sha256: string, networks: string[] = []): DeploymentTag {
+  return { name: deploymentTagName(network, version), version, sha256, entry: entry(sha256, networks) };
 }
 
-void test('only deployment tags are evidence and patch increments do not roll minor', () => {
-  assert.equal(parseDeploymentTagName('OpenCapTable-v34-v1.2.3'), null);
-  assert.deepEqual(parseDeploymentTagName('dar-deploy/devnet/OpenCapTable-v34/v1.2.3'), {
-    name: 'dar-deploy/devnet/OpenCapTable-v34/v1.2.3',
-    network: 'devnet',
-    packageName: NAME,
-    version: '1.2.3',
-  });
+function state(
+  latestDevnet: DeploymentTag | null = null,
+  currentDevnet: DeploymentTag | null = null,
+  currentMainnet: DeploymentTag | null = null
+): DeploymentState {
+  return { latestDevnet, currentDevnet, currentMainnet };
+}
+
+void test('candidate versions come only from the latest DevNet deployment tag', () => {
+  assert.equal(deploymentTagName('devnet', '1.2.3'), `dar-deploy/devnet/${NAME}/v1.2.3`);
   assert.equal(nextPatch('1.2.9'), '1.2.10');
+  assert.equal(expectedCandidateVersion(state()), '0.0.1');
+  assert.equal(expectedCandidateVersion(state(tag('devnet', '1.2.3', A))), '1.2.4');
+
+  assert.doesNotThrow(() => assertPackagePolicy(lock(['0.0.1', A, ['mainnet']]), state(), A, '0.0.1'));
+  assert.throws(() => assertPackagePolicy(lock(['0.0.2', B]), state(), B, '0.0.2'), /candidate v0\.0\.1/);
+
+  const anchor = tag('devnet', '0.0.1', A);
+  const history = lock(['0.0.1', A], ['0.0.2', B], ['0.0.9', C, ['mainnet']]);
+  assert.doesNotThrow(() => assertPackagePolicy(history, state(anchor), B, '0.0.2'));
+  assert.throws(() => assertPackagePolicy(history, state(anchor), B, '0.0.3'), /candidate v0\.0\.2/);
 });
 
-void test('an absent package starts at 0.0.1 with one candidate', () => {
-  assert.doesNotThrow(() => assertPackagePolicy(pkg('0.0.1'), lock(['0.0.1', HASH_A]), [], HASH_A));
-  assert.throws(() => assertPackagePolicy(pkg('0.0.2'), lock(['0.0.2', HASH_A]), [], HASH_A), /candidate v0\.0\.1/);
+void test('a deployed version must retain its exact tagged bytes and lock row', () => {
+  const anchor = tag('devnet', '0.0.1', A);
+  assert.doesNotThrow(() => assertPackagePolicy(lock(['0.0.1', A]), state(anchor, anchor), A, '0.0.1'));
+  assert.throws(() => assertPackagePolicy(lock(['0.0.1', B]), state(anchor, anchor), B, '0.0.1'), /immutable/);
 });
 
-void test('legacy fallback uses the highest nonempty marker and rejects ambiguous hashes', () => {
-  const history = lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B], ['0.0.3', HASH_C, ['mainnet']]);
-  assert.deepEqual(selectCandidateAnchor(pkg('0.0.4'), history, []), {
-    version: '0.0.3',
-    sha256: HASH_C,
-    source: 'legacy-marker',
-  });
+void test('base history is immutable except for the unmarked current candidate', () => {
+  const anchor = tag('devnet', '0.0.1', A, ['devnet']);
+  const base = lock(['0.0.1', A, ['devnet']], ['0.0.2', B], ['0.0.3', C, ['mainnet']]);
+  const changedCandidate = lock(['0.0.1', A, ['devnet']], ['0.0.2', C], ['0.0.3', C, ['mainnet']]);
+  assert.doesNotThrow(() => assertHistoryRetention(base, changedCandidate, state(anchor), '0.0.2'));
   assert.throws(
     () =>
-      selectCandidateAnchor(
-        pkg('0.0.2'),
-        lock(['0.0.1', HASH_A, ['devnet']], ['0.0.1', HASH_B, ['mainnet'], 'alias.dar']),
-        []
+      assertHistoryRetention(
+        base,
+        lock(['0.0.1', A, ['devnet']], ['0.0.2', C], ['0.0.3', A, ['mainnet']]),
+        state(anchor),
+        '0.0.2'
       ),
-    /ambiguous legacy deployment hashes/
+    /must be retained/
   );
-});
-
-void test('the highest DevNet tag replaces legacy markers as the anchor', () => {
-  const history = lock(['0.0.1', HASH_A], ['0.0.9', HASH_C, ['mainnet']]);
-  assert.deepEqual(selectCandidateAnchor(pkg('0.0.2'), history, [tag('devnet', '0.0.1', HASH_A)]), {
-    version: '0.0.1',
-    sha256: HASH_A,
-    source: 'devnet-tag',
-  });
-});
-
-void test('only the latest DevNet predecessor must remain in the branch', () => {
-  const tags = [tag('devnet', '0.0.1', HASH_A), tag('devnet', '0.0.2', HASH_B)];
-  assert.doesNotThrow(() =>
-    assertPackagePolicy(pkg('0.0.3'), lock(['0.0.2', HASH_B], ['0.0.3', HASH_C]), tags, HASH_C)
-  );
-});
-
-void test('a deployed version is allowed only with its exact tagged bytes', () => {
-  const tags = [tag('devnet', '0.0.1', HASH_A)];
-  assert.doesNotThrow(() => assertPackagePolicy(pkg('0.0.1'), lock(['0.0.1', HASH_A]), tags, HASH_A));
-  assert.throws(() => assertPackagePolicy(pkg('0.0.1'), lock(['0.0.1', HASH_B]), tags, HASH_B), /immutable lock entry/);
   assert.throws(
-    () => assertPackagePolicy(pkg('0.0.1'), lock(['0.0.1', HASH_A, ['devnet']]), tags, HASH_A),
-    /immutable lock entry/
+    () => assertHistoryRetention(lock(['0.0.1', A, ['devnet']]), lock(['0.0.1', B]), state(), '0.0.1'),
+    /must be retained/
   );
 });
 
-void test('candidate is exactly one patch above the anchor while uncertain historical rows are retained', () => {
-  const valid = lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B]);
-  assert.doesNotThrow(() => assertPackagePolicy(pkg('0.0.2'), valid, [], HASH_B));
-  assert.throws(
-    () => assertPackagePolicy(pkg('0.0.3'), lock(['0.0.1', HASH_A, ['devnet']], ['0.0.3', HASH_C]), [], HASH_C),
-    /candidate v0\.0\.2/
-  );
-  assert.doesNotThrow(() =>
-    assertPackagePolicy(
-      pkg('0.0.2'),
-      lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B], ['0.0.3', HASH_C]),
-      [],
-      HASH_B
-    )
-  );
-});
-
-void test('backup replaces only the expected candidate and preserves all historical rows', () => {
-  const history = lock(['0.0.1', HASH_A], ['0.0.2', HASH_B], ['0.0.3', HASH_C], ['0.0.4', HASH_A, ['mainnet']]);
-  assert.deepEqual(planCandidateBackup(pkg('0.0.2'), history, [tag('devnet', '0.0.1', HASH_A)], HASH_C, 11), {
+void test('backup planning replaces only an unmarked candidate', () => {
+  const anchor = tag('devnet', '0.0.1', A);
+  assert.deepEqual(planCandidateBackup(lock(['0.0.1', A], ['0.0.2', B]), state(anchor), C, 11, '0.0.2'), {
     replace: true,
   });
-  assert.throws(
-    () => planCandidateBackup(pkg('0.0.1'), history, [tag('devnet', '0.0.1', HASH_A)], HASH_B, 10),
-    /cannot be replaced/
-  );
-});
-
-void test('only the canonical current candidate row may change relative to the base tree', () => {
-  assert.doesNotThrow(() => {
-    const base = lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B], ['0.0.3', HASH_C]);
-    const current = lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_C], ['0.0.3', HASH_C]);
-    assertHistoryRetention(pkg('0.0.2'), base, current, []);
+  assert.throws(() => planCandidateBackup(lock(['0.0.1', A]), state(anchor, anchor), B, 10, '0.0.1'), /immutable/);
+  assert.deepEqual(planCandidateBackup(lock(['0.0.1', A, ['mainnet']]), state(), A, 10, '0.0.1'), {
+    replace: false,
   });
-  assert.throws(
-    () => assertHistoryRetention(pkg('0.0.2'), lock(['0.0.1', HASH_A, ['devnet']]), lock(['0.0.1', HASH_A, []]), []),
-    /must be retained/
-  );
-  assert.throws(
-    () =>
-      assertHistoryRetention(
-        pkg('0.0.2'),
-        lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B]),
-        lock(['0.0.1', HASH_A, ['devnet']], ['0.0.2', HASH_B, ['devnet']]),
-        []
-      ),
-    /must be retained/
-  );
-  assert.throws(
-    () =>
-      assertHistoryRetention(
-        pkg('0.0.2'),
-        lock(['0.0.1', HASH_A, ['devnet']], ['0.0.3', HASH_C]),
-        lock(['0.0.1', HASH_A, ['devnet']]),
-        []
-      ),
-    /must be retained/
-  );
 });
 
-void test('Mainnet requires the same-version exact DevNet hash and no newer Mainnet tag', () => {
-  const current = pkg('0.0.2');
-  assert.doesNotThrow(() => assertDeploymentUpload('mainnet', current, HASH_B, [tag('devnet', '0.0.2', HASH_B)]));
-  assert.throws(() => assertDeploymentUpload('mainnet', current, HASH_B, []), /Mainnet requires/);
-  assert.throws(
-    () => assertDeploymentUpload('mainnet', current, HASH_B, [tag('devnet', '0.0.2', HASH_A)]),
-    /not current hash/
-  );
-  assert.throws(
-    () =>
-      assertDeploymentUpload('mainnet', current, HASH_B, [
-        tag('devnet', '0.0.2', HASH_B),
-        tag('mainnet', '0.0.3', HASH_C),
-      ]),
-    /Newer Mainnet deployment/
-  );
+void test('backup restoration repairs missing and corrupt files with unchanged lock metadata', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'dar-backup-'));
+  try {
+    const source = path.join(dir, 'source.dar');
+    const destination = path.join(dir, 'backup.dar');
+    fs.writeFileSync(source, 'fresh DAR bytes');
+    const sha256 = computeSha256(source);
+    const { size } = fs.statSync(source);
+    assert.equal(ensureBackupFile(source, destination, sha256, size), true);
+    assert.equal(ensureBackupFile(source, destination, sha256, size), false);
+    fs.writeFileSync(destination, 'corrupt');
+    assert.equal(ensureBackupFile(source, destination, sha256, size), true);
+    assert.deepEqual([computeSha256(destination), fs.statSync(destination).size], [sha256, size]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
-void test('an exact existing tag makes a release rerun idempotent, but a different hash fails', () => {
-  assert.deepEqual(assertDeploymentUpload('devnet', pkg('0.0.2'), HASH_B, [tag('devnet', '0.0.2', HASH_B)]), {
+void test('deployment gates are idempotent and Mainnet requires the exact DevNet hash', () => {
+  assert.deepEqual(assertDeploymentUpload('devnet', B, state(tag('devnet', '0.0.1', A)), '0.0.2'), {
+    tagExists: false,
+  });
+  const devnet = tag('devnet', '0.0.2', B);
+  assert.deepEqual(assertDeploymentUpload('devnet', B, state(devnet, devnet), '0.0.2'), { tagExists: true });
+  assert.deepEqual(assertDeploymentUpload('mainnet', B, state(devnet, devnet), '0.0.2'), { tagExists: false });
+  assert.throws(() => assertDeploymentUpload('mainnet', A, state(), '0.0.1'), /Mainnet requires/);
+  assert.throws(() => assertDeploymentUpload('mainnet', C, state(devnet, devnet), '0.0.2'), /immutable/);
+  const mainnet = tag('mainnet', '0.0.2', B);
+  assert.deepEqual(assertDeploymentUpload('mainnet', B, state(devnet, devnet, mainnet), '0.0.2'), {
     tagExists: true,
   });
-  assert.throws(
-    () => assertDeploymentUpload('devnet', pkg('0.0.2'), HASH_B, [tag('devnet', '0.0.2', HASH_A)]),
-    /not current hash/
-  );
-  assert.deepEqual(
-    assertDeploymentUpload('mainnet', pkg('0.0.2'), HASH_B, [
-      tag('devnet', '0.0.2', HASH_B),
-      tag('mainnet', '0.0.2', HASH_B),
-    ]),
-    { tagExists: true }
-  );
-  assert.equal(getDarLockKey(NAME, '0.0.2', NAME), `${NAME}/0.0.2/${NAME}.dar`);
 });
