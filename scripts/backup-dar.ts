@@ -6,7 +6,7 @@ import * as path from 'path';
 import * as yaml from 'yaml';
 
 import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock, saveDarsLock } from './dar-utils';
-import { planCandidateBackup, readDeploymentTags } from './dar-version-policy';
+import { planCandidateBackup, readDeploymentState } from './dar-version-policy';
 import { getAllPackages, getPackage, parsePackageArg, parseVersionArg } from './packages';
 
 function usage(message?: string): never {
@@ -27,6 +27,29 @@ function sdkVersion(sourceDir: string): string {
   return parsed['sdk-version'] ?? 'unknown';
 }
 
+/** Restore a missing/corrupt backup atomically, then verify both its hash and size. */
+export function ensureBackupFile(source: string, destination: string, sha256: string, size: number): boolean {
+  const valid =
+    fs.existsSync(destination) && fs.statSync(destination).size === size && computeSha256(destination) === sha256;
+  if (!valid) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const temporary = `${destination}.tmp-${process.pid}`;
+    try {
+      fs.copyFileSync(source, temporary);
+      if (fs.statSync(temporary).size !== size || computeSha256(temporary) !== sha256) {
+        throw new Error('Temporary DAR copy failed integrity verification');
+      }
+      fs.renameSync(temporary, destination);
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
+  }
+  if (fs.statSync(destination).size !== size || computeSha256(destination) !== sha256) {
+    throw new Error('Backed-up DAR failed integrity verification');
+  }
+  return !valid;
+}
+
 function main(): void {
   const packageArg = parsePackageArg();
   const version = parseVersionArg();
@@ -42,20 +65,12 @@ function main(): void {
   const sha256 = computeSha256(source);
   const { size } = fs.statSync(source);
   const lock = loadDarsLock();
-  const plan = planCandidateBackup(pkg, lock, readDeploymentTags(pkg, root), sha256, size);
+  const plan = planCandidateBackup(lock, readDeploymentState(root), sha256, size);
   const key = getDarLockKey(pkg.name, version, pkg.darName);
   const destination = path.join(getDarsDir(), key);
+  const restored = ensureBackupFile(source, destination, sha256, size);
 
   if (plan.replace) {
-    fs.mkdirSync(path.dirname(destination), { recursive: true });
-    const temporary = `${destination}.tmp-${process.pid}`;
-    try {
-      fs.copyFileSync(source, temporary);
-      if (computeSha256(temporary) !== sha256) throw new Error('Temporary DAR copy failed integrity verification');
-      fs.renameSync(temporary, destination);
-    } finally {
-      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
-    }
     lock.packages[key] = {
       sha256,
       size,
@@ -69,13 +84,15 @@ function main(): void {
     Object.entries(lock.packages).sort(([left], [right]) => left.localeCompare(right))
   );
   saveDarsLock(lock);
-  console.log(`${plan.replace ? '✅ Backed up' : '✅ Verified'}: ${key}`);
+  console.log(`${plan.replace || restored ? '✅ Backed up' : '✅ Verified'}: ${key}`);
   console.log(`   SHA256: ${sha256}`);
 }
 
-try {
-  main();
-} catch (error) {
-  console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
 }
