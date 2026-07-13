@@ -1,0 +1,507 @@
+module OpenCapTable.TestStockSecurityBalances where
+
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+import qualified DA.Date as DA
+import DA.Date (Month(..))
+import qualified DA.Time as DT
+import Daml.Script
+
+stockRepurchase : Text -> Text -> Decimal -> Time -> StockRepurchaseOcfData
+stockRepurchase repurchaseId securityId quantity date = StockRepurchaseOcfData with
+  id = repurchaseId
+  date = date
+  security_id = securityId
+  price = OcfMonetary with amount = 1.0, currency = "USD"
+  quantity = quantity
+  balance_security_id = None
+  consideration_text = None
+  comments = []
+
+stockTransfer : Text -> Text -> Decimal -> Time -> StockTransferOcfData
+stockTransfer transferId securityId quantity date = StockTransferOcfData with
+  id = transferId
+  date = date
+  security_id = securityId
+  quantity = quantity
+  resulting_security_ids = [transferId <> "_RESULT"]
+  balance_security_id = None
+  consideration_text = None
+  comments = []
+
+stockTransferWithBalance : Text -> Text -> Decimal -> Text -> Time -> StockTransferOcfData
+stockTransferWithBalance transferId securityId quantity balanceSecurityId date =
+  (stockTransfer transferId securityId quantity date) with
+    balance_security_id = Some balanceSecurityId
+
+stockConversion : Text -> Text -> Decimal -> Time -> StockConversionOcfData
+stockConversion conversionId securityId quantity date = StockConversionOcfData with
+  id = conversionId
+  date = date
+  security_id = securityId
+  quantity_converted = quantity
+  resulting_security_ids = [conversionId <> "_RESULT"]
+  balance_security_id = None
+  comments = []
+
+stockRetraction : Text -> Text -> Time -> StockRetractionOcfData
+stockRetraction retractionId securityId date = StockRetractionOcfData with
+  id = retractionId
+  date = date
+  security_id = securityId
+  reason_text = "Retracted stock issuance"
+  comments = []
+
+stockReissuance : Text -> Text -> Time -> StockReissuanceOcfData
+stockReissuance reissuanceId securityId date = StockReissuanceOcfData with
+  id = reissuanceId
+  date = date
+  security_id = securityId
+  resulting_security_ids = [reissuanceId <> "_RESULT"]
+  split_transaction_id = None
+  reason_text = None
+  comments = []
+
+stockConsolidation : Text -> [Text] -> Time -> StockConsolidationOcfData
+stockConsolidation consolidationId securityIds date = StockConsolidationOcfData with
+  id = consolidationId
+  date = date
+  security_ids = securityIds
+  resulting_security_id = consolidationId <> "_RESULT"
+  reason_text = None
+  comments = []
+
+jan02 : Time
+jan02 = DT.time (DA.date 2024 Jan 02) 0 0 0
+
+jan03 : Time
+jan03 = DT.time (DA.date 2024 Jan 03) 0 0 0
+
+testStockSecurityBalance_CancellationCannotExceedIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_CANCEL"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_CANCEL" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_TOO_MUCH" securityId 101.0 jan02)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_NegativeReductionsCannotIncreaseBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let cancellationSecurityId = "SEC_STOCK_BAL_NEGATIVE_CANCEL"
+  let cancellationIssuance =
+        (defaultStockIssuance "TX_STOCK_BAL_NEGATIVE_CANCEL" cancellationSecurityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance cancellationIssuance
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_NEGATIVE" cancellationSecurityId (-1.0) jan02)
+        ]
+      edits = []
+      deletes = []
+
+  let repurchaseSecurityId = "SEC_STOCK_BAL_NEGATIVE_REPURCHASE"
+  let repurchaseIssuance =
+        (defaultStockIssuance "TX_STOCK_BAL_NEGATIVE_REPURCHASE" repurchaseSecurityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance repurchaseIssuance
+        , CT.OcfCreateStockRepurchase (stockRepurchase "TX_REPURCHASE_NEGATIVE" repurchaseSecurityId (-1.0) jan02)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_CumulativeReductionsCannotExceedIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_CUMULATIVE"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_CUMULATIVE" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_60" securityId 60.0 jan02)
+        , CT.OcfCreateStockRepurchase (stockRepurchase "TX_REPURCHASE_50" securityId 50.0 jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_TransferCannotExceedIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_TRANSFER"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockTransfer (stockTransfer "TX_TRANSFER_TOO_MUCH" securityId 101.0 jan02)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_BalanceSecurityRetiresSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_TRANSFER_BALANCE"
+  let transferId = "TX_TRANSFER_WITH_BALANCE"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "SEC_STOCK_BAL_REMAINDER"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER_BALANCE" securityId stakeholderId stockClassId) with quantity = 100.0
+  let resultIssuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER_RESULT" resultSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 40.0
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER_REMAINDER" balanceSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 60.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockTransfer (stockTransferWithBalance transferId securityId 40.0 balanceSecurityId jan02)
+        , CT.OcfCreateStockIssuance resultIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_OLD_SOURCE_AFTER_BALANCE" securityId 1.0 jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_FullReductionWithoutBalanceCanConsumeRemainingSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_ZERO_REMAINDER"
+  let transferId = "TX_TRANSFER_FINAL_REMAINDER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_ZERO_REMAINDER" securityId stakeholderId stockClassId) with quantity = 100.0
+  let resultIssuance = (defaultStockIssuance "TX_STOCK_BAL_FINAL_RESULT" resultSecurityId stakeholderId stockClassId) with
+        date = jan03
+        quantity = 60.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_BEFORE_BALANCE_TRANSFER" securityId 40.0 jan02)
+        , CT.OcfCreateStockTransfer (stockTransfer transferId securityId 60.0 jan03)
+        , CT.OcfCreateStockIssuance resultIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockSecurityBalance_BalanceSecurityRetirementUpdatesIssuedQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let stockClassId = "SC_STOCK_BAL_TERMINAL_INDEX"
+  (capTableWithClass, _) <- setupStockClassWith issuer cap_table (limitedStockClass stockClassId 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_STOCK_BAL_TERMINAL_INDEX" "Balance Holder"
+  let securityId = "SEC_STOCK_BAL_TERMINAL_INDEX"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_TERMINAL_INDEX" securityId stakeholderId stockClassId) with quantity = 100.0
+  capTableIssued <- createStockIssuanceWith issuer capTableReady issuance
+
+  let cancellation = (stockCancellationOn "TX_STOCK_BAL_TERMINAL_CANCEL" securityId 40.0 jan02) with
+        balance_security_id = Some "SEC_STOCK_BAL_TERMINAL_REMAINDER"
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_BAL_TERMINAL_REMAINDER" "SEC_STOCK_BAL_TERMINAL_REMAINDER" stakeholderId stockClassId) with
+        date = jan02
+        quantity = 60.0
+  let replacement = (defaultStockIssuance "TX_STOCK_BAL_TERMINAL_REPLACE" "SEC_STOCK_BAL_TERMINAL_REPLACE" stakeholderId stockClassId) with
+        date = jan03
+        quantity = 40.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableIssued CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockIssuance balanceIssuance
+        , CT.OcfCreateStockIssuance replacement
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockSecurityBalance_MissingCancellationBalanceSecurityFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_MISSING_CANCEL_REMAINDER"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_MISSING_CANCEL_REMAINDER" securityId stakeholderId stockClassId) with quantity = 100.0
+  let cancellation = (stockCancellationOn "TX_STOCK_BAL_MISSING_CANCEL_REMAINDER_CANCEL" securityId 1.0 jan02) with
+        balance_security_id = Some "SEC_STOCK_BAL_MISSING_CANCEL_REMAINDER_RESULT"
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation cancellation
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_BalanceSecurityMustMatchRemainingQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_WRONG_REMAINDER"
+  let balanceSecurityId = "SEC_STOCK_BAL_WRONG_REMAINDER_RESULT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_WRONG_REMAINDER" securityId stakeholderId stockClassId) with quantity = 100.0
+  let cancellation = (stockCancellationOn "TX_STOCK_BAL_WRONG_REMAINDER_CANCEL" securityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_BAL_WRONG_REMAINDER_RESULT" balanceSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 1.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_BalanceSecurityMustMatchSourceStockClass = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let otherStockClassId = "SC_STOCK_BAL_WRONG_CLASS"
+  (capTableWithOtherClass, _) <- setupStockClassWith issuer capTableReady (defaultStockClass otherStockClassId)
+  let securityId = "SEC_STOCK_BAL_WRONG_CLASS"
+  let balanceSecurityId = "SEC_STOCK_BAL_WRONG_CLASS_RESULT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_WRONG_CLASS" securityId stakeholderId stockClassId) with quantity = 100.0
+  let cancellation = (stockCancellationOn "TX_STOCK_BAL_WRONG_CLASS_CANCEL" securityId 40.0 jan02) with
+        balance_security_id = Some balanceSecurityId
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_BAL_WRONG_CLASS_RESULT" balanceSecurityId stakeholderId otherStockClassId) with
+        date = jan02
+        quantity = 60.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableWithOtherClass CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockCancellation cancellation
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_MissingTransferBalanceCannotFreeAuthorizedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let stockClassId = "SC_STOCK_BAL_MISSING_TRANSFER_BALANCE"
+  (capTableWithClass, _) <- setupStockClassWith issuer cap_table (limitedStockClass stockClassId 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_STOCK_BAL_MISSING_TRANSFER_BALANCE" "Transfer Holder"
+  let securityId = "SEC_STOCK_BAL_MISSING_TRANSFER_BALANCE"
+  let transferId = "TX_STOCK_BAL_MISSING_TRANSFER_BALANCE"
+  let resultSecurityId = transferId <> "_RESULT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_MISSING_TRANSFER_BALANCE_SOURCE" securityId stakeholderId stockClassId) with quantity = 100.0
+  let transfer = stockTransferWithBalance transferId securityId 40.0 "SEC_STOCK_BAL_MISSING_TRANSFER_REMAINDER" jan02
+  let transferredIssuance = (defaultStockIssuance "TX_STOCK_BAL_MISSING_TRANSFER_RESULT" resultSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 40.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance transferredIssuance
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_TransferBalanceRetirementUpdatesIssuedQuantity = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let stockClassId = "SC_STOCK_BAL_TRANSFER_TERMINAL_INDEX"
+  (capTableWithClass, _) <- setupStockClassWith issuer cap_table (limitedStockClass stockClassId 100.0)
+  (capTableReady, stakeholderId) <- setupStakeholderWithId issuer capTableWithClass "SH_STOCK_BAL_TRANSFER_TERMINAL_INDEX" "Transfer Holder"
+  let securityId = "SEC_STOCK_BAL_TRANSFER_TERMINAL_INDEX"
+  let transferId = "TX_STOCK_BAL_TERMINAL_TRANSFER"
+  let resultSecurityId = transferId <> "_RESULT"
+  let balanceSecurityId = "SEC_STOCK_BAL_TRANSFER_TERMINAL_REMAINDER"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER_TERMINAL_INDEX" securityId stakeholderId stockClassId) with quantity = 100.0
+  let transfer = stockTransferWithBalance transferId securityId 40.0 balanceSecurityId jan02
+  let transferredIssuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFERRED" resultSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 40.0
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_BAL_TRANSFER_REMAINDER" balanceSecurityId stakeholderId stockClassId) with
+        date = jan02
+        quantity = 60.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockTransfer transfer
+        , CT.OcfCreateStockIssuance transferredIssuance
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockSecurityBalance_ConversionCannotExceedIssuedShares = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_CONVERT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_CONVERT" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockConversion (stockConversion "TX_CONVERT_TOO_MUCH" securityId 101.0 jan02)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_ReductionAfterRetractionFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_RETRACTED"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_RETRACTED" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockRetraction (stockRetraction "TX_RETRACT_ALL" securityId jan02)
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_AFTER_RETRACT" securityId 1.0 jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_ReductionAfterReissuanceFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_REISSUED"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_REISSUED" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUE_ALL" securityId jan02)
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_AFTER_REISSUE" securityId 1.0 jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_TerminalEventRequiresRemainingBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_TERMINAL_ONCE"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_TERMINAL_ONCE" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUE_FIRST" securityId jan02)
+        , CT.OcfCreateStockReissuance (stockReissuance "TX_REISSUE_SECOND" securityId jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_ReductionAfterConsolidationFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_CONSOLIDATED"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_CONSOLIDATED" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockConsolidation (stockConsolidation "TX_CONSOLIDATE_ALL" [securityId] jan02)
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_AFTER_CONSOLIDATE" securityId 1.0 jan03)
+        ]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_SplitAdjustedBalanceAllowsReduction = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_SPLIT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_SPLIT" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  _ <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockClassSplit (stockClassSplitOn "TX_SPLIT_2_FOR_1" stockClassId 2.0 1.0 jan02)
+        , CT.OcfCreateStockRepurchase (stockRepurchase "TX_REPURCHASE_AFTER_SPLIT" securityId 150.0 jan03)
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testStockSecurityBalance_ReissuanceSuccessorIgnoresSameDaySplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let sourceSecurityId = "SEC_STOCK_BAL_SAME_DAY_SPLIT_SOURCE"
+      reissuanceId = "TX_STOCK_BAL_SAME_DAY_SPLIT_REISSUANCE"
+      reissuedSecurityId = reissuanceId <> "_RESULT"
+      splitId = "TX_STOCK_BAL_SAME_DAY_SPLIT"
+      transferId = "TX_STOCK_BAL_AFTER_SAME_DAY_SPLIT"
+      transferResultSecurityId = transferId <> "_RESULT"
+      finalDate = DT.time (DA.date 2024 Jan 04) 0 0 0
+      issuance = (defaultStockIssuance "TX_STOCK_BAL_SAME_DAY_SPLIT_SOURCE" sourceSecurityId stakeholderId stockClassId) with quantity = 25.0
+
+  reissued <- submit issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockClassSplit (stockClassSplitOn splitId stockClassId 2.0 1.0 jan02)
+        , stockSuccessorIssuance "TX_STOCK_BAL_SAME_DAY_SPLIT_RESULT" reissuedSecurityId stakeholderId stockClassId jan02 50.0
+        , CT.OcfCreateStockReissuance ((stockReissuance reissuanceId sourceSecurityId jan02) with split_transaction_id = Some splitId)
+        ]
+      edits = []
+      deletes = []
+
+  transferred <- submit issuer do
+    exerciseCmd reissued.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockTransfer (stockTransfer transferId reissuedSecurityId 50.0 jan03)
+        , stockSuccessorIssuance "TX_STOCK_BAL_AFTER_SAME_DAY_SPLIT_RESULT" transferResultSecurityId stakeholderId stockClassId jan03 50.0
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd transferred.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation (stockCancellationOn "TX_STOCK_BAL_REUSE_CONSUMED_REISSUANCE" reissuedSecurityId 1.0 finalDate)]
+      edits = []
+      deletes = []
+
+testStockSecurityBalance_ReverseSplitReducesAvailableBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableReady, stockClassId, stakeholderId) <- setupForStockIssuance issuer cap_table
+  let securityId = "SEC_STOCK_BAL_REVERSE_SPLIT"
+  let issuance = (defaultStockIssuance "TX_STOCK_BAL_REVERSE_SPLIT" securityId stakeholderId stockClassId) with quantity = 100.0
+
+  submitMustFail issuer do
+    exerciseCmd capTableReady CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance issuance
+        , CT.OcfCreateStockClassSplit (stockClassSplitOn "TX_REVERSE_SPLIT" stockClassId 1.0 2.0 jan02)
+        , CT.OcfCreateStockCancellation (stockCancellationOn "TX_CANCEL_AFTER_REVERSE_SPLIT" securityId 75.0 jan03)
+        ]
+      edits = []
+      deletes = []
