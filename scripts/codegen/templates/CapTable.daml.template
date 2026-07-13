@@ -15,7 +15,7 @@ import qualified DA.Map as Map
 import DA.List (sortOn)
 import DA.Action (foldlA, when)
 import DA.Foldable (mapA_)
-import DA.Optional (isNone, isSome)
+import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
@@ -32,8 +32,11 @@ import {{module}} ({{name}}(..), {{data_type}})
 
 -- | Sum type for all OCF data that can be created in a batch
 data OcfCreateData
-{{#each types_alpha}}
+{{#each types_existing}}
   {{#if @first}}={{else}}|{{/if}} OcfCreate{{name}} {{data_type}}
+{{/each}}
+{{#each types_appended}}
+  | OcfCreate{{name}} {{data_type}}
 {{/each}}
   deriving (Eq, Show)
 
@@ -41,15 +44,21 @@ data OcfCreateData
 -- Issuer is edit-only (no create/delete) - always exactly 1 issuer per CapTable
 data OcfEditData
   = OcfEditIssuer IssuerOcfData
-{{#each types_alpha}}
+{{#each types_existing}}
+  | OcfEdit{{name}} {{data_type}}
+{{/each}}
+{{#each types_appended}}
   | OcfEdit{{name}} {{data_type}}
 {{/each}}
   deriving (Eq, Show)
 
 -- | Sum type for delete operations (ID to delete, tagged by type)
 data OcfDeleteData
-{{#each types_alpha}}
+{{#each types_existing}}
   {{#if @first}}={{else}}|{{/if}} OcfDelete{{name}} Text
+{{/each}}
+{{#each types_appended}}
+  | OcfDelete{{name}} Text
 {{/each}}
   deriving (Eq, Show)
 
@@ -57,7 +66,10 @@ data OcfDeleteData
 -- CidIssuer is included for issuer edits (edit-only, no create/delete)
 data OcfContractId
   = CidIssuer (ContractId Issuer)
-{{#each types_alpha}}
+{{#each types_existing}}
+  | Cid{{name}} (ContractId {{name}})
+{{/each}}
+{{#each types_appended}}
   | Cid{{name}} (ContractId {{name}})
 {{/each}}
   deriving (Eq, Show)
@@ -76,7 +88,7 @@ data UpdateCapTableResult = UpdateCapTableResult with
 
 -- | Internal record type for passing maps through batch processing
 data CapTableMaps = CapTableMaps with
-{{#each types_alpha}}
+{{#each types_existing}}
     {{map_field}}: Map Text (ContractId {{name}})
 {{/each}}
     -- Security ID index maps (for O(1) lookup by security_id)
@@ -84,12 +96,15 @@ data CapTableMaps = CapTableMaps with
     equity_compensation_issuances_by_security_id: Map Text (ContractId EquityCompensationIssuance)
     stock_issuances_by_security_id: Map Text (ContractId StockIssuance)
     warrant_issuances_by_security_id: Map Text (ContractId WarrantIssuance)
+{{#each types_appended}}
+    {{map_field}}: Optional (Map Text (ContractId {{name}}))
+{{/each}}
   deriving (Eq, Show)
 
 -- | Extract maps from CapTable for processing
 toMaps : CapTable -> CapTableMaps
 toMaps ct = CapTableMaps with
-{{#each types_alpha}}
+{{#each types_existing}}
       {{map_field}} = ct.{{map_field}}
 {{/each}}
       -- Security ID index maps
@@ -97,6 +112,9 @@ toMaps ct = CapTableMaps with
       equity_compensation_issuances_by_security_id = ct.equity_compensation_issuances_by_security_id
       stock_issuances_by_security_id = ct.stock_issuances_by_security_id
       warrant_issuances_by_security_id = ct.warrant_issuances_by_security_id
+{{#each types_appended}}
+      {{map_field}} = ct.{{map_field}}
+{{/each}}
 
 -- | Get the processing tier for a create operation
 getCreateTier : OcfCreateData -> Int
@@ -128,6 +146,29 @@ processDelete maps deleteData = case deleteData of
       {{> delete-case}}
 {{/each}}
 
+-- | A Financing issuance ID must identify exactly one supported issuance family.
+-- Counting matches rejects both missing IDs and ambiguous cross-family collisions.
+financingIssuanceMatchCount : CapTableMaps -> Text -> Int
+financingIssuanceMatchCount maps issuanceId =
+  (if isSome (Map.lookup issuanceId maps.convertible_issuances) then 1 else 0)
+    + (if isSome (Map.lookup issuanceId maps.equity_compensation_issuances) then 1 else 0)
+    + (if isSome (Map.lookup issuanceId maps.stock_issuances) then 1 else 0)
+    + (if isSome (Map.lookup issuanceId maps.warrant_issuances) then 1 else 0)
+
+validateFinancingIssuanceReferences : CapTableMaps -> Update ()
+validateFinancingIssuanceReferences maps =
+  mapA_
+    (\financingCid -> do
+      financing <- fetch financingCid
+      mapA_
+        (\issuanceId -> do
+          let matchCount = financingIssuanceMatchCount maps issuanceId
+          assertMsg
+            ("Financing " <> financing.financing_data.id <> " issuance reference must match exactly one issuance object: " <> issuanceId <> " (matches " <> show matchCount <> ")")
+            (matchCount == 1))
+        financing.financing_data.issuance_ids)
+    (Map.values (fromOptional Map.empty maps.financings))
+
 
 -- =============================================================================
 -- CapTable Template
@@ -141,7 +182,7 @@ template CapTable
     issuer: ContractId Issuer
 
     -- OCF object/transaction maps
-{{#each types_alpha}}
+{{#each types_existing}}
     {{map_field}}: Map Text (ContractId {{name}})
 {{/each}}
 
@@ -150,6 +191,11 @@ template CapTable
     equity_compensation_issuances_by_security_id: Map Text (ContractId EquityCompensationIssuance)
     stock_issuances_by_security_id: Map Text (ContractId StockIssuance)
     warrant_issuances_by_security_id: Map Text (ContractId WarrantIssuance)
+
+    -- Optional appended maps preserve compatibility with pre-support CapTable payloads.
+{{#each types_appended}}
+    {{map_field}}: Optional (Map Text (ContractId {{name}}))
+{{/each}}
 
   where
     signatory context.issuer, context.system_operator
@@ -231,10 +277,13 @@ template CapTable
           (mapsAfterEdits, [])
           sortedCreates
 
+        -- Validate Financing references only after the complete batch state is known.
+        validateFinancingIssuanceReferences finalMaps
+
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
           issuer = newIssuerCid
-{{#each types_alpha}}
+{{#each types_existing}}
           {{map_field}} = finalMaps.{{map_field}}
 {{/each}}
           -- Security ID index maps
@@ -242,6 +291,9 @@ template CapTable
           equity_compensation_issuances_by_security_id = finalMaps.equity_compensation_issuances_by_security_id
           stock_issuances_by_security_id = finalMaps.stock_issuances_by_security_id
           warrant_issuances_by_security_id = finalMaps.warrant_issuances_by_security_id
+{{#each types_appended}}
+          {{map_field}} = finalMaps.{{map_field}}
+{{/each}}
 
         pure UpdateCapTableResult with
           updatedCapTableCid = newCapTableCid
@@ -260,8 +312,11 @@ template CapTable
       controller context.system_operator
       do
         -- Assert all entity maps are empty (caller must delete via UpdateCapTable first)
-{{#each types_alpha}}
+{{#each types_existing}}
         assertMsg "Cannot archive: {{map_field}} is not empty" (Map.null {{map_field}})
+{{/each}}
+{{#each types_appended}}
+        assertMsg "Cannot archive: {{map_field}} is not empty" (Map.null (fromOptional Map.empty {{map_field}}))
 {{/each}}
         -- Archive the issuer contract (separate contract referenced by CapTable)
         archive issuer
