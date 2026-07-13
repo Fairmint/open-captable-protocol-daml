@@ -11,6 +11,12 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
+import {
+  assertDevnetPreferencesConsistent,
+  nextDevnetCandidateVersion,
+  resolveMajorPackageLineTarget,
+} from './dar-version-policy';
+import { queryDevnetPackagePreferences } from './devnet-package-versions';
 
 interface UpgradeOptions {
   packageName: string;
@@ -20,6 +26,7 @@ interface UpgradeOptions {
 interface PackageInfo {
   currentFolder: string;
   currentMajorVersion: string;
+  currentPackageName: string;
   currentFullVersion: string;
   newFolder?: string;
   newMajorVersion?: string;
@@ -104,8 +111,9 @@ function readDamlYaml(folderPath: string): { name: string; version: string } {
 }
 
 /** Get package information for upgrade */
-function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): PackageInfo {
+async function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): Promise<PackageInfo> {
   const currentFolder = findPackageFolder(packageName);
+  const { name: currentPackageName, version: currentFullVersion } = readDamlYaml(currentFolder);
   const match = currentFolder.match(/^(.+)-(v(\d+))$/);
 
   // Check if package has version suffix
@@ -119,20 +127,14 @@ function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): Pa
       );
     }
 
-    const { version: currentFullVersion } = readDamlYaml(currentFolder);
-
-    // Minor upgrade - increment patch version
-    const versionParts = currentFullVersion.split('.');
-    if (versionParts.length !== 3) {
-      throw new Error(`Invalid version format: ${currentFullVersion}`);
-    }
-    versionParts[2] = (parseInt(versionParts[2], 10) + 1).toString();
-
+    const preferences = await queryDevnetPackagePreferences(currentPackageName);
+    assertDevnetPreferencesConsistent(preferences);
     return {
       currentFolder,
       currentMajorVersion: '', // No major version for packages without suffix
+      currentPackageName,
       currentFullVersion,
-      newFullVersion: versionParts.join('.'),
+      newFullVersion: nextDevnetCandidateVersion(preferences),
     };
   }
 
@@ -140,28 +142,23 @@ function getPackageInfo(packageName: string, upgradeType: 'major' | 'minor'): Pa
   const currentMajorVersion = match[2]; // e.g., "v07"
   const majorVersionNum = parseInt(match[3], 10); // e.g., 7
 
-  const { version: currentFullVersion } = readDamlYaml(currentFolder);
-
   const info: PackageInfo = {
     currentFolder,
     currentMajorVersion,
+    currentPackageName,
     currentFullVersion,
     newFullVersion: currentFullVersion,
   };
 
   if (upgradeType === 'major') {
-    const newMajorVersionNum = majorVersionNum + 1;
-    info.newMajorVersion = `v${newMajorVersionNum.toString().padStart(2, '0')}`;
-    info.newFolder = `${baseName}-${info.newMajorVersion}`;
-    info.newFullVersion = '0.0.1';
+    const target = await resolveMajorPackageLineTarget(baseName, majorVersionNum, queryDevnetPackagePreferences);
+    info.newMajorVersion = target.majorVersion;
+    info.newFolder = target.packageName;
+    info.newFullVersion = target.candidateVersion;
   } else {
-    // Minor upgrade - increment patch version
-    const versionParts = currentFullVersion.split('.');
-    if (versionParts.length !== 3) {
-      throw new Error(`Invalid version format: ${currentFullVersion}`);
-    }
-    versionParts[2] = (parseInt(versionParts[2], 10) + 1).toString();
-    info.newFullVersion = versionParts.join('.');
+    const preferences = await queryDevnetPackagePreferences(currentPackageName);
+    assertDevnetPreferencesConsistent(preferences);
+    info.newFullVersion = nextDevnetCandidateVersion(preferences);
   }
 
   return info;
@@ -274,11 +271,21 @@ function performMajorUpgrade(info: PackageInfo): void {
 
 /** Perform minor upgrade */
 function performMinorUpgrade(info: PackageInfo): void {
-  console.log('\n🔄 Performing MINOR upgrade...\n');
+  console.log('\n🔄 Selecting the compatible release version...\n');
   console.log(`Package: ${info.currentFolder}`);
   console.log(`Current version: ${info.currentFullVersion}`);
-  console.log(`New version: ${info.newFullVersion}`);
+  console.log(`Working version: ${info.newFullVersion}`);
   console.log();
+
+  if (info.newFullVersion === info.currentFullVersion) {
+    console.log('✅ Current version is already the one mutable candidate selected from live DevNet.');
+    console.log('\nNext steps:');
+    console.log('1. Build and test the package');
+    console.log(
+      `2. Refresh the candidate: npm run backup-dar -- --package ${info.currentPackageName} --version ${info.currentFullVersion}`
+    );
+    return;
+  }
 
   // Step 1: Update daml.yaml
   updateDamlYaml(info.currentFolder, info.newFullVersion);
@@ -296,7 +303,7 @@ function performMinorUpgrade(info: PackageInfo): void {
     console.log('  (No references found in other files)');
   }
 
-  console.log('\n✅ Minor upgrade completed successfully!');
+  console.log('\n✅ Selected exactly one patch beyond the highest live DevNet preference!');
   console.log(`\nNext steps:`);
   console.log(`1. Review changes: git diff`);
   console.log(`2. Build the package: cd ${info.currentFolder} && daml build`);
@@ -305,10 +312,10 @@ function performMinorUpgrade(info: PackageInfo): void {
 }
 
 /** Main function */
-function main(): void {
+async function main(): Promise<void> {
   try {
     const options = parseArgs();
-    const info = getPackageInfo(options.packageName, options.upgradeType);
+    const info = await getPackageInfo(options.packageName, options.upgradeType);
 
     if (options.upgradeType === 'major') {
       performMajorUpgrade(info);
@@ -326,4 +333,4 @@ function main(): void {
   }
 }
 
-main();
+void main();

@@ -1,0 +1,208 @@
+name: DAR Version Policy
+
+on:
+  pull_request_target:
+  workflow_dispatch:
+
+concurrency:
+  group: dar-version-policy-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dar-version-policy:
+    name: dar-version-policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      # pull_request_target runs this workflow and every executable below from the trusted target commit.
+      - name: Checkout trusted target code
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          # A stacked PR's base can itself be untrusted. Always execute the repository default branch.
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          lfs: true
+          submodules: false
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '20'
+
+      - name: Install trusted dependencies
+        run: npm install --ignore-scripts --no-audit --no-fund
+
+      - name: Restore Daml SDK cache
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
+        with:
+          path: ~/.dpm
+          key: dpm-sdk-${{ runner.os }}-${{ hashFiles('**/daml.yaml', 'scripts/install-dpm-sdks.sh') }}
+          restore-keys: |
+            dpm-sdk-${{ runner.os }}-
+
+      - name: Install trusted DAML SDK
+        run: scripts/install-dpm-sdks.sh
+
+      - name: Materialize pull request as data only
+        if: github.event_name == 'pull_request_target'
+        id: candidate
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin "refs/pull/${PR_NUMBER}/head"
+          if [ "$(git rev-parse FETCH_HEAD)" != "$PR_HEAD_SHA" ]; then
+            echo "::error::Fetched PR head does not match the event SHA."
+            exit 1
+          fi
+
+          lfs_include=$(npx tsx scripts/validate-pr-dar-lfs.ts --commit "$PR_HEAD_SHA")
+          if [ -n "$lfs_include" ]; then
+            git lfs fetch origin "$PR_HEAD_SHA" --include="$lfs_include" --exclude=''
+          fi
+          candidate_root="$RUNNER_TEMP/pr-candidate"
+          GIT_LFS_SKIP_SMUDGE=1 git -c core.hooksPath=/dev/null worktree add --detach "$candidate_root" "$PR_HEAD_SHA"
+          dar_paths=()
+          if [ -n "$lfs_include" ]; then
+            IFS=',' read -r -a dar_paths <<< "$lfs_include"
+          fi
+          npx tsx scripts/validate-candidate-dar-paths.ts --root "$candidate_root" -- "${dar_paths[@]}"
+          if [ "${#dar_paths[@]}" -gt 0 ]; then
+            git -C "$candidate_root" lfs checkout "${dar_paths[@]}"
+          fi
+          npx tsx scripts/validate-candidate-dar-paths.ts --root "$candidate_root" -- "${dar_paths[@]}"
+          echo "candidate_root=$candidate_root" >> "$GITHUB_OUTPUT"
+
+      - name: Detect whether Mainnet attestation is required
+        if: github.event_name == 'pull_request_target'
+        id: mainnet_requirement
+        env:
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          npx tsx scripts/mainnet-marker-attestation.ts needs-attestation \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --base-head HEAD \
+            --candidate-head "$PR_HEAD_SHA" \
+            > "$RUNNER_TEMP/mainnet-marker-requirement.json"
+          required=$(jq -er '.required' "$RUNNER_TEMP/mainnet-marker-requirement.json")
+          echo "required=$required" >> "$GITHUB_OUTPUT"
+
+      - name: Verify immutable Mainnet marker attestation
+        if: >-
+          steps.mainnet_requirement.outputs.required == 'true' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          startsWith(github.event.pull_request.head.ref, 'automation/ocp-release-')
+        id: mainnet_attestation
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          GH_TOKEN: ${{ github.token }}
+          PR_HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          attestation_dir="$RUNNER_TEMP/mainnet-marker-attestation"
+          mkdir -m 700 "$attestation_dir"
+
+          npx tsx scripts/mainnet-marker-attestation.ts parse-branch \
+            --branch "$PR_HEAD_BRANCH" > "$attestation_dir/branch.json"
+          run_id=$(jq -er '.runId' "$attestation_dir/branch.json")
+          run_attempt=$(jq -er '.runAttempt' "$attestation_dir/branch.json")
+          package=$(jq -er '.package' "$attestation_dir/branch.json")
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}" \
+            > "$attestation_dir/run.json"
+          # The marker branch is pushed before this fallible artifact upload so deployment evidence is never stranded.
+          # A synchronize check can therefore start a few seconds before upload-artifact finishes; retry only that
+          # bounded publication window, then fail closed on a missing, expired, or ambiguous artifact.
+          selection_ready=false
+          for attempt in {1..12}; do
+            gh api \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+              > "$attestation_dir/artifacts.json"
+            if npx tsx scripts/mainnet-marker-attestation.ts inspect \
+              --repository "$GITHUB_REPOSITORY" \
+              --default-branch "$DEFAULT_BRANCH" \
+              --workflow-path ".github/workflows/release.yml" \
+              --branch "$PR_HEAD_BRANCH" \
+              --workflow-run-json "$attestation_dir/run.json" \
+              --artifacts-json "$attestation_dir/artifacts.json" \
+              > "$attestation_dir/selection.json" 2> "$attestation_dir/selection-error.txt"
+            then
+              selection_ready=true
+              break
+            fi
+            if (( attempt < 12 )); then
+              sleep 5
+            fi
+          done
+          if [ "$selection_ready" != true ]; then
+            cat "$attestation_dir/selection-error.txt" >&2
+            exit 1
+          fi
+          artifact_id=$(jq -er '.artifactId' "$attestation_dir/selection.json")
+
+          gh api \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" \
+            > "$attestation_dir/artifact.zip"
+          archive_bytes=$(stat -c '%s' "$attestation_dir/artifact.zip")
+          if (( archive_bytes < 1 || archive_bytes > 1048576 )); then
+            echo "::error::Mainnet attestation archive has an unsafe size."
+            exit 1
+          fi
+          mapfile -t archive_entries < <(unzip -Z1 "$attestation_dir/artifact.zip")
+          if (( ${#archive_entries[@]} != 1 )) || [[ "${archive_entries[0]}" != "mainnet-marker-attestation.json" ]]; then
+            echo "::error::Mainnet attestation archive must contain only mainnet-marker-attestation.json."
+            exit 1
+          fi
+          unzip -p "$attestation_dir/artifact.zip" mainnet-marker-attestation.json \
+            > "$attestation_dir/mainnet-marker-attestation.json"
+          artifact_bytes=$(stat -c '%s' "$attestation_dir/mainnet-marker-attestation.json")
+          if (( artifact_bytes < 1 || artifact_bytes > 65536 )); then
+            echo "::error::Mainnet attestation JSON has an unsafe size."
+            exit 1
+          fi
+
+          npx tsx scripts/mainnet-marker-attestation.ts verify \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --default-branch "$DEFAULT_BRANCH" \
+            --workflow-path ".github/workflows/release.yml" \
+            --branch "$PR_HEAD_BRANCH" \
+            --candidate-head "$PR_HEAD_SHA" \
+            --trusted-default-head "$(git rev-parse HEAD)" \
+            --workflow-run-json "$attestation_dir/run.json" \
+            --artifact-json "$attestation_dir/mainnet-marker-attestation.json"
+
+          echo "Verified run ${run_id}, attempt ${run_attempt}, package ${package}."
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+
+      - name: Validate candidate against live DevNet
+        env:
+          CANDIDATE_ROOT: ${{ steps.candidate.outputs.candidate_root }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          MAINNET_ATTESTATION_VERIFIED: ${{ steps.mainnet_attestation.outputs.verified }}
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "pull_request_target" ]; then
+            args=(--base HEAD --candidate-root "$CANDIDATE_ROOT")
+            if [[ "$MAINNET_ATTESTATION_VERIFIED" == "true" ]]; then
+              args+=(--allow-mainnet-marker-additions)
+            fi
+            npm run check:dar-version-policy -- "${args[@]}"
+          else
+            npm run check:dar-version-policy -- --base HEAD --audit-all
+          fi

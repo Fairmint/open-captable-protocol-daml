@@ -2,8 +2,7 @@
 /**
  * Upload a DAR file to devnet or mainnet.
  *
- * Requires the DAR to be backed up first. If not backed up, the script will automatically run the backup process before
- * uploading.
+ * Requires the fresh build to exactly match the committed DAR backup. Upload never rewrites candidate bytes.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
  * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki
@@ -16,39 +15,47 @@
  * <main-dalf-id>` (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
  */
 
-import { execSync } from 'child_process';
 import * as fs from 'fs';
-import { getFreshDarPath, isDarBackedUp, recordNetworkUpload, requireBackedUpDar } from './dar-utils';
-import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
+import {
+  computeSha256,
+  getDarLockKey,
+  getFreshDarPath,
+  loadDarsLock,
+  recordNetworkUpload,
+  requireBackedUpDar,
+} from './dar-utils';
+import { assertDevnetMarkerForMainnet } from './dar-version-policy';
+import { validateDevnetDarCandidate } from './devnet-dar-policy';
+import { queryDevnetPackagePreferences } from './devnet-package-versions';
+import {
+  type PackageConfig,
+  parseNetworkArg,
+  parsePackageArg,
+  printPackageUsage,
+  requireNetwork,
+  requirePackage,
+} from './packages';
 import { LEDGER_SCRIPT_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
 
-/** Ensure the DAR is backed up before upload. If not backed up, automatically run the backup process. */
-function ensureDarBackedUp(packageName: string, version: string, darName: string): void {
-  if (isDarBackedUp(packageName, version, darName)) {
-    return;
-  }
-
-  // Check if fresh DAR exists to backup
-  const freshPath = getFreshDarPath(packageName, version, darName);
+function requireFreshDar(pkg: PackageConfig): string {
+  const freshPath = getFreshDarPath(pkg.sourceDir, pkg.version, pkg.darName);
   if (!freshPath) {
     console.error(`❌ No DAR found to backup`);
-    console.error(`   Expected: ${packageName}/.daml/dist/${darName}-${version}.dar`);
+    console.error(`   Expected: ${pkg.sourceDir}/.daml/dist/${pkg.darName}-${pkg.version}.dar`);
     console.error(`   Run "npm run build" first to build the DAR.`);
     process.exit(1);
   }
+  return freshPath;
+}
 
-  console.log(`📋 DAR not backed up yet, backing up first...\n`);
-
-  try {
-    execSync(`npm run backup-dar -- --package ${packageName} --version ${version}`, {
-      stdio: 'inherit',
-      cwd: process.cwd(),
-    });
-    console.log('');
-  } catch {
-    console.error(`\n❌ Failed to backup DAR`);
-    process.exit(1);
+function assertBuildMatchesBackup(freshPath: string, backupPath: string): void {
+  const freshHash = computeSha256(freshPath);
+  const backupHash = computeSha256(backupPath);
+  if (freshHash !== backupHash) {
+    throw new Error(
+      `Fresh build SHA256 ${freshHash} does not match committed backup ${backupHash}. Run backup-dar and commit the candidate before uploading.`
+    );
   }
 }
 
@@ -64,11 +71,31 @@ async function main() {
 
   console.log(`\n📦 Uploading ${pkg.name} v${pkg.version} to ${network}\n`);
 
-  // Ensure DAR is backed up first (auto-backup if needed)
-  ensureDarBackedUp(pkg.name, pkg.version, pkg.darName);
-
-  // Now require the backed-up DAR (this verifies integrity)
+  const freshPath = requireFreshDar(pkg);
   const darPath = requireBackedUpDar(pkg.name, pkg.version, pkg.darName);
+  assertBuildMatchesBackup(freshPath, darPath);
+  const lock = loadDarsLock();
+
+  if (network === 'mainnet') {
+    const lockKey = getDarLockKey(pkg.name, pkg.version, pkg.darName);
+    const entry = Object.prototype.hasOwnProperty.call(lock.packages, lockKey) ? lock.packages[lockKey] : undefined;
+    assertDevnetMarkerForMainnet(entry, lockKey);
+  }
+
+  // DevNet is the sole live version authority even for a Mainnet upload. Never query Mainnet package preferences.
+  const preferences = await queryDevnetPackagePreferences(pkg.name);
+  const validation = validateDevnetDarCandidate({
+    repositoryRoot: process.cwd(),
+    lock,
+    packageName: pkg.name,
+    packageVersion: pkg.version,
+    candidateDarPath: darPath,
+    preferences,
+    requireExactOnProviderCount: network === 'mainnet' ? LEDGER_SCRIPT_PROVIDERS.length : undefined,
+  });
+  console.log(
+    `✅ Live DevNet policy and ${validation.compatibilityBaselines.length} compatibility baseline(s) verified for ${validation.candidatePackageId}\n`
+  );
 
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
   // does not block the other.
@@ -123,7 +150,10 @@ async function main() {
   }
 
   recordNetworkUpload(pkg.name, pkg.version, pkg.darName, network);
-  console.log(`\n🎉 Upload complete\n`);
+  console.log(`\n🎉 Upload complete; ${network} marker recorded in dars.lock\n`);
 }
 
-void main();
+void main().catch((error: unknown) => {
+  console.error(`\n❌ ${error instanceof Error ? error.message : String(error)}`);
+  process.exit(1);
+});

@@ -1,23 +1,26 @@
 #!/usr/bin/env node
 /**
- * Backup a DAR file after mainnet upload. Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
+ * Synchronize a built DAR into dars/{package}/{version}/ and update dars.lock.
  *
- * **Retention:** When bumping a package version, add the new backup with this script but **do not remove** prior
- * `dars/<package>/<oldVersion>/` trees that are already in the repo—keep historical DARs for audit, re-upload, and
- * debugging. See the repo wiki: https://github.com/Fairmint/open-captable-protocol-daml/wiki
+ * Undeployed versions are mutable PR candidates. Live DevNet is the version authority, any recorded or exact-live DAR
+ * is immutable, and superseded undeployed backups are pruned only after integrity and live-ID checks.
  *
- * Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]
+ * Usage: tsx scripts/backup-dar.ts --package <name> --version <version>
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
-import { computeSha256, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
-import { getAllPackages, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
+import { applyBackupTransaction } from './dar-backup-transaction';
+import { computeSha256, getDarsDir, loadDarsLock, type DarsLockEntry } from './dar-utils';
+import { candidateDevnetNetworks, decideBackupMutation, planBackupRetention } from './dar-version-policy';
+import { inspectPackageBackups, validateDevnetDarCandidate } from './devnet-dar-policy';
+import { queryDevnetPackagePreferences } from './devnet-package-versions';
+import { getAllPackages, getPackage, parsePackageArg, parseVersionArg } from './packages';
 
 function printUsage(errorMessage?: string): never {
   if (errorMessage) console.error(`❌ ${errorMessage}\n`);
-  console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]');
+  console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version>');
   console.error('\nPackages:');
   for (const pkg of getAllPackages()) {
     console.error(`  ${pkg.name}`);
@@ -38,15 +41,24 @@ function getSdkVersion(sourceDir: string): string {
   }
 }
 
-function main() {
+function frozenVersionError(packageName: string, version: string): Error {
+  return new Error(
+    `${packageName} ${version} is immutable because its exact DAR is recorded on a network. ` +
+      `Run npm run upgrade-package -- --package ${packageName} --type minor to select the live DevNet candidate version.`
+  );
+}
+
+async function main(): Promise<void> {
   const packageArg = parsePackageArg();
   const version = parseVersionArg();
-  const network = parseNetworkArg();
 
   if (!packageArg || !version) printUsage('Missing required arguments');
 
   const pkg = getPackage(packageArg);
   if (!pkg) printUsage(`Unknown package: ${packageArg}`);
+  if (version !== pkg.version) {
+    printUsage(`Requested version ${version} does not match ${pkg.name}/daml.yaml (${pkg.version})`);
+  }
 
   const rootDir = path.join(__dirname, '..');
   const darsDir = getDarsDir();
@@ -65,67 +77,91 @@ function main() {
   }
 
   const lock = loadDarsLock();
+  const sourceHash = computeSha256(sourcePath);
+  const existed = Object.prototype.hasOwnProperty.call(lock.packages, lockKey);
+  const existingEntry: DarsLockEntry | undefined = existed ? lock.packages[lockKey] : undefined;
 
-  // Already backed up?
-  if (lockKey in lock.packages) {
-    console.log(`ℹ️  Already backed up: ${lockKey}`);
-
+  // Verify an existing backup before deciding whether it can be replaced.
+  if (existingEntry) {
     if (!fs.existsSync(destPath)) {
       console.error(`❌ Lock entry exists but file missing: ${destPath}`);
       process.exit(1);
     }
 
     // Verify hash
-    const hash = computeSha256(destPath);
-    if (hash !== lock.packages[lockKey].sha256) {
+    const storedHash = computeSha256(destPath);
+    if (storedHash !== existingEntry.sha256) {
       console.error(`❌ Hash mismatch! File may have been modified.`);
       process.exit(1);
     }
+  }
 
-    // Add network if specified
-    if (network && !lock.packages[lockKey].networks.includes(network)) {
-      lock.packages[lockKey].networks.push(network);
-      lock.packages[lockKey].networks.sort();
-      saveDarsLock(lock);
-      console.log(`✅ Added network: ${network}`);
-    }
+  // Query and validate even when the backup bytes already match. This turns unrecorded exact-live backups into durable
+  // DevNet history and prevents a later branch from pruning or replacing them.
+  const preferences = await queryDevnetPackagePreferences(pkg.name);
+  const inspectedBackups = inspectPackageBackups(rootDir, lock, pkg.name);
+  const validation = validateDevnetDarCandidate({
+    repositoryRoot: rootDir,
+    lock,
+    packageName: pkg.name,
+    packageVersion: version,
+    candidateDarPath: sourcePath,
+    preferences,
+  });
+  console.log(
+    `✅ Live DevNet preflight passed for ${validation.candidatePackageId} (${validation.compatibilityBaselines.length} baseline(s))`
+  );
+
+  const retentionPlan = planBackupRetention(inspectedBackups, lockKey, preferences);
+  const inspectedCurrent = inspectedBackups.find((backup) => backup.lockKey === lockKey);
+  const currentIsExactLive = Boolean(
+    inspectedCurrent &&
+    candidateDevnetNetworks(preferences, inspectedCurrent.packageVersion, inspectedCurrent.packageId).length > 0
+  );
+  const effectiveExistingEntry =
+    existingEntry && currentIsExactLive
+      ? { ...existingEntry, networks: [...new Set([...existingEntry.networks, 'devnet'])] }
+      : existingEntry;
+
+  let mutation: ReturnType<typeof decideBackupMutation>;
+  try {
+    mutation = decideBackupMutation(effectiveExistingEntry, sourceHash);
+  } catch {
+    throw frozenVersionError(pkg.name, version);
+  }
+
+  let candidateWrite;
+  if (mutation !== 'no-op') {
+    const sourceStats = fs.statSync(sourcePath);
+    candidateWrite = {
+      lockKey,
+      sourcePath,
+      destPath,
+      replaceExisting: mutation === 'replace',
+      entry: {
+        sha256: sourceHash,
+        size: sourceStats.size,
+        sdkVersion: getSdkVersion(pkg.sourceDir),
+        uploadedAt: new Date().toISOString(),
+        networks: candidateDevnetNetworks(preferences, version, validation.candidatePackageId),
+      },
+    };
+  }
+
+  applyBackupTransaction({ lock, retentionPlan, darsDir, candidateWrite });
+  for (const key of retentionPlan.freezeKeys) console.log(`🔒 Recorded exact live DevNet backup: ${key}`);
+  for (const key of retentionPlan.pruneKeys) console.log(`🧹 Pruned superseded undeployed backup: ${key}`);
+  if (mutation === 'no-op') {
+    console.log(`ℹ️  Backup already matches current build: ${lockKey}`);
     return;
   }
 
-  // Create backup
-  fs.mkdirSync(destDir, { recursive: true });
-  fs.copyFileSync(sourcePath, destPath);
-
-  const hash = computeSha256(destPath);
-  const stats = fs.statSync(destPath);
-
-  lock.packages[lockKey] = {
-    sha256: hash,
-    size: stats.size,
-    sdkVersion: getSdkVersion(pkg.sourceDir),
-    uploadedAt: new Date().toISOString(),
-    networks: network ? [network] : [],
-  };
-
-  // Sort for consistent ordering
-  const sorted: Record<string, DarsLockEntry> = {};
-  Object.keys(lock.packages)
-    .sort()
-    .forEach((k) => {
-      sorted[k] = lock.packages[k];
-    });
-  lock.packages = sorted;
-
-  saveDarsLock(lock);
-
-  console.log(`✅ Backed up: ${lockKey}`);
-  console.log(`   SHA256: ${hash}`);
-  console.log(`   Size: ${stats.size} bytes`);
+  console.log(`${existed ? '✅ Synchronized' : '✅ Backed up'}: ${lockKey}`);
+  console.log(`   SHA256: ${sourceHash}`);
+  console.log(`   Size: ${candidateWrite?.entry.size ?? 0} bytes`);
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('❌ Error:', err);
+void main().catch((err: unknown) => {
+  console.error('❌ Error:', err instanceof Error ? err.message : String(err));
   process.exit(1);
-}
+});

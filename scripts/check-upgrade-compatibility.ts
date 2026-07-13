@@ -5,15 +5,12 @@
  * against the most recent backup for each package. Fails CI if:
  *
  * - Breaking changes are introduced without a major version bump
- * - Compatible changes are made without bumping the minor version
+ * - A built DAR does not match its mutable candidate backup
  *
  * Usage: npx tsx scripts/check-upgrade-compatibility.ts
  *
- * Why can “comments only” still fail? The check compares two concrete DAR builds with the same package name and
- * version. Any source change can yield a different LF package (package id / archive bytes). The validator may then
- * reject the pair as not a valid upgrade. For non-breaking edits, bump the package patch in daml.yaml (see `npm run
- * upgrade-package` with `--type minor` for unversioned folders like CouponMinter) so CI compares backup v0.0.1 against
- * v0.0.2 instead of v0.0.1 against a different v0.0.1 build.
+ * Any source change can yield a different LF package id. Before the current version reaches a network, refresh that
+ * version's candidate backup in place. Live DevNet policy checks select the version separately.
  *
  * Every deployable package must have its **current** `daml.yaml` version recorded under `dars/` (lock entry + file on
  * disk) with a SHA256 matching the committed backup. After building, run `npx tsx scripts/backup-dar.ts --package <key>
@@ -23,11 +20,13 @@
  * name/version with different package ids, which `upgrade-check` rejects.)
  */
 
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 
+import { assertDarArchiveSafe, DAML_UPGRADE_CHECK_TIMEOUT_MS } from './dar-archive-policy';
 import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock } from './dar-utils';
+import { compareSemver, isDeployed } from './dar-version-policy';
 
 const ROOT_DIR = path.join(__dirname, '..');
 
@@ -49,19 +48,7 @@ function parsePackageName(name: string): { baseName: string; majorVersion: numbe
   return { baseName: name, majorVersion: null };
 }
 
-/** Semver compare: negative if a < b, zero if equal, positive if a > b. */
-function compareSemver(a: string, b: string): number {
-  const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
-  const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0;
-    const db = pb[i] ?? 0;
-    if (da !== db) return da - db;
-  }
-  return 0;
-}
-
-/** Get all backed-up packages from dars.lock, grouped by exact package name (file must exist on disk). */
+/** Get DevNet-marked packages from dars.lock, grouped by exact package name (file must exist on disk). */
 function getBackedUpPackages(): Map<string, Array<{ packageName: string; version: string; darPath: string }>> {
   const lock = loadDarsLock();
   const darsDir = getDarsDir();
@@ -69,7 +56,8 @@ function getBackedUpPackages(): Map<string, Array<{ packageName: string; version
   // Group by exact package name (e.g., "OpenCapTable-v34")
   const byPackageName = new Map<string, Array<{ packageName: string; version: string; darPath: string }>>();
 
-  for (const [lockKey, _entry] of Object.entries(lock.packages)) {
+  for (const [lockKey, entry] of Object.entries(lock.packages)) {
+    if (!entry.networks.includes('devnet')) continue;
     // lockKey format: "OpenCapTable-v34/0.0.1/OpenCapTable-v34.dar"
     const parts = lockKey.split('/');
     if (parts.length !== 3) continue;
@@ -159,19 +147,21 @@ function reportUpgradeFailure(packageName: string, baseName: string, output: str
     for (const line of lines.slice(-(maxLines / 2))) indent(line);
   }
   console.error('');
-  console.error(
-    `   If this was a non-breaking change, bump the patch in daml.yaml (e.g. \`npm run upgrade-package -- --package ${baseName} --type minor\`).`
-  );
+  console.error('   Fix the source or dependency change if this was expected to be backwards compatible.');
   console.error('   To introduce breaking changes, bump the major version:');
   console.error(`   npm run upgrade-package -- --package ${baseName} --type major\n`);
 }
 
 /** Run dpm upgrade-check and return success/failure. */
 function runUpgradeCheck(oldDar: string, newDar: string): { success: boolean; output: string } {
+  assertDarArchiveSafe(oldDar);
+  assertDarArchiveSafe(newDar);
   try {
-    const output = execSync(`dpm upgrade-check --both "${oldDar}" "${newDar}"`, {
+    const output = execFileSync('dpm', ['upgrade-check', '--both', oldDar, newDar], {
       encoding: 'utf8',
+      killSignal: 'SIGKILL',
       stdio: ['pipe', 'pipe', 'pipe'],
+      timeout: DAML_UPGRADE_CHECK_TIMEOUT_MS,
       env: { ...process.env, PATH: `${process.env.HOME}/.dpm/bin:${process.env.PATH}` },
     });
     return { success: true, output };
@@ -252,8 +242,15 @@ function main(): void {
       console.error(`   Expected (dars.lock): ${lockEntry.sha256}`);
       console.error(`   Actual (build):       ${builtHash}`);
       console.error('');
-      console.error('   The tree under dars/ must be the exact DAR for this daml.yaml version.');
-      console.error('   After `npm run build`, run backup-dar for this package and commit.\n');
+      if (isDeployed(lockEntry)) {
+        console.error('   This exact backup is recorded on a network and is immutable.');
+        console.error(`   Run npm run upgrade-package -- --package ${currentPackageName} --type minor.\n`);
+      } else {
+        console.error('   This version is still an undeployed PR candidate; keep the version.');
+        console.error(
+          `   Refresh it with npm run backup-dar -- --package ${currentPackageName} --version ${currentDar.version}, then commit dars/.\n`
+        );
+      }
       hasFailures = true;
       checkedCount++;
       continue;
@@ -287,7 +284,9 @@ function main(): void {
         );
       }
     } else {
-      console.log(`✅ ${currentPackageName}: No older backed-up version to upgrade-check (first release in dars/)\n`);
+      console.log(
+        `✅ ${currentPackageName}: No older deployed version to upgrade-check (first release in this line)\n`
+      );
     }
 
     checkedCount++;
@@ -298,7 +297,7 @@ function main(): void {
 
   if (hasFailures) {
     console.error('\n❌ Upgrade compatibility check failed!');
-    console.error('   Fix the issues above or bump the major version for breaking changes.');
+    console.error('   Fix the issues above; use a major package line only for breaking changes.');
     process.exit(1);
   }
 

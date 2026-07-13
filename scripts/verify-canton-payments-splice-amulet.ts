@@ -11,6 +11,7 @@
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { assertDarArchiveSafe, DAML_INSPECT_TIMEOUT_MS } from './dar-archive-policy';
 
 const ROOT = path.join(__dirname, '..');
 const CANTON_PAYMENTS_DIR = path.join(ROOT, 'CantonPayments');
@@ -40,10 +41,13 @@ function main(): void {
     process.exit(1);
   }
 
+  assertDarArchiveSafe(darPath);
   const raw = execFileSync('dpm', ['damlc', 'inspect-dar', path.relative(CANTON_PAYMENTS_DIR, darPath), '--json'], {
     cwd: CANTON_PAYMENTS_DIR,
     encoding: 'utf8',
+    killSignal: 'SIGKILL',
     maxBuffer: 32 * 1024 * 1024,
+    timeout: DAML_INSPECT_TIMEOUT_MS,
   });
   const j = JSON.parse(raw) as {
     main_package_id: string;

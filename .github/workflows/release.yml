@@ -12,7 +12,9 @@ on:
         type: string
 
 concurrency:
-  group: package-release-${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+  # One mutable DevNet candidate exists per package line. This repository currently has one release package, so all
+  # releases share a lock and cannot race between DevNet preflight and marker persistence.
+  group: package-release-${{ github.repository }}
   cancel-in-progress: false
 
 jobs:
@@ -20,33 +22,45 @@ jobs:
     name: Build, upload, and publish release
     runs-on: ubuntu-latest
     permissions:
-      # Required to push generated release artifacts back to main.
+      # Required to push generated release artifacts to a protected draft-PR branch.
       contents: write
+      pull-requests: write
       # Required if package publication is later routed through GitHub Packages.
       packages: write
       # Required for npm trusted publishing/provenance support.
       id-token: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
-      CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
-      CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
-      CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+      RELEASE_ARTIFACT_BRANCH: automation/ocp-release-${{ github.run_id }}-${{ github.run_attempt }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref }}
           fetch-depth: 0
-          lfs: true
-          submodules: recursive
+          lfs: false
+          submodules: false
           persist-credentials: false
+
+      # Do not install dependencies or execute repository scripts until this immutable release ref is proven to be main.
+      - name: Validate release tag is current main
+        run: |
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch origin main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "::error::Release tag $RELEASE_TAG is not the current origin/main commit; refusing to run release side effects."
+            exit 1
+          fi
+          git remote set-url origin "https://github.com/${{ github.repository }}.git"
 
       - name: Setup Git LFS
         run: |
           git lfs install
           git lfs pull
+
+      - name: Initialize submodules
+        run: git submodule update --init --recursive
 
       - name: Setup Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
@@ -68,11 +82,17 @@ jobs:
 
       - name: Validate release secrets
         env:
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
           missing=()
           for name in \
             NODE_AUTH_TOKEN \
+            PAT_TOKEN \
             CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
             CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET \
             CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
@@ -103,7 +123,7 @@ jobs:
           NODE
 
       - name: Restore Daml SDK cache
-        uses: actions/cache@v5
+        uses: actions/cache@caa296126883cff596d87d8935842f9db880ef25 # v5
         with:
           path: ~/.dpm
           key: dpm-sdk-${{ runner.os }}-${{ hashFiles('**/daml.yaml', 'scripts/install-dpm-sdks.sh') }}
@@ -122,19 +142,9 @@ jobs:
             exit 1
           fi
 
-      - name: Validate release tag is current main
-        run: |
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git fetch origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-            echo "::error::Release tag $RELEASE_TAG is not the current origin/main commit; refusing to run release side effects."
-            exit 1
-          fi
-
       - name: Build and validate package
         run: |
           npm run build
-          npm run backup-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --version "${{ steps.release_tag.outputs.version }}"
           npm run lint
           npm run format
           npm run lint:daml
@@ -144,13 +154,171 @@ jobs:
           npm run test
 
       - name: Upload DAR to devnet
+        env:
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
         run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network devnet
 
-      - name: Upload DAR to mainnet
-        run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network mainnet
+      - name: Persist DevNet deployment marker
+        id: devnet_marker
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          public_origin="https://github.com/${{ github.repository }}.git"
+          trap 'git remote set-url origin "$public_origin"' EXIT
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          release_sha=$(git rev-parse HEAD)
+          echo "release_sha=$release_sha" >> "$GITHUB_OUTPUT"
+          git switch -c "$RELEASE_ARTIFACT_BRANCH"
+          git add dars/dars.lock
+
+          marker_commit_created=false
+          if git diff --cached --quiet; then
+            echo "DevNet marker was already present on the validated release commit."
+          else
+            git commit -m "chore: record DevNet DAR deployment for ${RELEASE_TAG}"
+            marker_commit_created=true
+          fi
+
+          # Persist the upload result before consulting mutable branch state. Even if main advanced while the upload
+          # ran, this unique branch remains rooted at the already validated release SHA and cannot overwrite main.
+          git push --no-verify origin "HEAD:${RELEASE_ARTIFACT_BRANCH}"
+
+          if [ "$marker_commit_created" = true ]; then
+            gh pr create \
+              --draft \
+              --base main \
+              --head "$RELEASE_ARTIFACT_BRANCH" \
+              --title "Record release artifacts for ${RELEASE_TAG}" \
+              --body "DevNet upload succeeded and its dars.lock marker is durable on this branch. The release workflow is still running; keep this PR in draft."
+          fi
+
+          # Never leave the PAT embedded in repository config for later package scripts.
+          git remote set-url origin "$public_origin"
+          trap - EXIT
+          unset GH_TOKEN
+
+          git fetch origin main
+          main_advanced=false
+          if [ "$release_sha" != "$(git rev-parse origin/main)" ]; then
+            main_advanced=true
+          fi
+
+          # Verification may stop later release side effects, but it must not strand a successful upload without a
+          # durable marker branch and draft PR.
+          npm run verify-dars
+
+          if [ "$main_advanced" = true ]; then
+            echo "::error::Main advanced after the release SHA was validated. The DevNet marker is durable on ${RELEASE_ARTIFACT_BRANCH}; refusing later release side effects."
+            exit 1
+          fi
+
+      - name: Revalidate base and upload DAR to Mainnet
+        env:
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          RELEASE_SHA: ${{ steps.devnet_marker.outputs.release_sha }}
+        run: |
+          git fetch origin main
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main || [ "$RELEASE_SHA" != "$(git rev-parse origin/main)" ]; then
+            echo "::error::Main changed after DevNet upload. The durable DevNet marker PR remains available; refusing irreversible Mainnet side effects."
+            exit 1
+          fi
+          echo "Main still equals the validated release SHA. Mainnet never selects a version: upload-dar now independently requires this exact candidate identity to be preferred by both DevNet providers."
+          npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network mainnet
+
+      - name: Persist Mainnet deployment marker
+        id: mainnet_marker
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          public_origin="https://github.com/${{ github.repository }}.git"
+          trap 'git remote set-url origin "$public_origin"' EXIT
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git add dars/dars.lock
+          echo "marker_created=false" >> "$GITHUB_OUTPUT"
+          if git diff --cached --quiet; then
+            echo "Mainnet marker was already present."
+          else
+            git commit -m "chore: record Mainnet DAR deployment for ${RELEASE_TAG}"
+            git push --no-verify origin "HEAD:${RELEASE_ARTIFACT_BRANCH}"
+            echo "marker_commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+            echo "marker_created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Scrub authenticated remote state before any later repository script runs.
+          git remote set-url origin "$public_origin"
+          trap - EXIT
+          unset GH_TOKEN
+
+      - name: Create immutable Mainnet marker attestation
+        if: ${{ steps.mainnet_marker.outputs.marker_created == 'true' }}
+        env:
+          MARKER_COMMIT: ${{ steps.mainnet_marker.outputs.marker_commit }}
+          PACKAGE_KEY: ${{ steps.release_tag.outputs.package_key }}
+        run: |
+          set -euo pipefail
+          npx tsx scripts/mainnet-marker-attestation.ts create \
+            --repository-root "$GITHUB_WORKSPACE" \
+            --repository "$GITHUB_REPOSITORY" \
+            --default-branch main \
+            --workflow-path ".github/workflows/release.yml" \
+            --run-id "$GITHUB_RUN_ID" \
+            --run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --package "$PACKAGE_KEY" \
+            --marker-commit "$MARKER_COMMIT" \
+            --output "$RUNNER_TEMP/mainnet-marker-attestation.json"
+
+      - name: Upload immutable Mainnet marker attestation
+        if: ${{ steps.mainnet_marker.outputs.marker_created == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dar-mainnet-marker-attestation-${{ github.run_id }}-${{ github.run_attempt }}-${{ steps.release_tag.outputs.package_key }}
+          path: ${{ runner.temp }}/mainnet-marker-attestation.json
+          if-no-files-found: error
+          retention-days: 90
+          compression-level: 0
+
+      - name: Update durable release marker pull request
+        if: ${{ steps.mainnet_marker.outputs.marker_created == 'true' }}
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          set -euo pipefail
+          pr_url=$(gh pr list --head "$RELEASE_ARTIFACT_BRANCH" --state open --json url --jq '.[0].url')
+          if [ -z "$pr_url" ]; then
+            gh pr create \
+              --draft \
+              --base main \
+              --head "$RELEASE_ARTIFACT_BRANCH" \
+              --title "Record release artifacts for ${RELEASE_TAG}" \
+              --body "DevNet and Mainnet uploads succeeded and both dars.lock markers are durable on this branch. The release workflow is still running; keep this PR in draft."
+          else
+            pr_number=$(gh pr view "$pr_url" --json number --jq '.number')
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              -f body="DevNet and Mainnet uploads succeeded and both dars.lock markers are durable on this branch. The release workflow is still running; keep this PR in draft." \
+            >/dev/null
+          fi
+
+      - name: Verify durable Mainnet marker backup
+        run: |
+          # Keep verification after marker persistence for the same durability reason as the DevNet marker.
+          npm run verify-dars
 
       - name: Detect factory state
         id: factory
+        env:
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
         run: |
           npx tsx scripts/detect-factory-need.ts --package "${{ steps.release_tag.outputs.package_key }}" | tee factory-need.json
           node <<'NODE'
@@ -162,6 +330,11 @@ jobs:
 
       - name: Create missing factories
         if: steps.factory.outputs.needs_factory == 'true'
+        env:
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
         run: |
           while IFS= read -r network; do
             if [ -n "$network" ]; then
@@ -181,11 +354,15 @@ jobs:
         run: npm publish
 
       - name: Commit generated release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          public_origin="https://github.com/${{ github.repository }}.git"
+          trap 'git remote set-url origin "$public_origin"' EXIT
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
           git fetch origin main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-            echo "::error::Release tag $RELEASE_TAG is not the current origin/main commit; refusing to push generated artifacts."
+          if [ "$(git merge-base HEAD origin/main)" != "$(git rev-parse origin/main)" ]; then
+            echo "::error::Main advanced during the release; leaving the durable draft artifact PR for reconciliation."
             exit 1
           fi
 
@@ -209,5 +386,26 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore: record release artifacts for ${RELEASE_TAG} [skip ci]"
-          git push origin HEAD:main
+          git commit -m "chore: record release artifacts for ${RELEASE_TAG}"
+          git push --no-verify origin "HEAD:${RELEASE_ARTIFACT_BRANCH}"
+
+          pr_url=$(gh pr list --head "$RELEASE_ARTIFACT_BRANCH" --state open --json url --jq '.[0].url')
+          if [ -z "$pr_url" ]; then
+            gh pr create \
+              --draft \
+              --base main \
+              --head "$RELEASE_ARTIFACT_BRANCH" \
+              --title "Record release artifacts for ${RELEASE_TAG}" \
+              --body "DevNet and Mainnet uploads succeeded. Generated release artifacts and deployment markers are ready for validation; keep this PR in draft until checks and automated reviews complete."
+          else
+            pr_number=$(gh pr view "$pr_url" --json number --jq '.number')
+            gh api \
+              --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/pulls/${pr_number}" \
+              -f body="DevNet and Mainnet uploads succeeded. Generated release artifacts and deployment markers are ready for validation; keep this PR in draft until checks and automated reviews complete." \
+              >/dev/null
+          fi
+
+          git remote set-url origin "$public_origin"
+          trap - EXIT
+          unset GH_TOKEN
