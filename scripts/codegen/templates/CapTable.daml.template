@@ -18,15 +18,19 @@ import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
+import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
+import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
 
 -- OCF Types
 {{#each types_alpha}}
+{{#unless is_document}}
 import {{module}} ({{name}}(..), {{data_type}})
+{{/unless}}
 {{/each}}
 
 
@@ -2574,6 +2578,448 @@ validateIssuerAuthorizedShareAdjustmentReferences maps issuerCid = do
         (adjustment.adjustment_data.issuer_id == issuerContract.issuer_data.id))
     (Map.values maps.issuer_authorized_shares_adjustments)
 
+validateIssuerReference : ContractId Issuer -> Text -> Update ()
+validateIssuerReference issuerCid issuerId = do
+  issuerContract <- fetch issuerCid
+  assertMsg
+    ("Issuer ID mismatch: " <> issuerId <> " does not match cap table issuer " <> issuerContract.issuer_data.id)
+    (issuerId == issuerContract.issuer_data.id)
+
+validateObjectReference : CapTableMaps -> ContractId Issuer -> OcfObjectReference -> Update ()
+validateObjectReference maps issuerCid ref = case ref.object_type of
+  OcfObjIssuer -> do
+    validateIssuerReference issuerCid ref.object_id
+  OcfObjTxPlanSecurityAcceptance ->
+    assertMsg ("EquityCompensationAcceptance not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_acceptances))
+  OcfObjTxPlanSecurityCancellation ->
+    assertMsg ("EquityCompensationCancellation not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_cancellations))
+  OcfObjTxPlanSecurityExercise ->
+    assertMsg ("EquityCompensationExercise not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_exercises))
+  OcfObjTxPlanSecurityIssuance ->
+    assertMsg ("EquityCompensationIssuance not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_issuances))
+  OcfObjTxPlanSecurityRelease ->
+    assertMsg ("EquityCompensationRelease not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_releases))
+  OcfObjTxPlanSecurityRetraction ->
+    assertMsg ("EquityCompensationRetraction not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_retractions))
+  OcfObjTxPlanSecurityTransfer ->
+    assertMsg ("EquityCompensationTransfer not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.equity_compensation_transfers))
+{{#each types_alpha}}
+  {{object_type_constructor}} ->
+    assertMsg ("{{name}} not found: " <> ref.object_id) (isSome (Map.lookup ref.object_id maps.{{map_field}}))
+{{/each}}
+  _ -> assertMsg ("Unsupported related object type " <> show ref.object_type <> " for object id " <> ref.object_id) False
+
+validateDocumentRelatedObjects : CapTableMaps -> ContractId Issuer -> Update ()
+validateDocumentRelatedObjects maps issuerCid =
+  mapA_
+    (\documentCid -> do
+      document <- fetch documentCid
+      mapA_ (validateObjectReference maps issuerCid) document.document_data.related_objects)
+    (Map.values maps.documents)
+
+validateStockClassReference : Text -> CapTableMaps -> Text -> Update ()
+validateStockClassReference label maps stockClassId =
+  validateReference label maps.stock_classes stockClassId
+
+validateReference : Text -> Map Text a -> Text -> Update ()
+validateReference label refMap refId =
+  assertMsg
+    (label <> " not found: " <> refId)
+    (isSome (Map.lookup refId refMap))
+
+hasDuplicateText : [Text] -> Bool
+hasDuplicateText ids = case ids of
+  [] -> False
+  id :: rest -> id `elem` rest || hasDuplicateText rest
+
+validateUniqueTextList : Text -> [Text] -> Update ()
+validateUniqueTextList label ids =
+  assertMsg
+    (label <> " contains duplicate id")
+    (not (hasDuplicateText ids))
+
+validateStakeholderReference : Text -> CapTableMaps -> Text -> Update ()
+validateStakeholderReference label maps stakeholderId =
+  validateReference label maps.stakeholders stakeholderId
+
+validateOptionalReference : Text -> Map Text a -> Optional Text -> Update ()
+validateOptionalReference label refMap refId = case refId of
+  Some id -> validateReference label refMap id
+  None -> pure ()
+
+validateOptionalStockClassReference : Text -> CapTableMaps -> Optional Text -> Update ()
+validateOptionalStockClassReference label maps stockClassId = case stockClassId of
+  Some id -> validateStockClassReference label maps id
+  None -> pure ()
+
+validateStockClassConversionRightReferences : CapTableMaps -> Update ()
+validateStockClassConversionRightReferences maps =
+  mapA_
+    (\stockClassCid -> do
+      stockClass <- fetch stockClassCid
+      mapA_
+        (\conversionRight -> validateAnyConversionRightStockClassReferences ("Stock class conversion right for " <> stockClass.stock_class_data.id) maps (OcfRightStockClass conversionRight))
+        stockClass.stock_class_data.conversion_rights)
+    (Map.values maps.stock_classes)
+
+validateAnyConversionRightStockClassReferences : Text -> CapTableMaps -> OcfAnyConversionRight -> Update ()
+validateAnyConversionRightStockClassReferences label maps conversionRight = case conversionRight of
+  OcfRightConvertible convertibleRight ->
+    validateOptionalStockClassReference (label <> " convertible conversion target") maps convertibleRight.converts_to_stock_class_id
+  OcfRightWarrant warrantRight ->
+    validateOptionalStockClassReference (label <> " warrant conversion target") maps warrantRight.converts_to_stock_class_id
+  OcfRightStockClass stockClassRight -> do
+    validateStockClassReference (label <> " stock class conversion target") maps stockClassRight.converts_to_stock_class_id
+    validateAnyConversionRightStockClassReferences (label <> " stock class nested trigger") maps stockClassRight.conversion_trigger.conversion_right
+
+validateConvertibleConversionRightReferences : CapTableMaps -> Update ()
+validateConvertibleConversionRightReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateUniqueTextList
+        ("Convertible conversion triggers for " <> issuance.issuance_data.id)
+        (map (\trigger -> trigger.trigger_id) issuance.issuance_data.conversion_triggers)
+      mapA_
+        (\trigger -> validateOptionalStockClassReference "Convertible conversion target" maps trigger.conversion_right.converts_to_stock_class_id)
+        issuance.issuance_data.conversion_triggers)
+    (Map.values maps.convertible_issuances)
+
+validateConvertibleIssuanceReferences : CapTableMaps -> Update ()
+validateConvertibleIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateStakeholderReference "Convertible issuance stakeholder" maps issuance.issuance_data.stakeholder_id)
+    (Map.values maps.convertible_issuances)
+
+validateWarrantConversionRightReferences : CapTableMaps -> Update ()
+validateWarrantConversionRightReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateUniqueTextList
+        ("Warrant exercise triggers for " <> issuance.issuance_data.id)
+        (map (\trigger -> trigger.trigger_id) issuance.issuance_data.exercise_triggers)
+      mapA_
+        (\trigger -> validateAnyConversionRightStockClassReferences ("Warrant exercise trigger for " <> issuance.issuance_data.id) maps trigger.conversion_right)
+        issuance.issuance_data.exercise_triggers)
+    (Map.values maps.warrant_issuances)
+
+validateValuationStockClassReferences : CapTableMaps -> Update ()
+validateValuationStockClassReferences maps =
+  mapA_
+    (\valuationCid -> do
+      valuation <- fetch valuationCid
+      validateStockClassReference "Valuation stock class" maps valuation.valuation_data.stock_class_id)
+    (Map.values maps.valuations)
+
+validateStockPlanReferences : CapTableMaps -> Update ()
+validateStockPlanReferences maps =
+  mapA_
+    (\stockPlanCid -> do
+      stockPlan <- fetch stockPlanCid
+      mapA_
+        (validateStockClassReference ("Stock plan stock class for " <> stockPlan.plan_data.id) maps)
+        stockPlan.plan_data.stock_class_ids)
+    (Map.values maps.stock_plans)
+
+validateStockIssuanceReferences : CapTableMaps -> Update ()
+validateStockIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateStakeholderReference "Stock issuance stakeholder" maps issuance.issuance_data.stakeholder_id
+      validateStockClassReference "Stock issuance stock class" maps issuance.issuance_data.stock_class_id
+      mapA_
+        (validateReference "Stock issuance stock legend" maps.stock_legend_templates)
+        issuance.issuance_data.stock_legend_ids
+      validateOptionalReference "Stock issuance vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
+    (Map.values maps.stock_issuances)
+
+validateEquityCompensationIssuanceReferences : CapTableMaps -> Update ()
+validateEquityCompensationIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateStakeholderReference "Equity compensation stakeholder" maps issuance.issuance_data.stakeholder_id
+      validateOptionalStockClassReference "Equity compensation stock class" maps issuance.issuance_data.stock_class_id
+      validateOptionalReference "Equity compensation stock plan" maps.stock_plans issuance.issuance_data.stock_plan_id
+      validateOptionalReference "Equity compensation vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
+    (Map.values maps.equity_compensation_issuances)
+
+validateWarrantIssuanceReferences : CapTableMaps -> Update ()
+validateWarrantIssuanceReferences maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      validateStakeholderReference "Warrant issuance stakeholder" maps issuance.issuance_data.stakeholder_id
+      validateOptionalReference "Warrant vesting terms" maps.vesting_terms issuance.issuance_data.vesting_terms_id)
+    (Map.values maps.warrant_issuances)
+
+vestingTermsIdForSecurity : CapTableMaps -> Text -> Update (Optional Text)
+vestingTermsIdForSecurity maps securityId = do
+  let stockCidOpt = Map.lookup securityId maps.stock_issuances_by_security_id
+  let warrantCidOpt = Map.lookup securityId maps.warrant_issuances_by_security_id
+  let equityCompensationCidOpt = Map.lookup securityId maps.equity_compensation_issuances_by_security_id
+  let stockMatch = if isSome stockCidOpt then 1 else 0
+  let warrantMatch = if isSome warrantCidOpt then 1 else 0
+  let equityCompensationMatch = if isSome equityCompensationCidOpt then 1 else 0
+  assertMsg
+    ("Vesting transaction security id is ambiguous: " <> securityId)
+    (stockMatch + warrantMatch + equityCompensationMatch <= 1)
+  case (stockCidOpt, warrantCidOpt, equityCompensationCidOpt) of
+    (Some stockCid, None, None) -> do
+      issuance <- fetch stockCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, Some warrantCid, None) -> do
+      issuance <- fetch warrantCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, None, Some equityCompensationCid) -> do
+      issuance <- fetch equityCompensationCid
+      pure issuance.issuance_data.vesting_terms_id
+    (None, None, None) -> do
+      assertMsg ("Vesting transaction security not found: " <> securityId) False
+      pure None
+    _ -> do
+      assertMsg ("Vesting transaction security id is ambiguous: " <> securityId) False
+      pure None
+
+vestingTermsDataForSecurity : CapTableMaps -> Text -> Update (Optional VestingTermsOcfData)
+vestingTermsDataForSecurity maps securityId = do
+  vestingTermsIdOpt <- vestingTermsIdForSecurity maps securityId
+  case vestingTermsIdOpt of
+    Some vestingTermsId -> case Map.lookup vestingTermsId maps.vesting_terms of
+      Some vestingTermsCid -> do
+        vestingTerms <- fetch vestingTermsCid
+        pure (Some vestingTerms.vesting_terms_data)
+      None -> do
+        assertMsg ("Vesting transaction references missing VestingTerms " <> vestingTermsId <> " for security " <> securityId) False
+        pure None
+    None -> do
+      assertMsg ("Vesting transaction security has no VestingTerms: " <> securityId) False
+      pure None
+
+vestingConditionMatchesExpectedTrigger : VT.OcfVestingTrigger -> VT.OcfVestingCondition -> Bool
+vestingConditionMatchesExpectedTrigger expectedTrigger condition =
+  case (expectedTrigger, condition.trigger) of
+    (VT.OcfVestingStartTrigger, VT.OcfVestingStartTrigger) -> True
+    (VT.OcfVestingEventTrigger, VT.OcfVestingEventTrigger) -> True
+    _ -> False
+
+vestingConditionById : [VT.OcfVestingCondition] -> Text -> Optional VT.OcfVestingCondition
+vestingConditionById conditions conditionId = case conditions of
+  [] -> None
+  condition :: rest ->
+    if condition.id == conditionId
+      then Some condition
+      else vestingConditionById rest conditionId
+
+validateVestingTransactionCondition :
+  Text ->
+  CapTableMaps ->
+  Text ->
+  Text ->
+  VT.OcfVestingTrigger ->
+  Update ()
+validateVestingTransactionCondition label maps securityId vestingConditionId expectedTrigger = do
+  vestingTermsDataOpt <- vestingTermsDataForSecurity maps securityId
+  case vestingTermsDataOpt of
+    Some vestingTermsData -> do
+      let conditionOpt = vestingConditionById vestingTermsData.vesting_conditions vestingConditionId
+      case conditionOpt of
+        Some condition ->
+          assertMsg
+            (label <> " references VestingCondition " <> vestingConditionId <> " with the wrong trigger type")
+            (vestingConditionMatchesExpectedTrigger expectedTrigger condition)
+        None ->
+          assertMsg
+            (label <> " references missing VestingCondition " <> vestingConditionId <> " for security " <> securityId)
+            False
+    None -> pure ()
+
+validateVestingStartConditionReferences : CapTableMaps -> Update ()
+validateVestingStartConditionReferences maps =
+  mapA_
+    (\vestingStartCid -> do
+      vestingStart <- fetch vestingStartCid
+      validateVestingTransactionCondition
+        "VestingStart"
+        maps
+        vestingStart.vesting_data.security_id
+        vestingStart.vesting_data.vesting_condition_id
+        VT.OcfVestingStartTrigger)
+    (Map.values maps.vesting_starts)
+
+validateVestingEventConditionReferences : CapTableMaps -> Update ()
+validateVestingEventConditionReferences maps =
+  mapA_
+    (\vestingEventCid -> do
+      vestingEvent <- fetch vestingEventCid
+      validateVestingTransactionCondition
+        "VestingEvent"
+        maps
+        vestingEvent.vesting_data.security_id
+        vestingEvent.vesting_data.vesting_condition_id
+        VT.OcfVestingEventTrigger)
+    (Map.values maps.vesting_events)
+
+validateVestingTransactionConditionReferences : CapTableMaps -> Update ()
+validateVestingTransactionConditionReferences maps = do
+  validateVestingStartConditionReferences maps
+  validateVestingEventConditionReferences maps
+
+vestingConditionReferenceExists : Text -> [Text] -> Text -> Update ()
+vestingConditionReferenceExists label conditionIds conditionId =
+  assertMsg
+    (label <> " references missing VestingCondition: " <> conditionId)
+    (conditionId `elem` conditionIds)
+
+validateVestingConditionTriggerReferences : Text -> [Text] -> VT.OcfVestingCondition -> Update ()
+validateVestingConditionTriggerReferences label conditionIds condition =
+  case condition.trigger of
+    VT.OcfVestingScheduleRelativeTrigger with relative_to_condition_id ->
+      vestingConditionReferenceExists label conditionIds relative_to_condition_id
+    _ -> pure ()
+
+validateVestingTermsConditionGraphReferences : CapTableMaps -> Update ()
+validateVestingTermsConditionGraphReferences maps =
+  mapA_
+    (\vestingTermsCid -> do
+      vestingTerms <- fetch vestingTermsCid
+      let conditions = vestingTerms.vesting_terms_data.vesting_conditions
+      let conditionIds = map (\condition -> condition.id) conditions
+      validateUniqueTextList
+        ("VestingTerms conditions for " <> vestingTerms.vesting_terms_data.id)
+        conditionIds
+      mapA_
+        (\condition -> do
+          validateVestingConditionTriggerReferences
+            ("VestingTerms " <> vestingTerms.vesting_terms_data.id <> " condition " <> condition.id)
+            conditionIds
+            condition
+          mapA_
+            (vestingConditionReferenceExists ("VestingTerms " <> vestingTerms.vesting_terms_data.id <> " condition " <> condition.id) conditionIds)
+            condition.next_condition_ids)
+        conditions)
+    (Map.values maps.vesting_terms)
+
+validateSecurityReference : Text -> CapTableMaps -> Text -> Update ()
+validateSecurityReference label maps securityId =
+  assertMsg
+    (label <> " security not found: " <> securityId)
+    (isSome (Map.lookup securityId maps.convertible_issuances_by_security_id)
+      || isSome (Map.lookup securityId maps.equity_compensation_issuances_by_security_id)
+      || isSome (Map.lookup securityId maps.stock_issuances_by_security_id)
+      || isSome (Map.lookup securityId maps.warrant_issuances_by_security_id))
+
+validateCapitalizationDefinitionReferences : Text -> CapTableMaps -> OcfCapitalizationDefinition -> Update ()
+validateCapitalizationDefinitionReferences label maps capitalizationDefinition = do
+  mapA_
+    (validateSecurityReference (label <> " included") maps)
+    capitalizationDefinition.include_security_ids
+  mapA_
+    (validateSecurityReference (label <> " excluded") maps)
+    capitalizationDefinition.exclude_security_ids
+  mapA_
+    (validateStockClassReference (label <> " stock class") maps)
+    capitalizationDefinition.include_stock_class_ids
+  mapA_
+    (validateReference (label <> " stock plan") maps.stock_plans)
+    capitalizationDefinition.include_stock_plans_ids
+
+validateConvertibleConversionCapitalizationReferences : CapTableMaps -> Update ()
+validateConvertibleConversionCapitalizationReferences maps =
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      case conversion.conversion_data.capitalization_definition of
+        Some capitalizationDefinition ->
+          validateCapitalizationDefinitionReferences
+            ("Convertible conversion capitalization definition for " <> conversion.conversion_data.id)
+            maps
+            capitalizationDefinition
+        None -> pure ())
+    (Map.values maps.convertible_conversions)
+
+validateConvertibleConversionTriggerReferences : CapTableMaps -> Update ()
+validateConvertibleConversionTriggerReferences maps =
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      case Map.lookup conversion.conversion_data.security_id maps.convertible_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertMsg
+            ("Convertible conversion trigger not found: " <> conversion.conversion_data.trigger_id)
+            (conversion.conversion_data.trigger_id `elem` map (\trigger -> trigger.trigger_id) issuance.issuance_data.conversion_triggers)
+        None -> assertMsg ("Security not found: " <> conversion.conversion_data.security_id) False)
+    (Map.values maps.convertible_conversions)
+
+validateWarrantExerciseTriggerReferences : CapTableMaps -> Update ()
+validateWarrantExerciseTriggerReferences maps =
+  mapA_
+    (\exerciseCid -> do
+      exercise <- fetch exerciseCid
+      case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertMsg
+            ("Warrant exercise trigger not found: " <> exercise.exercise_data.trigger_id)
+            (exercise.exercise_data.trigger_id `elem` map (\trigger -> trigger.trigger_id) issuance.issuance_data.exercise_triggers)
+        None -> assertMsg ("Security not found: " <> exercise.exercise_data.security_id) False)
+    (Map.values maps.warrant_exercises)
+
+validateStockReissuanceSplitReferences : CapTableMaps -> Update ()
+validateStockReissuanceSplitReferences maps =
+  mapA_
+    (\reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      validateOptionalReference "Stock reissuance split transaction" maps.stock_class_splits reissuance.reissuance_data.split_transaction_id)
+    (Map.values maps.stock_reissuances)
+
+{{#each types_alpha}}
+{{#if has_validations}}
+validate{{name}}ConfiguredReferences : CapTableMaps -> Update ()
+validate{{name}}ConfiguredReferences maps =
+  mapA_
+    (\contractCid -> do
+      contract <- fetch contractCid
+{{#each validations}}
+{{#if is_optional}}
+{{#if or_maps}}
+      case contract.{{../data_param}}.{{field}} of
+        Some refId -> assertMsg ("{{error}}: " <> refId) (isSome (Map.lookup refId maps.{{firstMap}}) || isSome (Map.lookup refId maps.{{secondMap}}) || isSome (Map.lookup refId maps.{{thirdMap}}))
+        None -> pure ()
+{{else}}
+      case contract.{{../data_param}}.{{field}} of
+        Some refId -> assertMsg ("{{error}}: " <> refId) (isSome (Map.lookup refId maps.{{map}}))
+        None -> pure ()
+{{/if}}
+{{else}}
+{{#if is_array}}
+      mapA_ (\refId -> assertMsg ("{{error}}: " <> refId) (isSome (Map.lookup refId maps.{{map}}))) contract.{{../data_param}}.{{field}}
+{{else}}
+{{#if or_maps}}
+      assertMsg ("{{error}}: " <> contract.{{../data_param}}.{{field}}) (isSome (Map.lookup contract.{{../data_param}}.{{field}} maps.{{firstMap}}) || isSome (Map.lookup contract.{{../data_param}}.{{field}} maps.{{secondMap}}) || isSome (Map.lookup contract.{{../data_param}}.{{field}} maps.{{thirdMap}}))
+{{else}}
+      assertMsg ("{{error}}: " <> contract.{{../data_param}}.{{field}}) (isSome (Map.lookup contract.{{../data_param}}.{{field}} maps.{{map}}))
+{{/if}}
+{{/if}}
+{{/if}}
+{{/each}}    )
+    (Map.values maps.{{map_field}})
+
+{{/if}}
+{{/each}}
+validateConfiguredReferences : CapTableMaps -> Update ()
+validateConfiguredReferences maps = do
+{{#each types_alpha}}
+{{#if has_validations}}
+  validate{{name}}ConfiguredReferences maps
+{{/if}}
+{{/each}}
+
 addQuantityById : Text -> Decimal -> Map Text Decimal -> Map Text Decimal
 addQuantityById key quantity totals =
   let current = fromOptional 0.0 (Map.lookup key totals)
@@ -4863,16 +5309,16 @@ getCreateTier createData = case createData of
 {{/each}}
 
 -- | Process a single create operation, returning updated maps and the created ContractId
-processCreate : Context -> CapTableMaps -> OcfCreateData -> Update (CapTableMaps, OcfContractId)
-processCreate ctx maps createData = case createData of
+processCreate : Context -> ContractId Issuer -> CapTableMaps -> OcfCreateData -> Update (CapTableMaps, OcfContractId)
+processCreate ctx issuerCid maps createData = case createData of
 {{#each types_tier}}
       {{> create-case}}
 {{/each}}
 
 -- | Process a single edit operation, returning updated maps and the edited ContractId.
 -- Note: OcfEditIssuer is handled separately in UpdateCapTable since issuer is not a map
-processEdit : Context -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId)
-processEdit ctx maps editData = case editData of
+processEdit : Context -> ContractId Issuer -> CapTableMaps -> OcfEditData -> Update (CapTableMaps, OcfContractId)
+processEdit ctx issuerCid maps editData = case editData of
       OcfEditIssuer _ -> error "OcfEditIssuer should be handled separately in UpdateCapTable"
 {{#each types_alpha}}
       {{> edit-case}}
@@ -4984,7 +5430,7 @@ template CapTable
         -- Process regular edits (map-based entities)
         (mapsAfterEdits, regularEditedCids) <- foldlA
           (\(maps, cids) editData -> do
-            (newMaps, cid) <- processEdit context maps editData
+            (newMaps, cid) <- processEdit context issuer maps editData
             pure (newMaps, cids ++ [cid]))
           (mapsAfterDeletes, [])
           regularEdits
@@ -5011,7 +5457,7 @@ template CapTable
         -- Process creates last (after deletes freed constraints)
         (finalMaps, createdCids) <- foldlA
           (\(maps, cids) createData -> do
-            (newMaps, cid) <- processCreate context maps createData
+            (newMaps, cid) <- processCreate context newIssuerCid maps createData
             pure (newMaps, cids ++ [cid]))
           (mapsAfterEdits, [])
           sortedCreates
@@ -5019,6 +5465,23 @@ template CapTable
         -- Validate Financing references only after the complete batch state is known.
         validateFinancingIssuanceReferences finalMaps
 
+        validateDocumentRelatedObjects finalMaps newIssuerCid
+        validateStockClassConversionRightReferences finalMaps
+        validateConvertibleIssuanceReferences finalMaps
+        validateConvertibleConversionRightReferences finalMaps
+        validateWarrantConversionRightReferences finalMaps
+        validateValuationStockClassReferences finalMaps
+        validateStockPlanReferences finalMaps
+        validateStockIssuanceReferences finalMaps
+        validateEquityCompensationIssuanceReferences finalMaps
+        validateWarrantIssuanceReferences finalMaps
+        validateVestingTransactionConditionReferences finalMaps
+        validateVestingTermsConditionGraphReferences finalMaps
+        validateConvertibleConversionCapitalizationReferences finalMaps
+        validateConvertibleConversionTriggerReferences finalMaps
+        validateWarrantExerciseTriggerReferences finalMaps
+        validateStockReissuanceSplitReferences finalMaps
+        validateConfiguredReferences finalMaps
         authorizedShareAdjustmentIndex <- stockClassAuthorizedAdjustmentIndex finalMaps
         validateAuthorizedShareCeilings
           finalMaps
