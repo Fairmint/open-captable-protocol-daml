@@ -238,16 +238,22 @@ jobs:
           NODE
 
       - name: Create DevNet factory
-        if: inputs.network == 'devnet' && steps.factory.outputs.needs_factory == 'true'
+        if: inputs.network == 'devnet' && steps.factory.outputs.needs_factory == 'true' && steps.deployment.outputs.tag_exists != 'true'
         env:
           CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
         run: npx tsx scripts/create-ocp-factory.ts --network devnet
 
       - name: Create Mainnet factory
-        if: inputs.network == 'mainnet' && steps.factory.outputs.needs_factory == 'true'
+        if: inputs.network == 'mainnet' && steps.factory.outputs.needs_factory == 'true' && steps.deployment.outputs.tag_exists != 'true'
         env:
           CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
         run: npx tsx scripts/create-ocp-factory.ts --network mainnet
+
+      - name: Require recovered factory metadata
+        if: steps.deployment.outputs.tag_exists == 'true' && steps.factory.outputs.needs_factory == 'true'
+        run: |
+          echo "::error::The deployment tag exists, but current factory metadata is missing. Recover the metadata artifact from the original deployment run instead of creating a duplicate factory."
+          exit 1
 
       - name: Upload factory metadata artifact
         if: always()
@@ -258,17 +264,13 @@ jobs:
             generated/ocp-factory-contract-id.json
             generated/ocp-factory-contract-id.json.d.ts
 
-      - name: Commit generated factory metadata
+      - name: Open generated factory metadata pull request
         env:
+          # Use the PAT so the branch push and PR creation trigger required CI.
+          GH_TOKEN: ${{ secrets.PAT_TOKEN }}
           NETWORK_INPUT: ${{ inputs.network }}
         run: |
           set -euo pipefail
-          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git fetch --no-tags origin main:refs/remotes/origin/main
-          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
-            echo "::error::Main moved during deployment. Factory metadata is available in the workflow artifact."
-            exit 1
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add generated/ocp-factory-contract-id.json generated/ocp-factory-contract-id.json.d.ts
@@ -276,5 +278,15 @@ jobs:
             echo "No generated factory metadata changed."
             exit 0
           fi
+          metadata_branch="automation/record-${NETWORK_INPUT}-ocp-factory-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          git switch -c "$metadata_branch"
           git commit -m "chore: record ${NETWORK_INPUT} OCP factory [skip ci]"
-          git push --no-verify origin HEAD:main
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push --no-verify origin "HEAD:refs/heads/$metadata_branch"
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --base main \
+            --head "$metadata_branch" \
+            --draft \
+            --title "chore: record ${NETWORK_INPUT} OCP factory" \
+            --body "Records generated OCP factory metadata from workflow run ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
