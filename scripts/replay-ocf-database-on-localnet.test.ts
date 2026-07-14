@@ -8,6 +8,7 @@ import {
   matchesLedgerTemplateId,
   parseReplayOptions,
   preparePortal,
+  renderReplayMarkdown,
   ReplayPhaseError,
   resolveDatabaseUrl,
   toOcfCreateOperation,
@@ -16,6 +17,13 @@ import {
   type DatabaseOcfRow,
   type ReplayReport,
 } from './localnet-replay/core';
+import {
+  buildNetworkTrafficPricing,
+  buildReplayTrafficReport,
+  getPaidTrafficCostBytes,
+  getParticipantTrafficConsumedBytes,
+  renderReplayTrafficMarkdown,
+} from './localnet-replay/traffic';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -172,6 +180,153 @@ function run(): void {
     false
   );
 
+  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: 12_345 }), 12_345);
+  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: '67890' }), 67_890);
+  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: Number.MAX_SAFE_INTEGER + 1 }), undefined);
+  assert.equal(
+    getParticipantTrafficConsumedBytes({ traffic_status: { actual: { total_consumed: 987_654 } } }),
+    987_654
+  );
+
+  const observedAt = new Date('2026-01-01T00:00:00.000Z');
+  const pricing = buildNetworkTrafficPricing(
+    {
+      amulet_rules: {
+        contract: {
+          payload: {
+            configSchedule: {
+              initialValue: {
+                decentralizedSynchronizer: { fees: { extraTrafficPrice: '60.0' } },
+              },
+              futureValues: [
+                {
+                  _1: '2025-12-31T00:00:00.000Z',
+                  _2: { decentralizedSynchronizer: { fees: { extraTrafficPrice: '50.0' } } },
+                },
+                {
+                  _1: '2026-02-01T00:00:00.000Z',
+                  _2: { decentralizedSynchronizer: { fees: { extraTrafficPrice: '40.0' } } },
+                },
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      open_mining_rounds: {
+        'round-10': {
+          contract: {
+            payload: {
+              opensAt: '2025-12-30T00:00:00.000Z',
+              round: { number: '10' },
+              amuletPrice: '0.005',
+            },
+          },
+        },
+        'round-11': {
+          contract: {
+            payload: {
+              opensAt: '2025-12-31T00:00:00.000Z',
+              round: { number: '11' },
+              amuletPrice: '0.01',
+            },
+          },
+        },
+        'round-12': {
+          contract: {
+            payload: {
+              opensAt: '2026-01-02T00:00:00.000Z',
+              round: { number: '12' },
+              amuletPrice: '0.02',
+            },
+          },
+        },
+      },
+    },
+    observedAt
+  );
+  assert.deepEqual(pricing, {
+    observedAt: observedAt.toISOString(),
+    extraTrafficPriceUsdPerMegabyte: 50,
+    cantonCoinPriceUsd: 0.01,
+  });
+
+  const traffic = buildReplayTrafficReport({
+    participantTrafficBeforeBytes: 1_000,
+    participantTrafficAfterBytes: 2_001_000,
+    committedTransactionCount: 4,
+    measuredTransactionCount: 4,
+    confirmationRequestTrafficBytes: 1_800_000,
+    pricingAtStart: pricing,
+    pricingAtEnd: { ...pricing, observedAt: '2026-01-01T00:01:00.000Z' },
+  });
+  assert.equal(traffic.measurementStatus, 'complete');
+  assert.equal(traffic.measurementScope, 'participant-replay-window');
+  assert.equal(traffic.totalTrafficBytes, 2_000_000);
+  assert.equal(traffic.totalTrafficMegabytes, 2);
+  assert.equal(traffic.equivalentExtraTrafficCostUsd, 100);
+  assert.equal(traffic.equivalentExtraTrafficCostCantonCoin, 10_000);
+
+  const changedPricingTraffic = buildReplayTrafficReport({
+    committedTransactionCount: 1,
+    measuredTransactionCount: 1,
+    confirmationRequestTrafficBytes: 1_000_000,
+    pricingAtStart: pricing,
+    pricingAtEnd: { ...pricing, extraTrafficPriceUsdPerMegabyte: 55 },
+  });
+  assert.equal(changedPricingTraffic.measurementScope, 'confirmation-requests');
+  assert.equal(changedPricingTraffic.pricingChangedDuringReplay, true);
+  assert.equal(changedPricingTraffic.equivalentExtraTrafficCostCantonCoin, undefined);
+  assert.match(
+    renderReplayTrafficMarkdown(changedPricingTraffic).join('\n'),
+    /omitted because network pricing changed/
+  );
+
+  const missingPricingTraffic = buildReplayTrafficReport({
+    committedTransactionCount: 1,
+    measuredTransactionCount: 1,
+    confirmationRequestTrafficBytes: 1_000_000,
+  });
+  assert.match(
+    renderReplayTrafficMarkdown(missingPricingTraffic).join('\n'),
+    /both start and end network prices could not be captured/
+  );
+
+  const unavailableTraffic = buildReplayTrafficReport({
+    committedTransactionCount: 1,
+    measuredTransactionCount: 0,
+    confirmationRequestTrafficBytes: 0,
+  });
+  const unavailableMarkdown = renderReplayTrafficMarkdown(unavailableTraffic).join('\n');
+  assert.match(unavailableMarkdown, /unavailable from this LocalNet version/);
+  assert.match(unavailableMarkdown, /total traffic measurement is unavailable/);
+
+  const partialTraffic = buildReplayTrafficReport({
+    participantTrafficBeforeBytes: 1_000,
+    participantTrafficAfterBytes: 2_001_000,
+    committedTransactionCount: 2,
+    measuredTransactionCount: 1,
+    confirmationRequestTrafficBytes: 1_000_000,
+  });
+  const partialMarkdown = renderReplayMarkdown({
+    database: 'dev',
+    gitRef: undefined,
+    gitSha: undefined,
+    startedAt: observedAt.toISOString(),
+    finishedAt: observedAt.toISOString(),
+    durationMs: 0,
+    sourceObjectCount: 0,
+    portalCount: 0,
+    passedPortalCount: 0,
+    failedPortalCount: 0,
+    createdObjectCount: 0,
+    status: 'passed',
+    results: [],
+    traffic: partialTraffic,
+  });
+  assert.doesNotMatch(partialMarkdown, /Other participant traffic/);
+
   const failure = toReplayFailure(
     'portal-run-local',
     new ReplayPhaseError('batch', 'Sensitive Person and stakeholder-secret-id failed')
@@ -192,6 +347,7 @@ function run(): void {
     failedPortalCount: 1,
     createdObjectCount: 444,
     status: 'failed',
+    traffic,
     results: [
       {
         portalAlias: 'portal-run-local',
@@ -205,7 +361,14 @@ function run(): void {
   };
   const publicReportText = JSON.stringify(toPublicReplayReport(privateReport));
   assert.doesNotMatch(publicReportText, /portal-run-local|Sensitive Person|stakeholder-secret-id|456|444/);
+  assert.doesNotMatch(publicReportText, /committedTransactionCount|measuredTransactionCount/);
   assert.match(publicReportText, /"failurePhases":\["batch"\]/);
+  assert.match(publicReportText, /"totalTrafficMegabytes":2/);
+
+  const markdown = renderReplayMarkdown(privateReport);
+  assert.match(markdown, /Total participant traffic consumed during the replay window/);
+  assert.match(markdown, /Other participant traffic during the replay window/);
+  assert.match(markdown, /10000\.000000 CC/);
 
   const portalAlias = hashIdentifier(PORTAL_ID, 'portal');
   assert.match(portalAlias, /^portal-[0-9a-f]{12}$/);
