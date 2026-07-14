@@ -133,7 +133,12 @@ class ReplayTrafficMeter {
       const observedAt = new Date();
       const [amuletRules, miningRounds] = await Promise.all([
         initialAmuletRules === undefined ? this.validator.getAmuletRules() : Promise.resolve(initialAmuletRules),
-        this.validator.getOpenAndIssuingMiningRounds(),
+        this.scan.getOpenAndIssuingMiningRounds({
+          body: {
+            cached_open_mining_round_contract_ids: [],
+            cached_issuing_round_contract_ids: [],
+          },
+        }),
       ]);
       return buildNetworkTrafficPricing(amuletRules, miningRounds, observedAt);
     } catch {

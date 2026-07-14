@@ -214,8 +214,8 @@ function run(): void {
       },
     },
     {
-      open_mining_rounds: [
-        {
+      open_mining_rounds: {
+        'round-10': {
           contract: {
             payload: {
               opensAt: '2025-12-30T00:00:00.000Z',
@@ -224,7 +224,7 @@ function run(): void {
             },
           },
         },
-        {
+        'round-11': {
           contract: {
             payload: {
               opensAt: '2025-12-31T00:00:00.000Z',
@@ -233,7 +233,7 @@ function run(): void {
             },
           },
         },
-        {
+        'round-12': {
           contract: {
             payload: {
               opensAt: '2026-01-02T00:00:00.000Z',
@@ -242,7 +242,7 @@ function run(): void {
             },
           },
         },
-      ],
+      },
     },
     observedAt
   );

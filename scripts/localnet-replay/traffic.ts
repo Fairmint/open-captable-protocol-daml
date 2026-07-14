@@ -112,8 +112,13 @@ export function getLatestOpenRoundCantonCoinPriceUsd(
   observedAt: Date
 ): number | undefined {
   const root = asRecord(miningRoundsResponse);
-  const rounds = root?.['open_mining_rounds'];
-  if (!Array.isArray(rounds)) return undefined;
+  const roundsValue = root?.['open_mining_rounds'];
+  const rounds = Array.isArray(roundsValue)
+    ? roundsValue
+    : asRecord(roundsValue)
+      ? Object.values(roundsValue)
+      : undefined;
+  if (!rounds) return undefined;
 
   const observedAtMs = observedAt.getTime();
   const openedRounds = rounds.flatMap((round) => {
