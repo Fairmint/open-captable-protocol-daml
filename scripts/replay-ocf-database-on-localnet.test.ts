@@ -22,6 +22,7 @@ import {
   buildReplayTrafficReport,
   getPaidTrafficCostBytes,
   getParticipantTrafficConsumedBytes,
+  renderReplayTrafficMarkdown,
 } from './localnet-replay/traffic';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
@@ -277,6 +278,29 @@ function run(): void {
   assert.equal(changedPricingTraffic.measurementScope, 'confirmation-requests');
   assert.equal(changedPricingTraffic.pricingChangedDuringReplay, true);
   assert.equal(changedPricingTraffic.equivalentExtraTrafficCostCantonCoin, undefined);
+  assert.match(
+    renderReplayTrafficMarkdown(changedPricingTraffic).join('\n'),
+    /omitted because network pricing changed/
+  );
+
+  const missingPricingTraffic = buildReplayTrafficReport({
+    committedTransactionCount: 1,
+    measuredTransactionCount: 1,
+    confirmationRequestTrafficBytes: 1_000_000,
+  });
+  assert.match(
+    renderReplayTrafficMarkdown(missingPricingTraffic).join('\n'),
+    /both start and end network prices could not be captured/
+  );
+
+  const unavailableTraffic = buildReplayTrafficReport({
+    committedTransactionCount: 1,
+    measuredTransactionCount: 0,
+    confirmationRequestTrafficBytes: 0,
+  });
+  const unavailableMarkdown = renderReplayTrafficMarkdown(unavailableTraffic).join('\n');
+  assert.match(unavailableMarkdown, /unavailable from this LocalNet version/);
+  assert.match(unavailableMarkdown, /total traffic measurement is unavailable/);
 
   const partialTraffic = buildReplayTrafficReport({
     participantTrafficBeforeBytes: 1_000,
@@ -343,6 +367,7 @@ function run(): void {
 
   const markdown = renderReplayMarkdown(privateReport);
   assert.match(markdown, /Total participant traffic consumed during the replay window/);
+  assert.match(markdown, /Other participant traffic during the replay window/);
   assert.match(markdown, /10000\.000000 CC/);
 
   const portalAlias = hashIdentifier(PORTAL_ID, 'portal');

@@ -256,8 +256,12 @@ export function renderReplayTrafficMarkdown(traffic: ReplayTrafficReport): strin
     );
   } else if (traffic.pricingChangedDuringReplay) {
     lines.push('- CC equivalent: omitted because network pricing changed between the start and end snapshots.');
+  } else if (traffic.totalTrafficBytes === undefined) {
+    lines.push('- CC equivalent: unavailable because the total traffic measurement is unavailable.');
+  } else if (!traffic.pricingAtStart || !traffic.pricingAtEnd) {
+    lines.push('- CC equivalent: unavailable because both start and end network prices could not be captured.');
   } else {
-    lines.push('- CC equivalent: unavailable because LocalNet did not expose both network price parameters.');
+    lines.push('- CC equivalent: unavailable because the observed network prices could not be converted.');
   }
 
   lines.push(

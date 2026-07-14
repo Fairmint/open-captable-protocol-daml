@@ -128,11 +128,11 @@ class ReplayTrafficMeter {
     }
   }
 
-  private async readPricing(): Promise<NetworkTrafficPricing | undefined> {
+  private async readPricing(initialAmuletRules?: unknown): Promise<NetworkTrafficPricing | undefined> {
     try {
       const observedAt = new Date();
       const [amuletRules, miningRounds] = await Promise.all([
-        this.validator.getAmuletRules(),
+        initialAmuletRules === undefined ? this.validator.getAmuletRules() : Promise.resolve(initialAmuletRules),
         this.validator.getOpenAndIssuingMiningRounds(),
       ]);
       return buildNetworkTrafficPricing(amuletRules, miningRounds, observedAt);
@@ -142,10 +142,10 @@ class ReplayTrafficMeter {
     }
   }
 
-  async start(): Promise<void> {
+  async start(initialAmuletRules: unknown): Promise<void> {
     [this.participantTrafficBeforeBytes, this.pricingAtStart] = await Promise.all([
       this.readParticipantTraffic(),
-      this.readPricing(),
+      this.readPricing(initialAmuletRules),
     ]);
   }
 
@@ -385,7 +385,7 @@ async function initializeReplayLedger(
   captureTrafficMeter(context.trafficMeter);
   await ensureActAsRight(context, systemOperatorParty);
 
-  await context.trafficMeter.start();
+  await context.trafficMeter.start(amuletRules);
 
   await ledger.uploadDarFile({ filePath: darPath });
   const factory = await createFactory(ledger, {
