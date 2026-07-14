@@ -235,6 +235,7 @@ export function renderReplayTrafficMarkdown(traffic: ReplayTrafficReport): strin
   );
 
   if (
+    traffic.confirmationRequestMeasurementComplete &&
     traffic.participantTrafficConsumedBytes !== undefined &&
     traffic.participantTrafficConsumedBytes >= traffic.confirmationRequestTrafficBytes
   ) {

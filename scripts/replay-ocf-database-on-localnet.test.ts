@@ -278,6 +278,31 @@ function run(): void {
   assert.equal(changedPricingTraffic.pricingChangedDuringReplay, true);
   assert.equal(changedPricingTraffic.equivalentExtraTrafficCostCantonCoin, undefined);
 
+  const partialTraffic = buildReplayTrafficReport({
+    participantTrafficBeforeBytes: 1_000,
+    participantTrafficAfterBytes: 2_001_000,
+    committedTransactionCount: 2,
+    measuredTransactionCount: 1,
+    confirmationRequestTrafficBytes: 1_000_000,
+  });
+  const partialMarkdown = renderReplayMarkdown({
+    database: 'dev',
+    gitRef: undefined,
+    gitSha: undefined,
+    startedAt: observedAt.toISOString(),
+    finishedAt: observedAt.toISOString(),
+    durationMs: 0,
+    sourceObjectCount: 0,
+    portalCount: 0,
+    passedPortalCount: 0,
+    failedPortalCount: 0,
+    createdObjectCount: 0,
+    status: 'passed',
+    results: [],
+    traffic: partialTraffic,
+  });
+  assert.doesNotMatch(partialMarkdown, /Other participant traffic/);
+
   const failure = toReplayFailure(
     'portal-run-local',
     new ReplayPhaseError('batch', 'Sensitive Person and stakeholder-secret-id failed')

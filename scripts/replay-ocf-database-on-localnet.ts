@@ -345,7 +345,9 @@ async function ensureActAsRight(context: ReplayLedgerContext, party: string): Pr
   context.actAsRights.add(party);
 }
 
-async function initializeReplayLedger(): Promise<ReplayLedgerContext> {
+async function initializeReplayLedger(
+  captureTrafficMeter: (trafficMeter: ReplayTrafficMeter) => void
+): Promise<ReplayLedgerContext> {
   const { templates, darPath } = await loadLocalContractArtifacts();
   process.env['DISABLE_FILE_LOGGER'] = 'true';
   process.env['CANTON_DEBUG'] = 'false';
@@ -380,6 +382,7 @@ async function initializeReplayLedger(): Promise<ReplayLedgerContext> {
     templates,
     trafficMeter: new ReplayTrafficMeter(ledger, validator, scan, synchronizerId, systemOperatorParty),
   } satisfies ReplayLedgerContext;
+  captureTrafficMeter(context.trafficMeter);
   await ensureActAsRight(context, systemOperatorParty);
 
   await context.trafficMeter.start();
@@ -626,8 +629,9 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
 
     const groupedRows = groupRowsByPortal(rows);
     portalCount = groupedRows.size;
-    const context = await initializeReplayLedger();
-    ({ trafficMeter } = context);
+    const context = await initializeReplayLedger((meter) => {
+      trafficMeter = meter;
+    });
 
     console.log('Replaying the committed OCF snapshot on isolated LocalNet...');
     for (const portalRows of groupedRows.values()) {
