@@ -13,6 +13,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
+          fetch-depth: 0
           submodules: false
           lfs: true
           # PAT_TOKEN (repo secret): checkout + later push use same creds so autofix commits trigger workflows.
@@ -22,6 +23,11 @@ jobs:
         run: |
           git lfs install
           git lfs pull
+
+      - name: Fetch deployment tags
+        run: |
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          git fetch --tags origin
 
       - name: Setup Java
         uses: actions/setup-java@v5
@@ -40,6 +46,9 @@ jobs:
       - name: Install npm dependencies
         run: npm install
 
+      - name: Test DAR version policy
+        run: npm run test:dar-version-policy
+
       - name: Check pinned dependencies
         run: npx --yes --package @hardlydifficult/ci-scripts@1.0.85 check-pinned-deps
 
@@ -52,31 +61,32 @@ jobs:
       - name: Run Prettier
         run: npm run format:fix
 
-      - name: Install DAML SDK (dpm)
-        run: |
-          # Extract version from daml.yaml
-          SDK_VERSION=$(grep '^sdk-version:' OpenCapTable-v34/daml.yaml | cut -d' ' -f2)
-          echo "Installing DAML SDK version: $SDK_VERSION (via dpm)"
+      - name: Restore Daml SDK cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.dpm
+          key: dpm-sdk-${{ runner.os }}-${{ hashFiles('**/daml.yaml', 'scripts/install-dpm-sdks.sh') }}
+          restore-keys: |
+            dpm-sdk-${{ runner.os }}-
 
-          # Install with retry logic for network issues
-          for i in {1..3}; do
-            echo "Attempt $i to install DAML SDK..."
-            if curl -sSL https://get.digitalasset.com/install/install.sh | sh -s "$SDK_VERSION"; then
-              echo "DAML SDK installed successfully"
-              break
-            else
-              echo "Attempt $i failed, retrying..."
-              if [ $i -eq 3 ]; then
-                echo "Failed to install DAML SDK after 3 attempts"
-                exit 1
-              fi
-              sleep 5
-            fi
-          done
-          echo "$HOME/.dpm/bin" >> $GITHUB_PATH
+      - name: Install DAML SDK (dpm)
+        run: scripts/install-dpm-sdks.sh
 
       - name: Build DAML
         run: npm run build
+
+      - name: Check DAR version policy
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          base=origin/main
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            base="$BEFORE_SHA"
+          fi
+          npm run check:dar-version-policy -- --base "$base"
+
+      - name: Verify DAR backups
+        run: npm run verify-dars
 
       - name: Lint DAML
         run: npm run lint:daml
@@ -108,7 +118,7 @@ jobs:
           fi
 
       - name: Commit and push auto-fixes
-        if: steps.check-changes.outputs.has_changes == 'true' && github.event_name == 'push'
+        if: steps.check-changes.outputs.has_changes == 'true' && github.event_name == 'push' && github.ref_type == 'branch'
         env:
           PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
         run: |

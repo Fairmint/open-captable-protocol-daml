@@ -1,0 +1,187 @@
+name: Replay OCF Database on LocalNet
+run-name: OCF LocalNet replay (${{ inputs.database }}) at ${{ inputs.target_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      database:
+        description: Read-only OCF database snapshot to replay
+        required: true
+        default: dev
+        type: choice
+        options:
+          - dev
+          - production
+      target_sha:
+        description: Exact contract commit SHA to test
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ocf-localnet-replay-${{ inputs.database }}
+  cancel-in-progress: false
+
+jobs:
+  validate-request:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate request
+        env:
+          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          if [ "${{ inputs.database }}" = "production" ] && [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
+            echo "::error::Production database replays may only run from the repository default branch."
+            exit 1
+          fi
+          if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_sha must be an exact lowercase 40-character Git commit SHA."
+            exit 1
+          fi
+
+  replay:
+    needs: validate-request
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    # Both environments require approval and expose only a dedicated database_ro connection.
+    environment:
+      name: ${{ inputs.database == 'production' && 'production-data' || 'development-data' }}
+    env:
+      CANTON_LOCALNET_AUTH_MODE: shared-secret
+      CANTON_LOCALNET_INFRA_ONLY: 'true'
+      CANTON_LOCALNET_QUICKSTART_REF: 5c90cf4d0eb934712fd8c269b56e6272b605ccad
+      CANTON_DEBUG: 'false'
+      DISABLE_FILE_LOGGER: 'true'
+
+    steps:
+      - name: Checkout contracts
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+        with:
+          ref: ${{ inputs.target_sha }}
+          lfs: true
+          persist-credentials: false
+          submodules: false
+
+      - name: Record tested contract commit
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+        run: |
+          actual_sha=$(git rev-parse HEAD)
+          if [ "$actual_sha" != "$TARGET_SHA" ]; then
+            echo "::error::Checked out $actual_sha instead of requested $TARGET_SHA."
+            exit 1
+          fi
+          echo "OCP_REPLAY_TARGET_SHA=$actual_sha" >> "$GITHUB_ENV"
+          echo "Tested contract SHA: \`$actual_sha\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Setup Git LFS
+        run: |
+          git lfs install
+          git lfs pull
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '22'
+
+      - name: Configure npm retries
+        run: |
+          npm config set fetch-retries 5
+          npm config set fetch-retry-mintimeout 20000
+          npm config set fetch-retry-maxtimeout 120000
+
+      - name: Upgrade npm
+        run: npm install --global npm@11.10.0
+
+      - name: Setup Java
+        uses: actions/setup-java@0f481fcb613427c0f801b606911222b5b6f3083a # v5
+        with:
+          distribution: temurin
+          java-version: '23'
+
+      - name: Install npm dependencies
+        run: npm install
+
+      - name: Initialize contract submodules
+        run: git submodule update --init --recursive --depth 1 libs/splice
+
+      - name: Restore Daml SDK cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.dpm
+          key: dpm-sdk-${{ runner.os }}-${{ hashFiles('**/daml.yaml', 'scripts/install-dpm-sdks.sh') }}
+          restore-keys: |
+            dpm-sdk-${{ runner.os }}-
+
+      - name: Install Daml SDKs
+        run: scripts/install-dpm-sdks.sh
+
+      - name: Build selected contracts and bindings
+        run: npm run codegen
+
+      - name: Test replay planner and generated package
+        run: npm run verify-package
+
+      - name: Validate environment-scoped database secret
+        env:
+          OCP_REPLAY_DATABASE_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
+        run: |
+          if [ -z "$OCP_REPLAY_DATABASE_URL" ]; then
+            echo "::error::The selected protected GitHub environment must define an OCP_REPLAY_DATABASE_URL secret for a dedicated read-only role."
+            exit 1
+          fi
+
+      - name: Restore LocalNet asset cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.cache/fairmint/canton-localnet
+          key: canton-localnet-${{ runner.os }}-${{ hashFiles('package.json') }}-${{ env.CANTON_LOCALNET_QUICKSTART_REF }}
+          restore-keys: |
+            canton-localnet-${{ runner.os }}-
+
+      - name: Start LocalNet
+        run: ./node_modules/.bin/canton-localnet start
+        timeout-minutes: 45
+
+      - name: Smoke test LocalNet
+        run: ./node_modules/.bin/canton-localnet smoke
+
+      - name: Replay every committed OCF object
+        id: replay
+        env:
+          POSTGRES_DB_URL: ${{ secrets.OCP_REPLAY_DATABASE_URL }}
+          POSTGRES_SSL_CA: ${{ secrets.OCP_REPLAY_SSL_CA }}
+        run: |
+          set +e
+          GITHUB_SHA="$OCP_REPLAY_TARGET_SHA" npm run replay-ocf:localnet -- --database "${{ inputs.database }}" \
+            > "$RUNNER_TEMP/ocf-replay.log" 2>&1
+          replay_status=$?
+          set -e
+          if [ "$replay_status" -ne 0 ]; then
+            echo "::error::OCF replay failed. See the sanitized replay report artifact for details."
+          fi
+          exit "$replay_status"
+        timeout-minutes: 120
+
+      # Canton command logs may contain submitted OCF payloads. Only inspect them when replay never started.
+      - name: Show LocalNet startup logs
+        if: failure() && steps.replay.outcome == 'skipped'
+        run: ./node_modules/.bin/canton-localnet logs || true
+
+      - name: Upload sanitized replay report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocf-localnet-replay-${{ inputs.database }}-${{ github.run_id }}
+          path: artifacts/ocf-localnet-replay/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Stop LocalNet
+        if: always()
+        run: |
+          ./node_modules/.bin/canton-localnet stop || true
+          docker volume prune --force || true
