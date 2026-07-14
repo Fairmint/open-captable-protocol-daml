@@ -3,7 +3,12 @@
 import { access, appendFile, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 
-import type { LedgerJsonApiClient } from '@fairmint/canton-node-sdk';
+import {
+  Canton,
+  type LedgerJsonApiClient,
+  type ScanApiClient,
+  type ValidatorApiClient,
+} from '@fairmint/canton-node-sdk';
 import {
   buildCantonOcfDataMap,
   computeReplicationDiff,
@@ -38,6 +43,14 @@ import {
   type ReplayOptions,
   type ReplayReport,
 } from './localnet-replay/core';
+import {
+  buildNetworkTrafficPricing,
+  buildReplayTrafficReport,
+  getPaidTrafficCostBytes,
+  getParticipantTrafficConsumedBytes,
+  type NetworkTrafficPricing,
+  type ReplayTrafficReport,
+} from './localnet-replay/traffic';
 
 const LOCALNET_USER_ID = 'ledger-api-user';
 const POSTGRES_SSL_QUERY_KEYS = ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert'] as const;
@@ -60,6 +73,7 @@ interface ReplayLedgerContext {
     templateId: string;
   };
   templates: LocalTemplates;
+  trafficMeter: ReplayTrafficMeter;
 }
 
 interface ContractDetails {
@@ -74,6 +88,122 @@ interface CreatedEventValue {
   templateId: string;
   createdEventBlob?: string;
   createArgument?: unknown;
+}
+
+class ReplayTrafficMeter {
+  private participantTrafficBeforeBytes: number | undefined;
+  private committedTransactionCount = 0;
+  private measuredTransactionCount = 0;
+  private confirmationRequestTrafficBytes = 0;
+  private pricingAtStart: NetworkTrafficPricing | undefined;
+  private finalReport: ReplayTrafficReport | undefined;
+  private participantMemberId: string | undefined;
+
+  constructor(
+    private readonly ledger: LedgerJsonApiClient,
+    private readonly validator: ValidatorApiClient,
+    private readonly scan: ScanApiClient,
+    private readonly synchronizerId: string,
+    private readonly systemOperatorParty: string
+  ) {}
+
+  private async readParticipantTraffic(): Promise<number | undefined> {
+    try {
+      if (!this.participantMemberId) {
+        const lookup = await this.scan.getPartyToParticipant({
+          domainId: this.synchronizerId,
+          partyId: this.systemOperatorParty,
+        });
+        this.participantMemberId = lookup.participant_id;
+      }
+      return getParticipantTrafficConsumedBytes(
+        await this.scan.getMemberTrafficStatus({
+          domainId: this.synchronizerId,
+          memberId: this.participantMemberId,
+        })
+      );
+    } catch {
+      console.warn('Canton participant traffic status is unavailable; transaction traffic will still be measured.');
+      return undefined;
+    }
+  }
+
+  private async readPricing(): Promise<NetworkTrafficPricing | undefined> {
+    try {
+      const observedAt = new Date();
+      const [amuletRules, miningRounds] = await Promise.all([
+        this.validator.getAmuletRules(),
+        this.validator.getOpenAndIssuingMiningRounds(),
+      ]);
+      return buildNetworkTrafficPricing(amuletRules, miningRounds, observedAt);
+    } catch {
+      console.warn('Canton network pricing is unavailable; traffic bytes will still be reported.');
+      return undefined;
+    }
+  }
+
+  async start(): Promise<void> {
+    [this.participantTrafficBeforeBytes, this.pricingAtStart] = await Promise.all([
+      this.readParticipantTraffic(),
+      this.readPricing(),
+    ]);
+  }
+
+  async recordCommittedTransaction(updateId: string, submittingParties: string[]): Promise<void> {
+    this.committedTransactionCount += 1;
+    try {
+      const filtersByParty = Object.fromEntries(
+        submittingParties.map((party) => [
+          party,
+          {
+            cumulative: [
+              {
+                identifierFilter: {
+                  WildcardFilter: { value: { includeCreatedEventBlob: false } },
+                },
+              },
+            ],
+          },
+        ])
+      );
+      const response = await this.ledger.getTransactionById({
+        updateId,
+        transactionFormat: {
+          eventFormat: { filtersByParty, verbose: false },
+          transactionShape: 'TRANSACTION_SHAPE_ACS_DELTA',
+        },
+      });
+      const paidTrafficCost = getPaidTrafficCostBytes(response.transaction);
+      if (paidTrafficCost === undefined) {
+        console.warn('Canton omitted paidTrafficCost for a committed OCP transaction.');
+        return;
+      }
+      this.measuredTransactionCount += 1;
+      this.confirmationRequestTrafficBytes += paidTrafficCost;
+    } catch {
+      console.warn('Canton transaction traffic lookup failed for a committed OCP transaction.');
+    }
+  }
+
+  async finish(): Promise<ReplayTrafficReport> {
+    if (this.finalReport) return this.finalReport;
+    const [participantTrafficAfterBytes, pricingAtEnd] = await Promise.all([
+      this.readParticipantTraffic(),
+      this.readPricing(),
+    ]);
+    this.finalReport = buildReplayTrafficReport({
+      ...(this.participantTrafficBeforeBytes !== undefined
+        ? { participantTrafficBeforeBytes: this.participantTrafficBeforeBytes }
+        : {}),
+      ...(participantTrafficAfterBytes !== undefined ? { participantTrafficAfterBytes } : {}),
+      committedTransactionCount: this.committedTransactionCount,
+      measuredTransactionCount: this.measuredTransactionCount,
+      confirmationRequestTrafficBytes: this.confirmationRequestTrafficBytes,
+      ...(this.pricingAtStart ? { pricingAtStart: this.pricingAtStart } : {}),
+      ...(pricingAtEnd ? { pricingAtEnd } : {}),
+    });
+    return this.finalReport;
+  }
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -219,8 +349,9 @@ async function initializeReplayLedger(): Promise<ReplayLedgerContext> {
   const { templates, darPath } = await loadLocalContractArtifacts();
   process.env['DISABLE_FILE_LOGGER'] = 'true';
   process.env['CANTON_DEBUG'] = 'false';
-  const ocp = OcpClient.forLocalNet();
-  const { ledger } = ocp;
+  const canton = new Canton({ network: 'localnet' });
+  const { ledger, scan, validator } = canton;
+  const ocp = new OcpClient({ ledger, validator, environment: 'localnet' });
   const { partyDetails } = await ledger.listParties({});
   const systemOperatorParty =
     partyDetails.find((party) => party.party.toLowerCase().includes('app_provider'))?.party ?? partyDetails[0]?.party;
@@ -229,35 +360,36 @@ async function initializeReplayLedger(): Promise<ReplayLedgerContext> {
   }
 
   ledger.setPartyId(systemOperatorParty);
+  validator.setPartyId(systemOperatorParty);
   const rightsResponse = await ledger.listUserRights({ userId: LOCALNET_USER_ID });
   const actAsRights = new Set(
     (rightsResponse.rights ?? []).flatMap((right) =>
       'CanActAs' in right.kind ? [right.kind.CanActAs.value.party] : []
     )
   );
+  const amuletRules = await validator.getAmuletRules();
+  const synchronizerId = amuletRules.amulet_rules.domain_id;
 
   const context = {
     ocp,
     ledger,
     systemOperatorParty,
-    synchronizerId: '',
+    synchronizerId,
     actAsRights,
     factory: { contractId: '', templateId: '' },
     templates,
+    trafficMeter: new ReplayTrafficMeter(ledger, validator, scan, synchronizerId, systemOperatorParty),
   } satisfies ReplayLedgerContext;
   await ensureActAsRight(context, systemOperatorParty);
 
-  if (!ocp.validator) {
-    throw new ReplayPhaseError('infrastructure', 'LocalNet Validator API client is unavailable');
-  }
-  const amuletRules = await ocp.validator.getAmuletRules();
-  context.synchronizerId = amuletRules.amulet_rules.domain_id;
+  await context.trafficMeter.start();
 
   await ledger.uploadDarFile({ filePath: darPath });
   const factory = await createFactory(ledger, {
     systemOperator: systemOperatorParty,
     templateId: templates.ocpFactory,
   });
+  await context.trafficMeter.recordCommittedTransaction(factory.updateId, [systemOperatorParty]);
   context.factory = { contractId: factory.contractId, templateId: factory.templateId };
   return context;
 }
@@ -295,6 +427,9 @@ async function authorizeIssuer(context: ReplayLedgerContext, issuerParty: string
       ],
       actAs: [context.systemOperatorParty],
     });
+    await context.trafficMeter.recordCommittedTransaction(response.transactionTree.updateId, [
+      context.systemOperatorParty,
+    ]);
     const created = findCreatedEvent(response, context.templates.issuerAuthorization);
     const contractEvents = await context.ledger.getEventsByContractId({
       contractId: created.contractId,
@@ -333,6 +468,7 @@ async function createCapTable(
       readAs: [context.systemOperatorParty],
       disclosedContracts: built.disclosedContracts.filter((contract) => contract.createdEventBlob.length > 0),
     });
+    await context.trafficMeter.recordCommittedTransaction(response.transactionTree.updateId, [issuerParty]);
     const created = findCreatedEvent(response, context.templates.capTable);
     return { contractId: created.contractId, templateId: created.templateId };
   } catch (error) {
@@ -413,6 +549,7 @@ async function replayPortal(context: ReplayLedgerContext, portal: PreparedPortal
   } catch (error) {
     throw new ReplayPhaseError('batch', 'Atomic full-cap-table batch failed', { cause: error });
   }
+  await context.trafficMeter.recordCommittedTransaction(result.updateId, [issuerParty]);
   if (!Array.isArray(result.createdCids) || result.createdCids.length !== portal.creates.length) {
     throw new ReplayPhaseError(
       'convergence',
@@ -445,6 +582,7 @@ function buildReport(params: {
   sourceObjectCount: number;
   portalCount: number;
   results: PortalReplayResult[];
+  traffic?: ReplayTrafficReport;
   fatalFailure?: ReplayFailure;
 }): ReplayReport {
   const finishedAt = new Date();
@@ -465,6 +603,7 @@ function buildReport(params: {
     createdObjectCount: params.results.reduce((sum, result) => sum + result.createdObjectCount, 0),
     status,
     results: params.results,
+    ...(params.traffic ? { traffic: params.traffic } : {}),
     ...(params.fatalFailure ? { fatalFailure: params.fatalFailure } : {}),
   };
 }
@@ -474,6 +613,7 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
   const results: PortalReplayResult[] = [];
   let sourceObjectCount = 0;
   let portalCount = 0;
+  let trafficMeter: ReplayTrafficMeter | undefined;
 
   try {
     const database = resolveDatabaseUrl(options.database);
@@ -487,6 +627,7 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
     const groupedRows = groupRowsByPortal(rows);
     portalCount = groupedRows.size;
     const context = await initializeReplayLedger();
+    ({ trafficMeter } = context);
 
     console.log('Replaying the committed OCF snapshot on isolated LocalNet...');
     for (const portalRows of groupedRows.values()) {
@@ -518,11 +659,21 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
       }
     }
 
-    return buildReport({ options, startedAt, sourceObjectCount, portalCount, results });
+    const traffic = await trafficMeter.finish();
+    return buildReport({ options, startedAt, sourceObjectCount, portalCount, results, traffic });
   } catch (error) {
     const fatalFailure = toReplayFailure('all-portals', error);
     console.error(`::error title=OCP LocalNet replay setup::${escapeWorkflowCommand(fatalFailure.message)}`);
-    return buildReport({ options, startedAt, sourceObjectCount, portalCount, results, fatalFailure });
+    const traffic = trafficMeter ? await trafficMeter.finish() : undefined;
+    return buildReport({
+      options,
+      startedAt,
+      sourceObjectCount,
+      portalCount,
+      results,
+      ...(traffic ? { traffic } : {}),
+      fatalFailure,
+    });
   }
 }
 
