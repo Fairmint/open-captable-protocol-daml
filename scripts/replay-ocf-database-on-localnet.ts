@@ -16,6 +16,7 @@ import {
   extractCantonOcfManifest,
   getCapTableState,
   OcpClient,
+  toCantonConfig,
   type OcfIssuer,
 } from '@open-captable-protocol/canton';
 import { Pool, type PoolConfig } from 'pg';
@@ -55,6 +56,10 @@ import {
 const LOCALNET_USER_ID = 'ledger-api-user';
 const POSTGRES_SSL_QUERY_KEYS = ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert'] as const;
 const CONVERGENCE_RETRY_DELAYS_MS = [0, 1_000, 2_000, 5_000, 10_000] as const;
+
+export function buildReplayCantonConfig(): ConstructorParameters<typeof Canton>[0] {
+  return toCantonConfig({ environment: 'localnet' });
+}
 
 interface LocalTemplates {
   ocpFactory: string;
@@ -356,7 +361,7 @@ async function initializeReplayLedger(
   const { templates, darPath } = await loadLocalContractArtifacts();
   process.env['DISABLE_FILE_LOGGER'] = 'true';
   process.env['CANTON_DEBUG'] = 'false';
-  const canton = new Canton({ network: 'localnet' });
+  const canton = new Canton(buildReplayCantonConfig());
   const { ledger, scan, validator } = canton;
   const ocp = new OcpClient({ ledger, validator, environment: 'localnet' });
   const { partyDetails } = await ledger.listParties({});
