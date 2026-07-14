@@ -24,6 +24,7 @@ import {
   getParticipantTrafficConsumedBytes,
   renderReplayTrafficMarkdown,
 } from './localnet-replay/traffic';
+import { buildReplayCantonConfig } from './replay-ocf-database-on-localnet';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -59,6 +60,12 @@ function expectReplayPhase(fn: () => unknown, phase: ReplayPhaseError['phase']):
 }
 
 function run(): void {
+  const cantonConfig = buildReplayCantonConfig();
+  assert.equal(cantonConfig.network, 'localnet');
+  for (const api of ['LEDGER_JSON_API', 'VALIDATOR_API', 'SCAN_API'] as const) {
+    assert.equal(typeof cantonConfig.apis?.[api]?.auth.tokenGenerator, 'function');
+  }
+
   const defaults = parseReplayOptions([]);
   assert.equal(defaults.database, 'dev');
   assert.match(defaults.reportDir, /artifacts\/ocf-localnet-replay$/);
