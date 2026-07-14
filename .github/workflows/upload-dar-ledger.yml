@@ -1,0 +1,277 @@
+# Manual: build the current backed-up OCP DAR and upload it to the selected Canton network.
+# This is intentionally separate from the package release workflow: it does not publish npm or touch the other network.
+
+name: Upload selected DAR to Canton
+
+on:
+  workflow_dispatch:
+    inputs:
+      package:
+        description: 'DAML package (keys match scripts/packages.ts)'
+        required: true
+        type: choice
+        options:
+          - ocp
+      network:
+        description: 'Target Canton network'
+        required: true
+        type: choice
+        options:
+          - devnet
+          - mainnet
+
+concurrency:
+  # Serialize this workflow with the package release workflow.
+  group: package-release-ocp
+  cancel-in-progress: false
+
+jobs:
+  upload-dar:
+    name: Upload ${{ inputs.package }} to ${{ inputs.network }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+          lfs: true
+          persist-credentials: false
+          submodules: recursive
+
+      - name: Require current main
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::DAR deployments must run from the main branch."
+            exit 1
+          fi
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "::error::Workflow checkout is not current origin/main; refusing deployment side effects."
+            exit 1
+          fi
+
+      - name: Fetch deployment tags
+        run: git fetch --tags origin
+
+      - name: Setup Git LFS
+        run: |
+          git lfs install
+          git lfs pull
+
+      - name: Setup Java
+        uses: actions/setup-java@be666c2fcd27ec809703dec50e508c2fdc7f6654 # v5
+        with:
+          distribution: 'temurin'
+          java-version: '23'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: '20'
+
+      - name: Upgrade npm
+        run: npm install -g npm@11.10.0
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Validate DevNet secrets
+        if: inputs.network == 'devnet'
+        env:
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
+            CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET
+          do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required DevNet secrets:\n'
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Validate Mainnet secrets
+        if: inputs.network == 'mainnet'
+        env:
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in \
+            CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
+            CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET
+          do
+            if [ -z "${!name}" ]; then
+              missing+=("$name")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf 'Missing required Mainnet secrets:\n'
+            printf '  - %s\n' "${missing[@]}"
+            exit 1
+          fi
+
+      - name: Restore Daml SDK cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.dpm
+          key: dpm-sdk-${{ runner.os }}-${{ hashFiles('**/daml.yaml', 'scripts/install-dpm-sdks.sh') }}
+          restore-keys: |
+            dpm-sdk-${{ runner.os }}-
+
+      - name: Install DAML SDKs
+        run: scripts/install-dpm-sdks.sh
+
+      - name: Build and validate package
+        run: |
+          npm run build
+          npm run test:dar-version-policy
+          npm run check:dar-version-policy
+          npm run lint
+          npm run format
+          npm run lint:daml
+          npm run check-upgrade-compat
+          npm run codegen
+          npm run verify-package
+          npm run verify-dars
+          npm run test
+
+      - name: Require committed build artifacts
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "::error::Build or code generation changed the committed tree."
+            git status --short
+            git diff
+            exit 1
+          fi
+
+      - name: Read package metadata
+        id: package
+        env:
+          PACKAGE_INPUT: ${{ inputs.package }}
+          NETWORK_INPUT: ${{ inputs.network }}
+        run: |
+          npx tsx -e \
+            "import { requirePackageConfig } from './scripts/packages'; process.stdout.write(JSON.stringify(requirePackageConfig(process.env.PACKAGE_INPUT ?? '')))" \
+            > package-metadata.json
+          node <<'NODE'
+          const fs = require('fs');
+
+          const pkg = JSON.parse(fs.readFileSync('package-metadata.json', 'utf8'));
+          const lockKey = `${pkg.name}/${pkg.version}/${pkg.darName}.dar`;
+          const lock = JSON.parse(fs.readFileSync('dars/dars.lock', 'utf8'));
+          const entry = lock.packages[lockKey];
+          if (!entry) throw new Error(`Missing DAR lock entry: ${lockKey}`);
+          const tag = `dar-deploy/${process.env.NETWORK_INPUT}/${pkg.name}/v${pkg.version}`;
+          const outputs = {
+            name: pkg.name,
+            version: pkg.version,
+            sha256: entry.sha256,
+            tag,
+          };
+          for (const [key, value] of Object.entries(outputs)) {
+            fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
+          }
+          NODE
+
+      - name: Check deployment policy
+        id: deployment
+        run: npm run check:dar-deployment -- --network ${{ inputs.network }}
+
+      - name: Upload DAR to DevNet
+        if: inputs.network == 'devnet' && steps.deployment.outputs.tag_exists != 'true'
+        env:
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: npm run upload-dar -- --package ${{ inputs.package }} --network devnet
+
+      - name: Upload DAR to Mainnet
+        if: inputs.network == 'mainnet' && steps.deployment.outputs.tag_exists != 'true'
+        env:
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+          CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: npm run upload-dar -- --package ${{ inputs.package }} --network mainnet
+
+      - name: Record successful deployment tag
+        if: steps.deployment.outputs.tag_exists != 'true'
+        env:
+          DAR_DEPLOY_TAG: ${{ steps.package.outputs.tag }}
+          DAR_SHA256: ${{ steps.package.outputs.sha256 }}
+          PACKAGE_NAME: ${{ steps.package.outputs.name }}
+          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git tag -a "$DAR_DEPLOY_TAG" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to ${{ inputs.network }} (${DAR_SHA256})"
+          git push --no-verify origin "refs/tags/$DAR_DEPLOY_TAG"
+
+      - name: Detect selected-network factory state
+        id: factory
+        env:
+          NETWORK_INPUT: ${{ inputs.network }}
+        run: |
+          npx tsx scripts/detect-factory-need.ts --package ${{ inputs.package }} | tee factory-need.json
+          node <<'NODE'
+          const fs = require('fs');
+          const result = JSON.parse(fs.readFileSync('factory-need.json', 'utf8'));
+          const factory = result.factories[process.env.NETWORK_INPUT];
+          if (!factory) throw new Error(`Missing factory result for ${process.env.NETWORK_INPUT}`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `needs_factory=${factory.exists ? 'false' : 'true'}\n`);
+          NODE
+
+      - name: Create DevNet factory
+        if: inputs.network == 'devnet' && steps.factory.outputs.needs_factory == 'true'
+        env:
+          CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: npx tsx scripts/create-ocp-factory.ts --network devnet
+
+      - name: Create Mainnet factory
+        if: inputs.network == 'mainnet' && steps.factory.outputs.needs_factory == 'true'
+        env:
+          CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
+        run: npx tsx scripts/create-ocp-factory.ts --network mainnet
+
+      - name: Upload factory metadata artifact
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: ocp-factory-${{ inputs.network }}-${{ github.run_id }}
+          path: |
+            generated/ocp-factory-contract-id.json
+            generated/ocp-factory-contract-id.json.d.ts
+
+      - name: Commit generated factory metadata
+        env:
+          NETWORK_INPUT: ${{ inputs.network }}
+        run: |
+          set -euo pipefail
+          git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          git fetch --no-tags origin main:refs/remotes/origin/main
+          if [ "$(git rev-parse HEAD)" != "$(git rev-parse origin/main)" ]; then
+            echo "::error::Main moved during deployment. Factory metadata is available in the workflow artifact."
+            exit 1
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add generated/ocp-factory-contract-id.json generated/ocp-factory-contract-id.json.d.ts
+          if git diff --cached --quiet; then
+            echo "No generated factory metadata changed."
+            exit 0
+          fi
+          git commit -m "chore: record ${NETWORK_INPUT} OCP factory [skip ci]"
+          git push --no-verify origin HEAD:main
