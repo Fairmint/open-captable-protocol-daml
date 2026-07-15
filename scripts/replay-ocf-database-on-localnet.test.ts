@@ -23,7 +23,11 @@ import {
   getParticipantExtraTrafficConsumedBytes,
   renderReplayTrafficMarkdown,
 } from './localnet-replay/traffic';
-import { buildReplayCantonConfig } from './replay-ocf-database-on-localnet';
+import {
+  buildReplayCantonConfig,
+  waitForPartyVisibility,
+  waitForStableTrafficCounters,
+} from './replay-ocf-database-on-localnet';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -58,7 +62,7 @@ function expectReplayPhase(fn: () => unknown, phase: ReplayPhaseError['phase']):
   assert.throws(fn, (error: unknown) => error instanceof ReplayPhaseError && error.phase === phase);
 }
 
-function run(): void {
+async function run(): Promise<void> {
   const operatorConfig = buildReplayCantonConfig('app-provider');
   const issuerConfig = buildReplayCantonConfig('app-user');
   const operatorApis = operatorConfig.apis;
@@ -78,6 +82,28 @@ function run(): void {
       assert.equal(typeof apis[api]?.auth.tokenGenerator, 'function');
     }
   }
+
+  let trafficReadCount = 0;
+  const stableTraffic = await waitForStableTrafficCounters(
+    () => {
+      trafficReadCount += 1;
+      return trafficReadCount === 1 ? [10, 20] : [30, 40];
+    },
+    { delaysMs: [0, 0, 0], minimumWaitMs: 0 }
+  );
+  assert.deepEqual(stableTraffic, [30, 40]);
+  assert.equal(trafficReadCount, 3);
+
+  let partyReadCount = 0;
+  await waitForPartyVisibility(
+    'issuer-party',
+    () => {
+      partyReadCount += 1;
+      return { partyDetails: partyReadCount === 1 ? [] : [{ party: 'issuer-party' }] };
+    },
+    { delaysMs: [0, 0] }
+  );
+  assert.equal(partyReadCount, 2);
 
   const defaults = parseReplayOptions([]);
   assert.equal(defaults.database, 'dev');
@@ -391,4 +417,7 @@ function run(): void {
   console.log('OK: LocalNet replay planning, strict schema gate, template identity, and payload-free reports');
 }
 
-run();
+run().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});

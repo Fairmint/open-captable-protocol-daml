@@ -55,6 +55,9 @@ import {
 const LOCALNET_USER_ID = 'ledger-api-user';
 const POSTGRES_SSL_QUERY_KEYS = ['ssl', 'sslmode', 'sslcert', 'sslkey', 'sslrootcert'] as const;
 const CONVERGENCE_RETRY_DELAYS_MS = [0, 1_000, 2_000, 5_000, 10_000] as const;
+const PARTY_VISIBILITY_RETRY_DELAYS_MS = [0, 250, 500, 1_000, 2_000, 5_000, 10_000] as const;
+const TRAFFIC_SETTLEMENT_DELAYS_MS = [2_000, 1_000, 1_000, 1_000, 1_000, 2_000, 2_000] as const;
+const TRAFFIC_SETTLEMENT_MINIMUM_WAIT_MS = 5_000;
 
 export function buildReplayCantonConfig(
   provider: 'app-provider' | 'app-user' = 'app-provider'
@@ -104,6 +107,57 @@ interface CreatedEventValue {
   templateId: string;
   createdEventBlob?: string;
   createArgument?: unknown;
+}
+
+type TrafficCounters = readonly [number | undefined, number | undefined];
+
+interface PollOptions {
+  delaysMs?: readonly number[];
+  minimumWaitMs?: number;
+  sleep?: (milliseconds: number) => Promise<void>;
+}
+
+export async function waitForStableTrafficCounters(
+  readCounters: () => TrafficCounters | Promise<TrafficCounters>,
+  options: PollOptions = {}
+): Promise<TrafficCounters> {
+  const delaysMs = options.delaysMs ?? TRAFFIC_SETTLEMENT_DELAYS_MS;
+  const minimumWaitMs = options.minimumWaitMs ?? TRAFFIC_SETTLEMENT_MINIMUM_WAIT_MS;
+  const wait = options.sleep ?? sleep;
+  let elapsedMs = 0;
+  let previous: TrafficCounters | undefined;
+
+  for (const delayMs of delaysMs) {
+    if (delayMs > 0) await wait(delayMs);
+    elapsedMs += delayMs;
+    const current = await readCounters();
+    if (elapsedMs >= minimumWaitMs && previous?.[0] === current[0] && previous[1] === current[1]) return current;
+    previous = current;
+  }
+
+  return previous ?? readCounters();
+}
+
+export async function waitForPartyVisibility(
+  party: string,
+  readPartyDetails: () =>
+    { partyDetails: Array<{ party: string }> } | Promise<{ partyDetails: Array<{ party: string }> }>,
+  options: PollOptions = {}
+): Promise<void> {
+  const delaysMs = options.delaysMs ?? PARTY_VISIBILITY_RETRY_DELAYS_MS;
+  const wait = options.sleep ?? sleep;
+
+  for (const delayMs of delaysMs) {
+    if (delayMs > 0) await wait(delayMs);
+    try {
+      const { partyDetails } = await readPartyDetails();
+      if (partyDetails.some((details) => details.party === party)) return;
+    } catch {
+      // The remote participant can return not-found while topology propagates.
+    }
+  }
+
+  throw new Error(`Party ${party} did not become visible to the operator participant`);
 }
 
 class ReplayTrafficMeter {
@@ -174,9 +228,14 @@ class ReplayTrafficMeter {
 
   async finish(): Promise<ReplayTrafficReport> {
     if (this.finalReport) return this.finalReport;
-    const [systemOperatorExtraTrafficAfterBytes, issuerExtraTrafficAfterBytes, pricingAtEnd] = await Promise.all([
-      this.readParticipantTraffic(this.systemOperatorParty, 'system-operator'),
-      this.readParticipantTraffic(this.issuerParticipantParty, 'issuer'),
+    const [[systemOperatorExtraTrafficAfterBytes, issuerExtraTrafficAfterBytes], pricingAtEnd] = await Promise.all([
+      waitForStableTrafficCounters(async () => {
+        const counters = await Promise.all([
+          this.readParticipantTraffic(this.systemOperatorParty, 'system-operator'),
+          this.readParticipantTraffic(this.issuerParticipantParty, 'issuer'),
+        ]);
+        return counters;
+      }),
       this.readPricing(),
     ]);
     this.finalReport = buildReplayTrafficReport({
@@ -433,7 +492,10 @@ async function allocateIssuerParty(context: ReplayLedgerContext, portalAlias: st
     });
     const { party } = allocated.partyDetails;
     await ensureActAsRight(context.issuerLedger, context.issuerActAsRights, party);
-    await sleep(500);
+    await waitForPartyVisibility(party, async () => {
+      const details = await context.operatorLedger.getPartyDetails({ party });
+      return details;
+    });
     return party;
   } catch (error) {
     throw new ReplayPhaseError('party', 'Failed to allocate a LocalNet issuer party', { cause: error });
