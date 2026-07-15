@@ -8,14 +8,15 @@ export type ReplayTrafficMeasurementStatus = 'complete' | 'partial' | 'unavailab
 
 export interface ReplayTrafficReport {
   measurementStatus: ReplayTrafficMeasurementStatus;
-  measurementScope: 'participant-replay-window' | 'confirmation-requests' | 'unavailable';
-  totalTrafficBytes?: number;
-  totalTrafficMegabytes?: number;
-  participantTrafficBeforeBytes?: number;
-  participantTrafficAfterBytes?: number;
-  participantTrafficConsumedBytes?: number;
-  confirmationRequestMeasurementComplete: boolean;
-  confirmationRequestTrafficBytes: number;
+  measurementScope: 'participant-extra-traffic' | 'unavailable';
+  totalExtraTrafficBytes?: number;
+  totalExtraTrafficMegabytes?: number;
+  systemOperatorExtraTrafficBeforeBytes?: number;
+  systemOperatorExtraTrafficAfterBytes?: number;
+  systemOperatorExtraTrafficBytes?: number;
+  issuerExtraTrafficBeforeBytes?: number;
+  issuerExtraTrafficAfterBytes?: number;
+  issuerExtraTrafficBytes?: number;
   pricingAtStart?: NetworkTrafficPricing;
   pricingAtEnd?: NetworkTrafficPricing;
   pricingChangedDuringReplay: boolean;
@@ -24,11 +25,10 @@ export interface ReplayTrafficReport {
 }
 
 export interface BuildReplayTrafficReportParams {
-  participantTrafficBeforeBytes?: number;
-  participantTrafficAfterBytes?: number;
-  committedTransactionCount: number;
-  measuredTransactionCount: number;
-  confirmationRequestTrafficBytes: number;
+  systemOperatorExtraTrafficBeforeBytes?: number;
+  systemOperatorExtraTrafficAfterBytes?: number;
+  issuerExtraTrafficBeforeBytes?: number;
+  issuerExtraTrafficAfterBytes?: number;
   pricingAtStart?: NetworkTrafficPricing;
   pricingAtEnd?: NetworkTrafficPricing;
 }
@@ -65,12 +65,7 @@ function getTuple(value: unknown): [unknown, unknown] | undefined {
   return record && '_1' in record && '_2' in record ? [record['_1'], record['_2']] : undefined;
 }
 
-export function getPaidTrafficCostBytes(transaction: unknown): number | undefined {
-  const record = asRecord(transaction);
-  return parseNonNegativeSafeInteger(record?.['paidTrafficCost']);
-}
-
-export function getParticipantTrafficConsumedBytes(response: unknown): number | undefined {
+export function getParticipantExtraTrafficConsumedBytes(response: unknown): number | undefined {
   const root = asRecord(response);
   const trafficStatus = asRecord(root?.['traffic_status']);
   const actual = asRecord(trafficStatus?.['actual']);
@@ -161,27 +156,24 @@ function pricingMatches(left: NetworkTrafficPricing, right: NetworkTrafficPricin
 }
 
 export function buildReplayTrafficReport(params: BuildReplayTrafficReportParams): ReplayTrafficReport {
-  const before = params.participantTrafficBeforeBytes;
-  const after = params.participantTrafficAfterBytes;
-  const participantTrafficConsumedBytes =
-    before !== undefined && after !== undefined && after >= before ? after - before : undefined;
-  const transactionMeasurementComplete =
-    params.committedTransactionCount > 0 && params.measuredTransactionCount === params.committedTransactionCount;
-  const totalTrafficBytes =
-    participantTrafficConsumedBytes ??
-    (transactionMeasurementComplete ? params.confirmationRequestTrafficBytes : undefined);
-  const measurementScope =
-    participantTrafficConsumedBytes !== undefined
-      ? 'participant-replay-window'
-      : transactionMeasurementComplete
-        ? 'confirmation-requests'
-        : 'unavailable';
+  const systemOperatorExtraTrafficBytes = trafficDelta(
+    params.systemOperatorExtraTrafficBeforeBytes,
+    params.systemOperatorExtraTrafficAfterBytes
+  );
+  const issuerExtraTrafficBytes = trafficDelta(
+    params.issuerExtraTrafficBeforeBytes,
+    params.issuerExtraTrafficAfterBytes
+  );
+  const measuredParticipantCount = [systemOperatorExtraTrafficBytes, issuerExtraTrafficBytes].filter(
+    (value) => value !== undefined
+  ).length;
   const measurementStatus =
-    participantTrafficConsumedBytes !== undefined && transactionMeasurementComplete
-      ? 'complete'
-      : totalTrafficBytes !== undefined || params.measuredTransactionCount > 0
-        ? 'partial'
-        : 'unavailable';
+    measuredParticipantCount === 2 ? 'complete' : measuredParticipantCount === 1 ? 'partial' : 'unavailable';
+  const measurementScope = measuredParticipantCount > 0 ? 'participant-extra-traffic' : 'unavailable';
+  const totalExtraTrafficBytes =
+    measurementStatus === 'complete'
+      ? (systemOperatorExtraTrafficBytes ?? 0) + (issuerExtraTrafficBytes ?? 0)
+      : undefined;
   const pricingChangedDuringReplay =
     params.pricingAtStart !== undefined &&
     params.pricingAtEnd !== undefined &&
@@ -191,8 +183,8 @@ export function buildReplayTrafficReport(params: BuildReplayTrafficReportParams)
       ? params.pricingAtEnd
       : undefined;
   const equivalentExtraTrafficCostUsd =
-    totalTrafficBytes !== undefined && stablePricing
-      ? (totalTrafficBytes / 1_000_000) * stablePricing.extraTrafficPriceUsdPerMegabyte
+    totalExtraTrafficBytes !== undefined && stablePricing
+      ? (totalExtraTrafficBytes / 1_000_000) * stablePricing.extraTrafficPriceUsdPerMegabyte
       : undefined;
   const equivalentExtraTrafficCostCantonCoin =
     equivalentExtraTrafficCostUsd !== undefined && stablePricing
@@ -202,14 +194,23 @@ export function buildReplayTrafficReport(params: BuildReplayTrafficReportParams)
   return {
     measurementStatus,
     measurementScope,
-    ...(totalTrafficBytes !== undefined
-      ? { totalTrafficBytes, totalTrafficMegabytes: totalTrafficBytes / 1_000_000 }
+    ...(totalExtraTrafficBytes !== undefined
+      ? { totalExtraTrafficBytes, totalExtraTrafficMegabytes: totalExtraTrafficBytes / 1_000_000 }
       : {}),
-    ...(before !== undefined ? { participantTrafficBeforeBytes: before } : {}),
-    ...(after !== undefined ? { participantTrafficAfterBytes: after } : {}),
-    ...(participantTrafficConsumedBytes !== undefined ? { participantTrafficConsumedBytes } : {}),
-    confirmationRequestMeasurementComplete: transactionMeasurementComplete,
-    confirmationRequestTrafficBytes: params.confirmationRequestTrafficBytes,
+    ...(params.systemOperatorExtraTrafficBeforeBytes !== undefined
+      ? { systemOperatorExtraTrafficBeforeBytes: params.systemOperatorExtraTrafficBeforeBytes }
+      : {}),
+    ...(params.systemOperatorExtraTrafficAfterBytes !== undefined
+      ? { systemOperatorExtraTrafficAfterBytes: params.systemOperatorExtraTrafficAfterBytes }
+      : {}),
+    ...(systemOperatorExtraTrafficBytes !== undefined ? { systemOperatorExtraTrafficBytes } : {}),
+    ...(params.issuerExtraTrafficBeforeBytes !== undefined
+      ? { issuerExtraTrafficBeforeBytes: params.issuerExtraTrafficBeforeBytes }
+      : {}),
+    ...(params.issuerExtraTrafficAfterBytes !== undefined
+      ? { issuerExtraTrafficAfterBytes: params.issuerExtraTrafficAfterBytes }
+      : {}),
+    ...(issuerExtraTrafficBytes !== undefined ? { issuerExtraTrafficBytes } : {}),
     ...(params.pricingAtStart ? { pricingAtStart: params.pricingAtStart } : {}),
     ...(params.pricingAtEnd ? { pricingAtEnd: params.pricingAtEnd } : {}),
     pricingChangedDuringReplay,
@@ -218,35 +219,26 @@ export function buildReplayTrafficReport(params: BuildReplayTrafficReportParams)
   };
 }
 
+function trafficDelta(before: number | undefined, after: number | undefined): number | undefined {
+  return before !== undefined && after !== undefined && after >= before ? after - before : undefined;
+}
+
 function formatTraffic(bytes: number): string {
   return `${(bytes / 1_000_000).toFixed(3)} MB (${bytes.toLocaleString('en-US')} bytes)`;
 }
 
 export function renderReplayTrafficMarkdown(traffic: ReplayTrafficReport): string[] {
   const lines = ['', '## Canton traffic and cost', ''];
-  if (traffic.totalTrafficBytes !== undefined) {
-    const scope =
-      traffic.measurementScope === 'participant-replay-window'
-        ? 'Total participant traffic consumed during the replay window'
-        : 'Measured OCP confirmation-request traffic';
-    lines.push(`- ${scope}: **${formatTraffic(traffic.totalTrafficBytes)}**`);
+  if (traffic.totalExtraTrafficBytes !== undefined) {
+    lines.push(`- Total extra traffic consumed during replay: **${formatTraffic(traffic.totalExtraTrafficBytes)}**`);
   } else {
-    lines.push('- Total traffic: **unavailable from this LocalNet version**');
+    lines.push('- Total extra traffic: **unavailable because both participant counters were not captured**');
   }
 
-  lines.push(
-    `- OCP confirmation-request traffic: **${formatTraffic(traffic.confirmationRequestTrafficBytes)}** ` +
-      `(${traffic.confirmationRequestMeasurementComplete ? 'complete' : 'partial'} committed-transaction coverage)`
-  );
-
-  if (
-    traffic.confirmationRequestMeasurementComplete &&
-    traffic.participantTrafficConsumedBytes !== undefined &&
-    traffic.participantTrafficConsumedBytes >= traffic.confirmationRequestTrafficBytes
-  ) {
-    const otherTraffic = traffic.participantTrafficConsumedBytes - traffic.confirmationRequestTrafficBytes;
-    lines.push(`- Other participant traffic during the replay window: **${formatTraffic(otherTraffic)}**`);
-  }
+  if (traffic.systemOperatorExtraTrafficBytes !== undefined)
+    lines.push(`- Fairmint operator participant: **${formatTraffic(traffic.systemOperatorExtraTrafficBytes)}**`);
+  if (traffic.issuerExtraTrafficBytes !== undefined)
+    lines.push(`- Transfer-agent participant: **${formatTraffic(traffic.issuerExtraTrafficBytes)}**`);
 
   if (
     traffic.equivalentExtraTrafficCostUsd !== undefined &&
@@ -261,8 +253,8 @@ export function renderReplayTrafficMarkdown(traffic: ReplayTrafficReport): strin
     );
   } else if (traffic.pricingChangedDuringReplay) {
     lines.push('- CC equivalent: omitted because network pricing changed between the start and end snapshots.');
-  } else if (traffic.totalTrafficBytes === undefined) {
-    lines.push('- CC equivalent: unavailable because the total traffic measurement is unavailable.');
+  } else if (traffic.totalExtraTrafficBytes === undefined) {
+    lines.push('- CC equivalent: unavailable because the complete extra-traffic measurement is unavailable.');
   } else if (!traffic.pricingAtStart || !traffic.pricingAtEnd) {
     lines.push('- CC equivalent: unavailable because both start and end network prices could not be captured.');
   } else {
@@ -271,8 +263,8 @@ export function renderReplayTrafficMarkdown(traffic: ReplayTrafficReport): strin
 
   lines.push(
     '',
-    'The CC figure is the replacement cost of equivalent extra traffic at the observed on-ledger prices. ' +
-      'Traffic is pre-purchased and base traffic may be free, so this is not a claim that the replay directly burned that amount of CC.',
+    'These counters measure purchased extra traffic consumed after each participant exhausts its free base allowance. ' +
+      'The CC figure is the replacement cost at the observed on-ledger prices; traffic is pre-purchased, so it is not a direct per-transaction CC debit.',
     ''
   );
   return lines;
