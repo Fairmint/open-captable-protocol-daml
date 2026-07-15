@@ -20,11 +20,14 @@ import {
 import {
   buildNetworkTrafficPricing,
   buildReplayTrafficReport,
-  getPaidTrafficCostBytes,
-  getParticipantTrafficConsumedBytes,
+  getParticipantExtraTrafficConsumedBytes,
   renderReplayTrafficMarkdown,
 } from './localnet-replay/traffic';
-import { buildReplayCantonConfig } from './replay-ocf-database-on-localnet';
+import {
+  buildReplayCantonConfig,
+  waitForPartyVisibility,
+  waitForStableTrafficCounters,
+} from './replay-ocf-database-on-localnet';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -59,12 +62,48 @@ function expectReplayPhase(fn: () => unknown, phase: ReplayPhaseError['phase']):
   assert.throws(fn, (error: unknown) => error instanceof ReplayPhaseError && error.phase === phase);
 }
 
-function run(): void {
-  const cantonConfig = buildReplayCantonConfig();
-  assert.equal(cantonConfig.network, 'localnet');
-  for (const api of ['LEDGER_JSON_API', 'VALIDATOR_API', 'SCAN_API'] as const) {
-    assert.equal(typeof cantonConfig.apis?.[api]?.auth.tokenGenerator, 'function');
+async function run(): Promise<void> {
+  const operatorConfig = buildReplayCantonConfig('app-provider');
+  const issuerConfig = buildReplayCantonConfig('app-user');
+  const operatorApis = operatorConfig.apis;
+  const issuerApis = issuerConfig.apis;
+  assert(operatorApis);
+  assert(issuerApis);
+  assert.equal(operatorConfig.network, 'localnet');
+  assert.equal(operatorConfig.provider, 'app-provider');
+  assert.equal(operatorApis.LEDGER_JSON_API?.apiUrl, 'http://localhost:3975');
+  assert.equal(operatorApis.VALIDATOR_API?.apiUrl, 'http://localhost:3903');
+  assert.equal(issuerConfig.provider, 'app-user');
+  assert.equal(issuerApis.LEDGER_JSON_API?.apiUrl, 'http://localhost:2975');
+  assert.equal(issuerApis.VALIDATOR_API?.apiUrl, 'http://localhost:2903');
+  for (const apis of [operatorApis, issuerApis]) {
+    assert.equal(apis.SCAN_API?.apiUrl, 'http://scan.localhost:4000/api/scan');
+    for (const api of ['LEDGER_JSON_API', 'VALIDATOR_API', 'SCAN_API'] as const) {
+      assert.equal(typeof apis[api]?.auth.tokenGenerator, 'function');
+    }
   }
+
+  let trafficReadCount = 0;
+  const stableTraffic = await waitForStableTrafficCounters(
+    () => {
+      trafficReadCount += 1;
+      return trafficReadCount === 1 ? [10, 20] : [30, 40];
+    },
+    { delaysMs: [0, 0, 0], minimumWaitMs: 0 }
+  );
+  assert.deepEqual(stableTraffic, [30, 40]);
+  assert.equal(trafficReadCount, 3);
+
+  let partyReadCount = 0;
+  await waitForPartyVisibility(
+    'issuer-party',
+    () => {
+      partyReadCount += 1;
+      return { partyDetails: partyReadCount === 1 ? [] : [{ party: 'issuer-party' }] };
+    },
+    { delaysMs: [0, 0] }
+  );
+  assert.equal(partyReadCount, 2);
 
   const defaults = parseReplayOptions([]);
   assert.equal(defaults.database, 'dev');
@@ -187,11 +226,8 @@ function run(): void {
     false
   );
 
-  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: 12_345 }), 12_345);
-  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: '67890' }), 67_890);
-  assert.equal(getPaidTrafficCostBytes({ paidTrafficCost: Number.MAX_SAFE_INTEGER + 1 }), undefined);
   assert.equal(
-    getParticipantTrafficConsumedBytes({ traffic_status: { actual: { total_consumed: 987_654 } } }),
+    getParticipantExtraTrafficConsumedBytes({ traffic_status: { actual: { total_consumed: 987_654 } } }),
     987_654
   );
 
@@ -260,29 +296,31 @@ function run(): void {
   });
 
   const traffic = buildReplayTrafficReport({
-    participantTrafficBeforeBytes: 1_000,
-    participantTrafficAfterBytes: 2_001_000,
-    committedTransactionCount: 4,
-    measuredTransactionCount: 4,
-    confirmationRequestTrafficBytes: 1_800_000,
+    systemOperatorExtraTrafficBeforeBytes: 1_000,
+    systemOperatorExtraTrafficAfterBytes: 1_001_000,
+    issuerExtraTrafficBeforeBytes: 500,
+    issuerExtraTrafficAfterBytes: 1_000_500,
     pricingAtStart: pricing,
     pricingAtEnd: { ...pricing, observedAt: '2026-01-01T00:01:00.000Z' },
   });
   assert.equal(traffic.measurementStatus, 'complete');
-  assert.equal(traffic.measurementScope, 'participant-replay-window');
-  assert.equal(traffic.totalTrafficBytes, 2_000_000);
-  assert.equal(traffic.totalTrafficMegabytes, 2);
+  assert.equal(traffic.measurementScope, 'participant-extra-traffic');
+  assert.equal(traffic.totalExtraTrafficBytes, 2_000_000);
+  assert.equal(traffic.totalExtraTrafficMegabytes, 2);
+  assert.equal(traffic.systemOperatorExtraTrafficBytes, 1_000_000);
+  assert.equal(traffic.issuerExtraTrafficBytes, 1_000_000);
   assert.equal(traffic.equivalentExtraTrafficCostUsd, 100);
   assert.equal(traffic.equivalentExtraTrafficCostCantonCoin, 10_000);
 
   const changedPricingTraffic = buildReplayTrafficReport({
-    committedTransactionCount: 1,
-    measuredTransactionCount: 1,
-    confirmationRequestTrafficBytes: 1_000_000,
+    systemOperatorExtraTrafficBeforeBytes: 0,
+    systemOperatorExtraTrafficAfterBytes: 500_000,
+    issuerExtraTrafficBeforeBytes: 0,
+    issuerExtraTrafficAfterBytes: 500_000,
     pricingAtStart: pricing,
     pricingAtEnd: { ...pricing, extraTrafficPriceUsdPerMegabyte: 55 },
   });
-  assert.equal(changedPricingTraffic.measurementScope, 'confirmation-requests');
+  assert.equal(changedPricingTraffic.measurementScope, 'participant-extra-traffic');
   assert.equal(changedPricingTraffic.pricingChangedDuringReplay, true);
   assert.equal(changedPricingTraffic.equivalentExtraTrafficCostCantonCoin, undefined);
   assert.match(
@@ -291,30 +329,24 @@ function run(): void {
   );
 
   const missingPricingTraffic = buildReplayTrafficReport({
-    committedTransactionCount: 1,
-    measuredTransactionCount: 1,
-    confirmationRequestTrafficBytes: 1_000_000,
+    systemOperatorExtraTrafficBeforeBytes: 0,
+    systemOperatorExtraTrafficAfterBytes: 500_000,
+    issuerExtraTrafficBeforeBytes: 0,
+    issuerExtraTrafficAfterBytes: 500_000,
   });
   assert.match(
     renderReplayTrafficMarkdown(missingPricingTraffic).join('\n'),
     /both start and end network prices could not be captured/
   );
 
-  const unavailableTraffic = buildReplayTrafficReport({
-    committedTransactionCount: 1,
-    measuredTransactionCount: 0,
-    confirmationRequestTrafficBytes: 0,
-  });
+  const unavailableTraffic = buildReplayTrafficReport({});
   const unavailableMarkdown = renderReplayTrafficMarkdown(unavailableTraffic).join('\n');
-  assert.match(unavailableMarkdown, /unavailable from this LocalNet version/);
-  assert.match(unavailableMarkdown, /total traffic measurement is unavailable/);
+  assert.match(unavailableMarkdown, /both participant counters were not captured/);
+  assert.match(unavailableMarkdown, /complete extra-traffic measurement is unavailable/);
 
   const partialTraffic = buildReplayTrafficReport({
-    participantTrafficBeforeBytes: 1_000,
-    participantTrafficAfterBytes: 2_001_000,
-    committedTransactionCount: 2,
-    measuredTransactionCount: 1,
-    confirmationRequestTrafficBytes: 1_000_000,
+    systemOperatorExtraTrafficBeforeBytes: 1_000,
+    systemOperatorExtraTrafficAfterBytes: 2_001_000,
   });
   const partialMarkdown = renderReplayMarkdown({
     database: 'dev',
@@ -332,7 +364,8 @@ function run(): void {
     results: [],
     traffic: partialTraffic,
   });
-  assert.doesNotMatch(partialMarkdown, /Other participant traffic/);
+  assert.match(partialMarkdown, /Fairmint operator participant/);
+  assert.doesNotMatch(partialMarkdown, /Transfer-agent participant/);
 
   const failure = toReplayFailure(
     'portal-run-local',
@@ -368,13 +401,13 @@ function run(): void {
   };
   const publicReportText = JSON.stringify(toPublicReplayReport(privateReport));
   assert.doesNotMatch(publicReportText, /portal-run-local|Sensitive Person|stakeholder-secret-id|456|444/);
-  assert.doesNotMatch(publicReportText, /committedTransactionCount|measuredTransactionCount/);
   assert.match(publicReportText, /"failurePhases":\["batch"\]/);
-  assert.match(publicReportText, /"totalTrafficMegabytes":2/);
+  assert.match(publicReportText, /"totalExtraTrafficMegabytes":2/);
 
   const markdown = renderReplayMarkdown(privateReport);
-  assert.match(markdown, /Total participant traffic consumed during the replay window/);
-  assert.match(markdown, /Other participant traffic during the replay window/);
+  assert.match(markdown, /Total extra traffic consumed during replay/);
+  assert.match(markdown, /Fairmint operator participant/);
+  assert.match(markdown, /Transfer-agent participant/);
   assert.match(markdown, /10000\.000000 CC/);
 
   const portalAlias = hashIdentifier(PORTAL_ID, 'portal');
@@ -384,4 +417,7 @@ function run(): void {
   console.log('OK: LocalNet replay planning, strict schema gate, template identity, and payload-free reports');
 }
 
-run();
+run().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
