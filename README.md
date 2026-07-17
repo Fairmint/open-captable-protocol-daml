@@ -48,9 +48,9 @@ canonical guide for contract architecture, OCF validation, development, testing,
 release policy. The active package's
 [`daml.yaml`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/OpenCapTable-v34/daml.yaml),
 [`multi-package.yaml`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/multi-package.yaml),
-[`package.json`](./package.json), and
-[`scripts/`](https://github.com/Fairmint/open-captable-protocol-daml/tree/main/scripts) remain the
-source of truth for current versions, dependencies, and automation.
+[`package.json`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/package.json),
+and [`scripts/`](https://github.com/Fairmint/open-captable-protocol-daml/tree/main/scripts) remain
+the source of truth for current versions, dependencies, and automation.
 
 ## Build and validate
 
