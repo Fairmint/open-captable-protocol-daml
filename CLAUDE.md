@@ -1,11 +1,12 @@
 # Repository guidance
 
-Read the public repository documentation before changing contracts or automation:
+Read the public wiki before changing contracts or automation:
 
 - [`README.md`](./README.md)
-- [Contract architecture](./docs/architecture.md)
-- [OCF validation model](./docs/validation.md)
-- [Development, testing, and releases](./docs/development-and-releases.md)
+- [Contract architecture](https://github.com/Fairmint/open-captable-protocol-daml/wiki/Contract-Architecture)
+- [OCF validation policy](https://github.com/Fairmint/open-captable-protocol-daml/wiki/OCF-Validation-Policy)
+- [Development and testing](https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing)
+- [DAR backup and release policy](https://github.com/Fairmint/open-captable-protocol-daml/wiki/DAR-Backup)
 
 Keep repository guidance synchronized with the code:
 

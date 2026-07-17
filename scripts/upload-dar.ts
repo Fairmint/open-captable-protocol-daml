@@ -5,7 +5,7 @@
  * Requires a fresh build that exactly matches the committed candidate backup.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
- * purpose—see ../docs/development-and-releases.md
+ * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki/DAR-Backup
  *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet]
  *
@@ -15,21 +15,31 @@
  * <main-dalf-id>` (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
  */
 
-import * as fs from 'fs';
-import { computeSha256, getFreshDarPath, requireBackedUpDar } from './dar-utils';
-import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
-import { LEDGER_SCRIPT_PROVIDERS } from './providers';
-import { createLedgerJsonApiClient } from './utils';
+import * as fs from "fs";
+import {
+  computeSha256,
+  getFreshDarPath,
+  requireBackedUpDar,
+} from "./dar-utils";
+import {
+  parseNetworkArg,
+  parsePackageArg,
+  printPackageUsage,
+  requireNetwork,
+  requirePackage,
+} from "./packages";
+import { LEDGER_SCRIPT_PROVIDERS } from "./providers";
+import { createLedgerJsonApiClient } from "./utils";
 
 async function main() {
   // Validate args (show help if missing)
   if (!parsePackageArg() || !parseNetworkArg()) {
-    printPackageUsage('upload-dar.ts');
+    printPackageUsage("upload-dar.ts");
     process.exit(1);
   }
 
-  const pkg = requirePackage('upload-dar.ts');
-  const network = requireNetwork('upload-dar.ts');
+  const pkg = requirePackage("upload-dar.ts");
+  const network = requireNetwork("upload-dar.ts");
 
   console.log(`\n📦 Uploading ${pkg.name} v${pkg.version} to ${network}\n`);
 
@@ -52,10 +62,10 @@ async function main() {
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
   // does not block the other.
   const failures: Array<{ provider: string; message: string }> = [];
-  const noVet = process.argv.includes('--no-vet');
+  const noVet = process.argv.includes("--no-vet");
   if (noVet) {
     console.log(
-      '  ℹ️  --no-vet: uploading without auto-vet (avoids upgrade check at upload). Vet manually with scripts/vet-package-allow-incompatible-upgrade.ts if needed.\n'
+      "  ℹ️  --no-vet: uploading without auto-vet (avoids upgrade check at upload). Vet manually with scripts/vet-package-allow-incompatible-upgrade.ts if needed.\n",
     );
   }
 
@@ -68,7 +78,7 @@ async function main() {
         // keys). POST the octet-stream body ourselves with the query flag Canton documents for JSON API uploads.
         const url = `${client.getApiUrl()}/v2/packages?vetAllPackages=false`;
         await client.makePostRequest(url, fs.readFileSync(darPath), {
-          contentType: 'application/octet-stream',
+          contentType: "application/octet-stream",
           includeBearerToken: true,
         });
       } else {
@@ -87,17 +97,24 @@ async function main() {
     for (const { provider, message } of failures) {
       console.error(`   ${provider}: ${message}\n`);
     }
-    if (failures.some((f) => f.message.includes('NOT_VALID_UPGRADE_PACKAGE')) && !noVet) {
+    if (
+      failures.some((f) => f.message.includes("NOT_VALID_UPGRADE_PACKAGE")) &&
+      !noVet
+    ) {
       console.error(
-        'Tip: incompatible package lineage vetting at upload — retry with --no-vet, then vet the new main package id (see script header).\n'
+        "Tip: incompatible package lineage vetting at upload — retry with --no-vet, then vet the new main package id (see script header).\n",
       );
     }
     process.exit(1);
   }
 
   if (failures.length > 0) {
-    console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.`);
-    console.warn(`   Not updating dars.lock — upload must succeed on all providers first.\n`);
+    console.warn(
+      `\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.`,
+    );
+    console.warn(
+      `   Not updating dars.lock — upload must succeed on all providers first.\n`,
+    );
     process.exit(1);
   }
 
