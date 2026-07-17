@@ -1,11 +1,24 @@
-# open-captable-protocol-daml
+# Repository guidance
 
-## Step 0: Read the Wiki (REQUIRED)
+Read the public repository documentation before changing contracts or automation:
 
-All documentation lives in the
-[GitHub wiki](https://github.com/fairmint/open-captable-protocol-daml/wiki). Before doing any work
-in this repository, clone or update the local copy and read `Home.md`:
+- [`README.md`](./README.md)
+- [Contract architecture](./docs/architecture.md)
+- [OCF validation model](./docs/validation.md)
+- [Development, testing, and releases](./docs/development-and-releases.md)
 
-```bash
-if [ -d wiki/.git ]; then git -C wiki pull; else git clone https://github.com/fairmint/open-captable-protocol-daml.wiki.git wiki; fi
-```
+Keep repository guidance synchronized with the code:
+
+- Treat `multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`, and the
+  implementation in `scripts/` as the current source of truth. Do not copy versions or dependency
+  lists into prose.
+- Run `npm run build` and `npm test` for contract changes. Also run `npm run lint:daml`,
+  `npm run check-upgrade-compat`, `npm run codegen`, and `npm run verify-package` when DAML source,
+  upgrade compatibility, generated bindings, or the npm surface may change.
+- For DAR backup or release metadata changes, run the applicable policy checks from `package.json`,
+  including `npm run check:dar-version-policy` and `npm run verify-dars`.
+- `Fairmint/OpenCapTable/CapTable.daml` is generated and gitignored. Change
+  `scripts/codegen/generate-captable.ts`, its configuration, or its templates instead, then
+  regenerate through the repository scripts.
+- Validate protocol behavior against the official OCF schema and the repository's current schema
+  fixtures and tests. Do not add Fairmint-specific requirements to OCF data validity.
