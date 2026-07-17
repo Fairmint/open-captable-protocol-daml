@@ -16,10 +16,7 @@ The browser-safe root entry point exports the generated OpenCapTable namespace, 
 dependencies, and the three entry-point template IDs:
 
 ```ts
-import {
-  Fairmint,
-  OCP_TEMPLATES,
-} from "@fairmint/open-captable-protocol-daml-js";
+import { Fairmint, OCP_TEMPLATES } from '@fairmint/open-captable-protocol-daml-js';
 
 const { OpenCapTable } = Fairmint;
 const capTableTemplateId = OCP_TEMPLATES.capTable;
@@ -28,11 +25,11 @@ const capTableTemplateId = OCP_TEMPLATES.capTable;
 The package also exposes stable subpaths for deployment metadata and the DAR:
 
 ```ts
-import factoryIds from "@fairmint/open-captable-protocol-daml-js/ocp-factory-contract-id.json";
+import factoryIds from '@fairmint/open-captable-protocol-daml-js/ocp-factory-contract-id.json';
 import {
   getOpenCapTableDarPath,
   resolveOpenCapTableDarPath,
-} from "@fairmint/open-captable-protocol-daml-js/openCapTableDarPath";
+} from '@fairmint/open-captable-protocol-daml-js/openCapTableDarPath';
 ```
 
 The DAR itself is exported at `@fairmint/open-captable-protocol-daml-js/opencaptable.dar`. Check
@@ -72,5 +69,6 @@ npm run codegen
 npm run verify-package
 ```
 
-See [Development and Testing](https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing)
+See
+[Development and Testing](https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing)
 for the generated-file boundary and specialized checks.
