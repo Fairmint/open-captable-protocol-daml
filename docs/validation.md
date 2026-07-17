@@ -14,9 +14,11 @@ Validation is split across three code-level layers:
    validator from its `ensure` clause. See the object modules under
    [`OCF/`](../OpenCapTable-v34/daml/Fairmint/OpenCapTable/OCF/) and shared helpers under
    [`Types/`](../OpenCapTable-v34/daml/Fairmint/OpenCapTable/Types/).
-2. The generated `CapTable` validates references against the aggregate's current maps. The rules are
-   declared in [`captable-config.yaml`](../scripts/codegen/captable-config.yaml), including
-   type-specific security-ID indexes.
+2. The generated `CapTable` validates references against the aggregate's current maps. Most rules
+   are declared in [`captable-config.yaml`](../scripts/codegen/captable-config.yaml), including
+   type-specific security-ID indexes. Additional aggregate-wide checks, currently Financing
+   issuance references, live in
+   [`CapTable.daml.template`](../scripts/codegen/templates/CapTable.daml.template).
 3. DAML Script tests exercise object validation, lifecycle behavior, batch ordering, and reference
    failures under [`Test/daml/OpenCapTable/`](../Test/daml/OpenCapTable/).
 

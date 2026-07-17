@@ -4,7 +4,7 @@
  *
  * @remarks
  *   User-facing documentation for `OPEN_CAP_TABLE_DAR_PATH`, the packaged DAR, and local development lives in
- *   `docs/development-and-releases.md`.
+ *   `../../docs/development-and-releases.md`.
  */
 
 import * as fs from 'fs';

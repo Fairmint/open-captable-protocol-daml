@@ -20,5 +20,5 @@ Keep repository guidance synchronized with the code:
 - `Fairmint/OpenCapTable/CapTable.daml` is generated and gitignored. Change
   `scripts/codegen/generate-captable.ts`, its configuration, or its templates instead, then
   regenerate through the repository scripts.
-- Validate protocol behavior against the official OCF schema and the repository's current schema
-  fixtures and tests. Do not add Fairmint-specific requirements to OCF data validity.
+- Validate protocol behavior against the official OCF schema, `scripts/schema-gap-checker/`, and
+  `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity.

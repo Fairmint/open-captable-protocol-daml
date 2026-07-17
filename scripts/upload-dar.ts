@@ -5,7 +5,7 @@
  * Requires a fresh build that exactly matches the committed candidate backup.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
- * purpose—see docs/development-and-releases.md
+ * purpose—see ../docs/development-and-releases.md
  *
  * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet]
  *

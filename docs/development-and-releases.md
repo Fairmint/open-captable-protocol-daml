@@ -59,7 +59,7 @@ from `package.json`. They serve different compatibility domains and need not mat
 deployed package solely from a directory name or npm version: inspect `dars/dars.lock` and the
 deployment tags used by the workflows.
 
-The release flow is policy-driven:
+The package-scoped [`release.yml`](../.github/workflows/release.yml) flow is policy-driven:
 
 1. Prepare and review the package/source version change.
 2. Build, test, lint, check upgrade compatibility, generate bindings, and verify the npm surface.
@@ -68,8 +68,13 @@ The release flow is policy-driven:
 5. Record successful network deployment with the package-scoped deployment tag.
 6. Publish the npm package only after its workflow gates are satisfied.
 
-The exact policy is implemented in [`scripts/`](../scripts/) and
-[`release.yml`](../.github/workflows/release.yml). Use
+The repository also has a separate [`publish.yml`](../.github/workflows/publish.yml) npm path. It
+runs on pushes to `main` and by manual dispatch, then builds, generates bindings, prepares the npm
+artifact, publishes it, and creates an npm-version tag. It does not run the DAR version, upload, or
+deployment-tag gates above, so its success is not evidence that a DAR was deployed. Account for both
+workflows when changing package versions or release policy until the paths are consolidated.
+
+The exact policy is implemented in [`scripts/`](../scripts/) and the two workflows above. Use
 `npm run verify-dars` and `npm run check:dar-version-policy` for DAR changes. Major package-line
 upgrades require an explicit design decision because they create a new DAML upgrade lineage; do not
 start one as a routine version bump.
