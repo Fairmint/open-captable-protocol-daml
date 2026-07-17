@@ -22,14 +22,20 @@ Validation is split across three code-level layers:
 3. DAML Script tests exercise object validation, lifecycle behavior, batch ordering, and reference
    failures under [`Test/daml/OpenCapTable/`](../Test/daml/OpenCapTable/).
 
-Unknown or missing referenced IDs fail before the batch is committed. Reference checks are scoped
-to fields for which the repository has an authoritative target map; a field being named like an ID
-is not enough evidence to invent a relationship.
+Create and edit operations reject unknown or missing referenced IDs when their generated reference
+checks run. Deletes generally archive the target and remove it from the aggregate maps without
+scanning existing objects for reverse references; the post-batch Financing check is a current
+exception. Callers therefore must not assume that every delete is protected from leaving a dangling
+reference. Reference checks are scoped to fields for which the repository has an authoritative
+target map; a field being named like an ID is not enough evidence to invent a relationship.
 
 ## Schema-alignment rules
 
 - Match required, optional, array, enum, and scalar constraints from the schema.
-- A required numeric value may be zero unless the schema says otherwise.
+- A required numeric value may be zero unless the schema or a separately documented protocol rule
+  says otherwise. Current explicit exceptions include positive `amount` for `ConvertibleTransfer`
+  and positive `quantity` for `StockTransfer`; preserve such rules unless their authority and
+  compatibility impact have been reviewed.
 - Optional text, when present, must satisfy the shared non-empty-text rule used by the contracts.
 - `object_type` is not stored when the DAML template already determines it.
 - Cross-object checks must point at the semantically correct map. For example, a stock transaction

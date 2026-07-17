@@ -59,11 +59,14 @@ from `package.json`. They serve different compatibility domains and need not mat
 deployed package solely from a directory name or npm version: inspect `dars/dars.lock` and the
 deployment tags used by the workflows.
 
-The package-scoped [`release.yml`](../.github/workflows/release.yml) flow is policy-driven:
+The package-scoped release process is policy-driven. Complete steps 1-3 in the reviewed source PR
+before creating a release tag; [`release.yml`](../.github/workflows/release.yml) validates the
+committed backup and performs the guarded side effects in steps 4-6:
 
 1. Prepare and review the package/source version change.
 2. Build, test, lint, check upgrade compatibility, generate bindings, and verify the npm surface.
-3. Back up the selected DAR and verify `dars.lock` integrity and version policy.
+3. Run `npm run backup-dar -- --package <name> --version <version>`, commit the resulting `dars/`
+   and `dars/dars.lock` changes, and verify their integrity and version policy.
 4. Upload only through the guarded workflow or repository script for the selected network.
 5. Record successful network deployment with the package-scoped deployment tag.
 6. Publish the npm package only after its workflow gates are satisfied.
