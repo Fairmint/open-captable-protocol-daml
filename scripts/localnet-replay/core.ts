@@ -17,6 +17,8 @@ import {
   type OcfEntityType,
 } from '@open-captable-protocol/canton';
 
+import { renderReplayTrafficMarkdown, type ReplayTrafficReport } from './traffic';
+
 export type DatabaseSource = 'dev' | 'production';
 
 export interface ReplayOptions {
@@ -88,6 +90,7 @@ export interface ReplayReport {
   createdObjectCount: number;
   status: 'passed' | 'failed';
   results: PortalReplayResult[];
+  traffic?: ReplayTrafficReport;
   fatalFailure?: ReplayFailure;
 }
 
@@ -100,6 +103,7 @@ export interface PublicReplayReport {
   durationMs: number;
   status: 'passed' | 'failed';
   failurePhases: ReplayFailurePhase[];
+  traffic?: ReplayTrafficReport;
 }
 
 export class ReplayPhaseError extends Error {
@@ -440,6 +444,8 @@ export function renderReplayMarkdown(report: ReplayReport): string {
     '',
   ];
 
+  if (report.traffic) lines.push(...renderReplayTrafficMarkdown(report.traffic));
+
   const failures = [
     ...(report.fatalFailure ? [report.fatalFailure] : []),
     ...report.results.flatMap((result) => (result.failure ? [result.failure] : [])),
@@ -476,5 +482,6 @@ export function toPublicReplayReport(report: ReplayReport): PublicReplayReport {
     durationMs: report.durationMs,
     status: report.status,
     failurePhases: Array.from(new Set(failures.map((failure) => failure.phase))).sort(),
+    ...(report.traffic ? { traffic: report.traffic } : {}),
   };
 }

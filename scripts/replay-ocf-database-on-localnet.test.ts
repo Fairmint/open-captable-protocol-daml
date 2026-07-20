@@ -8,6 +8,7 @@ import {
   matchesLedgerTemplateId,
   parseReplayOptions,
   preparePortal,
+  renderReplayMarkdown,
   ReplayPhaseError,
   resolveDatabaseUrl,
   toOcfCreateOperation,
@@ -16,6 +17,17 @@ import {
   type DatabaseOcfRow,
   type ReplayReport,
 } from './localnet-replay/core';
+import {
+  buildNetworkTrafficPricing,
+  buildReplayTrafficReport,
+  getParticipantExtraTrafficConsumedBytes,
+  renderReplayTrafficMarkdown,
+} from './localnet-replay/traffic';
+import {
+  buildReplayCantonConfig,
+  waitForPartyVisibility,
+  waitForStableTrafficCounters,
+} from './replay-ocf-database-on-localnet';
 
 const PORTAL_ID = '550e8400-e29b-41d4-a716-446655440000';
 
@@ -50,7 +62,49 @@ function expectReplayPhase(fn: () => unknown, phase: ReplayPhaseError['phase']):
   assert.throws(fn, (error: unknown) => error instanceof ReplayPhaseError && error.phase === phase);
 }
 
-function run(): void {
+async function run(): Promise<void> {
+  const operatorConfig = buildReplayCantonConfig('app-provider');
+  const issuerConfig = buildReplayCantonConfig('app-user');
+  const operatorApis = operatorConfig.apis;
+  const issuerApis = issuerConfig.apis;
+  assert(operatorApis);
+  assert(issuerApis);
+  assert.equal(operatorConfig.network, 'localnet');
+  assert.equal(operatorConfig.provider, 'app-provider');
+  assert.equal(operatorApis.LEDGER_JSON_API?.apiUrl, 'http://localhost:3975');
+  assert.equal(operatorApis.VALIDATOR_API?.apiUrl, 'http://localhost:3903');
+  assert.equal(issuerConfig.provider, 'app-user');
+  assert.equal(issuerApis.LEDGER_JSON_API?.apiUrl, 'http://localhost:2975');
+  assert.equal(issuerApis.VALIDATOR_API?.apiUrl, 'http://localhost:2903');
+  for (const apis of [operatorApis, issuerApis]) {
+    assert.equal(apis.SCAN_API?.apiUrl, 'http://scan.localhost:4000/api/scan');
+    for (const api of ['LEDGER_JSON_API', 'VALIDATOR_API', 'SCAN_API'] as const) {
+      assert.equal(typeof apis[api]?.auth.tokenGenerator, 'function');
+    }
+  }
+
+  let trafficReadCount = 0;
+  const stableTraffic = await waitForStableTrafficCounters(
+    () => {
+      trafficReadCount += 1;
+      return trafficReadCount === 1 ? [10, 20] : [30, 40];
+    },
+    { delaysMs: [0, 0, 0], minimumWaitMs: 0 }
+  );
+  assert.deepEqual(stableTraffic, [30, 40]);
+  assert.equal(trafficReadCount, 3);
+
+  let partyReadCount = 0;
+  await waitForPartyVisibility(
+    'issuer-party',
+    () => {
+      partyReadCount += 1;
+      return { partyDetails: partyReadCount === 1 ? [] : [{ party: 'issuer-party' }] };
+    },
+    { delaysMs: [0, 0] }
+  );
+  assert.equal(partyReadCount, 2);
+
   const defaults = parseReplayOptions([]);
   assert.equal(defaults.database, 'dev');
   assert.match(defaults.reportDir, /artifacts\/ocf-localnet-replay$/);
@@ -172,6 +226,147 @@ function run(): void {
     false
   );
 
+  assert.equal(
+    getParticipantExtraTrafficConsumedBytes({ traffic_status: { actual: { total_consumed: 987_654 } } }),
+    987_654
+  );
+
+  const observedAt = new Date('2026-01-01T00:00:00.000Z');
+  const pricing = buildNetworkTrafficPricing(
+    {
+      amulet_rules: {
+        contract: {
+          payload: {
+            configSchedule: {
+              initialValue: {
+                decentralizedSynchronizer: { fees: { extraTrafficPrice: '60.0' } },
+              },
+              futureValues: [
+                {
+                  _1: '2025-12-31T00:00:00.000Z',
+                  _2: { decentralizedSynchronizer: { fees: { extraTrafficPrice: '50.0' } } },
+                },
+                {
+                  _1: '2026-02-01T00:00:00.000Z',
+                  _2: { decentralizedSynchronizer: { fees: { extraTrafficPrice: '40.0' } } },
+                },
+              ],
+            },
+          },
+        },
+      },
+    },
+    {
+      open_mining_rounds: {
+        'round-10': {
+          contract: {
+            payload: {
+              opensAt: '2025-12-30T00:00:00.000Z',
+              round: { number: '10' },
+              amuletPrice: '0.005',
+            },
+          },
+        },
+        'round-11': {
+          contract: {
+            payload: {
+              opensAt: '2025-12-31T00:00:00.000Z',
+              round: { number: '11' },
+              amuletPrice: '0.01',
+            },
+          },
+        },
+        'round-12': {
+          contract: {
+            payload: {
+              opensAt: '2026-01-02T00:00:00.000Z',
+              round: { number: '12' },
+              amuletPrice: '0.02',
+            },
+          },
+        },
+      },
+    },
+    observedAt
+  );
+  assert.deepEqual(pricing, {
+    observedAt: observedAt.toISOString(),
+    extraTrafficPriceUsdPerMegabyte: 50,
+    cantonCoinPriceUsd: 0.01,
+  });
+
+  const traffic = buildReplayTrafficReport({
+    systemOperatorExtraTrafficBeforeBytes: 1_000,
+    systemOperatorExtraTrafficAfterBytes: 1_001_000,
+    issuerExtraTrafficBeforeBytes: 500,
+    issuerExtraTrafficAfterBytes: 1_000_500,
+    pricingAtStart: pricing,
+    pricingAtEnd: { ...pricing, observedAt: '2026-01-01T00:01:00.000Z' },
+  });
+  assert.equal(traffic.measurementStatus, 'complete');
+  assert.equal(traffic.measurementScope, 'participant-extra-traffic');
+  assert.equal(traffic.totalExtraTrafficBytes, 2_000_000);
+  assert.equal(traffic.totalExtraTrafficMegabytes, 2);
+  assert.equal(traffic.systemOperatorExtraTrafficBytes, 1_000_000);
+  assert.equal(traffic.issuerExtraTrafficBytes, 1_000_000);
+  assert.equal(traffic.equivalentExtraTrafficCostUsd, 100);
+  assert.equal(traffic.equivalentExtraTrafficCostCantonCoin, 10_000);
+
+  const changedPricingTraffic = buildReplayTrafficReport({
+    systemOperatorExtraTrafficBeforeBytes: 0,
+    systemOperatorExtraTrafficAfterBytes: 500_000,
+    issuerExtraTrafficBeforeBytes: 0,
+    issuerExtraTrafficAfterBytes: 500_000,
+    pricingAtStart: pricing,
+    pricingAtEnd: { ...pricing, extraTrafficPriceUsdPerMegabyte: 55 },
+  });
+  assert.equal(changedPricingTraffic.measurementScope, 'participant-extra-traffic');
+  assert.equal(changedPricingTraffic.pricingChangedDuringReplay, true);
+  assert.equal(changedPricingTraffic.equivalentExtraTrafficCostCantonCoin, undefined);
+  assert.match(
+    renderReplayTrafficMarkdown(changedPricingTraffic).join('\n'),
+    /omitted because network pricing changed/
+  );
+
+  const missingPricingTraffic = buildReplayTrafficReport({
+    systemOperatorExtraTrafficBeforeBytes: 0,
+    systemOperatorExtraTrafficAfterBytes: 500_000,
+    issuerExtraTrafficBeforeBytes: 0,
+    issuerExtraTrafficAfterBytes: 500_000,
+  });
+  assert.match(
+    renderReplayTrafficMarkdown(missingPricingTraffic).join('\n'),
+    /both start and end network prices could not be captured/
+  );
+
+  const unavailableTraffic = buildReplayTrafficReport({});
+  const unavailableMarkdown = renderReplayTrafficMarkdown(unavailableTraffic).join('\n');
+  assert.match(unavailableMarkdown, /both participant counters were not captured/);
+  assert.match(unavailableMarkdown, /complete extra-traffic measurement is unavailable/);
+
+  const partialTraffic = buildReplayTrafficReport({
+    systemOperatorExtraTrafficBeforeBytes: 1_000,
+    systemOperatorExtraTrafficAfterBytes: 2_001_000,
+  });
+  const partialMarkdown = renderReplayMarkdown({
+    database: 'dev',
+    gitRef: undefined,
+    gitSha: undefined,
+    startedAt: observedAt.toISOString(),
+    finishedAt: observedAt.toISOString(),
+    durationMs: 0,
+    sourceObjectCount: 0,
+    portalCount: 0,
+    passedPortalCount: 0,
+    failedPortalCount: 0,
+    createdObjectCount: 0,
+    status: 'passed',
+    results: [],
+    traffic: partialTraffic,
+  });
+  assert.match(partialMarkdown, /Fairmint operator participant/);
+  assert.doesNotMatch(partialMarkdown, /Transfer-agent participant/);
+
   const failure = toReplayFailure(
     'portal-run-local',
     new ReplayPhaseError('batch', 'Sensitive Person and stakeholder-secret-id failed')
@@ -192,6 +387,7 @@ function run(): void {
     failedPortalCount: 1,
     createdObjectCount: 444,
     status: 'failed',
+    traffic,
     results: [
       {
         portalAlias: 'portal-run-local',
@@ -206,6 +402,13 @@ function run(): void {
   const publicReportText = JSON.stringify(toPublicReplayReport(privateReport));
   assert.doesNotMatch(publicReportText, /portal-run-local|Sensitive Person|stakeholder-secret-id|456|444/);
   assert.match(publicReportText, /"failurePhases":\["batch"\]/);
+  assert.match(publicReportText, /"totalExtraTrafficMegabytes":2/);
+
+  const markdown = renderReplayMarkdown(privateReport);
+  assert.match(markdown, /Total extra traffic consumed during replay/);
+  assert.match(markdown, /Fairmint operator participant/);
+  assert.match(markdown, /Transfer-agent participant/);
+  assert.match(markdown, /10000\.000000 CC/);
 
   const portalAlias = hashIdentifier(PORTAL_ID, 'portal');
   assert.match(portalAlias, /^portal-[0-9a-f]{12}$/);
@@ -214,4 +417,7 @@ function run(): void {
   console.log('OK: LocalNet replay planning, strict schema gate, template identity, and payload-free reports');
 }
 
-run();
+run().catch((error: unknown) => {
+  console.error(error);
+  process.exitCode = 1;
+});
