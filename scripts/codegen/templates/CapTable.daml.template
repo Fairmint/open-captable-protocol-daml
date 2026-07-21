@@ -170,286 +170,622 @@ validateFinancingIssuanceReferences maps =
         financing.financing_data.issuance_ids)
     (Map.values (fromOptional Map.empty maps.financings))
 
--- OCF dates are calendar dates. A non-quantity transaction may occur on the
--- same date as a terminal transaction, but it cannot target the retired source
--- security on a later OCF date.
+-- OCF dates are calendar dates. A transaction may share a date with the
+-- terminal event that retires its source security, but it cannot target that
+-- source on a later OCF date.
 ocfDate : Time -> Date
 ocfDate = Date.toDateUTC
 
 isEarlierOcfDate : Time -> Time -> Bool
 isEarlierOcfDate candidate target = ocfDate candidate < ocfDate target
 
-priorStockRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
-priorStockRetirementExists maps securityId targetDate = do
+data TerminalEvent = TerminalEvent with
+    label: Text
+    date: Time
+    reduction: Optional Decimal
+    reduction_currency: Optional Text
+    balance_security_id: Optional Text
+    partial_requires_balance: Bool
+  deriving (Eq, Show)
+
+type TerminalEventIndex = Map Text [TerminalEvent]
+
+data SecurityTerminalIndexes = SecurityTerminalIndexes with
+    stock: TerminalEventIndex
+    convertible: TerminalEventIndex
+    warrant: TerminalEventIndex
+    equity_compensation: TerminalEventIndex
+  deriving (Eq, Show)
+
+addTerminalEvent : Text -> TerminalEvent -> TerminalEventIndex -> TerminalEventIndex
+addTerminalEvent securityId event index =
+  Map.insert securityId (event :: fromOptional [] (Map.lookup securityId index)) index
+
+stockTerminalEventIndex : CapTableMaps -> Update TerminalEventIndex
+stockTerminalEventIndex maps = do
   afterCancellations <- foldlA
-    (\found cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (found ||
-        (cancellation.cancellation_data.security_id == securityId &&
-          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
-    False
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.cancellation_data.security_id
+        (TerminalEvent with
+          label = "Stock cancellation " <> tx.cancellation_data.id
+          date = tx.cancellation_data.date
+          reduction = Some tx.cancellation_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.cancellation_data.balance_security_id
+          partial_requires_balance = True)
+        index))
+    Map.empty
     (Map.values maps.stock_cancellations)
   afterTransfers <- foldlA
-    (\found transferCid -> do
-      transfer <- fetch transferCid
-      pure (found ||
-        (transfer.transfer_data.security_id == securityId &&
-          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.transfer_data.security_id
+        (TerminalEvent with
+          label = "Stock transfer " <> tx.transfer_data.id
+          date = tx.transfer_data.date
+          reduction = Some tx.transfer_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.transfer_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterCancellations
     (Map.values maps.stock_transfers)
   afterRepurchases <- foldlA
-    (\found repurchaseCid -> do
-      repurchase <- fetch repurchaseCid
-      pure (found ||
-        (repurchase.repurchase_data.security_id == securityId &&
-          isEarlierOcfDate repurchase.repurchase_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.repurchase_data.security_id
+        (TerminalEvent with
+          label = "Stock repurchase " <> tx.repurchase_data.id
+          date = tx.repurchase_data.date
+          reduction = Some tx.repurchase_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.repurchase_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterTransfers
     (Map.values maps.stock_repurchases)
   afterConversions <- foldlA
-    (\found conversionCid -> do
-      conversion <- fetch conversionCid
-      pure (found ||
-        (conversion.conversion_data.security_id == securityId &&
-          isEarlierOcfDate conversion.conversion_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.conversion_data.security_id
+        (TerminalEvent with
+          label = "Stock conversion " <> tx.conversion_data.id
+          date = tx.conversion_data.date
+          reduction = Some tx.conversion_data.quantity_converted
+          reduction_currency = None
+          balance_security_id = tx.conversion_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterRepurchases
     (Map.values maps.stock_conversions)
   afterReissuances <- foldlA
-    (\found reissuanceCid -> do
-      reissuance <- fetch reissuanceCid
-      pure (found ||
-        (reissuance.reissuance_data.security_id == securityId &&
-          isEarlierOcfDate reissuance.reissuance_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.reissuance_data.security_id
+        (TerminalEvent with
+          label = "Stock reissuance " <> tx.reissuance_data.id
+          date = tx.reissuance_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
     afterConversions
     (Map.values maps.stock_reissuances)
   afterConsolidations <- foldlA
-    (\found consolidationCid -> do
-      consolidation <- fetch consolidationCid
-      pure (found ||
-        (securityId `elem` consolidation.consolidation_data.security_ids &&
-          isEarlierOcfDate consolidation.consolidation_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      let event = TerminalEvent with
+            label = "Stock consolidation " <> tx.consolidation_data.id
+            date = tx.consolidation_data.date
+            reduction = None
+            reduction_currency = None
+            balance_security_id = None
+            partial_requires_balance = False
+      pure (foldl (\next securityId -> addTerminalEvent securityId event next) index tx.consolidation_data.security_ids))
     afterReissuances
     (Map.values maps.stock_consolidations)
   foldlA
-    (\found retractionCid -> do
-      retraction <- fetch retractionCid
-      pure (found ||
-        (retraction.retraction_data.security_id == securityId &&
-          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.retraction_data.security_id
+        (TerminalEvent with
+          label = "Stock retraction " <> tx.retraction_data.id
+          date = tx.retraction_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
     afterConsolidations
     (Map.values maps.stock_retractions)
 
-priorConvertibleRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
-priorConvertibleRetirementExists maps securityId targetDate = do
+convertibleTerminalEventIndex : CapTableMaps -> Update TerminalEventIndex
+convertibleTerminalEventIndex maps = do
   afterCancellations <- foldlA
-    (\found cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (found ||
-        (cancellation.cancellation_data.security_id == securityId &&
-          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
-    False
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.cancellation_data.security_id
+        (TerminalEvent with
+          label = "Convertible cancellation " <> tx.cancellation_data.id
+          date = tx.cancellation_data.date
+          reduction = Some tx.cancellation_data.amount.amount
+          reduction_currency = Some tx.cancellation_data.amount.currency
+          balance_security_id = tx.cancellation_data.balance_security_id
+          partial_requires_balance = True)
+        index))
+    Map.empty
     (Map.values maps.convertible_cancellations)
   afterTransfers <- foldlA
-    (\found transferCid -> do
-      transfer <- fetch transferCid
-      pure (found ||
-        (transfer.transfer_data.security_id == securityId &&
-          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.transfer_data.security_id
+        (TerminalEvent with
+          label = "Convertible transfer " <> tx.transfer_data.id
+          date = tx.transfer_data.date
+          reduction = Some tx.transfer_data.amount.amount
+          reduction_currency = Some tx.transfer_data.amount.currency
+          balance_security_id = tx.transfer_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterCancellations
     (Map.values maps.convertible_transfers)
   afterConversions <- foldlA
-    (\found conversionCid -> do
-      conversion <- fetch conversionCid
-      pure (found ||
-        (conversion.conversion_data.security_id == securityId &&
-          isEarlierOcfDate conversion.conversion_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.conversion_data.security_id
+        (TerminalEvent with
+          label = "Convertible conversion " <> tx.conversion_data.id
+          date = tx.conversion_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = tx.conversion_data.balance_security_id
+          partial_requires_balance = False)
+        index))
     afterTransfers
     (Map.values maps.convertible_conversions)
   foldlA
-    (\found retractionCid -> do
-      retraction <- fetch retractionCid
-      pure (found ||
-        (retraction.retraction_data.security_id == securityId &&
-          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.retraction_data.security_id
+        (TerminalEvent with
+          label = "Convertible retraction " <> tx.retraction_data.id
+          date = tx.retraction_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
     afterConversions
     (Map.values maps.convertible_retractions)
 
-priorWarrantRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
-priorWarrantRetirementExists maps securityId targetDate = do
+warrantTerminalEventIndex : CapTableMaps -> Update TerminalEventIndex
+warrantTerminalEventIndex maps = do
   afterCancellations <- foldlA
-    (\found cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (found ||
-        (cancellation.cancellation_data.security_id == securityId &&
-          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
-    False
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.cancellation_data.security_id
+        (TerminalEvent with
+          label = "Warrant cancellation " <> tx.cancellation_data.id
+          date = tx.cancellation_data.date
+          reduction = Some tx.cancellation_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.cancellation_data.balance_security_id
+          partial_requires_balance = True)
+        index))
+    Map.empty
     (Map.values maps.warrant_cancellations)
   afterTransfers <- foldlA
-    (\found transferCid -> do
-      transfer <- fetch transferCid
-      pure (found ||
-        (transfer.transfer_data.security_id == securityId &&
-          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.transfer_data.security_id
+        (TerminalEvent with
+          label = "Warrant transfer " <> tx.transfer_data.id
+          date = tx.transfer_data.date
+          reduction = Some tx.transfer_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.transfer_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterCancellations
     (Map.values maps.warrant_transfers)
-  afterRetractions <- foldlA
-    (\found retractionCid -> do
-      retraction <- fetch retractionCid
-      pure (found ||
-        (retraction.retraction_data.security_id == securityId &&
-          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+  afterExercises <- foldlA
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.exercise_data.security_id
+        (TerminalEvent with
+          label = "Warrant exercise " <> tx.exercise_data.id
+          date = tx.exercise_data.date
+          reduction = tx.exercise_data.quantity
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
     afterTransfers
+    (Map.values maps.warrant_exercises)
+  foldlA
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.retraction_data.security_id
+        (TerminalEvent with
+          label = "Warrant retraction " <> tx.retraction_data.id
+          date = tx.retraction_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
+    afterExercises
     (Map.values maps.warrant_retractions)
-  if afterRetractions
-    then pure True
-    else case Map.lookup securityId maps.warrant_issuances_by_security_id of
-      Some issuanceCid -> do
-        issuance <- fetch issuanceCid
-        (knownExerciseTotal, unknownExerciseRetirement) <- foldlA
-          (\(total, retired) exerciseCid -> do
-            exercise <- fetch exerciseCid
-            if exercise.exercise_data.security_id /= securityId ||
-                not (isEarlierOcfDate exercise.exercise_data.date targetDate)
-              then pure (total, retired)
-              else case exercise.exercise_data.quantity of
-                Some quantity -> pure (total + quantity, retired)
-                None -> pure (total, True))
-          (0.0, False)
-          (Map.values maps.warrant_exercises)
-        pure (unknownExerciseRetirement || case issuance.issuance_data.quantity of
-          Some quantity -> knownExerciseTotal >= quantity
-          None -> False)
-      None -> pure False
 
-priorEquityCompensationRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
-priorEquityCompensationRetirementExists maps securityId targetDate = do
+equityCompensationTerminalEventIndex : CapTableMaps -> Update TerminalEventIndex
+equityCompensationTerminalEventIndex maps = do
   afterCancellations <- foldlA
-    (\found cancellationCid -> do
-      cancellation <- fetch cancellationCid
-      pure (found ||
-        (cancellation.cancellation_data.security_id == securityId &&
-          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
-    False
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.cancellation_data.security_id
+        (TerminalEvent with
+          label = "Equity compensation cancellation " <> tx.cancellation_data.id
+          date = tx.cancellation_data.date
+          reduction = Some tx.cancellation_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.cancellation_data.balance_security_id
+          partial_requires_balance = True)
+        index))
+    Map.empty
     (Map.values maps.equity_compensation_cancellations)
   afterTransfers <- foldlA
-    (\found transferCid -> do
-      transfer <- fetch transferCid
-      pure (found ||
-        (transfer.transfer_data.security_id == securityId &&
-          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.transfer_data.security_id
+        (TerminalEvent with
+          label = "Equity compensation transfer " <> tx.transfer_data.id
+          date = tx.transfer_data.date
+          reduction = Some tx.transfer_data.quantity
+          reduction_currency = None
+          balance_security_id = tx.transfer_data.balance_security_id
+          partial_requires_balance = True)
+        index))
     afterCancellations
     (Map.values maps.equity_compensation_transfers)
-  afterRetractions <- foldlA
-    (\found retractionCid -> do
-      retraction <- fetch retractionCid
-      pure (found ||
-        (retraction.retraction_data.security_id == securityId &&
-          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+  afterExercises <- foldlA
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.exercise_data.security_id
+        (TerminalEvent with
+          label = "Equity compensation exercise " <> tx.exercise_data.id
+          date = tx.exercise_data.date
+          reduction = Some tx.exercise_data.quantity
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
     afterTransfers
+    (Map.values maps.equity_compensation_exercises)
+  afterReleases <- foldlA
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.release_data.security_id
+        (TerminalEvent with
+          label = "Equity compensation release " <> tx.release_data.id
+          date = tx.release_data.date
+          reduction = Some tx.release_data.quantity
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
+    afterExercises
+    (Map.values maps.equity_compensation_releases)
+  foldlA
+    (\index cid -> do
+      tx <- fetch cid
+      pure (addTerminalEvent tx.retraction_data.security_id
+        (TerminalEvent with
+          label = "Equity compensation retraction " <> tx.retraction_data.id
+          date = tx.retraction_data.date
+          reduction = None
+          reduction_currency = None
+          balance_security_id = None
+          partial_requires_balance = False)
+        index))
+    afterReleases
     (Map.values maps.equity_compensation_retractions)
-  if afterRetractions
-    then pure True
-    else case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
-      Some issuanceCid -> do
-        issuance <- fetch issuanceCid
-        exercised <- foldlA
-          (\total exerciseCid -> do
-            exercise <- fetch exerciseCid
-            pure (if exercise.exercise_data.security_id == securityId &&
-                isEarlierOcfDate exercise.exercise_data.date targetDate
-              then total + exercise.exercise_data.quantity
-              else total))
-          0.0
-          (Map.values maps.equity_compensation_exercises)
-        released <- foldlA
-          (\total releaseCid -> do
-            release <- fetch releaseCid
-            pure (if release.release_data.security_id == securityId &&
-                isEarlierOcfDate release.release_data.date targetDate
-              then total + release.release_data.quantity
-              else total))
-          0.0
-          (Map.values maps.equity_compensation_releases)
-        pure (exercised + released >= issuance.issuance_data.quantity)
-      None -> pure False
 
-assertActiveStockTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
-assertActiveStockTarget maps label targetDate securityId = do
-  retired <- priorStockRetirementExists maps securityId targetDate
-  assertMsg (label <> " targets inactive stock security " <> securityId) (not retired)
+securityTerminalIndexes : CapTableMaps -> Update SecurityTerminalIndexes
+securityTerminalIndexes maps = do
+  stock <- stockTerminalEventIndex maps
+  convertible <- convertibleTerminalEventIndex maps
+  warrant <- warrantTerminalEventIndex maps
+  equityCompensation <- equityCompensationTerminalEventIndex maps
+  pure SecurityTerminalIndexes with
+    stock = stock
+    convertible = convertible
+    warrant = warrant
+    equity_compensation = equityCompensation
 
-assertActiveConvertibleTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
-assertActiveConvertibleTarget maps label targetDate securityId = do
-  retired <- priorConvertibleRetirementExists maps securityId targetDate
-  assertMsg (label <> " targets inactive convertible security " <> securityId) (not retired)
+priorTerminalExists : TerminalEventIndex -> Text -> Time -> Bool
+priorTerminalExists index securityId targetDate =
+  any (\event -> isEarlierOcfDate event.date targetDate)
+    (fromOptional [] (Map.lookup securityId index))
 
-assertActiveWarrantTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
-assertActiveWarrantTarget maps label targetDate securityId = do
-  retired <- priorWarrantRetirementExists maps securityId targetDate
-  assertMsg (label <> " targets inactive warrant security " <> securityId) (not retired)
+assertSingleTerminalEvent : Text -> Text -> [TerminalEvent] -> Update ()
+assertSingleTerminalEvent family securityId events =
+  assertMsg
+    (family <> " security " <> securityId <> " is targeted by multiple terminal transactions")
+    (length events <= 1)
 
-assertActiveEquityCompensationTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
-assertActiveEquityCompensationTarget maps label targetDate securityId = do
-  retired <- priorEquityCompensationRetirementExists maps securityId targetDate
-  assertMsg (label <> " targets inactive equity compensation security " <> securityId) (not retired)
+validateTerminalEventReferences : Text -> Map Text a -> TerminalEventIndex -> Update ()
+validateTerminalEventReferences family issuancesBySecurityId index =
+  mapA_
+    (\(securityId, events) -> do
+      assertMsg
+        (family <> " terminal transaction references missing issuance security " <> securityId)
+        (isSome (Map.lookup securityId issuancesBySecurityId))
+      assertSingleTerminalEvent family securityId events)
+    (Map.toList index)
 
-assertActiveVestingTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
-assertActiveVestingTarget maps label targetDate securityId =
+splitAdjustedQuantity : CapTableMaps -> Text -> Time -> Time -> Decimal -> Update Decimal
+splitAdjustedQuantity maps stockClassId issuanceDate eventDate initialQuantity =
+  foldlA
+    (\quantity splitCid -> do
+      split <- fetch splitCid
+      let splitDate = ocfDate split.split_data.date
+      pure (if split.split_data.stock_class_id == stockClassId &&
+          splitDate >= ocfDate issuanceDate && splitDate <= ocfDate eventDate
+        then quantity * split.split_data.split_ratio.numerator / split.split_data.split_ratio.denominator
+        else quantity))
+    initialQuantity
+    (Map.values maps.stock_class_splits)
+
+validateStockBalanceSuccessor : CapTableMaps -> StockIssuanceOcfData -> TerminalEvent -> Decimal -> Text -> Update ()
+validateStockBalanceSuccessor maps source event remainder balanceSecurityId = do
+  assertMsg (event.label <> " balance security must differ from its retired source")
+    (balanceSecurityId /= source.security_id)
+  case Map.lookup balanceSecurityId maps.stock_issuances_by_security_id of
+    Some cid -> do
+      balance <- fetch cid
+      assertMsg (event.label <> " balance stakeholder mismatch")
+        (balance.issuance_data.stakeholder_id == source.stakeholder_id)
+      assertMsg (event.label <> " balance stock class mismatch")
+        (balance.issuance_data.stock_class_id == source.stock_class_id)
+      assertMsg (event.label <> " balance quantity mismatch: expected " <> show remainder <> ", found " <> show balance.issuance_data.quantity)
+        (balance.issuance_data.quantity == remainder)
+    None -> assertMsg (event.label <> " balance stock issuance not found: " <> balanceSecurityId) False
+
+validateStockTerminalCompleteness : CapTableMaps -> TerminalEventIndex -> Update ()
+validateStockTerminalCompleteness maps index =
+  mapA_
+    (\cid -> do
+      issuance <- fetch cid
+      case Map.lookup issuance.issuance_data.security_id index of
+        Some [event] -> when event.partial_requires_balance do
+          currentQuantity <- splitAdjustedQuantity maps issuance.issuance_data.stock_class_id issuance.issuance_data.date event.date issuance.issuance_data.quantity
+          case event.reduction of
+            Some reduction -> do
+              let remainder = currentQuantity - reduction
+              assertMsg (event.label <> " exceeds current source quantity") (remainder >= 0.0)
+              case event.balance_security_id of
+                Some balanceSecurityId -> do
+                  assertMsg (event.label <> " balance security requires a positive remainder") (remainder > 0.0)
+                  validateStockBalanceSuccessor maps issuance.issuance_data event remainder balanceSecurityId
+                None -> assertMsg
+                  (event.label <> " without balance_security_id must consume the full current source quantity")
+                  (remainder == 0.0)
+            None -> assertMsg (event.label <> " is missing its reduction quantity") False
+        _ -> pure ())
+    (Map.values maps.stock_issuances)
+
+validateWarrantBalanceSuccessor : CapTableMaps -> WarrantIssuanceOcfData -> TerminalEvent -> Optional Decimal -> Text -> Update ()
+validateWarrantBalanceSuccessor maps source event remainder balanceSecurityId = do
+  assertMsg (event.label <> " balance security must differ from its retired source")
+    (balanceSecurityId /= source.security_id)
+  case Map.lookup balanceSecurityId maps.warrant_issuances_by_security_id of
+    Some cid -> do
+      balance <- fetch cid
+      assertMsg (event.label <> " balance stakeholder mismatch")
+        (balance.issuance_data.stakeholder_id == source.stakeholder_id)
+      assertMsg (event.label <> " balance quantity mismatch")
+        (balance.issuance_data.quantity == remainder)
+    None -> assertMsg (event.label <> " balance warrant issuance not found: " <> balanceSecurityId) False
+
+validateWarrantTerminalCompleteness : CapTableMaps -> TerminalEventIndex -> Update ()
+validateWarrantTerminalCompleteness maps index =
+  mapA_
+    (\cid -> do
+      issuance <- fetch cid
+      case Map.lookup issuance.issuance_data.security_id index of
+        Some [event] -> when event.partial_requires_balance do
+          case issuance.issuance_data.quantity of
+            Some currentQuantity -> case event.reduction of
+              Some reduction -> do
+                let remainder = currentQuantity - reduction
+                assertMsg (event.label <> " exceeds current source quantity") (remainder >= 0.0)
+                case event.balance_security_id of
+                  Some balanceSecurityId -> do
+                    assertMsg (event.label <> " balance security requires a positive remainder") (remainder > 0.0)
+                    validateWarrantBalanceSuccessor maps issuance.issuance_data event (Some remainder) balanceSecurityId
+                  None -> assertMsg
+                    (event.label <> " without balance_security_id must consume the full current source quantity")
+                    (remainder == 0.0)
+              None -> assertMsg (event.label <> " is missing its reduction quantity") False
+            None -> case event.balance_security_id of
+              Some balanceSecurityId -> validateWarrantBalanceSuccessor maps issuance.issuance_data event None balanceSecurityId
+              None -> pure ()
+        _ -> pure ())
+    (Map.values maps.warrant_issuances)
+
+equityCompensationQuantityAt : CapTableMaps -> EquityCompensationIssuanceOcfData -> Time -> Update Decimal
+equityCompensationQuantityAt maps source eventDate = case source.stock_class_id of
+  Some stockClassId -> splitAdjustedQuantity maps stockClassId source.date eventDate source.quantity
+  None -> pure source.quantity
+
+validateEquityCompensationBalanceSuccessor : CapTableMaps -> EquityCompensationIssuanceOcfData -> TerminalEvent -> Decimal -> Text -> Update ()
+validateEquityCompensationBalanceSuccessor maps source event remainder balanceSecurityId = do
+  assertMsg (event.label <> " balance security must differ from its retired source")
+    (balanceSecurityId /= source.security_id)
+  case Map.lookup balanceSecurityId maps.equity_compensation_issuances_by_security_id of
+    Some cid -> do
+      balance <- fetch cid
+      assertMsg (event.label <> " balance stakeholder mismatch")
+        (balance.issuance_data.stakeholder_id == source.stakeholder_id)
+      assertMsg (event.label <> " balance stock class mismatch")
+        (balance.issuance_data.stock_class_id == source.stock_class_id)
+      assertMsg (event.label <> " balance quantity mismatch: expected " <> show remainder <> ", found " <> show balance.issuance_data.quantity)
+        (balance.issuance_data.quantity == remainder)
+    None -> assertMsg (event.label <> " balance equity compensation issuance not found: " <> balanceSecurityId) False
+
+validateEquityCompensationTerminalCompleteness : CapTableMaps -> TerminalEventIndex -> Update ()
+validateEquityCompensationTerminalCompleteness maps index =
+  mapA_
+    (\cid -> do
+      issuance <- fetch cid
+      case Map.lookup issuance.issuance_data.security_id index of
+        Some [event] -> when event.partial_requires_balance do
+          currentQuantity <- equityCompensationQuantityAt maps issuance.issuance_data event.date
+          case event.reduction of
+            Some reduction -> do
+              let remainder = currentQuantity - reduction
+              assertMsg (event.label <> " exceeds current source quantity") (remainder >= 0.0)
+              case event.balance_security_id of
+                Some balanceSecurityId -> do
+                  assertMsg (event.label <> " balance security requires a positive remainder") (remainder > 0.0)
+                  validateEquityCompensationBalanceSuccessor maps issuance.issuance_data event remainder balanceSecurityId
+                None -> assertMsg
+                  (event.label <> " without balance_security_id must consume the full current source quantity")
+                  (remainder == 0.0)
+            None -> assertMsg (event.label <> " is missing its reduction quantity") False
+        _ -> pure ())
+    (Map.values maps.equity_compensation_issuances)
+
+validateConvertibleBalanceSuccessor : CapTableMaps -> ConvertibleIssuanceOcfData -> TerminalEvent -> Decimal -> Text -> Update ()
+validateConvertibleBalanceSuccessor maps source event remainder balanceSecurityId = do
+  assertMsg (event.label <> " balance security must differ from its retired source")
+    (balanceSecurityId /= source.security_id)
+  case Map.lookup balanceSecurityId maps.convertible_issuances_by_security_id of
+    Some cid -> do
+      balance <- fetch cid
+      assertMsg (event.label <> " balance stakeholder mismatch")
+        (balance.issuance_data.stakeholder_id == source.stakeholder_id)
+      assertMsg (event.label <> " balance currency mismatch")
+        (balance.issuance_data.investment_amount.currency == source.investment_amount.currency)
+      assertMsg (event.label <> " balance principal mismatch: expected " <> show remainder <> ", found " <> show balance.issuance_data.investment_amount.amount)
+        (balance.issuance_data.investment_amount.amount == remainder)
+    None -> assertMsg (event.label <> " balance convertible issuance not found: " <> balanceSecurityId) False
+
+validateConvertibleTerminalCompleteness : CapTableMaps -> TerminalEventIndex -> Update ()
+validateConvertibleTerminalCompleteness maps index =
+  mapA_
+    (\cid -> do
+      issuance <- fetch cid
+      case Map.lookup issuance.issuance_data.security_id index of
+        Some [event] -> when event.partial_requires_balance do
+          case event.reduction of
+            Some reduction -> do
+              assertMsg (event.label <> " currency mismatch")
+                (event.reduction_currency == Some issuance.issuance_data.investment_amount.currency)
+              let remainder = issuance.issuance_data.investment_amount.amount - reduction
+              assertMsg (event.label <> " exceeds current source principal") (remainder >= 0.0)
+              case event.balance_security_id of
+                Some balanceSecurityId -> do
+                  assertMsg (event.label <> " balance security requires a positive remainder") (remainder > 0.0)
+                  validateConvertibleBalanceSuccessor maps issuance.issuance_data event remainder balanceSecurityId
+                None -> assertMsg
+                  (event.label <> " without balance_security_id must consume the full current source principal")
+                  (remainder == 0.0)
+            None -> assertMsg (event.label <> " is missing its reduction amount") False
+        _ -> pure ())
+    (Map.values maps.convertible_issuances)
+
+validateTerminalTransactionCompleteness : CapTableMaps -> SecurityTerminalIndexes -> Update ()
+validateTerminalTransactionCompleteness maps indexes = do
+  validateTerminalEventReferences "Stock" maps.stock_issuances_by_security_id indexes.stock
+  validateTerminalEventReferences "Convertible" maps.convertible_issuances_by_security_id indexes.convertible
+  validateTerminalEventReferences "Warrant" maps.warrant_issuances_by_security_id indexes.warrant
+  validateTerminalEventReferences "Equity compensation" maps.equity_compensation_issuances_by_security_id indexes.equity_compensation
+  validateStockTerminalCompleteness maps indexes.stock
+  validateConvertibleTerminalCompleteness maps indexes.convertible
+  validateWarrantTerminalCompleteness maps indexes.warrant
+  validateEquityCompensationTerminalCompleteness maps indexes.equity_compensation
+
+assertActiveStockTarget : SecurityTerminalIndexes -> Text -> Time -> Text -> Update ()
+assertActiveStockTarget indexes label targetDate securityId =
+  assertMsg (label <> " targets inactive stock security " <> securityId)
+    (not (priorTerminalExists indexes.stock securityId targetDate))
+
+assertActiveConvertibleTarget : SecurityTerminalIndexes -> Text -> Time -> Text -> Update ()
+assertActiveConvertibleTarget indexes label targetDate securityId =
+  assertMsg (label <> " targets inactive convertible security " <> securityId)
+    (not (priorTerminalExists indexes.convertible securityId targetDate))
+
+assertActiveWarrantTarget : SecurityTerminalIndexes -> Text -> Time -> Text -> Update ()
+assertActiveWarrantTarget indexes label targetDate securityId =
+  assertMsg (label <> " targets inactive warrant security " <> securityId)
+    (not (priorTerminalExists indexes.warrant securityId targetDate))
+
+assertActiveEquityCompensationTarget : SecurityTerminalIndexes -> Text -> Time -> Text -> Update ()
+assertActiveEquityCompensationTarget indexes label targetDate securityId =
+  assertMsg (label <> " targets inactive equity compensation security " <> securityId)
+    (not (priorTerminalExists indexes.equity_compensation securityId targetDate))
+
+assertActiveVestingTarget : CapTableMaps -> SecurityTerminalIndexes -> Text -> Time -> Text -> Update ()
+assertActiveVestingTarget maps indexes label targetDate securityId =
   case Map.lookup securityId maps.stock_issuances_by_security_id of
-    Some _ -> assertActiveStockTarget maps label targetDate securityId
+    Some _ -> assertActiveStockTarget indexes label targetDate securityId
     None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
-      Some _ -> assertActiveWarrantTarget maps label targetDate securityId
+      Some _ -> assertActiveWarrantTarget indexes label targetDate securityId
       None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
-        Some _ -> assertActiveEquityCompensationTarget maps label targetDate securityId
+        Some _ -> assertActiveEquityCompensationTarget indexes label targetDate securityId
         None -> pure ()
 
-validateActiveSecurityTargets : CapTableMaps -> Update ()
-validateActiveSecurityTargets maps = do
+validateActiveSecurityTargets : CapTableMaps -> SecurityTerminalIndexes -> Update ()
+validateActiveSecurityTargets maps indexes = do
   mapA_
     (\acceptanceCid -> do
       acceptance <- fetch acceptanceCid
-      assertActiveStockTarget maps ("Stock acceptance " <> acceptance.acceptance_data.id)
+      assertActiveStockTarget indexes ("Stock acceptance " <> acceptance.acceptance_data.id)
         acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
     (Map.values maps.stock_acceptances)
   mapA_
     (\acceptanceCid -> do
       acceptance <- fetch acceptanceCid
-      assertActiveConvertibleTarget maps ("Convertible acceptance " <> acceptance.acceptance_data.id)
+      assertActiveConvertibleTarget indexes ("Convertible acceptance " <> acceptance.acceptance_data.id)
         acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
     (Map.values maps.convertible_acceptances)
   mapA_
     (\acceptanceCid -> do
       acceptance <- fetch acceptanceCid
-      assertActiveWarrantTarget maps ("Warrant acceptance " <> acceptance.acceptance_data.id)
+      assertActiveWarrantTarget indexes ("Warrant acceptance " <> acceptance.acceptance_data.id)
         acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
     (Map.values maps.warrant_acceptances)
   mapA_
     (\acceptanceCid -> do
       acceptance <- fetch acceptanceCid
-      assertActiveEquityCompensationTarget maps ("Equity compensation acceptance " <> acceptance.acceptance_data.id)
+      assertActiveEquityCompensationTarget indexes ("Equity compensation acceptance " <> acceptance.acceptance_data.id)
         acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
     (Map.values maps.equity_compensation_acceptances)
   mapA_
     (\repricingCid -> do
       repricing <- fetch repricingCid
-      assertActiveEquityCompensationTarget maps ("Equity compensation repricing " <> repricing.repricing_data.id)
+      assertActiveEquityCompensationTarget indexes ("Equity compensation repricing " <> repricing.repricing_data.id)
         repricing.repricing_data.date repricing.repricing_data.security_id)
     (Map.values maps.equity_compensation_repricings)
   mapA_
     (\startCid -> do
       start <- fetch startCid
-      assertActiveVestingTarget maps ("Vesting start " <> start.vesting_data.id)
+      assertActiveVestingTarget maps indexes ("Vesting start " <> start.vesting_data.id)
         start.vesting_data.date start.vesting_data.security_id)
     (Map.values maps.vesting_starts)
   mapA_
     (\eventCid -> do
       event <- fetch eventCid
-      assertActiveVestingTarget maps ("Vesting event " <> event.vesting_data.id)
+      assertActiveVestingTarget maps indexes ("Vesting event " <> event.vesting_data.id)
         event.vesting_data.date event.vesting_data.security_id)
     (Map.values maps.vesting_events)
   mapA_
     (\accelerationCid -> do
       acceleration <- fetch accelerationCid
-      assertActiveVestingTarget maps ("Vesting acceleration " <> acceleration.acceleration_data.id)
+      assertActiveVestingTarget maps indexes ("Vesting acceleration " <> acceleration.acceleration_data.id)
         acceleration.acceleration_data.date acceleration.acceleration_data.security_id)
     (Map.values maps.vesting_accelerations)
 
@@ -563,7 +899,9 @@ template CapTable
 
         -- Validate Financing references only after the complete batch state is known.
         validateFinancingIssuanceReferences finalMaps
-        validateActiveSecurityTargets finalMaps
+        terminalIndexes <- securityTerminalIndexes finalMaps
+        validateTerminalTransactionCompleteness finalMaps terminalIndexes
+        validateActiveSecurityTargets finalMaps terminalIndexes
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
