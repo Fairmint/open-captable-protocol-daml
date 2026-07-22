@@ -8,6 +8,7 @@
 import { extractEventsFromTransaction } from '@fairmint/canton-node-sdk';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getDarPath, inspectDarPackageId } from './detect-factory-need';
 import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
 import { OCP_FACTORY_LEDGER_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
@@ -24,6 +25,54 @@ interface ContractIdEntry {
   packageVersion?: string;
   sourceDir?: string;
   updatedAt?: string;
+}
+
+export interface ActiveFactory {
+  contractId: string;
+  templateId: string;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object';
+}
+
+/** Find the one active factory for this exact package and operator, if it already exists. */
+export function findActiveFactory(
+  response: unknown,
+  expectedTemplateId: string,
+  expectedOperatorPartyId: string
+): ActiveFactory | null {
+  if (!Array.isArray(response)) {
+    return null;
+  }
+
+  const matches: ActiveFactory[] = [];
+  for (const item of response) {
+    if (!isRecord(item)) continue;
+    const { contractEntry } = item;
+    if (!isRecord(contractEntry)) continue;
+    const { JsActiveContract: activeContract } = contractEntry;
+    if (!isRecord(activeContract)) continue;
+    const { createdEvent } = activeContract;
+    if (!isRecord(createdEvent)) continue;
+    const { createArgument, contractId, templateId } = createdEvent;
+    if (!isRecord(createArgument)) continue;
+
+    if (
+      typeof contractId === 'string' &&
+      templateId === expectedTemplateId &&
+      createArgument.system_operator === expectedOperatorPartyId
+    ) {
+      matches.push({ contractId, templateId });
+    }
+  }
+
+  if (matches.length > 1) {
+    throw new Error(
+      `Found ${matches.length} active OcpFactory contracts for ${expectedTemplateId} and ${expectedOperatorPartyId}; refusing to choose one.`
+    );
+  }
+  return matches[0] ?? null;
 }
 
 function loadExistingData(filePath: string): ContractIdData {
@@ -61,8 +110,10 @@ async function main() {
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
-  // Build template ID dynamically from package config (single source of truth)
-  const templateId = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
+  const darPath = getDarPath(pkg.name, pkg.version, pkg.darName);
+  const packageId = inspectDarPackageId(darPath, pkg.name, pkg.version);
+  const templateId = `${packageId}:Fairmint.OpenCapTable.OcpFactory:OcpFactory`;
+  const templateQuery = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
   console.log(`  Template: ${templateId}`);
 
   const [provider] = OCP_FACTORY_LEDGER_PROVIDERS;
@@ -70,6 +121,16 @@ async function main() {
   const operatorPartyId = client.getPartyId();
   console.log(`  Provider: ${provider}`);
   console.log(`  Operator: ${operatorPartyId}`);
+
+  const activeFactory = findActiveFactory(
+    await client.getActiveContracts({ parties: [operatorPartyId], templateIds: [templateQuery] }),
+    templateId,
+    operatorPartyId
+  );
+  if (activeFactory) {
+    saveFactory(network, activeFactory, outputPathForJson(), pkg, 'Recovered');
+    return;
+  }
 
   const response = await client.submitAndWaitForTransactionTree({
     commands: [
@@ -100,10 +161,20 @@ function finishCreate(
 
   const { contractId, templateId: resultTemplateId } = created[0];
 
+  saveFactory(network, { contractId, templateId: resultTemplateId }, outputPath, pkg, 'Created');
+}
+
+function saveFactory(
+  network: 'devnet' | 'mainnet',
+  factory: ActiveFactory,
+  outputPath: string,
+  pkg: { name: string; version: string; sourceDir: string },
+  action: 'Created' | 'Recovered'
+): void {
   const data = loadExistingData(outputPath);
   data[network] = {
-    ocpFactoryContractId: contractId,
-    templateId: resultTemplateId,
+    ocpFactoryContractId: factory.contractId,
+    templateId: factory.templateId,
     packageName: pkg.name,
     packageVersion: pkg.version,
     sourceDir: pkg.sourceDir,
@@ -111,7 +182,7 @@ function finishCreate(
   };
   fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
 
-  console.log(`\n✅ Created: ${contractId}`);
+  console.log(`\n✅ ${action}: ${factory.contractId}`);
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}`);
 
   if (data.mainnet) console.log(`   Mainnet:  ${data.mainnet.ocpFactoryContractId}`);
@@ -119,7 +190,9 @@ function finishCreate(
   console.log('');
 }
 
-main().catch((err) => {
-  console.error('❌ Failed:', err);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((err) => {
+    console.error('❌ Failed:', err);
+    process.exit(1);
+  });
+}
