@@ -202,16 +202,6 @@ export function requireBackedUpDar(packageName: string, version: string, darName
   process.exit(1);
 }
 
-/** Check if a DAR has been backed up. */
-export function isDarBackedUp(packageName: string, version: string, darName: string): boolean {
-  const lockKey = getDarLockKey(packageName, version, darName);
-  const lock = loadDarsLock();
-  if (!(lockKey in lock.packages)) return false;
-
-  const darPath = path.join(getDarsDir(), lockKey);
-  return fs.existsSync(darPath);
-}
-
 /**
  * @deprecated Use requireBackedUpDar instead to ensure backups are mandatory. Get the path to a DAR file, preferring
  *   backed-up version over fresh build. Returns the backed-up DAR path if available and verified, otherwise falls back
@@ -248,24 +238,4 @@ export function getDarPath(packageName: string, version: string, darName: string
   }
 
   return freshPath;
-}
-
-/** Record that a DAR was uploaded to a specific network. Updates the networks array in dars.lock. */
-export function recordNetworkUpload(packageName: string, version: string, darName: string, network: string): void {
-  const lockKey = getDarLockKey(packageName, version, darName);
-  const lock = loadDarsLock();
-
-  // Only update if entry exists
-  if (!(lockKey in lock.packages)) {
-    console.log(`ℹ️ DAR not backed up yet, skipping network record for ${lockKey} (${network})`);
-    return;
-  }
-
-  const entry = lock.packages[lockKey];
-  if (!entry.networks.includes(network)) {
-    entry.networks.push(network);
-    entry.networks.sort();
-    saveDarsLock(lock);
-    console.log(`📝 Recorded ${network} upload in dars.lock`);
-  }
 }

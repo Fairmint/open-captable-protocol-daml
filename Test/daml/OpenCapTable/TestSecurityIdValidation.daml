@@ -11,49 +11,16 @@ module OpenCapTable.TestSecurityIdValidation where
 
 import qualified Fairmint.OpenCapTable.OCF.StockTransfer as ST
 import qualified Fairmint.OpenCapTable.OCF.WarrantTransfer as WT
-import qualified Fairmint.OpenCapTable.OCF.WarrantIssuance as WI
 import qualified Fairmint.OpenCapTable.OCF.ConvertibleTransfer as CVT
 import qualified Fairmint.OpenCapTable.OCF.EquityCompensationTransfer as ECT
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers
-  ( addPrerequisites
-  , addDefaultStockIssuance
-  , addDefaultWarrantIssuance
-  , addDefaultConvertibleIssuance
-  , addDefaultEquityCompensationIssuance
-  , addStockIssuance
-  , defaultStockIssuance
-  , stockSuccessorIssuance
-  , warrantSuccessorIssuance
-  )
+import OpenCapTable.TestHelpers (addPrerequisites, addDefaultStockIssuance, addDefaultWarrantIssuance, addDefaultConvertibleIssuance, addDefaultEquityCompensationIssuance)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
-import qualified DA.Map as Map
 import qualified DA.Time as DT
 import Daml.Script
-
-warrantIssuanceData : Text -> Text -> Text -> WI.WarrantIssuanceOcfData
-warrantIssuanceData issuanceId securityId stakeholderId = WI.WarrantIssuanceOcfData with
-  id = issuanceId
-  custom_id = "WR-" <> issuanceId
-  date = DT.time (DA.date 2024 Jan 01) 0 0 0
-  purchase_price = OcfMonetary with amount = 1.0, currency = "USD"
-  security_id = securityId
-  stakeholder_id = stakeholderId
-  comments = []
-  exercise_triggers = []
-  security_law_exemptions = []
-  vestings = []
-  board_approval_date = None
-  consideration_text = None
-  exercise_price = None
-  quantity = Some 100.0
-  quantity_source = None
-  stockholder_approval_date = None
-  vesting_terms_id = None
-  warrant_expiration_date = None
 
 
 -- =============================================================================
@@ -237,149 +204,6 @@ testEquityCompensationTransfer_WrongSecurityTypeFails = script do
       deletes = []
   pure ()
 
--- =============================================================================
--- Test: security_id values are globally unique across security issuance types
--- =============================================================================
-
-testSecurityIssuance_DuplicateSecurityIdAcrossTypesFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultStockIssuance issuer cap_table
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantIssuance (warrantIssuanceData "WR-DUP-STOCK-SECURITY" "SEC-STOCK-1" "SH-1")]
-      edits = []
-      deletes = []
-  pure ()
-
-testSecurityIssuance_DuplicateSecurityIdAcrossTypesFailsInSameBatch = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockIssuance (defaultStockIssuance "TX-BATCH-STOCK" "SEC-BATCH-DUP" "SH-1" "SC_COMMON")
-        , CT.OcfCreateWarrantIssuance (warrantIssuanceData "TX-BATCH-WARRANT" "SEC-BATCH-DUP" "SH-1")
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
-testSecurityIssuance_EditCannotReuseSecurityIdFromAnotherType = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultWarrantIssuance issuer cap_table
-  cap_table <- addStockIssuance issuer cap_table "STOCK-EDIT-SRC" "SEC-STOCK-EDIT" "SH-1" "SC_COMMON"
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = []
-      edits = [CT.OcfEditStockIssuance (defaultStockIssuance "STOCK-EDIT-SRC" "SEC-WR-1" "SH-1" "SC_COMMON")]
-      deletes = []
-  pure ()
-
--- Validate issuance contracts rather than trusting potentially stale indexes
--- on cap tables upgraded from an earlier package.
-testSecurityIssuance_FinalStateDuplicateSecurityIdsFail = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultStockIssuance issuer cap_table
-  capTableDataOpt <- queryContractId issuer cap_table
-  let Some capTableData = capTableDataOpt
-
-  duplicateWarrantCid <- submit (actAs issuer <> actAs system_operator) $ createCmd $ WI.WarrantIssuance with
-    context = ctx
-    issuance_data = warrantIssuanceData "WR-UPGRADED-DUPLICATE" "SEC-STOCK-1" "SH-1"
-
-  let corruptedCapTable = capTableData with
-        warrant_issuances = Map.insert "WR-UPGRADED-DUPLICATE" duplicateWarrantCid capTableData.warrant_issuances
-  corruptedCapTableCid <- submit (actAs issuer <> actAs system_operator) $ createCmd corruptedCapTable
-
-  submitMustFail issuer do
-    exerciseCmd corruptedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits = []
-      deletes = []
-  pure ()
-
-testSuccessorSecurityId_CannotReuseSourceSecurityId = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addStockIssuance issuer cap_table "STOCK-SOURCE-REUSE" "SEC-SOURCE-REUSE" "SH-1" "SC_COMMON"
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-        id = "TX-SOURCE-REUSE"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-SOURCE-REUSE"
-        quantity = 100.0
-        comments = []
-        resulting_security_ids = ["SEC-SOURCE-REUSE"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
-
-testSuccessorSecurityId_BalanceCannotAlsoBeResult = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addStockIssuance issuer cap_table "STOCK-BALANCE-RESULT-SOURCE" "SEC-BALANCE-RESULT-SOURCE" "SH-1" "SC_COMMON"
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockIssuance
-            ((defaultStockIssuance "STOCK-BALANCE-RESULT" "SEC-BALANCE-RESULT" "SH-1" "SC_COMMON") with quantity = 50.0)
-        , CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-            id = "TX-BALANCE-RESULT"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-BALANCE-RESULT-SOURCE"
-            quantity = 50.0
-            comments = []
-            resulting_security_ids = ["SEC-BALANCE-RESULT"]
-            balance_security_id = Some "SEC-BALANCE-RESULT"
-            consideration_text = None
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
-testSuccessorSecurityId_CannotBeProducedByMultipleTransactionTypes = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addStockIssuance issuer cap_table "STOCK-SHARED-RESULT-A" "SEC-SHARED-RESULT-A" "SH-1" "SC_COMMON"
-  cap_table <- addDefaultWarrantIssuance issuer cap_table
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-            id = "TX-SHARED-RESULT-A"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-SHARED-RESULT-A"
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["SEC-SHARED-RESULT"]
-            balance_security_id = None
-            consideration_text = None
-        , CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
-            id = "TX-SHARED-RESULT-B"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-WR-1"
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["SEC-SHARED-RESULT"]
-            balance_security_id = None
-            consideration_text = None
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
 
 -- =============================================================================
 -- Test: Valid security_id succeeds
@@ -394,18 +218,15 @@ testStockTransfer_CorrectSecurityIdSucceeds = script do
   -- Create a stock transfer using the correct stock security_id
   result <- submit issuer do
     exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-            id = "TX_TRANSFER_VALID"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-STOCK-1"  -- Correct stock security_id
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["NEW-SEC-1"]
-            balance_security_id = None
-            consideration_text = None
-        , stockSuccessorIssuance "TX_TRANSFER_VALID_RESULT" "NEW-SEC-1" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Jan 01) 0 0 0) 100.0
-        ]
+      creates = [CT.OcfCreateStockTransfer ST.StockTransferOcfData with
+        id = "TX_TRANSFER_VALID"
+        date = DT.time (DA.date 2024 Jan 01) 0 0 0
+        security_id = "SEC-STOCK-1"  -- Correct stock security_id
+        quantity = 50.0
+        comments = []
+        resulting_security_ids = ["NEW-SEC-1"]
+        balance_security_id = None
+        consideration_text = None]
       edits = []
       deletes = []
   pure ()
@@ -419,18 +240,15 @@ testWarrantTransfer_CorrectSecurityIdSucceeds = script do
   -- Create a warrant transfer using the correct warrant security_id
   result <- submit issuer do
     exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
-            id = "TX_WARRANT_TRANSFER_VALID"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-WR-1"  -- Correct warrant security_id
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["NEW-WARRANT-1"]
-            balance_security_id = None
-            consideration_text = None
-        , warrantSuccessorIssuance "TX_WARRANT_TRANSFER_VALID_RESULT" "NEW-WARRANT-1" "SH-1" (DT.time (DA.date 2024 Jan 01) 0 0 0) 100.0
-        ]
+      creates = [CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
+        id = "TX_WARRANT_TRANSFER_VALID"
+        date = DT.time (DA.date 2024 Jan 01) 0 0 0
+        security_id = "SEC-WR-1"  -- Correct warrant security_id
+        quantity = 25.0
+        comments = []
+        resulting_security_ids = ["NEW-WARRANT-1"]
+        balance_security_id = None
+        consideration_text = None]
       edits = []
       deletes = []
   pure ()

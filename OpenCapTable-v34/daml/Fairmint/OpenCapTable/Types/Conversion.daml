@@ -7,7 +7,6 @@ module Fairmint.OpenCapTable.Types.Conversion where
 -- All conversion mechanism types for convertible securities, warrants, and stock.
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/
 
-import DA.Optional (isNone, isSome)
 import Fairmint.Shared.TypeHelpers (validateOptionalText, validateRequiredText)
 import Fairmint.OpenCapTable.Types.Validation (validateOcfPercentage)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary, validateOcfMonetary)
@@ -240,23 +239,13 @@ validateOcfSharePriceBasedConversionMechanism m =
           (Some _, Some _) -> False
       else
         case (m.discount_percentage, m.discount_amount) of
-          (None, None) -> True
-          (Some _, None) -> percentOk
-          (None, Some _) -> amountOk
           (Some _, Some _) -> False
+          _ -> percentOk && amountOk
 
 -- Enum - Valuation Based Formula Type
 -- Formula for valuation-based conversion
 data OcfValuationBasedFormulaType = OcfValuationCap | OcfValuationFixed | OcfValuationActual
   deriving (Eq, Show)
-
-valuationBasedFormulaTypeFromText : Text -> Optional OcfValuationBasedFormulaType
-valuationBasedFormulaTypeFromText valuationType =
-  case valuationType of
-    "CAP" -> Some OcfValuationCap
-    "FIXED" -> Some OcfValuationFixed
-    "ACTUAL" -> Some OcfValuationActual
-    _ -> None
 
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/conversion_mechanisms/ValuationBasedConversionMechanism.schema.json
 data OcfValuationBasedConversionMechanism = OcfValuationBasedConversionMechanism
@@ -280,12 +269,11 @@ data OcfValuationBasedConversionMechanism = OcfValuationBasedConversionMechanism
 
 validateOcfValuationBasedConversionMechanism : OcfValuationBasedConversionMechanism -> Bool
 validateOcfValuationBasedConversionMechanism m =
-  let amountOk = case m.valuation_type of
-        OcfValuationActual -> optional True validateOcfMonetary m.valuation_amount
-        OcfValuationCap -> optional False validateOcfMonetary m.valuation_amount
-        OcfValuationFixed -> optional False validateOcfMonetary m.valuation_amount
-   in amountOk &&
-      validateOptionalText m.capitalization_definition
+  case m.valuation_type of
+    OcfValuationActual -> True
+    OcfValuationCap -> optional False validateOcfMonetary m.valuation_amount
+    OcfValuationFixed -> optional False validateOcfMonetary m.valuation_amount
+  && validateOptionalText m.capitalization_definition
 
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/conversion_mechanisms/SAFEConversionMechanism.schema.json
 data OcfSAFEConversionMechanism = OcfSAFEConversionMechanism
@@ -446,15 +434,10 @@ validateOcfWarrantConversionMechanism mechanism =
       validateOptionalText capitalization_definition
     OcfWarrantMechanismFixedAmount with converts_to_quantity ->
       converts_to_quantity > (0.0)
-    OcfWarrantMechanismValuationBased with valuation_type; valuation_amount; capitalization_definition; capitalization_definition_rules ->
-      case valuationBasedFormulaTypeFromText valuation_type of
-        Some formulaType ->
-          validateOcfValuationBasedConversionMechanism OcfValuationBasedConversionMechanism with
-            valuation_type = formulaType
-            valuation_amount = valuation_amount
-            capitalization_definition = capitalization_definition
-            capitalization_definition_rules = capitalization_definition_rules
-        None -> False
+    OcfWarrantMechanismValuationBased with valuation_type; valuation_amount; capitalization_definition ->
+      validateRequiredText valuation_type &&
+      optional False validateOcfMonetary valuation_amount &&
+      validateOptionalText capitalization_definition
     OcfWarrantMechanismPpsBased with description; discount; discount_percentage; discount_amount ->
       validateOcfSharePriceBasedConversionMechanism OcfSharePriceBasedConversionMechanism with
         description = description
@@ -488,10 +471,9 @@ validateOcfConvertibleConversionMechanism mechanism =
     OcfConvMechCustom m -> validateOcfCustomConversionMechanism m
     OcfConvMechPercentCapitalization m -> validateOcfPercentCapitalizationConversionMechanism m
     OcfConvMechFixedAmount m -> validateOcfFixedAmountConversionMechanism m
-    -- Kept for package upgrades; OCF does not support these for convertibles.
-    OcfConvMechPpsBased _ -> False
-    OcfConvMechValuationBased _ -> False
-    OcfConvMechRatio _ -> False
+    OcfConvMechPpsBased m -> validateOcfSharePriceBasedConversionMechanism m
+    OcfConvMechValuationBased m -> validateOcfValuationBasedConversionMechanism m
+    OcfConvMechRatio r -> validateOcfRatio r
 
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/conversion_rights/ConvertibleConversionRight.schema.json
 data OcfConvertibleConversionRight = OcfConvertibleConversionRight
@@ -528,8 +510,7 @@ data OcfStockClassConversionRight = OcfStockClassConversionRight
 
     -- Mechanism by which conversion occurs
     conversion_mechanism: OcfConversionMechanism
-    -- Required by the DAML representation, but absent from the OCF stock-class
-    -- conversion-right schema and therefore ignored by OCF validation.
+    -- Trigger that would cause conversion
     conversion_trigger: OcfConversionTrigger
     -- Identifier of stock class to which this converts
     converts_to_stock_class_id: Text
@@ -571,18 +552,32 @@ validateOcfStockClassConversionRight conversionRight =
   validateRequiredText conversionRight.converts_to_stock_class_id &&
   (case conversionRight.conversion_mechanism of
      OcfConversionMechanismRatioConversion ->
-       optional False validateOcfRatio conversionRight.ratio &&
-       optional False validateOcfMonetary conversionRight.conversion_price &&
-       isNone conversionRight.percent_of_capitalization &&
-       isNone conversionRight.reference_share_price &&
-       isNone conversionRight.reference_valuation_price_per_share &&
-       isNone conversionRight.discount_rate &&
-       isNone conversionRight.valuation_cap &&
-       isNone conversionRight.custom_description &&
-       isNone conversionRight.floor_price_per_share &&
-       isNone conversionRight.ceiling_price_per_share &&
-       isNone conversionRight.expires_at
-     _ -> False)
+       optional False validateOcfRatio conversionRight.ratio
+     OcfConversionMechanismPercentCapitalizationConversion ->
+       optional False (\p -> p > (0.0) && p <= (1.0 : Decimal)) conversionRight.percent_of_capitalization
+     OcfConversionMechanismFixedAmountConversion ->
+       optional False validateOcfMonetary conversionRight.conversion_price
+     OcfConversionMechanismValuationBasedConversion ->
+       optional False validateOcfMonetary conversionRight.reference_valuation_price_per_share
+     OcfConversionMechanismPpsBasedConversion ->
+       optional False validateOcfMonetary conversionRight.reference_share_price
+     OcfConversionMechanismSAFEConversion ->
+      ((case (conversionRight.discount_rate, conversionRight.valuation_cap) of
+          (Some d, _) -> d > (0.0) && d < (1.0 : Decimal)
+          (_, Some cap) -> validateOcfMonetary cap
+          _ -> False) &&
+       optional True validateOcfMonetary conversionRight.floor_price_per_share &&
+       optional True validateOcfMonetary conversionRight.ceiling_price_per_share)
+     OcfConversionMechanismNoteConversion ->
+      ((case (conversionRight.discount_rate, conversionRight.valuation_cap) of
+          (Some d, _) -> d > (0.0) && d < (1.0 : Decimal)
+          (_, Some cap) -> validateOcfMonetary cap
+          _ -> False) &&
+       optional True validateOcfMonetary conversionRight.floor_price_per_share &&
+       optional True validateOcfMonetary conversionRight.ceiling_price_per_share)
+     OcfConversionMechanismCustomConversion ->
+       optional False (/= "") conversionRight.custom_description) &&
+  optional True validateOcfMonetary conversionRight.conversion_price
 
 -- =============================================================================
 -- CONVERSION TRIGGER
@@ -601,30 +596,6 @@ validateOcfAnyConversionRight right =
     OcfRightConvertible convertibleRight -> validateOcfConvertibleConversionRight convertibleRight
     OcfRightWarrant warrantRight -> validateOcfWarrantConversionRight warrantRight
     OcfRightStockClass stockClassRight -> validateOcfStockClassConversionRight stockClassRight
-
--- Conversion trigger variants have additionalProperties: false in OCF; optional fields
--- must be present only on the variants whose schemas define them.
-validateOcfConversionTriggerFields : OcfConversionTriggerType -> Optional Time -> Optional Time -> Optional Text -> Optional Time -> Bool
-validateOcfConversionTriggerFields triggerType startDate endDate triggerCondition triggerDate =
-  let hasCondition = optional False validateRequiredText triggerCondition
-      noCondition = isNone triggerCondition
-      noTriggerDate = isNone triggerDate
-      hasStartDate = isSome startDate
-      hasEndDate = isSome endDate
-      noRange = isNone startDate && isNone endDate
-   in case triggerType of
-        OcfTriggerTypeTypeAutomaticOnDate ->
-          isSome triggerDate && noCondition && noRange
-        OcfTriggerTypeTypeAutomaticOnCondition ->
-          hasCondition && noTriggerDate && noRange
-        OcfTriggerTypeTypeElectiveOnCondition ->
-          hasCondition && noTriggerDate && noRange
-        OcfTriggerTypeTypeElectiveInRange ->
-          hasStartDate && hasEndDate && noCondition && noTriggerDate
-        OcfTriggerTypeTypeElectiveAtWill ->
-          noCondition && noTriggerDate && noRange
-        OcfTriggerTypeTypeUnspecified ->
-          noCondition && noTriggerDate && noRange
 
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/primitives/types/conversion_triggers/ConversionTrigger.schema.json
 data OcfConversionTrigger = OcfConversionTrigger
@@ -658,12 +629,17 @@ data OcfConversionTrigger = OcfConversionTrigger
 
 validateOcfConversionTrigger : OcfConversionTrigger -> Bool
 validateOcfConversionTrigger t =
-  validateOcfConversionTriggerShape t &&
-  validateOcfAnyConversionRight t.conversion_right
-
-validateOcfConversionTriggerShape : OcfConversionTrigger -> Bool
-validateOcfConversionTriggerShape t =
-  validateRequiredText t.trigger_id &&
-  validateOptionalText t.nickname &&
-  validateOptionalText t.trigger_description &&
-  validateOcfConversionTriggerFields t.type_ t.start_date t.end_date t.trigger_condition t.trigger_date
+  let hasDate = case t.trigger_date of Some _ -> True; None -> False
+      hasCond = optional False validateRequiredText t.trigger_condition
+   in validateRequiredText t.trigger_id &&
+      validateOptionalText t.nickname &&
+      validateOptionalText t.trigger_description &&
+      validateOptionalText t.trigger_condition &&
+      validateOcfAnyConversionRight t.conversion_right &&
+      case t.type_ of
+        OcfTriggerTypeTypeAutomaticOnDate -> hasDate
+        OcfTriggerTypeTypeAutomaticOnCondition -> hasCond
+        OcfTriggerTypeTypeElectiveOnCondition -> hasCond
+        OcfTriggerTypeTypeElectiveInRange -> True
+        OcfTriggerTypeTypeElectiveAtWill -> True
+        OcfTriggerTypeTypeUnspecified -> True
