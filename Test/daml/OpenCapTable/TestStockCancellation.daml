@@ -6,7 +6,7 @@ import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..), OcfInitialSharesAuthorized(..))
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites)
+import OpenCapTable.TestHelpers (addPrerequisites, defaultStockIssuance)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
@@ -69,7 +69,7 @@ createStockCancellation issuer capTableCid =
         id = "TX_STOCK_CANCEL_1"
         date = DT.time (DA.date 2024 Jan 02) 0 0 0
         security_id = "SEC-1"
-        quantity = 50.0
+        quantity = 100.0
         balance_security_id = None
         reason_text = "Forfeit"
         comments = []]
@@ -90,21 +90,152 @@ testStockCancellation_CreateAndArchiveBuiltIn = script do
   _ <- createStockCancellation issuer result.updatedCapTableCid
   pure ()
 
+testStockCancellation_PartialWithoutBalanceSecurityFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  result <- createStockIssuance issuer capTableCid
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
+        id = "TX_STOCK_CANCEL_PARTIAL_NO_BALANCE"
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        security_id = "SEC-1"
+        quantity = 50.0
+        balance_security_id = None
+        reason_text = "Invalid partial cancellation"
+        comments = []]
+      edits = []
+      deletes = []
+
+testStockCancellation_MultipleTerminalTransactionsFail = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  result <- createStockIssuance issuer capTableCid
+
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
+            id = "TX_STOCK_CANCEL_DUPLICATE_1"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            security_id = "SEC-1"
+            quantity = 50.0
+            balance_security_id = None
+            reason_text = "First terminal transaction"
+            comments = []
+        , CT.OcfCreateStockCancellation StockCancellationOcfData with
+            id = "TX_STOCK_CANCEL_DUPLICATE_2"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            security_id = "SEC-1"
+            quantity = 50.0
+            balance_security_id = None
+            reason_text = "Second terminal transaction"
+            comments = []
+        ]
+      edits = []
+      deletes = []
+
+testStockCancellation_BalanceSecurityCannotBeReused = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let sourceA = (defaultStockIssuance "TX_STOCK_SOURCE_A" "SEC-SOURCE-A" "SH-1" "SC_COMMON") with quantity = 100.0
+  let sourceB = (defaultStockIssuance "TX_STOCK_SOURCE_B" "SEC-SOURCE-B" "SH-1" "SC_COMMON") with quantity = 100.0
+  let sharedBalance = (defaultStockIssuance "TX_STOCK_SHARED_BALANCE" "SEC-SHARED-BALANCE" "SH-1" "SC_COMMON") with quantity = 50.0
+  issuanceResult <- submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance sourceA
+        , CT.OcfCreateStockIssuance sourceB
+        , CT.OcfCreateStockIssuance sharedBalance
+        ]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd issuanceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
+            id = "TX_STOCK_CANCEL_SHARED_BALANCE_A"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            security_id = sourceA.security_id
+            quantity = 50.0
+            balance_security_id = Some sharedBalance.security_id
+            reason_text = "Partial cancellation A"
+            comments = []
+        , CT.OcfCreateStockCancellation StockCancellationOcfData with
+            id = "TX_STOCK_CANCEL_SHARED_BALANCE_B"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            security_id = sourceB.security_id
+            quantity = 50.0
+            balance_security_id = Some sharedBalance.security_id
+            reason_text = "Partial cancellation B"
+            comments = []
+        ]
+      edits = []
+      deletes = []
+
+testStockCancellation_BalanceSecurityMustBeActive = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let source = (defaultStockIssuance "TX_STOCK_ACTIVE_SOURCE" "SEC-ACTIVE-SOURCE" "SH-1" "SC_COMMON") with quantity = 100.0
+  let retiredBalance = (defaultStockIssuance "TX_STOCK_RETIRED_BALANCE" "SEC-RETIRED-BALANCE" "SH-1" "SC_COMMON") with quantity = 50.0
+  issuanceResult <- submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockIssuance source
+        , CT.OcfCreateStockIssuance retiredBalance
+        ]
+      edits = []
+      deletes = []
+  retirementResult <- submit issuer do
+    exerciseCmd issuanceResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
+        id = "TX_STOCK_RETIRE_BALANCE"
+        date = DT.time (DA.date 2024 Jan 02) 0 0 0
+        security_id = retiredBalance.security_id
+        quantity = 50.0
+        balance_security_id = None
+        reason_text = "Retire candidate balance"
+        comments = []]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd retirementResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
+        id = "TX_STOCK_REFERENCE_RETIRED_BALANCE"
+        date = DT.time (DA.date 2024 Jan 03) 0 0 0
+        security_id = source.security_id
+        quantity = 50.0
+        balance_security_id = Some retiredBalance.security_id
+        reason_text = "Invalid retired balance reference"
+        comments = []]
+      edits = []
+      deletes = []
+
 -- Optionals Some and arrays non-empty
 testStockCancellation_OptionalsSome = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
   capTableCid <- addPrerequisites issuer cap_table
   result <- createStockIssuance issuer capTableCid
+  let cancellationDate = DT.time (DA.date 2024 Jan 03) 0 0 0
+  let balanceIssuance = (defaultStockIssuance "TX_STOCK_CANCEL_2_BALANCE" "SEC-1-BAL2" "SH-1" "SC_COMMON") with
+        date = cancellationDate
+        quantity = 75.0
   _ <- submit issuer do
     exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
-        id = "TX_STOCK_CANCEL_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-1"
-        quantity = 25.0
-        balance_security_id = Some "SEC-1-BAL2"
-        reason_text = "Return to pool"
-        comments = ["Admin correction"]]
+      creates =
+        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
+            id = "TX_STOCK_CANCEL_2"
+            date = cancellationDate
+            security_id = "SEC-1"
+            quantity = 25.0
+            balance_security_id = Some balanceIssuance.security_id
+            reason_text = "Return to pool"
+            comments = ["Admin correction"]
+        , CT.OcfCreateStockIssuance balanceIssuance
+        ]
       edits = []
       deletes = []
   pure ()
