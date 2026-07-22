@@ -572,25 +572,32 @@ validateWarrantBalanceSuccessor maps index source event remainder balanceSecurit
       balance <- fetch cid
       assertMsg (event.label <> " balance stakeholder mismatch")
         (balance.issuance_data.stakeholder_id == source.stakeholder_id)
+      balanceQuantity <- warrantQuantityAt maps balance.issuance_data event.date
+      assertMsg (event.label <> " balance security was already fully exercised: " <> balanceSecurityId)
+        (case balanceQuantity of
+          Some quantity -> quantity > 0.0
+          None -> True)
       case remainder of
         Some expectedQuantity ->
           assertMsg (event.label <> " balance quantity mismatch")
-            (balance.issuance_data.quantity == Some expectedQuantity)
+            (balanceQuantity == Some expectedQuantity)
         None -> pure ()
     None -> assertMsg (event.label <> " balance warrant issuance not found: " <> balanceSecurityId) False
 
-priorWarrantExerciseQuantity : CapTableMaps -> Text -> Time -> Update (Optional Decimal)
-priorWarrantExerciseQuantity maps securityId targetDate =
+warrantQuantityAt : CapTableMaps -> WarrantIssuanceOcfData -> Time -> Update (Optional Decimal)
+warrantQuantityAt maps source targetDate =
   foldlA
-    (\total exerciseCid -> do
+    (\current exerciseCid -> do
       exercise <- fetch exerciseCid
-      if exercise.exercise_data.security_id /= securityId ||
+      if exercise.exercise_data.security_id /= source.security_id ||
           not (isEarlierOcfDate exercise.exercise_data.date targetDate)
-        then pure total
-        else case (total, exercise.exercise_data.quantity) of
-          (Some current, Some quantity) -> pure (Some (current + quantity))
-          (_, _) -> pure None)
-    (Some 0.0)
+        then pure current
+        else case exercise.exercise_data.quantity of
+          -- OCF only supplies quantity for partial exercises. An omitted
+          -- quantity therefore consumes the entire remaining warrant.
+          None -> pure (Some 0.0)
+          Some quantity -> pure (fmap (\remaining -> remaining - quantity) current))
+    source.quantity
     (Map.values maps.warrant_exercises)
 
 validateWarrantTerminalCompleteness : CapTableMaps -> TerminalEventIndex -> Update ()
@@ -600,10 +607,7 @@ validateWarrantTerminalCompleteness maps index =
       issuance <- fetch cid
       case Map.lookup issuance.issuance_data.security_id index of
         Some [event] -> when event.partial_requires_balance do
-          exercisedQuantity <- priorWarrantExerciseQuantity maps issuance.issuance_data.security_id event.date
-          let currentQuantityOpt = case (issuance.issuance_data.quantity, exercisedQuantity) of
-                (Some issuedQuantity, Some exercised) -> Some (issuedQuantity - exercised)
-                (_, _) -> None
+          currentQuantityOpt <- warrantQuantityAt maps issuance.issuance_data event.date
           case currentQuantityOpt of
             Some currentQuantity -> case event.reduction of
               Some reduction -> do
@@ -787,19 +791,9 @@ priorWarrantExerciseRetirementExists maps securityId targetDate =
   case Map.lookup securityId maps.warrant_issuances_by_security_id of
     Some issuanceCid -> do
       issuance <- fetch issuanceCid
-      (knownExerciseTotal, unknownExerciseRetirement) <- foldlA
-        (\(total, retired) exerciseCid -> do
-          exercise <- fetch exerciseCid
-          if exercise.exercise_data.security_id /= securityId ||
-              not (isEarlierOcfDate exercise.exercise_data.date targetDate)
-            then pure (total, retired)
-            else case exercise.exercise_data.quantity of
-              Some quantity -> pure (total + quantity, retired)
-              None -> pure (total, True))
-        (0.0, False)
-        (Map.values maps.warrant_exercises)
-      pure (unknownExerciseRetirement || case issuance.issuance_data.quantity of
-        Some quantity -> knownExerciseTotal >= quantity
+      liveQuantity <- warrantQuantityAt maps issuance.issuance_data targetDate
+      pure (case liveQuantity of
+        Some quantity -> quantity <= 0.0
         None -> False)
     None -> pure False
 
