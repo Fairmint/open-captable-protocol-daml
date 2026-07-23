@@ -1,131 +1,98 @@
 #!/usr/bin/env node
-/**
- * Backup a DAR file after mainnet upload. Copies from .daml/dist/ to dars/{package}/{version}/ and updates dars.lock.
- *
- * **Retention:** When bumping a package version, add the new backup with this script but **do not remove** prior
- * `dars/<package>/<oldVersion>/` trees that are already in the repo—keep historical DARs for audit, re-upload, and
- * debugging. See the repo wiki: https://github.com/Fairmint/open-captable-protocol-daml/wiki
- *
- * Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]
- */
+/** Replace the one undeployed candidate backup while preserving every deployed DAR. */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
-import { computeSha256, getDarsDir, loadDarsLock, saveDarsLock, type DarsLockEntry } from './dar-utils';
-import { getAllPackages, getPackage, parseNetworkArg, parsePackageArg, parseVersionArg } from './packages';
 
-function printUsage(errorMessage?: string): never {
-  if (errorMessage) console.error(`❌ ${errorMessage}\n`);
-  console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version> [--network <network>]');
-  console.error('\nPackages:');
-  for (const pkg of getAllPackages()) {
-    console.error(`  ${pkg.name}`);
-  }
+import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock, saveDarsLock } from './dar-utils';
+import { planCandidateBackup, readDeploymentState } from './dar-version-policy';
+import { getAllPackages, getPackage, parsePackageArg, parseVersionArg } from './packages';
+
+function usage(message?: string): never {
+  if (message) console.error(`❌ ${message}\n`);
+  console.error('Usage: tsx scripts/backup-dar.ts --package <name> --version <version>');
+  console.error(
+    `Packages: ${getAllPackages()
+      .map((pkg) => pkg.name)
+      .join(', ')}`
+  );
   process.exit(1);
 }
 
-function getSdkVersion(sourceDir: string): string {
-  const damlYamlPath = path.join(__dirname, '..', sourceDir, 'daml.yaml');
-  if (!fs.existsSync(damlYamlPath)) return 'unknown';
-
-  try {
-    const content = fs.readFileSync(damlYamlPath, 'utf-8');
-    const parsed = yaml.parse(content);
-    return parsed?.['sdk-version'] ?? 'unknown';
-  } catch {
-    return 'unknown';
-  }
+function sdkVersion(sourceDir: string): string {
+  const parsed = yaml.parse(fs.readFileSync(path.join(__dirname, '..', sourceDir, 'daml.yaml'), 'utf8')) as {
+    'sdk-version'?: string;
+  };
+  return parsed['sdk-version'] ?? 'unknown';
 }
 
-function main() {
+/** Restore a missing/corrupt backup atomically, then verify both its hash and size. */
+export function ensureBackupFile(source: string, destination: string, sha256: string, size: number): boolean {
+  const valid =
+    fs.existsSync(destination) && fs.statSync(destination).size === size && computeSha256(destination) === sha256;
+  if (!valid) {
+    fs.mkdirSync(path.dirname(destination), { recursive: true });
+    const temporary = `${destination}.tmp-${process.pid}`;
+    try {
+      fs.copyFileSync(source, temporary);
+      if (fs.statSync(temporary).size !== size || computeSha256(temporary) !== sha256) {
+        throw new Error('Temporary DAR copy failed integrity verification');
+      }
+      fs.renameSync(temporary, destination);
+    } finally {
+      if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
+  }
+  if (fs.statSync(destination).size !== size || computeSha256(destination) !== sha256) {
+    throw new Error('Backed-up DAR failed integrity verification');
+  }
+  return !valid;
+}
+
+function main(): void {
   const packageArg = parsePackageArg();
   const version = parseVersionArg();
-  const network = parseNetworkArg();
-
-  if (!packageArg || !version) printUsage('Missing required arguments');
-
+  if (!packageArg || !version) usage('Missing required arguments');
   const pkg = getPackage(packageArg);
-  if (!pkg) printUsage(`Unknown package: ${packageArg}`);
+  if (!pkg) usage(`Unknown package: ${packageArg}`);
+  if (version !== pkg.version) usage(`daml.yaml is v${pkg.version}, not v${version}`);
 
-  const rootDir = path.join(__dirname, '..');
-  const darsDir = getDarsDir();
+  const root = path.join(__dirname, '..');
+  const source = path.join(root, pkg.sourceDir, '.daml', 'dist', `${pkg.darName}-${version}.dar`);
+  if (!fs.existsSync(source)) usage(`Source DAR not found: ${source}. Run npm run build first.`);
 
-  // Build paths
-  const sourcePath = path.join(rootDir, pkg.sourceDir, '.daml', 'dist', `${pkg.darName}-${version}.dar`);
-  const destDir = path.join(darsDir, pkg.name, version);
-  const destPath = path.join(destDir, `${pkg.darName}.dar`);
-  const lockKey = `${pkg.name}/${version}/${pkg.darName}.dar`;
-
-  // Check source exists
-  if (!fs.existsSync(sourcePath)) {
-    console.error(`❌ Source DAR not found: ${sourcePath}`);
-    console.error('   Run "npm run build" first');
-    process.exit(1);
-  }
-
+  const sha256 = computeSha256(source);
+  const { size } = fs.statSync(source);
   const lock = loadDarsLock();
+  const plan = planCandidateBackup(lock, readDeploymentState(root), sha256, size);
+  const key = getDarLockKey(pkg.name, version, pkg.darName);
+  const destination = path.join(getDarsDir(), key);
+  const restored = ensureBackupFile(source, destination, sha256, size);
 
-  // Already backed up?
-  if (lockKey in lock.packages) {
-    console.log(`ℹ️  Already backed up: ${lockKey}`);
-
-    if (!fs.existsSync(destPath)) {
-      console.error(`❌ Lock entry exists but file missing: ${destPath}`);
-      process.exit(1);
-    }
-
-    // Verify hash
-    const hash = computeSha256(destPath);
-    if (hash !== lock.packages[lockKey].sha256) {
-      console.error(`❌ Hash mismatch! File may have been modified.`);
-      process.exit(1);
-    }
-
-    // Add network if specified
-    if (network && !lock.packages[lockKey].networks.includes(network)) {
-      lock.packages[lockKey].networks.push(network);
-      lock.packages[lockKey].networks.sort();
-      saveDarsLock(lock);
-      console.log(`✅ Added network: ${network}`);
-    }
-    return;
+  if (plan.replace) {
+    lock.packages[key] = {
+      sha256,
+      size,
+      sdkVersion: sdkVersion(pkg.sourceDir),
+      uploadedAt: new Date().toISOString(),
+      networks: [],
+    };
   }
 
-  // Create backup
-  fs.mkdirSync(destDir, { recursive: true });
-  fs.copyFileSync(sourcePath, destPath);
-
-  const hash = computeSha256(destPath);
-  const stats = fs.statSync(destPath);
-
-  lock.packages[lockKey] = {
-    sha256: hash,
-    size: stats.size,
-    sdkVersion: getSdkVersion(pkg.sourceDir),
-    uploadedAt: new Date().toISOString(),
-    networks: network ? [network] : [],
-  };
-
-  // Sort for consistent ordering
-  const sorted: Record<string, DarsLockEntry> = {};
-  Object.keys(lock.packages)
-    .sort()
-    .forEach((k) => {
-      sorted[k] = lock.packages[k];
-    });
-  lock.packages = sorted;
-
+  lock.packages = Object.fromEntries(
+    Object.entries(lock.packages).sort(([left], [right]) => left.localeCompare(right))
+  );
   saveDarsLock(lock);
-
-  console.log(`✅ Backed up: ${lockKey}`);
-  console.log(`   SHA256: ${hash}`);
-  console.log(`   Size: ${stats.size} bytes`);
+  console.log(`${plan.replace || restored ? '✅ Backed up' : '✅ Verified'}: ${key}`);
+  console.log(`   SHA256: ${sha256}`);
 }
 
-try {
-  main();
-} catch (err) {
-  console.error('❌ Error:', err);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (error) {
+    console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
 }
