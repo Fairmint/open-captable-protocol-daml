@@ -1,11 +1,13 @@
 module OpenCapTable.TestEquityCompensationCancellation where
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
 import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation
+import Fairmint.OpenCapTable.OCF.StockClassSplit
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder)
+import OpenCapTable.TestHelpers (addDefaultStakeholder, addPrerequisites)
 import qualified DA.Date as DA
 import DA.Date (Month(..))
 import qualified DA.Time as DT
@@ -37,6 +39,36 @@ createEquityCompensationIssuance issuer capTableCid securityId quantity =
         expiration_date = None
         termination_exercise_windows = []
         comments = []]
+      edits = []
+      deletes = []
+
+createClassLinkedEquityCompensationIssuance issuer capTableCid securityId quantity =
+  submit issuer do
+    exerciseCmd capTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
+            id = "TX_EC_CLASS_LINKED_ISS"
+            date = DT.time (DA.date 2024 Jan 01) 0 0 0
+            security_id = securityId
+            custom_id = "GRANT-CLASS-LINKED"
+            stakeholder_id = "SH-1"
+            board_approval_date = None
+            stockholder_approval_date = None
+            consideration_text = None
+            security_law_exemptions = []
+            stock_plan_id = None
+            stock_class_id = Some "SC_COMMON"
+            compensation_type = OcfCompensationTypeOptionNSO
+            quantity = quantity
+            exercise_price = Some (OcfMonetary with amount = 0.10, currency = "USD")
+            base_price = None
+            early_exercisable = Some False
+            vesting_terms_id = None
+            vestings = []
+            expiration_date = None
+            termination_exercise_windows = []
+            comments = []
+        ]
       edits = []
       deletes = []
 
@@ -101,6 +133,137 @@ testEquityCompensationCancellation_PartialWithOptionals = script do
         reason_text = "Partial forfeiture due to early departure"
         balance_security_id = Some "SEC-EC-PARTIAL-BAL"
         comments = ["Partial cancellation per separation agreement", "Remaining vested options: 350,000"]]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationCancellation_CumulativeOverdrawRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addDefaultStakeholder issuer cap_table
+  let securityId = "SEC-EC-OVERDRAW"
+  result <- createEquityCompensationIssuance issuer capTableCid securityId 100.0
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_OVERDRAW_1"
+            date = DT.time (DA.date 2024 Mar 15) 0 0 0
+            security_id = securityId
+            quantity = 60.0
+            reason_text = "Test reduction"
+            balance_security_id = None
+            comments = []
+        , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_OVERDRAW_2"
+            date = DT.time (DA.date 2024 Mar 15) 0 0 0
+            security_id = securityId
+            quantity = 50.0
+            reason_text = "Test reduction"
+            balance_security_id = None
+            comments = []
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationCancellation_PreIssuanceReductionRejected = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addDefaultStakeholder issuer cap_table
+  let securityId = "SEC-EC-PRE-ISSUANCE"
+  result <- createEquityCompensationIssuance issuer capTableCid securityId 100.0
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_BEFORE_ISSUANCE"
+            date = DT.time (DA.date 2020 Jan 14) 0 0 0
+            security_id = securityId
+            quantity = 10.0
+            reason_text = "Predates the source issuance"
+            balance_security_id = None
+            comments = []
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationCancellation_SameDaySplitDoesNotMaskOverdraw = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "SEC-EC-SAME-DAY-SPLIT"
+  result <- createClassLinkedEquityCompensationIssuance issuer capTableCid securityId 100.0
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+            id = "TX_EC_SPLIT_SAME_DAY"
+            date = DT.time (DA.date 2024 Jan 01) 23 59 59
+            stock_class_id = "SC_COMMON"
+            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
+            comments = []
+        , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_AFTER_SAME_DAY_SPLIT"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            security_id = securityId
+            quantity = 150.0
+            reason_text = "Same-day split ordering is ambiguous"
+            balance_security_id = None
+            comments = []
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationCancellation_LaterSplitScalesBalance = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "SEC-EC-LATER-SPLIT"
+  result <- createClassLinkedEquityCompensationIssuance issuer capTableCid securityId 100.0
+  _ <- submit issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+            id = "TX_EC_SPLIT_LATER"
+            date = DT.time (DA.date 2024 Jan 02) 0 0 0
+            stock_class_id = "SC_COMMON"
+            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
+            comments = []
+        , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_AFTER_LATER_SPLIT"
+            date = DT.time (DA.date 2024 Jan 03) 0 0 0
+            security_id = securityId
+            quantity = 150.0
+            reason_text = "Later split scales source balance"
+            balance_security_id = None
+            comments = []
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testEquityCompensationCancellation_SameDayReductionCannotRelyOnSplit = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  capTableCid <- addPrerequisites issuer cap_table
+  let securityId = "SEC-EC-SAME-DAY-REDUCTION"
+  result <- createClassLinkedEquityCompensationIssuance issuer capTableCid securityId 100.0
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+            id = "TX_EC_SPLIT_WITH_SAME_DAY_REDUCTION"
+            date = DT.time (DA.date 2024 Jan 02) 12 0 0
+            stock_class_id = "SC_COMMON"
+            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
+            comments = []
+        , CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
+            id = "TX_EC_CANCEL_SAME_DAY_AS_SPLIT"
+            date = DT.time (DA.date 2024 Jan 02) 18 0 0
+            security_id = securityId
+            quantity = 150.0
+            reason_text = "Same-day ordering is ambiguous"
+            balance_security_id = None
+            comments = []
+        ]
       edits = []
       deletes = []
   pure ()

@@ -7,6 +7,9 @@ module Fairmint.OpenCapTable.Types.Conversion where
 -- All conversion mechanism types for convertible securities, warrants, and stock.
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/types/
 
+import DA.Optional (isNone, isSome)
+import DA.List (sortOn)
+import qualified DA.Date as Date
 import Fairmint.Shared.TypeHelpers (validateOptionalText, validateRequiredText)
 import Fairmint.OpenCapTable.Types.Validation (validateOcfPercentage)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary, validateOcfMonetary)
@@ -71,7 +74,27 @@ data OcfInterestRate = OcfInterestRate
   deriving (Eq, Show)
 
 validateOcfInterestRate : OcfInterestRate -> Bool
-validateOcfInterestRate r = validateOcfPercentage r.rate
+validateOcfInterestRate r =
+  validateOcfPercentage r.rate &&
+  optional True
+    (\endDate -> Date.toDateUTC endDate >= Date.toDateUTC r.accrual_start_date)
+    r.accrual_end_date
+
+validateSortedOcfInterestRateSchedule : [OcfInterestRate] -> Bool
+validateSortedOcfInterestRateSchedule rates = case rates of
+  [] -> True
+  [rate] -> validateOcfInterestRate rate
+  current :: next :: rest ->
+    validateOcfInterestRate current &&
+    Date.toDateUTC current.accrual_start_date < Date.toDateUTC next.accrual_start_date &&
+    optional True
+      (\endDate -> Date.toDateUTC endDate < Date.toDateUTC next.accrual_start_date)
+      current.accrual_end_date &&
+    validateSortedOcfInterestRateSchedule (next :: rest)
+
+validateOcfInterestRateSchedule : [OcfInterestRate] -> Bool
+validateOcfInterestRateSchedule rates =
+  validateSortedOcfInterestRateSchedule (sortOn (\rate -> Date.toDateUTC rate.accrual_start_date) rates)
 
 -- =============================================================================
 -- CAPITALIZATION DEFINITION TYPES
@@ -348,7 +371,7 @@ data OcfNoteConversionMechanism = OcfNoteConversionMechanism
 
 validateOcfNoteConversionMechanism : OcfNoteConversionMechanism -> Bool
 validateOcfNoteConversionMechanism m =
-  all validateOcfInterestRate m.interest_rates &&
+  validateOcfInterestRateSchedule m.interest_rates &&
   optional True (\d -> d >= (0.0) && d < (1.0 : Decimal)) m.conversion_discount &&
   optional True validateOcfMonetary m.conversion_valuation_cap &&
   optional True validateOcfRatio m.exit_multiple &&
@@ -597,6 +620,31 @@ validateOcfAnyConversionRight right =
     OcfRightWarrant warrantRight -> validateOcfWarrantConversionRight warrantRight
     OcfRightStockClass stockClassRight -> validateOcfStockClassConversionRight stockClassRight
 
+validateOcfConversionTriggerFields : OcfConversionTriggerType -> Optional Time -> Optional Time -> Optional Text -> Optional Time -> Bool
+validateOcfConversionTriggerFields triggerType startDate endDate triggerCondition triggerDate =
+  let hasCondition = optional False validateRequiredText triggerCondition
+      noCondition = isNone triggerCondition
+      noTriggerDate = isNone triggerDate
+      hasStartDate = isSome startDate
+      hasEndDate = isSome endDate
+      hasValidRange = case (startDate, endDate) of
+        (Some start, Some end) -> Date.toDateUTC start <= Date.toDateUTC end
+        _ -> False
+      noRange = isNone startDate && isNone endDate
+   in case triggerType of
+        OcfTriggerTypeTypeAutomaticOnDate ->
+          isSome triggerDate && noCondition && noRange
+        OcfTriggerTypeTypeAutomaticOnCondition ->
+          hasCondition && noTriggerDate && noRange
+        OcfTriggerTypeTypeElectiveOnCondition ->
+          hasCondition && noTriggerDate && noRange
+        OcfTriggerTypeTypeElectiveInRange ->
+          hasStartDate && hasEndDate && hasValidRange && noCondition && noTriggerDate
+        OcfTriggerTypeTypeElectiveAtWill ->
+          noCondition && noTriggerDate && noRange
+        OcfTriggerTypeTypeUnspecified ->
+          noCondition && noTriggerDate && noRange
+
 -- OCF: https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/main/schema/primitives/types/conversion_triggers/ConversionTrigger.schema.json
 data OcfConversionTrigger = OcfConversionTrigger
   with
@@ -629,17 +677,9 @@ data OcfConversionTrigger = OcfConversionTrigger
 
 validateOcfConversionTrigger : OcfConversionTrigger -> Bool
 validateOcfConversionTrigger t =
-  let hasDate = case t.trigger_date of Some _ -> True; None -> False
-      hasCond = optional False validateRequiredText t.trigger_condition
-   in validateRequiredText t.trigger_id &&
+  validateRequiredText t.trigger_id &&
       validateOptionalText t.nickname &&
       validateOptionalText t.trigger_description &&
       validateOptionalText t.trigger_condition &&
       validateOcfAnyConversionRight t.conversion_right &&
-      case t.type_ of
-        OcfTriggerTypeTypeAutomaticOnDate -> hasDate
-        OcfTriggerTypeTypeAutomaticOnCondition -> hasCond
-        OcfTriggerTypeTypeElectiveOnCondition -> hasCond
-        OcfTriggerTypeTypeElectiveInRange -> True
-        OcfTriggerTypeTypeElectiveAtWill -> True
-        OcfTriggerTypeTypeUnspecified -> True
+      validateOcfConversionTriggerFields t.type_ t.start_date t.end_date t.trigger_condition t.trigger_date
