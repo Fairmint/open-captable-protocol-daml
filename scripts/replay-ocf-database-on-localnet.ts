@@ -141,8 +141,7 @@ export async function waitForStableTrafficCounters(
 export async function waitForPartyVisibility(
   party: string,
   readPartyDetails: () =>
-    | { partyDetails: Array<{ party: string }> }
-    | Promise<{ partyDetails: Array<{ party: string }> }>,
+    { partyDetails: Array<{ party: string }> } | Promise<{ partyDetails: Array<{ party: string }> }>,
   options: PollOptions = {}
 ): Promise<void> {
   const delaysMs = options.delaysMs ?? PARTY_VISIBILITY_RETRY_DELAYS_MS;
