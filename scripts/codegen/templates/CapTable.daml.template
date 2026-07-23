@@ -19,6 +19,7 @@ import DA.Optional (fromOptional, isNone, isSome)
 import qualified DA.Date as Date
 
 import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.Types.Conversion (OcfConversionMechanism(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 
 -- OCF Types
@@ -422,6 +423,34 @@ validateSourceSecurityBalances maps = do
       validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (reductions ++ splits))
     (Map.values maps.equity_compensation_issuances)
 
+stockClassHasRatioConversionRight : StockClassOcfData -> Bool
+stockClassHasRatioConversionRight stockClassData =
+  any
+    (\right -> case right.conversion_mechanism of
+      OcfConversionMechanismRatioConversion -> True
+      _ -> False)
+    stockClassData.conversion_rights
+
+validateStockClassConversionRatioAdjustmentTargets : CapTableMaps -> Update ()
+validateStockClassConversionRatioAdjustmentTargets maps =
+  mapA_
+    (\adjustmentCid -> do
+      adjustment <- fetch adjustmentCid
+      let data_ = adjustment.adjustment_data
+      case Map.lookup data_.stock_class_id maps.stock_classes of
+        Some stockClassCid -> do
+          stockClass <- fetch stockClassCid
+          assertMsg
+            ("Stock class conversion ratio adjustment " <> data_.id <> " targets a stock class without a ratio conversion right: " <> data_.stock_class_id)
+            (stockClassHasRatioConversionRight stockClass.stock_class_data)
+        -- Create/edit handlers validate this reference, while this final-state
+        -- check also prevents deleting a class that an adjustment still targets.
+        None ->
+          assertMsg
+            ("Stock class conversion ratio adjustment " <> data_.id <> " target not found: " <> data_.stock_class_id)
+            False)
+    (Map.values maps.stock_class_conversion_ratio_adjustments)
+
 -- OCF dates are calendar dates. A non-quantity transaction may occur on the
 -- same date as a terminal transaction, but it cannot target the retired source
 -- security on a later OCF date.
@@ -817,6 +846,7 @@ template CapTable
         validateFinancingIssuanceReferences finalMaps
         validateActiveSecurityTargets finalMaps
         validateSourceSecurityBalances finalMaps
+        validateStockClassConversionRatioAdjustmentTargets finalMaps
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
