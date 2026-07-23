@@ -191,11 +191,14 @@ validateFinancingIssuanceReferences maps =
 
 securityBalanceEventSortKey : SecurityBalanceEvent -> (Date, Int, Text)
 securityBalanceEventSortKey event = case event of
-  -- Full retirement sorts first so a same-day reduction cannot consume the
-  -- source a second time. Split/reduction ambiguity is rejected separately.
-  SecurityBalanceRetirement with event_date; event_id -> (ocfDate event_date, 0, event_id)
-  SecurityBalanceReduction with event_date; event_id -> (ocfDate event_date, 1, event_id)
-  SecurityBalanceMultiplier with event_date; event_id -> (ocfDate event_date, 2, event_id)
+  -- OCF provides no intra-day ordering. Evaluate each date in the ordering
+  -- that yields the lowest possible balance: reverse splits, retirements,
+  -- reductions, then forward splits. This rejects only when some possible
+  -- ordering overdraws or consumes a retired security.
+  SecurityBalanceMultiplier with event_date; event_id; numerator; denominator ->
+    (ocfDate event_date, if numerator < denominator then 0 else 3, event_id)
+  SecurityBalanceRetirement with event_date; event_id -> (ocfDate event_date, 1, event_id)
+  SecurityBalanceReduction with event_date; event_id -> (ocfDate event_date, 2, event_id)
 
 securityBalanceEventDate : SecurityBalanceEvent -> Time
 securityBalanceEventDate event = case event of
@@ -203,28 +206,17 @@ securityBalanceEventDate event = case event of
   SecurityBalanceRetirement with event_date -> event_date
   SecurityBalanceMultiplier with event_date -> event_date
 
-hasAmbiguousSameDaySplitAndReduction : [SecurityBalanceEvent] -> Bool
-hasAmbiguousSameDaySplitAndReduction events =
-  any
-    (\event -> case event of
-      SecurityBalanceMultiplier with event_date ->
-        let multiplierDate = event_date
-        in any
-            (\candidate -> case candidate of
-              SecurityBalanceReduction with event_date ->
-                ocfDate multiplierDate == ocfDate event_date
-              _ -> False)
-            events
-      _ -> False)
-    events
-
--- OCF dates have day precision and provide no intra-day ordering. Only apply
--- splits that unambiguously occurred after an issuance; treating a same-day
--- split as earlier can double-scale a post-split issuance. Same-day splits are
--- treated as ambiguous and excluded.
-splitUnambiguouslyFollowsIssuance : Time -> SecurityBalanceEvent -> Bool
-splitUnambiguouslyFollowsIssuance issuanceDate event =
-  ocfDate (securityBalanceEventDate event) > ocfDate issuanceDate
+-- A later split always affects an issuance. On the issuance date, only a
+-- reverse split is relevant to the conservative balance: it may have happened
+-- after issuance and reduced the balance. A same-day forward split is excluded
+-- because the issuance may already record the post-split quantity.
+splitMayReducePostIssuanceBalance : Time -> SecurityBalanceEvent -> Bool
+splitMayReducePostIssuanceBalance issuanceDate event = case event of
+  SecurityBalanceMultiplier with event_date; numerator; denominator ->
+    let splitDate = ocfDate event_date
+        issuedDate = ocfDate issuanceDate
+    in splitDate > issuedDate || (splitDate == issuedDate && numerator < denominator)
+  _ -> False
 
 addSecurityBalanceEvent : Text -> SecurityBalanceEvent -> Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent]
 addSecurityBalanceEvent key event index =
@@ -254,15 +246,44 @@ applySecurityBalanceEvent securityId current event = case event of
       (numerator > 0.0 && denominator > 0.0)
     pure (current * numerator / denominator)
 
-validateSourceSecurityBalance : Text -> Decimal -> [SecurityBalanceEvent] -> Update ()
-validateSourceSecurityBalance securityId initialQuantity events = do
-  assertMsg
-    ("Security " <> securityId <>
-      " has a split and reduction on the same OCF date without an intra-day ordering")
-    (not (hasAmbiguousSameDaySplitAndReduction events))
+validateSecurityBalanceEventDates : Text -> Time -> [SecurityBalanceEvent] -> Update ()
+validateSecurityBalanceEventDates securityId issuanceDate events =
+  mapA_
+    (\event ->
+      assertMsg
+        ("Security lifecycle event predates issuance for " <> securityId)
+        (ocfDate (securityBalanceEventDate event) >= ocfDate issuanceDate))
+    events
+
+validateSourceSecurityBalance : Text -> Time -> Decimal -> [SecurityBalanceEvent] -> Update ()
+validateSourceSecurityBalance securityId issuanceDate initialQuantity events = do
+  validateSecurityBalanceEventDates securityId issuanceDate events
   _ <- foldlA
     (applySecurityBalanceEvent securityId)
     initialQuantity
+    (sortOn securityBalanceEventSortKey events)
+  pure ()
+
+applyUnknownQuantitySecurityBalanceEvent : Text -> Bool -> SecurityBalanceEvent -> Update Bool
+applyUnknownQuantitySecurityBalanceEvent securityId active event = case event of
+  SecurityBalanceReduction with event_id -> do
+    assertMsg
+      ("Security cannot be reduced after retirement for " <> securityId <> " at " <> event_id)
+      active
+    pure active
+  SecurityBalanceRetirement with event_id -> do
+    assertMsg
+      ("Security cannot be retired more than once for " <> securityId <> " at " <> event_id)
+      active
+    pure False
+  SecurityBalanceMultiplier {} -> pure active
+
+validateUnknownQuantitySecurityBalance : Text -> Time -> [SecurityBalanceEvent] -> Update ()
+validateUnknownQuantitySecurityBalance securityId issuanceDate events = do
+  validateSecurityBalanceEventDates securityId issuanceDate events
+  _ <- foldlA
+    (applyUnknownQuantitySecurityBalanceEvent securityId)
+    True
     (sortOn securityBalanceEventSortKey events)
   pure ()
 
@@ -516,20 +537,30 @@ validateSourceSecurityBalances maps = do
       issuance <- fetch issuanceCid
       let events = fromOptional [] (Map.lookup issuance.issuance_data.security_id stockEvents)
           splits = filter
-            (splitUnambiguouslyFollowsIssuance issuance.issuance_data.date)
+            (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
             (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents))
-      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (events ++ splits))
+      validateSourceSecurityBalance
+        issuance.issuance_data.security_id
+        issuance.issuance_data.date
+        issuance.issuance_data.quantity
+        (events ++ splits))
     (Map.values maps.stock_issuances)
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
+      let events = fromOptional [] (Map.lookup issuance.issuance_data.security_id warrantEvents)
       case issuance.issuance_data.quantity of
         Some quantity ->
           validateSourceSecurityBalance
             issuance.issuance_data.security_id
+            issuance.issuance_data.date
             quantity
-            (fromOptional [] (Map.lookup issuance.issuance_data.security_id warrantEvents))
-        None -> pure ())
+            events
+        None ->
+          validateUnknownQuantitySecurityBalance
+            issuance.issuance_data.security_id
+            issuance.issuance_data.date
+            events)
     (Map.values maps.warrant_issuances)
   mapA_
     (\issuanceCid -> do
@@ -537,10 +568,14 @@ validateSourceSecurityBalances maps = do
       let events = fromOptional [] (Map.lookup issuance.issuance_data.security_id equityCompensationEvents)
           splits = case issuance.issuance_data.stock_class_id of
             Some stockClassId -> filter
-              (splitUnambiguouslyFollowsIssuance issuance.issuance_data.date)
+              (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
               (fromOptional [] (Map.lookup stockClassId splitEvents))
             None -> []
-      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (events ++ splits))
+      validateSourceSecurityBalance
+        issuance.issuance_data.security_id
+        issuance.issuance_data.date
+        issuance.issuance_data.quantity
+        (events ++ splits))
     (Map.values maps.equity_compensation_issuances)
 
 stockClassHasRatioConversionRight : StockClassOcfData -> Bool
