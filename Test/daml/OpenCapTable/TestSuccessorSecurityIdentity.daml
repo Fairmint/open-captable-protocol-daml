@@ -1,0 +1,215 @@
+module OpenCapTable.TestSuccessorSecurityIdentity where
+
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers
+  ( addPrerequisites
+  , addStockIssuance
+  )
+import qualified DA.Date as Date
+import DA.Date (Month(..))
+import qualified DA.Time as Time
+import Daml.Script
+
+transactionDate : Time
+transactionDate = Time.time (Date.date 2024 Jan 02) 0 0 0
+
+stockTransfer : Text -> Text -> [Text] -> Optional Text -> CT.OcfCreateData
+stockTransfer transactionId sourceSecurityId resultingSecurityIds balanceSecurityId =
+  CT.OcfCreateStockTransfer StockTransferOcfData with
+    id = transactionId
+    date = transactionDate
+    quantity = 50.0
+    security_id = sourceSecurityId
+    comments = []
+    resulting_security_ids = resultingSecurityIds
+    balance_security_id = balanceSecurityId
+    consideration_text = None
+
+-- A security ID is a package-wide identity, not a per-instrument namespace.
+testSecurityId_CrossFamilyDuplicateFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CROSS-FAMILY"
+    "SEC-CROSS-FAMILY"
+    "SH-1"
+    "SC_COMMON"
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
+        id = "WARRANT-CROSS-FAMILY"
+        date = transactionDate
+        security_id = "SEC-CROSS-FAMILY"
+        custom_id = "W-CROSS-FAMILY"
+        stakeholder_id = "SH-1"
+        board_approval_date = None
+        stockholder_approval_date = None
+        consideration_text = None
+        security_law_exemptions = []
+        quantity = Some 100.0
+        quantity_source = None
+        exercise_price = None
+        purchase_price = OcfMonetary with amount = 0.0, currency = "USD"
+        exercise_triggers = []
+        warrant_expiration_date = None
+        vesting_terms_id = None
+        vestings = []
+        comments = []]
+      edits = []
+      deletes = []
+  pure ()
+
+testSuccessorSecurityId_CannotReuseSource = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-SOURCE-REUSE"
+    "SEC-SOURCE-REUSE"
+    "SH-1"
+    "SC_COMMON"
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [stockTransfer
+        "TRANSFER-SOURCE-REUSE"
+        "SEC-SOURCE-REUSE"
+        ["SEC-SOURCE-REUSE"]
+        None]
+      edits = []
+      deletes = []
+  pure ()
+
+testSuccessorSecurityId_BalanceCannotAlsoBeResult = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-BALANCE-RESULT"
+    "SEC-BALANCE-RESULT-SOURCE"
+    "SH-1"
+    "SC_COMMON"
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [stockTransfer
+        "TRANSFER-BALANCE-RESULT"
+        "SEC-BALANCE-RESULT-SOURCE"
+        ["SEC-BALANCE-RESULT"]
+        (Some "SEC-BALANCE-RESULT")]
+      edits = []
+      deletes = []
+  pure ()
+
+testSuccessorSecurityId_CannotBeClaimedByMultipleTransactions = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-DUPLICATE-CLAIM-A"
+    "SEC-DUPLICATE-CLAIM-A"
+    "SH-1"
+    "SC_COMMON"
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-DUPLICATE-CLAIM-B"
+    "SEC-DUPLICATE-CLAIM-B"
+    "SH-1"
+    "SC_COMMON"
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ stockTransfer
+            "TRANSFER-DUPLICATE-CLAIM-A"
+            "SEC-DUPLICATE-CLAIM-A"
+            ["SEC-DUPLICATE-CLAIM"]
+            None
+        , stockTransfer
+            "TRANSFER-DUPLICATE-CLAIM-B"
+            "SEC-DUPLICATE-CLAIM-B"
+            ["SEC-DUPLICATE-CLAIM"]
+            None
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testSuccessorSecurityGraph_CycleFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CYCLE-A"
+    "SEC-CYCLE-A"
+    "SH-1"
+    "SC_COMMON"
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CYCLE-B"
+    "SEC-CYCLE-B"
+    "SH-1"
+    "SC_COMMON"
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ stockTransfer "TRANSFER-CYCLE-A" "SEC-CYCLE-A" ["SEC-CYCLE-B"] None
+        , stockTransfer "TRANSFER-CYCLE-B" "SEC-CYCLE-B" ["SEC-CYCLE-A"] None
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testSuccessorSecurityGraph_AcyclicChainSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CHAIN-A"
+    "SEC-CHAIN-A"
+    "SH-1"
+    "SC_COMMON"
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CHAIN-B"
+    "SEC-CHAIN-B"
+    "SH-1"
+    "SC_COMMON"
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ stockTransfer "TRANSFER-CHAIN-A" "SEC-CHAIN-A" ["SEC-CHAIN-B"] None
+        , stockTransfer "TRANSFER-CHAIN-B" "SEC-CHAIN-B" ["SEC-CHAIN-C"] None
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+-- A consolidation has multiple source edges but only one producing transaction;
+-- its single result is therefore not a duplicate cross-transaction claim.
+testSuccessorSecurityId_ConsolidationMayJoinMultipleSources = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  cap_table <- addPrerequisites issuer cap_table
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CONSOLIDATION-A"
+    "SEC-CONSOLIDATION-A"
+    "SH-1"
+    "SC_COMMON"
+  cap_table <- addStockIssuance issuer cap_table
+    "STOCK-CONSOLIDATION-B"
+    "SEC-CONSOLIDATION-B"
+    "SH-1"
+    "SC_COMMON"
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockConsolidation StockConsolidationOcfData with
+        id = "CONSOLIDATION-JOIN"
+        date = transactionDate
+        security_ids = ["SEC-CONSOLIDATION-A", "SEC-CONSOLIDATION-B"]
+        resulting_security_id = "SEC-CONSOLIDATION-RESULT"
+        reason_text = None
+        comments = []]
+      edits = []
+      deletes = []
+  pure ()
