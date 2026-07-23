@@ -33,6 +33,8 @@ interface Validation {
   thirdMap?: string;
   // For array field validation (validates each element in the array)
   is_array?: boolean;
+  // For Optional Text reference fields
+  is_optional?: boolean;
 }
 
 // Maps issuance type names to their security_id index map names
@@ -41,6 +43,11 @@ const SECURITY_ID_INDEX_MAPS: Record<string, string> = {
   EquityCompensationIssuance: 'equity_compensation_issuances_by_security_id',
   StockIssuance: 'stock_issuances_by_security_id',
   WarrantIssuance: 'warrant_issuances_by_security_id',
+};
+
+const OBJECT_TYPE_CONSTRUCTOR_OVERRIDES: Record<string, string> = {
+  StakeholderRelationshipChangeEvent: 'OcfObjCeStakeholderRelationship',
+  StakeholderStatusChangeEvent: 'OcfObjCeStakeholderStatus',
 };
 
 interface TypeDef {
@@ -53,6 +60,10 @@ interface TypeDef {
   validations: Validation[];
   // Types introduced after v0.0.2 must be appended to upgrade-sensitive records and variants.
   is_upgrade_append: boolean;
+  has_validations: boolean;
+  validates_issuer_id_reference: boolean;
+  is_document: boolean;
+  object_type_constructor: string;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
 }
@@ -96,6 +107,27 @@ function pluralize(str: string): string {
   // Words ending in s (like stock_class) get "es"
   if (str.endsWith('s')) return `${str}es`;
   return `${str}s`;
+}
+
+function objectTypeConstructor(name: string): string {
+  if (OBJECT_TYPE_CONSTRUCTOR_OVERRIDES[name]) return OBJECT_TYPE_CONSTRUCTOR_OVERRIDES[name];
+  if (
+    /^(Convertible|EquityCompensation|Stock|Warrant).*(Acceptance|Cancellation|Conversion|Exercise|Issuance|Release|Repricing|Retraction|Transfer|Consolidation|Repurchase|Reissuance)$/.test(
+      name
+    ) ||
+    name.startsWith('IssuerAuthorizedSharesAdjustment') ||
+    name.startsWith('StockClassAuthorizedSharesAdjustment') ||
+    name.startsWith('StockClassConversionRatioAdjustment') ||
+    name.startsWith('StockClassSplit') ||
+    name.startsWith('StockPlanPoolAdjustment') ||
+    name.startsWith('StockPlanReturnToPool') ||
+    name === 'VestingAcceleration' ||
+    name === 'VestingEvent' ||
+    name === 'VestingStart'
+  ) {
+    return `OcfObjTx${name}`;
+  }
+  return `OcfObj${name}`;
 }
 
 /** Parse a DAML file to find its main data type and field name */
@@ -174,20 +206,27 @@ function discoverTypes(config: Config): TypeDef[] {
       map_field: pluralize(snakeName),
       tier,
       validations: validationFields.map((fieldSpec) => {
-        // Support four formats:
+        // Support five formats:
         // - Simple: "stakeholder_id" -> field: stakeholder_id, map: stakeholders (auto-derived)
         // - Explicit: "security_id:stock_issuances_by_security_id" -> field: security_id, map: stock_issuances_by_security_id
         // - OR-based: "security_id:map1|map2|map3" -> field: security_id, checks all three maps with OR logic
         // - Array: "security_ids[]:stock_issuances_by_security_id" -> field: security_ids, validates each element in array
+        // - Optional: "stock_plan_id?:stock_plans" -> field: stock_plan_id, validates only when Some
         if (fieldSpec.includes(':')) {
           const parts = fieldSpec.split(':');
           let field = parts[0];
           const mapSpec = parts[1];
+          // Check for optional syntax (e.g., "stock_plan_id?")
+          const is_optional = field.endsWith('?');
+          if (is_optional) {
+            field = field.slice(0, -1); // Remove ? suffix
+          }
           // Check for array syntax (e.g., "security_ids[]")
           const is_array = field.endsWith('[]');
           if (is_array) {
             field = field.slice(0, -2); // Remove [] suffix
           }
+          const error = field.includes('security_id') ? 'Security not found' : `${toTitleCase(field)} not found`;
           // Check for OR-based multiple maps (e.g., "map1|map2|map3")
           if (mapSpec.includes('|')) {
             const maps = mapSpec.split('|');
@@ -200,19 +239,21 @@ function discoverTypes(config: Config): TypeDef[] {
             return {
               field,
               map: maps[0], // Default map (not used when or_maps is true)
-              error: `Security not found`,
+              error,
               or_maps: true,
               firstMap: maps[0],
               secondMap: maps[1],
               thirdMap: maps[2],
               is_array,
+              is_optional,
             };
           }
           return {
             field,
             map: mapSpec,
-            error: `Security not found`,
+            error,
             is_array,
+            is_optional,
           };
         }
         return {
@@ -224,6 +265,10 @@ function discoverTypes(config: Config): TypeDef[] {
       // Financing is the first type absent from the v0.0.2 baseline. Add every future post-v0.0.2 type here so its
       // constructors and Optional map stay appended instead of being inserted by alphabetical codegen ordering.
       is_upgrade_append: name === 'Financing',
+      has_validations: validationFields.length > 0,
+      validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
+      is_document: name === 'Document',
+      object_type_constructor: objectTypeConstructor(name),
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
