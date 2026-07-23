@@ -111,6 +111,9 @@ data SecurityBalanceEvent
       event_date: Time
       event_id: Text
       quantity: Decimal
+  | SecurityBalanceRetirement with
+      event_date: Time
+      event_id: Text
   | SecurityBalanceMultiplier with
       event_date: Time
       event_id: Text
@@ -188,15 +191,32 @@ validateFinancingIssuanceReferences maps =
 
 securityBalanceEventSortKey : SecurityBalanceEvent -> (Date, Int, Text)
 securityBalanceEventSortKey event = case event of
-  -- OCF event dates are day-precision. A same-day reduction cannot rely on an
-  -- ambiguously ordered split to avoid an overdraw, so reductions sort first.
-  SecurityBalanceReduction with event_date; event_id -> (ocfDate event_date, 0, event_id)
-  SecurityBalanceMultiplier with event_date; event_id -> (ocfDate event_date, 1, event_id)
+  -- Full retirement sorts first so a same-day reduction cannot consume the
+  -- source a second time. Split/reduction ambiguity is rejected separately.
+  SecurityBalanceRetirement with event_date; event_id -> (ocfDate event_date, 0, event_id)
+  SecurityBalanceReduction with event_date; event_id -> (ocfDate event_date, 1, event_id)
+  SecurityBalanceMultiplier with event_date; event_id -> (ocfDate event_date, 2, event_id)
 
 securityBalanceEventDate : SecurityBalanceEvent -> Time
 securityBalanceEventDate event = case event of
   SecurityBalanceReduction with event_date -> event_date
+  SecurityBalanceRetirement with event_date -> event_date
   SecurityBalanceMultiplier with event_date -> event_date
+
+hasAmbiguousSameDaySplitAndReduction : [SecurityBalanceEvent] -> Bool
+hasAmbiguousSameDaySplitAndReduction events =
+  any
+    (\event -> case event of
+      SecurityBalanceMultiplier with event_date ->
+        let multiplierDate = event_date
+        in any
+            (\candidate -> case candidate of
+              SecurityBalanceReduction with event_date ->
+                ocfDate multiplierDate == ocfDate event_date
+              _ -> False)
+            events
+      _ -> False)
+    events
 
 -- OCF dates have day precision and provide no intra-day ordering. Only apply
 -- splits that unambiguously occurred after an issuance; treating a same-day
@@ -222,6 +242,12 @@ applySecurityBalanceEvent securityId current event = case event of
         ": reducing " <> show quantity <> " from " <> show current <> " leaves " <> show next)
       (next >= 0.0)
     pure next
+  SecurityBalanceRetirement with event_id -> do
+    assertMsg
+      ("Security cannot be retired more than once or reduced after retirement for " <>
+        securityId <> " at " <> event_id)
+      (current > 0.0)
+    pure 0.0
   SecurityBalanceMultiplier with event_id; numerator; denominator -> do
     assertMsg
       ("Security balance multiplier must be positive for " <> securityId <> " at " <> event_id)
@@ -230,27 +256,31 @@ applySecurityBalanceEvent securityId current event = case event of
 
 validateSourceSecurityBalance : Text -> Decimal -> [SecurityBalanceEvent] -> Update ()
 validateSourceSecurityBalance securityId initialQuantity events = do
+  assertMsg
+    ("Security " <> securityId <>
+      " has a split and reduction on the same OCF date without an intra-day ordering")
+    (not (hasAmbiguousSameDaySplitAndReduction events))
   _ <- foldlA
     (applySecurityBalanceEvent securityId)
     initialQuantity
     (sortOn securityBalanceEventSortKey events)
   pure ()
 
-validateReductionSecurityReferences
+validateSecurityEventReferences
   : Text
   -> Map Text issuanceCid
   -> Map Text [SecurityBalanceEvent]
   -> Update ()
-validateReductionSecurityReferences securityType issuancesBySecurityId reductionsBySecurityId =
+validateSecurityEventReferences securityType issuancesBySecurityId eventsBySecurityId =
   mapA_
     (\(securityId, _) ->
       assertMsg
         (securityType <> " lifecycle event references missing issuance security_id " <> securityId)
         (isSome (Map.lookup securityId issuancesBySecurityId)))
-    (Map.toList reductionsBySecurityId)
+    (Map.toList eventsBySecurityId)
 
-stockReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
-stockReductionEventsBySecurityId maps = do
+stockBalanceEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+stockBalanceEventsBySecurityId maps = do
   afterCancellations <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -287,7 +317,7 @@ stockReductionEventsBySecurityId maps = do
         index))
     afterRepurchases
     (Map.values maps.stock_transfers)
-  foldlA
+  afterConversions <- foldlA
     (\index conversionCid -> do
       conversion <- fetch conversionCid
       pure (addSecurityBalanceEvent
@@ -299,9 +329,46 @@ stockReductionEventsBySecurityId maps = do
         index))
     afterTransfers
     (Map.values maps.stock_conversions)
+  afterReissuances <- foldlA
+    (\index reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (addSecurityBalanceEvent
+        reissuance.reissuance_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = reissuance.reissuance_data.date
+          event_id = reissuance.reissuance_data.id)
+        index))
+    afterConversions
+    (Map.values maps.stock_reissuances)
+  afterConsolidations <- foldlA
+    (\index consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      foldlA
+        (\currentIndex securityId ->
+          pure (addSecurityBalanceEvent
+            securityId
+            (SecurityBalanceRetirement with
+              event_date = consolidation.consolidation_data.date
+              event_id = consolidation.consolidation_data.id)
+            currentIndex))
+        index
+        consolidation.consolidation_data.security_ids)
+    afterReissuances
+    (Map.values maps.stock_consolidations)
+  foldlA
+    (\index retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (addSecurityBalanceEvent
+        retraction.retraction_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = retraction.retraction_data.date
+          event_id = retraction.retraction_data.id)
+        index))
+    afterConsolidations
+    (Map.values maps.stock_retractions)
 
-warrantReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
-warrantReductionEventsBySecurityId maps = do
+warrantBalanceEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+warrantBalanceEventsBySecurityId maps = do
   afterCancellations <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -326,7 +393,7 @@ warrantReductionEventsBySecurityId maps = do
         index))
     afterCancellations
     (Map.values maps.warrant_transfers)
-  foldlA
+  afterExercises <- foldlA
     (\index exerciseCid -> do
       exercise <- fetch exerciseCid
       case exercise.exercise_data.quantity of
@@ -337,12 +404,28 @@ warrantReductionEventsBySecurityId maps = do
             event_id = exercise.exercise_data.id
             quantity = quantity)
           index)
-        None -> pure index)
+        None -> pure (addSecurityBalanceEvent
+          exercise.exercise_data.security_id
+          (SecurityBalanceRetirement with
+            event_date = exercise.exercise_data.date
+            event_id = exercise.exercise_data.id)
+          index))
     afterTransfers
     (Map.values maps.warrant_exercises)
+  foldlA
+    (\index retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (addSecurityBalanceEvent
+        retraction.retraction_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = retraction.retraction_data.date
+          event_id = retraction.retraction_data.id)
+        index))
+    afterExercises
+    (Map.values maps.warrant_retractions)
 
-equityCompensationReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
-equityCompensationReductionEventsBySecurityId maps = do
+equityCompensationBalanceEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+equityCompensationBalanceEventsBySecurityId maps = do
   afterCancellations <- foldlA
     (\index cancellationCid -> do
       cancellation <- fetch cancellationCid
@@ -379,7 +462,7 @@ equityCompensationReductionEventsBySecurityId maps = do
         index))
     afterTransfers
     (Map.values maps.equity_compensation_exercises)
-  foldlA
+  afterReleases <- foldlA
     (\index releaseCid -> do
       release <- fetch releaseCid
       pure (addSecurityBalanceEvent
@@ -391,6 +474,17 @@ equityCompensationReductionEventsBySecurityId maps = do
         index))
     afterExercises
     (Map.values maps.equity_compensation_releases)
+  foldlA
+    (\index retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (addSecurityBalanceEvent
+        retraction.retraction_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = retraction.retraction_data.date
+          event_id = retraction.retraction_data.id)
+        index))
+    afterReleases
+    (Map.values maps.equity_compensation_retractions)
 
 splitEventsByStockClassId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
 splitEventsByStockClassId maps =
@@ -410,21 +504,21 @@ splitEventsByStockClassId maps =
 
 validateSourceSecurityBalances : CapTableMaps -> Update ()
 validateSourceSecurityBalances maps = do
-  stockReductions <- stockReductionEventsBySecurityId maps
-  warrantReductions <- warrantReductionEventsBySecurityId maps
-  equityCompensationReductions <- equityCompensationReductionEventsBySecurityId maps
+  stockEvents <- stockBalanceEventsBySecurityId maps
+  warrantEvents <- warrantBalanceEventsBySecurityId maps
+  equityCompensationEvents <- equityCompensationBalanceEventsBySecurityId maps
   splitEvents <- splitEventsByStockClassId maps
-  validateReductionSecurityReferences "Stock" maps.stock_issuances_by_security_id stockReductions
-  validateReductionSecurityReferences "Warrant" maps.warrant_issuances_by_security_id warrantReductions
-  validateReductionSecurityReferences "Equity compensation" maps.equity_compensation_issuances_by_security_id equityCompensationReductions
+  validateSecurityEventReferences "Stock" maps.stock_issuances_by_security_id stockEvents
+  validateSecurityEventReferences "Warrant" maps.warrant_issuances_by_security_id warrantEvents
+  validateSecurityEventReferences "Equity compensation" maps.equity_compensation_issuances_by_security_id equityCompensationEvents
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
-      let reductions = fromOptional [] (Map.lookup issuance.issuance_data.security_id stockReductions)
+      let events = fromOptional [] (Map.lookup issuance.issuance_data.security_id stockEvents)
           splits = filter
             (splitUnambiguouslyFollowsIssuance issuance.issuance_data.date)
             (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents))
-      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (reductions ++ splits))
+      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (events ++ splits))
     (Map.values maps.stock_issuances)
   mapA_
     (\issuanceCid -> do
@@ -434,19 +528,19 @@ validateSourceSecurityBalances maps = do
           validateSourceSecurityBalance
             issuance.issuance_data.security_id
             quantity
-            (fromOptional [] (Map.lookup issuance.issuance_data.security_id warrantReductions))
+            (fromOptional [] (Map.lookup issuance.issuance_data.security_id warrantEvents))
         None -> pure ())
     (Map.values maps.warrant_issuances)
   mapA_
     (\issuanceCid -> do
       issuance <- fetch issuanceCid
-      let reductions = fromOptional [] (Map.lookup issuance.issuance_data.security_id equityCompensationReductions)
+      let events = fromOptional [] (Map.lookup issuance.issuance_data.security_id equityCompensationEvents)
           splits = case issuance.issuance_data.stock_class_id of
             Some stockClassId -> filter
               (splitUnambiguouslyFollowsIssuance issuance.issuance_data.date)
               (fromOptional [] (Map.lookup stockClassId splitEvents))
             None -> []
-      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (reductions ++ splits))
+      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (events ++ splits))
     (Map.values maps.equity_compensation_issuances)
 
 stockClassHasRatioConversionRight : StockClassOcfData -> Bool
