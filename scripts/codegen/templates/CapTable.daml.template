@@ -16,6 +16,7 @@ import DA.List (sortOn, unique)
 import DA.Action (foldlA, when)
 import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
+import qualified DA.Date as Date
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionMechanism(..), OcfWarrantConversionRight(..))
@@ -4910,6 +4911,289 @@ validateFinancingIssuanceReferences maps =
         financing.financing_data.issuance_ids)
     (Map.values (fromOptional Map.empty maps.financings))
 
+-- OCF dates are calendar dates. A non-quantity transaction may occur on the
+-- same date as a terminal transaction, but it cannot target the retired source
+-- security on a later OCF date.
+ocfDate : Time -> Date
+ocfDate = Date.toDateUTC
+
+isEarlierOcfDate : Time -> Time -> Bool
+isEarlierOcfDate candidate target = ocfDate candidate < ocfDate target
+
+priorStockRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
+priorStockRetirementExists maps securityId targetDate = do
+  afterCancellations <- foldlA
+    (\found cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (found ||
+        (cancellation.cancellation_data.security_id == securityId &&
+          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
+    False
+    (Map.values maps.stock_cancellations)
+  afterTransfers <- foldlA
+    (\found transferCid -> do
+      transfer <- fetch transferCid
+      pure (found ||
+        (transfer.transfer_data.security_id == securityId &&
+          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    afterCancellations
+    (Map.values maps.stock_transfers)
+  afterRepurchases <- foldlA
+    (\found repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (found ||
+        (repurchase.repurchase_data.security_id == securityId &&
+          isEarlierOcfDate repurchase.repurchase_data.date targetDate)))
+    afterTransfers
+    (Map.values maps.stock_repurchases)
+  afterConversions <- foldlA
+    (\found conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (found ||
+        (conversion.conversion_data.security_id == securityId &&
+          isEarlierOcfDate conversion.conversion_data.date targetDate)))
+    afterRepurchases
+    (Map.values maps.stock_conversions)
+  afterReissuances <- foldlA
+    (\found reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (found ||
+        (reissuance.reissuance_data.security_id == securityId &&
+          isEarlierOcfDate reissuance.reissuance_data.date targetDate)))
+    afterConversions
+    (Map.values maps.stock_reissuances)
+  afterConsolidations <- foldlA
+    (\found consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      pure (found ||
+        (securityId `elem` consolidation.consolidation_data.security_ids &&
+          isEarlierOcfDate consolidation.consolidation_data.date targetDate)))
+    afterReissuances
+    (Map.values maps.stock_consolidations)
+  foldlA
+    (\found retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (found ||
+        (retraction.retraction_data.security_id == securityId &&
+          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    afterConsolidations
+    (Map.values maps.stock_retractions)
+
+priorConvertibleRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
+priorConvertibleRetirementExists maps securityId targetDate = do
+  afterCancellations <- foldlA
+    (\found cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (found ||
+        (cancellation.cancellation_data.security_id == securityId &&
+          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
+    False
+    (Map.values maps.convertible_cancellations)
+  afterTransfers <- foldlA
+    (\found transferCid -> do
+      transfer <- fetch transferCid
+      pure (found ||
+        (transfer.transfer_data.security_id == securityId &&
+          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    afterCancellations
+    (Map.values maps.convertible_transfers)
+  afterConversions <- foldlA
+    (\found conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (found ||
+        (conversion.conversion_data.security_id == securityId &&
+          isEarlierOcfDate conversion.conversion_data.date targetDate)))
+    afterTransfers
+    (Map.values maps.convertible_conversions)
+  foldlA
+    (\found retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (found ||
+        (retraction.retraction_data.security_id == securityId &&
+          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    afterConversions
+    (Map.values maps.convertible_retractions)
+
+priorWarrantRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
+priorWarrantRetirementExists maps securityId targetDate = do
+  afterCancellations <- foldlA
+    (\found cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (found ||
+        (cancellation.cancellation_data.security_id == securityId &&
+          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
+    False
+    (Map.values maps.warrant_cancellations)
+  afterTransfers <- foldlA
+    (\found transferCid -> do
+      transfer <- fetch transferCid
+      pure (found ||
+        (transfer.transfer_data.security_id == securityId &&
+          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    afterCancellations
+    (Map.values maps.warrant_transfers)
+  afterRetractions <- foldlA
+    (\found retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (found ||
+        (retraction.retraction_data.security_id == securityId &&
+          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    afterTransfers
+    (Map.values maps.warrant_retractions)
+  if afterRetractions
+    then pure True
+    else case Map.lookup securityId maps.warrant_issuances_by_security_id of
+      Some issuanceCid -> do
+        issuance <- fetch issuanceCid
+        (knownExerciseTotal, unknownExerciseRetirement) <- foldlA
+          (\(total, retired) exerciseCid -> do
+            exercise <- fetch exerciseCid
+            if exercise.exercise_data.security_id /= securityId ||
+                not (isEarlierOcfDate exercise.exercise_data.date targetDate)
+              then pure (total, retired)
+              else case exercise.exercise_data.quantity of
+                Some quantity -> pure (total + quantity, retired)
+                None -> pure (total, True))
+          (0.0, False)
+          (Map.values maps.warrant_exercises)
+        pure (unknownExerciseRetirement || case issuance.issuance_data.quantity of
+          Some quantity -> knownExerciseTotal >= quantity
+          None -> False)
+      None -> pure False
+
+priorEquityCompensationRetirementExists : CapTableMaps -> Text -> Time -> Update Bool
+priorEquityCompensationRetirementExists maps securityId targetDate = do
+  afterCancellations <- foldlA
+    (\found cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (found ||
+        (cancellation.cancellation_data.security_id == securityId &&
+          isEarlierOcfDate cancellation.cancellation_data.date targetDate)))
+    False
+    (Map.values maps.equity_compensation_cancellations)
+  afterTransfers <- foldlA
+    (\found transferCid -> do
+      transfer <- fetch transferCid
+      pure (found ||
+        (transfer.transfer_data.security_id == securityId &&
+          isEarlierOcfDate transfer.transfer_data.date targetDate)))
+    afterCancellations
+    (Map.values maps.equity_compensation_transfers)
+  afterRetractions <- foldlA
+    (\found retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (found ||
+        (retraction.retraction_data.security_id == securityId &&
+          isEarlierOcfDate retraction.retraction_data.date targetDate)))
+    afterTransfers
+    (Map.values maps.equity_compensation_retractions)
+  if afterRetractions
+    then pure True
+    else case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
+      Some issuanceCid -> do
+        issuance <- fetch issuanceCid
+        exercised <- foldlA
+          (\total exerciseCid -> do
+            exercise <- fetch exerciseCid
+            pure (if exercise.exercise_data.security_id == securityId &&
+                isEarlierOcfDate exercise.exercise_data.date targetDate
+              then total + exercise.exercise_data.quantity
+              else total))
+          0.0
+          (Map.values maps.equity_compensation_exercises)
+        released <- foldlA
+          (\total releaseCid -> do
+            release <- fetch releaseCid
+            pure (if release.release_data.security_id == securityId &&
+                isEarlierOcfDate release.release_data.date targetDate
+              then total + release.release_data.quantity
+              else total))
+          0.0
+          (Map.values maps.equity_compensation_releases)
+        pure (exercised + released >= issuance.issuance_data.quantity)
+      None -> pure False
+
+assertActiveStockTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
+assertActiveStockTarget maps label targetDate securityId = do
+  retired <- priorStockRetirementExists maps securityId targetDate
+  assertMsg (label <> " targets inactive stock security " <> securityId) (not retired)
+
+assertActiveConvertibleTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
+assertActiveConvertibleTarget maps label targetDate securityId = do
+  retired <- priorConvertibleRetirementExists maps securityId targetDate
+  assertMsg (label <> " targets inactive convertible security " <> securityId) (not retired)
+
+assertActiveWarrantTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
+assertActiveWarrantTarget maps label targetDate securityId = do
+  retired <- priorWarrantRetirementExists maps securityId targetDate
+  assertMsg (label <> " targets inactive warrant security " <> securityId) (not retired)
+
+assertActiveEquityCompensationTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
+assertActiveEquityCompensationTarget maps label targetDate securityId = do
+  retired <- priorEquityCompensationRetirementExists maps securityId targetDate
+  assertMsg (label <> " targets inactive equity compensation security " <> securityId) (not retired)
+
+assertActiveVestingTarget : CapTableMaps -> Text -> Time -> Text -> Update ()
+assertActiveVestingTarget maps label targetDate securityId =
+  case Map.lookup securityId maps.stock_issuances_by_security_id of
+    Some _ -> assertActiveStockTarget maps label targetDate securityId
+    None -> case Map.lookup securityId maps.warrant_issuances_by_security_id of
+      Some _ -> assertActiveWarrantTarget maps label targetDate securityId
+      None -> case Map.lookup securityId maps.equity_compensation_issuances_by_security_id of
+        Some _ -> assertActiveEquityCompensationTarget maps label targetDate securityId
+        None -> pure ()
+
+validateActiveSecurityTargets : CapTableMaps -> Update ()
+validateActiveSecurityTargets maps = do
+  mapA_
+    (\acceptanceCid -> do
+      acceptance <- fetch acceptanceCid
+      assertActiveStockTarget maps ("Stock acceptance " <> acceptance.acceptance_data.id)
+        acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
+    (Map.values maps.stock_acceptances)
+  mapA_
+    (\acceptanceCid -> do
+      acceptance <- fetch acceptanceCid
+      assertActiveConvertibleTarget maps ("Convertible acceptance " <> acceptance.acceptance_data.id)
+        acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
+    (Map.values maps.convertible_acceptances)
+  mapA_
+    (\acceptanceCid -> do
+      acceptance <- fetch acceptanceCid
+      assertActiveWarrantTarget maps ("Warrant acceptance " <> acceptance.acceptance_data.id)
+        acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
+    (Map.values maps.warrant_acceptances)
+  mapA_
+    (\acceptanceCid -> do
+      acceptance <- fetch acceptanceCid
+      assertActiveEquityCompensationTarget maps ("Equity compensation acceptance " <> acceptance.acceptance_data.id)
+        acceptance.acceptance_data.date acceptance.acceptance_data.security_id)
+    (Map.values maps.equity_compensation_acceptances)
+  mapA_
+    (\repricingCid -> do
+      repricing <- fetch repricingCid
+      assertActiveEquityCompensationTarget maps ("Equity compensation repricing " <> repricing.repricing_data.id)
+        repricing.repricing_data.date repricing.repricing_data.security_id)
+    (Map.values maps.equity_compensation_repricings)
+  mapA_
+    (\startCid -> do
+      start <- fetch startCid
+      assertActiveVestingTarget maps ("Vesting start " <> start.vesting_data.id)
+        start.vesting_data.date start.vesting_data.security_id)
+    (Map.values maps.vesting_starts)
+  mapA_
+    (\eventCid -> do
+      event <- fetch eventCid
+      assertActiveVestingTarget maps ("Vesting event " <> event.vesting_data.id)
+        event.vesting_data.date event.vesting_data.security_id)
+    (Map.values maps.vesting_events)
+  mapA_
+    (\accelerationCid -> do
+      acceleration <- fetch accelerationCid
+      assertActiveVestingTarget maps ("Vesting acceleration " <> acceleration.acceleration_data.id)
+        acceleration.acceleration_data.date acceleration.acceleration_data.security_id)
+    (Map.values maps.vesting_accelerations)
+
 
 -- =============================================================================
 -- CapTable Template
@@ -5026,6 +5310,7 @@ template CapTable
 
         -- Validate Financing references only after the complete batch state is known.
         validateFinancingIssuanceReferences finalMaps
+        validateActiveSecurityTargets finalMaps
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
