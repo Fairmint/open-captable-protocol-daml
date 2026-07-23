@@ -12,14 +12,15 @@ module Fairmint.OpenCapTable.CapTable where
 
 import DA.Map (Map)
 import qualified DA.Map as Map
-import DA.List (sortOn)
+import DA.List (sortOn, unique)
 import DA.Action (foldlA, when)
 import DA.Foldable (mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 import qualified DA.Date as Date
 
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.Types.Conversion (OcfConversionMechanism(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), validateOcfConversionTriggerFields, validateOcfInterestRateSchedule)
+import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIssuance (OcfConvertibleConversionTrigger(..))
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 
 -- OCF Types
@@ -606,6 +607,273 @@ validateStockClassConversionRatioAdjustmentTargets maps =
             False)
     (Map.values maps.stock_class_conversion_ratio_adjustments)
 
+warrantExerciseTrigger : WarrantIssuanceOcfData -> Text -> Optional OcfConversionTrigger
+warrantExerciseTrigger issuanceData triggerId =
+  foldl
+    (\matched trigger ->
+      case matched of
+        Some _ -> matched
+        None -> if trigger.trigger_id == triggerId then Some trigger else None)
+    None
+    issuanceData.exercise_triggers
+
+convertibleConversionTrigger : ConvertibleIssuanceOcfData -> Text -> Optional ConvertibleIssuance.OcfConvertibleConversionTrigger
+convertibleConversionTrigger issuanceData triggerId =
+  foldl
+    (\matched trigger ->
+      case matched of
+        Some _ -> matched
+        None -> if trigger.trigger_id == triggerId then Some trigger else None)
+    None
+    issuanceData.conversion_triggers
+
+conversionTriggerDefinitionIsTemporallyValid :
+  Optional Time ->
+  OcfConversionTriggerType ->
+  Optional Time ->
+  Optional Time ->
+  Optional Time ->
+  Bool
+conversionTriggerDefinitionIsTemporallyValid expirationDate triggerType startDate endDate triggerDate =
+  let notAfterExpiration date = optional True (\expiration -> ocfDate date <= ocfDate expiration) expirationDate
+  in case triggerType of
+    OcfTriggerTypeTypeAutomaticOnDate ->
+      optional False notAfterExpiration triggerDate
+    OcfTriggerTypeTypeElectiveInRange -> case (startDate, endDate) of
+      (Some start, Some end) ->
+        ocfDate start <= ocfDate end && notAfterExpiration end
+      _ -> False
+    _ -> True
+
+conversionTriggerIsEligibleAt :
+  Time ->
+  OcfConversionTriggerType ->
+  Optional Time ->
+  Optional Time ->
+  Optional Time ->
+  Bool
+conversionTriggerIsEligibleAt eventDate triggerType startDate endDate triggerDate =
+  case triggerType of
+    OcfTriggerTypeTypeAutomaticOnDate -> case triggerDate of
+      Some date -> ocfDate eventDate == ocfDate date
+      None -> False
+    OcfTriggerTypeTypeElectiveInRange -> case (startDate, endDate) of
+      (Some start, Some end) ->
+        ocfDate eventDate >= ocfDate start && ocfDate eventDate <= ocfDate end
+      _ -> False
+    _ -> True
+
+assertConversionTriggerDefinitionIsTemporallyValid :
+  Text ->
+  Optional Time ->
+  OcfConversionTriggerType ->
+  Optional Time ->
+  Optional Time ->
+  Optional Time ->
+  Update ()
+assertConversionTriggerDefinitionIsTemporallyValid label expirationDate triggerType startDate endDate triggerDate =
+  assertMsg
+    (label <> " has invalid trigger timing or extends beyond the instrument expiration")
+    (conversionTriggerDefinitionIsTemporallyValid expirationDate triggerType startDate endDate triggerDate)
+
+assertConversionTriggerIsEligibleAt :
+  Text ->
+  Time ->
+  OcfConversionTriggerType ->
+  Optional Time ->
+  Optional Time ->
+  Optional Time ->
+  Update ()
+assertConversionTriggerIsEligibleAt label eventDate triggerType startDate endDate triggerDate =
+  assertMsg
+    (label <> " is not eligible on " <> show eventDate <> " under its selected trigger")
+    (conversionTriggerIsEligibleAt eventDate triggerType startDate endDate triggerDate)
+
+assertExpirationOnOrAfterIssuance : Text -> Time -> Optional Time -> Update ()
+assertExpirationOnOrAfterIssuance label issuanceDate expirationDate =
+  case expirationDate of
+    Some expiration ->
+      assertMsg
+        (label <> " expiration " <> show expiration <> " cannot precede issuance " <> show issuanceDate)
+        (ocfDate expiration >= ocfDate issuanceDate)
+    None -> pure ()
+
+assertEventOnOrAfterIssuance : Text -> Time -> Time -> Update ()
+assertEventOnOrAfterIssuance label issuanceDate eventDate =
+  assertMsg
+    (label <> " date " <> show eventDate <> " cannot precede issuance " <> show issuanceDate)
+    (ocfDate eventDate >= ocfDate issuanceDate)
+
+assertEventOnOrBeforeExpiration : Text -> Time -> Optional Time -> Update ()
+assertEventOnOrBeforeExpiration label eventDate expirationDate =
+  case expirationDate of
+    Some expiration ->
+      assertMsg
+        (label <> " date " <> show eventDate <> " cannot follow expiration " <> show expiration)
+        (ocfDate eventDate <= ocfDate expiration)
+    None -> pure ()
+
+convertibleTriggerIdsAreUnique : [ConvertibleIssuance.OcfConvertibleConversionTrigger] -> Bool
+convertibleTriggerIdsAreUnique triggers =
+  unique (map (\trigger -> trigger.trigger_id) triggers)
+
+warrantTriggerIdsAreUnique : [OcfConversionTrigger] -> Bool
+warrantTriggerIdsAreUnique triggers =
+  unique (map (\trigger -> trigger.trigger_id) triggers)
+
+validateConvertibleIssuanceTemporalTerms : CapTableMaps -> Update ()
+validateConvertibleIssuanceTemporalTerms maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        ("Convertible issuance " <> issuance.issuance_data.id <> " has duplicate conversion trigger IDs")
+        (convertibleTriggerIdsAreUnique issuance.issuance_data.conversion_triggers)
+      mapA_
+        (\trigger -> do
+          let label = "Convertible issuance " <> issuance.issuance_data.id <> " trigger " <> trigger.trigger_id
+          assertMsg
+            (label <> " fields do not match the declared trigger type")
+            (validateOcfConversionTriggerFields
+              trigger.type_
+              trigger.start_date
+              trigger.end_date
+              trigger.trigger_condition
+              trigger.trigger_date)
+          assertConversionTriggerDefinitionIsTemporallyValid
+            label
+            None
+            trigger.type_
+            trigger.start_date
+            trigger.end_date
+            trigger.trigger_date
+          case trigger.conversion_right.conversion_mechanism of
+            OcfConvMechNote noteMechanism -> do
+              assertMsg
+                (label <> " has invalid or overlapping interest rate intervals")
+                (validateOcfInterestRateSchedule noteMechanism.interest_rates)
+            _ -> pure ())
+        issuance.issuance_data.conversion_triggers)
+    (Map.values maps.convertible_issuances)
+
+validateWarrantIssuanceTemporalTerms : CapTableMaps -> Update ()
+validateWarrantIssuanceTemporalTerms maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertMsg
+        ("Warrant issuance " <> issuance.issuance_data.id <> " has duplicate exercise trigger IDs")
+        (warrantTriggerIdsAreUnique issuance.issuance_data.exercise_triggers)
+      assertExpirationOnOrAfterIssuance
+        ("Warrant issuance " <> issuance.issuance_data.id)
+        issuance.issuance_data.date
+        issuance.issuance_data.warrant_expiration_date
+      mapA_
+        (\trigger -> do
+          let label = "Warrant issuance " <> issuance.issuance_data.id <> " trigger " <> trigger.trigger_id
+          assertMsg
+            (label <> " fields do not match the declared trigger type")
+            (validateOcfConversionTriggerFields
+              trigger.type_
+              trigger.start_date
+              trigger.end_date
+              trigger.trigger_condition
+              trigger.trigger_date)
+          assertConversionTriggerDefinitionIsTemporallyValid
+            label
+            issuance.issuance_data.warrant_expiration_date
+            trigger.type_
+            trigger.start_date
+            trigger.end_date
+            trigger.trigger_date)
+        issuance.issuance_data.exercise_triggers)
+    (Map.values maps.warrant_issuances)
+
+validateEquityCompensationIssuanceTemporalTerms : CapTableMaps -> Update ()
+validateEquityCompensationIssuanceTemporalTerms maps =
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      assertExpirationOnOrAfterIssuance
+        ("Equity compensation issuance " <> issuance.issuance_data.id)
+        issuance.issuance_data.date
+        issuance.issuance_data.expiration_date)
+    (Map.values maps.equity_compensation_issuances)
+
+validateConvertibleConversionTemporalEligibility : CapTableMaps -> Update ()
+validateConvertibleConversionTemporalEligibility maps =
+  mapA_
+    (\conversionCid -> do
+      conversion <- fetch conversionCid
+      case Map.lookup conversion.conversion_data.security_id maps.convertible_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertEventOnOrAfterIssuance
+            ("Convertible conversion " <> conversion.conversion_data.id)
+            issuance.issuance_data.date
+            conversion.conversion_data.date
+          case convertibleConversionTrigger issuance.issuance_data conversion.conversion_data.trigger_id of
+            Some trigger ->
+              assertConversionTriggerIsEligibleAt
+                ("Convertible conversion " <> conversion.conversion_data.id)
+                conversion.conversion_data.date
+                trigger.type_
+                trigger.start_date
+                trigger.end_date
+                trigger.trigger_date
+            None -> assertMsg ("Convertible conversion trigger not found: " <> conversion.conversion_data.trigger_id) False
+        None -> assertMsg ("Convertible conversion security not found: " <> conversion.conversion_data.security_id) False)
+    (Map.values maps.convertible_conversions)
+
+validateWarrantExerciseTemporalEligibility : CapTableMaps -> Update ()
+validateWarrantExerciseTemporalEligibility maps =
+  mapA_
+    (\exerciseCid -> do
+      exercise <- fetch exerciseCid
+      case Map.lookup exercise.exercise_data.security_id maps.warrant_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertEventOnOrBeforeExpiration
+            ("Warrant exercise " <> exercise.exercise_data.id)
+            exercise.exercise_data.date
+            issuance.issuance_data.warrant_expiration_date
+          case warrantExerciseTrigger issuance.issuance_data exercise.exercise_data.trigger_id of
+            Some trigger ->
+              assertConversionTriggerIsEligibleAt
+                ("Warrant exercise " <> exercise.exercise_data.id)
+                exercise.exercise_data.date
+                trigger.type_
+                trigger.start_date
+                trigger.end_date
+                trigger.trigger_date
+            None -> assertMsg ("Warrant exercise trigger not found: " <> exercise.exercise_data.trigger_id) False
+        None -> assertMsg ("Warrant exercise security not found: " <> exercise.exercise_data.security_id) False)
+    (Map.values maps.warrant_exercises)
+
+validateEquityCompensationExerciseTemporalEligibility : CapTableMaps -> Update ()
+validateEquityCompensationExerciseTemporalEligibility maps =
+  mapA_
+    (\exerciseCid -> do
+      exercise <- fetch exerciseCid
+      case Map.lookup exercise.exercise_data.security_id maps.equity_compensation_issuances_by_security_id of
+        Some issuanceCid -> do
+          issuance <- fetch issuanceCid
+          assertEventOnOrBeforeExpiration
+            ("Equity compensation exercise " <> exercise.exercise_data.id)
+            exercise.exercise_data.date
+            issuance.issuance_data.expiration_date
+        None -> assertMsg ("Equity compensation exercise security not found: " <> exercise.exercise_data.security_id) False)
+    (Map.values maps.equity_compensation_exercises)
+
+validateInstrumentTemporalEligibility : CapTableMaps -> Update ()
+validateInstrumentTemporalEligibility maps = do
+  validateConvertibleIssuanceTemporalTerms maps
+  validateWarrantIssuanceTemporalTerms maps
+  validateEquityCompensationIssuanceTemporalTerms maps
+  validateConvertibleConversionTemporalEligibility maps
+  validateWarrantExerciseTemporalEligibility maps
+  validateEquityCompensationExerciseTemporalEligibility maps
+
 -- OCF dates are calendar dates. A non-quantity transaction may occur on the
 -- same date as a terminal transaction, but it cannot target the retired source
 -- security on a later OCF date.
@@ -1002,6 +1270,7 @@ template CapTable
         validateActiveSecurityTargets finalMaps
         validateSourceSecurityBalances finalMaps
         validateStockClassConversionRatioAdjustmentTargets finalMaps
+        validateInstrumentTemporalEligibility finalMaps
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
