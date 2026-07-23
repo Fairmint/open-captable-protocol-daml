@@ -58,6 +58,8 @@ interface TypeDef {
   map_field: string;
   tier: number;
   validations: Validation[];
+  // Types introduced after v0.0.2 must be appended to upgrade-sensitive records and variants.
+  is_upgrade_append: boolean;
   has_validations: boolean;
   validates_issuer_id_reference: boolean;
   is_document: boolean;
@@ -260,6 +262,9 @@ function discoverTypes(config: Config): TypeDef[] {
           error: `${toTitleCase(fieldSpec)} not found`,
         };
       }),
+      // Financing is the first type absent from the v0.0.2 baseline. Add every future post-v0.0.2 type here so its
+      // constructors and Optional map stay appended instead of being inserted by alphabetical codegen ordering.
+      is_upgrade_append: name === 'Financing',
       has_validations: validationFields.length > 0,
       validates_issuer_id_reference: name === 'IssuerAuthorizedSharesAdjustment',
       is_document: name === 'Document',
@@ -329,6 +334,11 @@ function generate(): void {
   // Alphabetically sorted (for most sections)
   const types_alpha = [...types].sort((a, b) => a.name.localeCompare(b.name));
 
+  // DAML upgrades preserve constructor and record-field order. Keep the v0.0.2 surface stable and append types that
+  // were added later, even when that differs from alphabetical order.
+  const types_existing = types_alpha.filter((type) => !type.is_upgrade_append);
+  const types_appended = types_alpha.filter((type) => type.is_upgrade_append);
+
   // Tier-then-alphabetically sorted (for processCreate)
   const types_tier = [...types].sort((a, b) => {
     if (a.tier !== b.tier) return a.tier - b.tier;
@@ -338,6 +348,8 @@ function generate(): void {
   console.log('Rendering template...');
   const output = template({
     types_alpha,
+    types_existing,
+    types_appended,
     types_tier,
   });
 

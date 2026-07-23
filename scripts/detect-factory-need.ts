@@ -123,7 +123,7 @@ function findPackageIdInInspectJson(value: unknown, packageName: string, version
   return null;
 }
 
-function inspectDarPackageId(darPath: string, packageName: string, version: string): string {
+export function inspectDarPackageId(darPath: string, packageName: string, version: string): string {
   let raw: string;
   try {
     raw = execFileSync('dpm', ['damlc', 'inspect-dar', darPath, '--json'], {
@@ -144,7 +144,7 @@ function inspectDarPackageId(darPath: string, packageName: string, version: stri
   return packageId;
 }
 
-function getDarPath(packageName: string, version: string, darName: string): string {
+export function getDarPath(packageName: string, version: string, darName: string): string {
   return (
     getBackedUpDarPath(packageName, version, darName) ??
     getFreshDarPath(packageName, version, darName) ??
@@ -220,10 +220,12 @@ function main(): void {
   );
 }
 
-try {
-  main();
-} catch (err) {
-  const message = err instanceof Error ? err.message : String(err);
-  console.error(`❌ ${message}`);
-  process.exit(1);
+if (require.main === module) {
+  try {
+    main();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`❌ ${message}`);
+    process.exit(1);
+  }
 }

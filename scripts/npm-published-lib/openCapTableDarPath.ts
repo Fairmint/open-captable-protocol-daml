@@ -3,8 +3,8 @@
  * Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
  *
  * @remarks
- *   User-facing documentation for `OPEN_CAP_TABLE_DAR_PATH`, monorepo layout, and options lives in this repository’s
- *   **GitHub Wiki** — not in markdown files inside the repo.
+ *   User-facing documentation for the packaged DAR and local development lives in the public wiki:
+ *   https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing
  */
 
 import * as fs from 'fs';
@@ -144,7 +144,7 @@ export function resolveOpenCapTableDarPath(options?: ResolveOpenCapTableDarPathO
       hints.push('No DAR at ../open-captable-protocol-daml/published-dars/OpenCapTable.dar.');
     } else {
       hints.push(
-        'Tip: set OPEN_CAP_TABLE_DAR_PATH, or pass siblingSearchFrom / siblingDarPath for monorepo dev (see GitHub Wiki).'
+        'Tip: set OPEN_CAP_TABLE_DAR_PATH, or pass siblingSearchFrom / siblingDarPath for monorepo development.'
       );
     }
 
