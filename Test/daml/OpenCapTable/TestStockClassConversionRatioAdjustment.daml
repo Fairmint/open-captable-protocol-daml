@@ -4,6 +4,7 @@ import Fairmint.OpenCapTable.OCF.StockClass
 import Fairmint.OpenCapTable.OCF.StockClassConversionRatioAdjustment
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import OpenCapTable.Setup
+import OpenCapTable.TestHelpers (defaultStockClass, successorStockClassConversionRightTo)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..), OcfRatio(..), OcfInitialSharesAuthorized(..))
 import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..))
@@ -12,13 +13,27 @@ import DA.Date (Month(..))
 import qualified DA.Time as DT
 import Daml.Script
 
+conversionRatioAdjustment : Text -> Text -> Time -> Decimal -> StockClassConversionRatioAdjustmentOcfData
+conversionRatioAdjustment adjustmentId stockClassId adjustmentDate numerator =
+  StockClassConversionRatioAdjustmentOcfData with
+    id = adjustmentId
+    date = adjustmentDate
+    stock_class_id = stockClassId
+    new_ratio_conversion_mechanism = OcfRatioConversionMechanism with
+      conversion_price = OcfMonetary with amount = 1.0, currency = "USD"
+      ratio = OcfRatio with numerator = numerator, denominator = 1.0
+      rounding_type = OcfRoundingNormal
+    comments = []
+
 
 -- Test: Create and archive conversion ratio adjustment (anti-dilution scenario)
 testCreateAndArchiveStockClassConversionRatioAdjustment = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
   result <- submit issuer do
     exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
+      creates =
+        [ CT.OcfCreateStockClass (defaultStockClass "SC_COMMON_FOR_SERIES_A")
+        , CT.OcfCreateStockClass StockClassOcfData with
         id = "SC_SERIES_A"
         name = "Series A Preferred"
         class_type = OcfStockClassTypePreferred
@@ -32,7 +47,7 @@ testCreateAndArchiveStockClassConversionRatioAdjustment = script do
         price_per_share = Some (OcfMonetary with amount = 1.00; currency = "USD")
         liquidation_preference_multiple = Some 1.0
         participation_cap_multiple = None
-        conversion_rights = []
+        conversion_rights = [successorStockClassConversionRightTo "SC_COMMON_FOR_SERIES_A"]
         comments = []]
       edits = []
       deletes = []
@@ -58,7 +73,9 @@ testCreateAndArchiveStockClassConversionRatioAdjustmentBuiltIn = script do
   TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
   result <- submit issuer do
     exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
+      creates =
+        [ CT.OcfCreateStockClass (defaultStockClass "SC_COMMON_FOR_SERIES_B")
+        , CT.OcfCreateStockClass StockClassOcfData with
         id = "SC_SERIES_B"
         name = "Series B Preferred"
         class_type = OcfStockClassTypePreferred
@@ -72,7 +89,7 @@ testCreateAndArchiveStockClassConversionRatioAdjustmentBuiltIn = script do
         price_per_share = Some (OcfMonetary with amount = 2.50; currency = "USD")
         liquidation_preference_multiple = Some 1.0
         participation_cap_multiple = None
-        conversion_rights = []
+        conversion_rights = [successorStockClassConversionRightTo "SC_COMMON_FOR_SERIES_B"]
         comments = []]
       edits = []
       deletes = []
@@ -91,3 +108,42 @@ testCreateAndArchiveStockClassConversionRatioAdjustmentBuiltIn = script do
       edits = []
       deletes = []
   pure ()
+
+testStockClassConversionRatioAdjustmentRequiresRatioRight = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let stockClassId = "SC_RATIO_ADJUSTMENT_WITHOUT_RIGHT"
+  result <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClass (defaultStockClass stockClassId)]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClassConversionRatioAdjustment
+            (conversionRatioAdjustment "TX_RATIO_ADJUSTMENT_WITHOUT_RIGHT" stockClassId (DT.time (DA.date 2024 Jan 01) 0 0 0) 1.25)
+        ]
+      edits = []
+      deletes = []
+
+testStockClassConversionRatioAdjustmentPreventsDeletingTargetClass = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  let commonClassId = "SC_RATIO_DELETE_COMMON"
+  let sourceClassId = "SC_RATIO_DELETE_SOURCE"
+  let sourceClass = (defaultStockClass sourceClassId) with
+        conversion_rights = [successorStockClassConversionRightTo commonClassId]
+  result <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStockClass (defaultStockClass commonClassId)
+        , CT.OcfCreateStockClass sourceClass
+        , CT.OcfCreateStockClassConversionRatioAdjustment
+            (conversionRatioAdjustment "TX_RATIO_DELETE_TARGET" sourceClassId (DT.time (DA.date 2024 Jan 01) 0 0 0) 1.25)
+        ]
+      edits = []
+      deletes = []
+  submitMustFail issuer do
+    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = [CT.OcfDeleteStockClass sourceClassId]
