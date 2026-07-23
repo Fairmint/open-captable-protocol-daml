@@ -102,6 +102,21 @@ data CapTableMaps = CapTableMaps with
 {{/each}}
   deriving (Eq, Show)
 
+-- | Quantity changes that can affect a source security's remaining balance.
+-- This intentionally models only the source itself. Successor identity,
+-- continuity, and balance-security materialization belong to separate rules.
+data SecurityBalanceEvent
+  = SecurityBalanceReduction with
+      event_date: Time
+      event_id: Text
+      quantity: Decimal
+  | SecurityBalanceMultiplier with
+      event_date: Time
+      event_id: Text
+      numerator: Decimal
+      denominator: Decimal
+  deriving (Eq, Show)
+
 -- | Extract maps from CapTable for processing
 toMaps : CapTable -> CapTableMaps
 toMaps ct = CapTableMaps with
@@ -169,6 +184,243 @@ validateFinancingIssuanceReferences maps =
             (matchCount == 1))
         financing.financing_data.issuance_ids)
     (Map.values (fromOptional Map.empty maps.financings))
+
+securityBalanceEventSortKey : SecurityBalanceEvent -> (Time, Int, Text)
+securityBalanceEventSortKey event = case event of
+  SecurityBalanceMultiplier with event_date; event_id -> (event_date, 0, event_id)
+  SecurityBalanceReduction with event_date; event_id -> (event_date, 1, event_id)
+
+securityBalanceEventDate : SecurityBalanceEvent -> Time
+securityBalanceEventDate event = case event of
+  SecurityBalanceReduction with event_date -> event_date
+  SecurityBalanceMultiplier with event_date -> event_date
+
+addSecurityBalanceEvent : Text -> SecurityBalanceEvent -> Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent]
+addSecurityBalanceEvent key event index =
+  Map.insert key (event :: fromOptional [] (Map.lookup key index)) index
+
+applySecurityBalanceEvent : Text -> Decimal -> SecurityBalanceEvent -> Update Decimal
+applySecurityBalanceEvent securityId current event = case event of
+  SecurityBalanceReduction with event_id; quantity -> do
+    assertMsg
+      ("Security reduction quantity must be non-negative for " <> securityId <> " at " <> event_id)
+      (quantity >= 0.0)
+    let next = current - quantity
+    assertMsg
+      ("Security balance cannot be negative for " <> securityId <> " at " <> event_id <>
+        ": reducing " <> show quantity <> " from " <> show current <> " leaves " <> show next)
+      (next >= 0.0)
+    pure next
+  SecurityBalanceMultiplier with event_id; numerator; denominator -> do
+    assertMsg
+      ("Security balance multiplier must be positive for " <> securityId <> " at " <> event_id)
+      (numerator > 0.0 && denominator > 0.0)
+    pure (current * numerator / denominator)
+
+validateSourceSecurityBalance : Text -> Decimal -> [SecurityBalanceEvent] -> Update ()
+validateSourceSecurityBalance securityId initialQuantity events = do
+  _ <- foldlA
+    (applySecurityBalanceEvent securityId)
+    initialQuantity
+    (sortOn securityBalanceEventSortKey events)
+  pure ()
+
+stockReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+stockReductionEventsBySecurityId maps = do
+  afterCancellations <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addSecurityBalanceEvent
+        cancellation.cancellation_data.security_id
+        (SecurityBalanceReduction with
+          event_date = cancellation.cancellation_data.date
+          event_id = cancellation.cancellation_data.id
+          quantity = cancellation.cancellation_data.quantity)
+        index))
+    Map.empty
+    (Map.values maps.stock_cancellations)
+  afterRepurchases <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (addSecurityBalanceEvent
+        repurchase.repurchase_data.security_id
+        (SecurityBalanceReduction with
+          event_date = repurchase.repurchase_data.date
+          event_id = repurchase.repurchase_data.id
+          quantity = repurchase.repurchase_data.quantity)
+        index))
+    afterCancellations
+    (Map.values maps.stock_repurchases)
+  afterTransfers <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addSecurityBalanceEvent
+        transfer.transfer_data.security_id
+        (SecurityBalanceReduction with
+          event_date = transfer.transfer_data.date
+          event_id = transfer.transfer_data.id
+          quantity = transfer.transfer_data.quantity)
+        index))
+    afterRepurchases
+    (Map.values maps.stock_transfers)
+  foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (addSecurityBalanceEvent
+        conversion.conversion_data.security_id
+        (SecurityBalanceReduction with
+          event_date = conversion.conversion_data.date
+          event_id = conversion.conversion_data.id
+          quantity = conversion.conversion_data.quantity_converted)
+        index))
+    afterTransfers
+    (Map.values maps.stock_conversions)
+
+warrantReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+warrantReductionEventsBySecurityId maps = do
+  afterCancellations <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addSecurityBalanceEvent
+        cancellation.cancellation_data.security_id
+        (SecurityBalanceReduction with
+          event_date = cancellation.cancellation_data.date
+          event_id = cancellation.cancellation_data.id
+          quantity = cancellation.cancellation_data.quantity)
+        index))
+    Map.empty
+    (Map.values maps.warrant_cancellations)
+  afterTransfers <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addSecurityBalanceEvent
+        transfer.transfer_data.security_id
+        (SecurityBalanceReduction with
+          event_date = transfer.transfer_data.date
+          event_id = transfer.transfer_data.id
+          quantity = transfer.transfer_data.quantity)
+        index))
+    afterCancellations
+    (Map.values maps.warrant_transfers)
+  foldlA
+    (\index exerciseCid -> do
+      exercise <- fetch exerciseCid
+      case exercise.exercise_data.quantity of
+        Some quantity -> pure (addSecurityBalanceEvent
+          exercise.exercise_data.security_id
+          (SecurityBalanceReduction with
+            event_date = exercise.exercise_data.date
+            event_id = exercise.exercise_data.id
+            quantity = quantity)
+          index)
+        None -> pure index)
+    afterTransfers
+    (Map.values maps.warrant_exercises)
+
+equityCompensationReductionEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+equityCompensationReductionEventsBySecurityId maps = do
+  afterCancellations <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addSecurityBalanceEvent
+        cancellation.cancellation_data.security_id
+        (SecurityBalanceReduction with
+          event_date = cancellation.cancellation_data.date
+          event_id = cancellation.cancellation_data.id
+          quantity = cancellation.cancellation_data.quantity)
+        index))
+    Map.empty
+    (Map.values maps.equity_compensation_cancellations)
+  afterTransfers <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addSecurityBalanceEvent
+        transfer.transfer_data.security_id
+        (SecurityBalanceReduction with
+          event_date = transfer.transfer_data.date
+          event_id = transfer.transfer_data.id
+          quantity = transfer.transfer_data.quantity)
+        index))
+    afterCancellations
+    (Map.values maps.equity_compensation_transfers)
+  afterExercises <- foldlA
+    (\index exerciseCid -> do
+      exercise <- fetch exerciseCid
+      pure (addSecurityBalanceEvent
+        exercise.exercise_data.security_id
+        (SecurityBalanceReduction with
+          event_date = exercise.exercise_data.date
+          event_id = exercise.exercise_data.id
+          quantity = exercise.exercise_data.quantity)
+        index))
+    afterTransfers
+    (Map.values maps.equity_compensation_exercises)
+  foldlA
+    (\index releaseCid -> do
+      release <- fetch releaseCid
+      pure (addSecurityBalanceEvent
+        release.release_data.security_id
+        (SecurityBalanceReduction with
+          event_date = release.release_data.date
+          event_id = release.release_data.id
+          quantity = release.release_data.quantity)
+        index))
+    afterExercises
+    (Map.values maps.equity_compensation_releases)
+
+splitEventsByStockClassId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
+splitEventsByStockClassId maps =
+  foldlA
+    (\index splitCid -> do
+      split <- fetch splitCid
+      pure (addSecurityBalanceEvent
+        split.split_data.stock_class_id
+        (SecurityBalanceMultiplier with
+          event_date = split.split_data.date
+          event_id = split.split_data.id
+          numerator = split.split_data.split_ratio.numerator
+          denominator = split.split_data.split_ratio.denominator)
+        index))
+    Map.empty
+    (Map.values maps.stock_class_splits)
+
+validateSourceSecurityBalances : CapTableMaps -> Update ()
+validateSourceSecurityBalances maps = do
+  stockReductions <- stockReductionEventsBySecurityId maps
+  warrantReductions <- warrantReductionEventsBySecurityId maps
+  equityCompensationReductions <- equityCompensationReductionEventsBySecurityId maps
+  splitEvents <- splitEventsByStockClassId maps
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      let reductions = fromOptional [] (Map.lookup issuance.issuance_data.security_id stockReductions)
+          splits = filter
+            (\event -> securityBalanceEventDate event >= issuance.issuance_data.date)
+            (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents))
+      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (reductions ++ splits))
+    (Map.values maps.stock_issuances)
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      case issuance.issuance_data.quantity of
+        Some quantity ->
+          validateSourceSecurityBalance
+            issuance.issuance_data.security_id
+            quantity
+            (fromOptional [] (Map.lookup issuance.issuance_data.security_id warrantReductions))
+        None -> pure ())
+    (Map.values maps.warrant_issuances)
+  mapA_
+    (\issuanceCid -> do
+      issuance <- fetch issuanceCid
+      let reductions = fromOptional [] (Map.lookup issuance.issuance_data.security_id equityCompensationReductions)
+          splits = case issuance.issuance_data.stock_class_id of
+            Some stockClassId -> filter
+              (\event -> securityBalanceEventDate event >= issuance.issuance_data.date)
+              (fromOptional [] (Map.lookup stockClassId splitEvents))
+            None -> []
+      validateSourceSecurityBalance issuance.issuance_data.security_id issuance.issuance_data.quantity (reductions ++ splits))
+    (Map.values maps.equity_compensation_issuances)
 
 -- OCF dates are calendar dates. A non-quantity transaction may occur on the
 -- same date as a terminal transaction, but it cannot target the retired source
@@ -564,6 +816,7 @@ template CapTable
         -- Validate Financing references only after the complete batch state is known.
         validateFinancingIssuanceReferences finalMaps
         validateActiveSecurityTargets finalMaps
+        validateSourceSecurityBalances finalMaps
 
         -- Create new CapTable with updated maps and potentially new issuer
         newCapTableCid <- create this with
