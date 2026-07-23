@@ -1,0 +1,121 @@
+module OpenCapTable.TestObjectIdUniqueness where
+
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import qualified Fairmint.OpenCapTable.OCF.Document as Document
+import OpenCapTable.Setup
+import OpenCapTable.TestHelpers (defaultStakeholder, setupStakeholderWithId)
+import qualified DA.Map as Map
+import Daml.Script
+
+documentData : Text -> Document.DocumentOcfData
+documentData objectId = Document.DocumentOcfData with
+  id = objectId
+  md5 = "0123456789abcdef0123456789abcdef"
+  comments = []
+  related_objects = []
+  path = Some ("documents/" <> objectId <> ".pdf")
+  uri = None
+
+testObjectIdUniqueness_SameBatchSameTypeDuplicateFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  submitMustFail issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateDocument (documentData "DUPLICATE-DOCUMENT-ID")
+        , CT.OcfCreateDocument (documentData "DUPLICATE-DOCUMENT-ID")
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_PriorBatchSameTypeDuplicateFails = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  createResult <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "PRIOR-DOCUMENT-ID")]
+      edits = []
+      deletes = []
+
+  submitMustFail issuer do
+    exerciseCmd createResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "PRIOR-DOCUMENT-ID")]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_SameBatchCrossTypeDuplicateSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates =
+        [ CT.OcfCreateStakeholder (defaultStakeholder "SHARED-CROSS-TYPE-ID" "Shared ID Holder")
+        , CT.OcfCreateDocument (documentData "SHARED-CROSS-TYPE-ID")
+        ]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_PriorBatchCrossTypeDuplicateSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  (capTableWithStakeholder, _) <- setupStakeholderWithId issuer cap_table "PRIOR-CROSS-TYPE-ID" "Prior Holder"
+
+  _ <- submit issuer do
+    exerciseCmd capTableWithStakeholder CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "PRIOR-CROSS-TYPE-ID")]
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_IssuerIdMayBeReusedByOtherType = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+
+  _ <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "ISSUER_1")]
+      edits = []
+      deletes = []
+  pure ()
+
+-- Validate fetched object data rather than trusting map keys on cap tables
+-- upgraded from a package that did not enforce per-type object-id uniqueness.
+testObjectIdUniqueness_CorruptedSameTypeFinalStateFails = script do
+  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
+  capTableDataOpt <- queryContractId issuer cap_table
+  let Some capTableData = capTableDataOpt
+
+  firstDocumentCid <- submit (actAs issuer <> actAs system_operator) $ createCmd $ Document.Document with
+    context = ctx
+    document_data = documentData "UPGRADED-DUPLICATE-DOCUMENT-ID"
+  secondDocumentCid <- submit (actAs issuer <> actAs system_operator) $ createCmd $ Document.Document with
+    context = ctx
+    document_data = documentData "UPGRADED-DUPLICATE-DOCUMENT-ID"
+
+  let corruptedCapTable = capTableData with
+        documents =
+          Map.insert "CORRUPTED-DOCUMENT-MAP-KEY-1" firstDocumentCid
+            (Map.insert "CORRUPTED-DOCUMENT-MAP-KEY-2" secondDocumentCid capTableData.documents)
+  corruptedCapTableCid <- submit (actAs issuer <> actAs system_operator) $ createCmd corruptedCapTable
+
+  submitMustFail issuer do
+    exerciseCmd corruptedCapTableCid CT.UpdateCapTable with
+      creates = []
+      edits = []
+      deletes = []
+  pure ()
+
+testObjectIdUniqueness_DeleteThenReuseWithinTypeSucceeds = script do
+  TestOcp{issuer, cap_table} <- setupTestOcp
+  createResult <- submit issuer do
+    exerciseCmd cap_table CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "REUSED-DOCUMENT-ID")]
+      edits = []
+      deletes = []
+
+  _ <- submit issuer do
+    exerciseCmd createResult.updatedCapTableCid CT.UpdateCapTable with
+      creates = [CT.OcfCreateDocument (documentData "REUSED-DOCUMENT-ID")]
+      edits = []
+      deletes = [CT.OcfDeleteDocument "REUSED-DOCUMENT-ID"]
+  pure ()
