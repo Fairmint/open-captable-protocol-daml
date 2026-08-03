@@ -9,16 +9,14 @@ import {
   type ScanApiClient,
   type ValidatorApiClient,
 } from '@fairmint/canton-node-sdk';
+import { OcpClient, toCantonConfig, type OcfIssuer } from '@open-captable-protocol/canton';
 import {
   buildCantonOcfDataMap,
   computeReplicationDiff,
   createFactory,
   extractCantonOcfManifest,
   getCapTableState,
-  OcpClient,
-  toCantonConfig,
-  type OcfIssuer,
-} from '@open-captable-protocol/canton';
+} from '@open-captable-protocol/canton/replication';
 import { Pool, type PoolConfig } from 'pg';
 
 import {

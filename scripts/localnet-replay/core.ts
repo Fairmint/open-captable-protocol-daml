@@ -2,20 +2,22 @@ import { createHmac, randomBytes } from 'crypto';
 import path from 'path';
 
 import {
+  isOcfCreatableEntityType,
+  mapOcfObjectTypeToEntityType,
+  type OcfCreateOperation,
+  type OcfEntityType,
+} from '@open-captable-protocol/canton';
+import {
   ENTITY_OBJECT_TYPE_MAP,
   getOcfSchema,
-  isOcfCreatableEntityType,
   mapCategorizedTypeToEntityType,
-  mapOcfObjectTypeToEntityType,
   matchesTemplateIdentity,
   normalizeEntityType,
   normalizeObjectType,
   parseOcfEntityInput,
   parseOcfObject,
   sortTransactions,
-  type OcfCreateOperation,
-  type OcfEntityType,
-} from '@open-captable-protocol/canton';
+} from '@open-captable-protocol/canton/replication';
 
 import { renderReplayTrafficMarkdown, type ReplayTrafficReport } from './traffic';
 
