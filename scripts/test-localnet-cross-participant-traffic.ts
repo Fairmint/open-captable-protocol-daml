@@ -5,7 +5,8 @@ import { access } from 'node:fs/promises';
 import path from 'node:path';
 
 import { Canton, type LedgerJsonApiClient, type ScanApiClient } from '@fairmint/canton-node-sdk';
-import { createFactory, OcpClient, toCantonConfig } from '@open-captable-protocol/canton';
+import { OcpClient, toCantonConfig } from '@open-captable-protocol/canton';
+import { createFactory } from '@open-captable-protocol/canton/replication';
 
 const LOCALNET_USER_ID = 'ledger-api-user';
 // Stock LocalNet includes a 400 KB free base allowance per participant. Repeat a real
