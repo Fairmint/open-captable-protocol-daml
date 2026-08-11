@@ -28,8 +28,8 @@ npm test        # prepare-build -> dpm build --all -> (cd Test && dpm test)
 ```
 
 `npm run build` compiles into `generated/build/<pkg>/.daml/dist/*.dar`. `sync-splice-dars` fetches
-Splice DARs over the network (packaged MainNet pin from `@fairmint/canton-dev-tools`), so build needs
-outbound access. `libs/` is gitignored and populated by sync.
+Splice DARs over the network (packaged MainNet pin from `@fairmint/canton-dev-tools`), so build
+needs outbound access. `libs/` is gitignored and populated by sync.
 
 After changing OpenCapTable, back up its DAR before CI upgrade-compat passes:
 
