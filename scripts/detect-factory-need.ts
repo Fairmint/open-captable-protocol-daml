@@ -5,10 +5,10 @@
  * Usage: tsx scripts/detect-factory-need.ts --package ocp
  */
 
+import { getBackedUpDarPath, getFreshDarPath } from '@fairmint/canton-dev-tools/daml';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { getBackedUpDarPath, getFreshDarPath } from './dar-utils';
 import { getPackage, parsePackageArg } from './packages';
 import type { ContractNetwork } from './types';
 
@@ -144,10 +144,10 @@ export function inspectDarPackageId(darPath: string, packageName: string, versio
   return packageId;
 }
 
-export function getDarPath(packageName: string, version: string, darName: string): string {
+export function getDarPath(packageName: string, version: string, darName: string, buildDir: string): string {
   return (
-    getBackedUpDarPath(packageName, version, darName) ??
-    getFreshDarPath(packageName, version, darName) ??
+    getBackedUpDarPath(ROOT_DIR, packageName, version, darName) ??
+    getFreshDarPath(ROOT_DIR, buildDir, version, darName) ??
     (() => {
       throw new Error(
         `No DAR found for ${packageName} ${version}. Run npm run build or npm run upload-dar before detecting factory state.`
@@ -191,7 +191,7 @@ function main(): void {
     throw new Error(`Unknown package: ${packageArg}`);
   }
 
-  const darPath = getDarPath(pkg.name, pkg.version, pkg.darName);
+  const darPath = getDarPath(pkg.name, pkg.version, pkg.darName, pkg.buildDir);
   const packageId = inspectDarPackageId(darPath, pkg.name, pkg.version);
   const factoryJson = readJsonFile<FactoryJson>(FACTORY_JSON_PATH) ?? {};
   const factories = Object.fromEntries(

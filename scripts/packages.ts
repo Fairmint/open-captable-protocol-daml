@@ -21,6 +21,8 @@ export interface PackageConfig {
   version: string;
   /** Source directory relative to repo root */
   sourceDir: string;
+  /** Generated build directory relative to repo root */
+  buildDir: string;
   /** Generated JS package metadata, if this package produces a generated package. */
   generated?: GeneratedPackageMetadata;
 }
@@ -40,19 +42,22 @@ export interface GeneratedPackageMetadata {
 
 const ROOT_DIR = path.join(__dirname, '..');
 
-/** Read version from a package's daml.yaml file. This ensures daml.yaml is the single source of truth. */
-function readVersionFromDamlYaml(sourceDir: string): string {
+interface DamlPackageMetadata {
+  name: string;
+  version: string;
+}
+
+/** Read package metadata from daml.yaml. This ensures daml.yaml is the single source of truth. */
+function readMetadataFromDamlYaml(sourceDir: string): DamlPackageMetadata {
   const yamlPath = path.join(ROOT_DIR, sourceDir, 'daml.yaml');
   if (!fs.existsSync(yamlPath)) {
     throw new Error(`daml.yaml not found: ${yamlPath}`);
   }
   const content = fs.readFileSync(yamlPath, 'utf8');
-  const parsed = yaml.parse(content) as { version: string };
-  return parsed.version;
+  return yaml.parse(content) as DamlPackageMetadata;
 }
 
 interface PackageDef {
-  name: string;
   sourceDir: string;
   generated?: GeneratedPackageMetadata;
 }
@@ -60,7 +65,6 @@ interface PackageDef {
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
   ocp: {
-    name: 'OpenCapTable-v34',
     sourceDir: 'OpenCapTable-v34',
     generated: { createIndex: true, publishNameSuffix: null },
   },
@@ -70,11 +74,13 @@ type PackageDefKey = keyof typeof PACKAGE_DEFS;
 
 /** Build full package config by reading version from daml.yaml. */
 function buildPackageConfig(def: PackageDef): PackageConfig {
+  const metadata = readMetadataFromDamlYaml(def.sourceDir);
   return {
-    name: def.name,
-    darName: def.name,
-    version: readVersionFromDamlYaml(def.sourceDir),
+    name: metadata.name,
+    darName: metadata.name,
+    version: metadata.version,
     sourceDir: def.sourceDir,
+    buildDir: path.join('generated', 'build', metadata.name),
     generated: def.generated ? { ...def.generated } : undefined,
   };
 }
@@ -114,8 +120,11 @@ export function getPackage(keyOrName: string): PackageConfig | undefined {
   if (matchingKey) {
     return packages[matchingKey];
   }
-  // Also support lookup by full name (case-insensitive)
-  return Object.values(packages).find((pkg) => pkg.name.toLowerCase() === keyOrName.toLowerCase());
+  // Also support lookup by full daml.yaml name or source directory (case-insensitive)
+  const lower = keyOrName.toLowerCase();
+  return Object.values(packages).find(
+    (pkg) => pkg.name.toLowerCase() === lower || pkg.sourceDir.toLowerCase() === lower
+  );
 }
 
 /**
@@ -250,15 +259,22 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
     console.error(`❌ ${errorMessage}`);
     console.error('');
   }
-  console.error(`Usage: tsx scripts/${scriptName} --package <package> --network <network>`);
+  const needsNetwork = scriptName.includes('upload') || scriptName.includes('check-dar-deployment');
+  console.error(
+    needsNetwork
+      ? `Usage: tsx scripts/${scriptName} --package <sourceDir> --network <network>`
+      : `Usage: tsx scripts/${scriptName} --package <sourceDir> --version <version>`
+  );
   console.error('');
-  console.error('Packages:');
+  console.error('Packages (multi-package.yaml source directories):');
   const packages = getPackages();
-  for (const [key, pkg] of Object.entries(packages)) {
-    console.error(`  ${key.padEnd(15)} → ${pkg.name} v${pkg.version}`);
+  for (const pkg of Object.values(packages)) {
+    console.error(`  ${pkg.sourceDir.padEnd(24)} → ${pkg.name} v${pkg.version}`);
   }
-  console.error('');
-  console.error('Networks: devnet, mainnet');
+  if (needsNetwork) {
+    console.error('');
+    console.error('Networks: devnet, mainnet');
+  }
 }
 
 // =============================================================================

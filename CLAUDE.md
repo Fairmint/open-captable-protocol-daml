@@ -20,6 +20,8 @@ Keep repository guidance synchronized with the code:
   including `npm run check:dar-version-policy` and `npm run verify-dars`.
 - `Fairmint/OpenCapTable/CapTable.daml` is generated and gitignored. Change
   `scripts/codegen/generate-captable.ts`, its configuration, or its templates instead, then
-  regenerate through the repository scripts.
+  regenerate through the repository scripts (`npm run generate-captable` / `npm run build`).
+- Builds run from `generated/build/` via `canton-dev-tools prepare-build`. Keep source
+  `Test/daml.yaml` sibling-relative paths; prepare-build rewrites them for the generated tree.
 - Validate protocol behavior against the official OCF schema, `scripts/schema-gap-checker/`, and
   `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity.

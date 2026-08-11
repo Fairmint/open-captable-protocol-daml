@@ -57,12 +57,14 @@ the source of truth for current versions, dependencies, and automation.
 Requires Node.js 22+ (see `@fairmint/canton-dev-tools`).
 
 ```bash
-git submodule update --init --recursive
 npm install
-npm exec canton-dev-tools -- install-dpm-sdks
+npx canton-dev-tools install-dpm-sdks
 npm run build
 npm test
 ```
+
+`npm run build` syncs Splice DARs, generates `CapTable.daml`, runs `prepare-build` into
+`generated/build/`, then builds with `dpm`. No Splice git submodule is required.
 
 When generated bindings or the published npm surface are affected, also run:
 
