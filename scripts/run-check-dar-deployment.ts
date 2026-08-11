@@ -5,7 +5,7 @@
  * Usage: npm run check:dar-deployment -- --network <devnet|mainnet> [--package <sourceDir|ocp>]
  */
 
-import { execFileSync } from 'node:child_process';
+import { checkDarVersionPolicy } from '@fairmint/canton-dev-tools/daml';
 import { getPackage, parseNetworkArg, parsePackageArg, printPackageUsage } from './packages';
 
 function main(): void {
@@ -22,11 +22,17 @@ function main(): void {
     process.exit(1);
   }
 
-  execFileSync(
-    'npx',
-    ['canton-dev-tools', 'check-dar-version-policy', '--package', pkg.sourceDir, '--deployment', network],
-    { stdio: 'inherit' }
-  );
+  try {
+    checkDarVersionPolicy({
+      rootDir: process.cwd(),
+      base: 'origin/main',
+      packageKey: pkg.sourceDir,
+      deployment: network,
+    });
+  } catch (error) {
+    console.error(`❌ DAR deployment check failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
 }
 
 main();
