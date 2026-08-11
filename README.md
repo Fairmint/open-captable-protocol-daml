@@ -54,10 +54,12 @@ the source of truth for current versions, dependencies, and automation.
 
 ## Build and validate
 
+Requires Node.js 22+ (see `@fairmint/canton-dev-tools`).
+
 ```bash
 git submodule update --init --recursive
 npm install
-npx canton-dev-tools install-dpm-sdks
+npm exec canton-dev-tools -- install-dpm-sdks
 npm run build
 npm test
 ```
