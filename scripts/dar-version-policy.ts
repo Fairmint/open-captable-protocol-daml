@@ -1,12 +1,25 @@
-import { execFileSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
+/**
+ * OCP-specific DAR deployment orchestration on top of shared policy primitives from `@fairmint/canton-dev-tools/daml`.
+ * Kept local because this repo builds in-place (`{pkg}/.daml/dist/`) and wires deployment gates through
+ * `scripts/packages.ts`.
+ */
 
-import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock, type DarsLock, type DarsLockEntry } from './dar-utils';
+import { execFileSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
+
+import {
+  buildDeploymentTag,
+  darLockEntriesEqual,
+  getLockEntry,
+  nextPatch,
+  type DarsLockEntry,
+} from '@fairmint/canton-dev-tools/daml';
+
+import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock, type DarsLock } from './dar-utils';
 import { parseNetworkArg, requirePackageConfig } from './packages';
 import type { ContractNetwork } from './types';
 
-const SEMVER = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
 const PKG = requirePackageConfig('ocp');
 
 export interface DeploymentTag {
@@ -22,36 +35,10 @@ export interface DeploymentState {
   currentMainnet: DeploymentTag | null;
 }
 
-function semverParts(version: string): [number, number, number] {
-  const match = SEMVER.exec(version);
-  if (!match) throw new Error(`Invalid semantic version: ${version}`);
-  return [Number(match[1]), Number(match[2]), Number(match[3])];
-}
-
-export function nextPatch(version: string): string {
-  const [major, minor, patch] = semverParts(version);
-  return `${major}.${minor}.${patch + 1}`;
-}
+export { getLockEntry, nextPatch };
 
 export function deploymentTagName(network: ContractNetwork, version: string): string {
-  semverParts(version);
-  return `dar-deploy/${network}/${PKG.name}/v${version}`;
-}
-
-export function getLockEntry(lock: DarsLock, key: string): DarsLockEntry | undefined {
-  return Object.prototype.hasOwnProperty.call(lock.packages, key) ? lock.packages[key] : undefined;
-}
-
-function sameEntry(left: DarsLockEntry | undefined, right: DarsLockEntry): boolean {
-  if (!left) return false;
-  return (
-    left.sha256 === right.sha256 &&
-    left.size === right.size &&
-    left.sdkVersion === right.sdkVersion &&
-    left.uploadedAt === right.uploadedAt &&
-    left.networks.length === right.networks.length &&
-    left.networks.every((network, index) => network === right.networks[index])
-  );
+  return buildDeploymentTag(network, PKG.name, version);
 }
 
 function git(args: string[], cwd: string): string {
@@ -71,7 +58,8 @@ function readTag(name: string, network: ContractNetwork, cwd: string): Deploymen
     throw new Error(`DAR deployment tag must be annotated: ${name}`);
   }
   const version = name.slice(prefix.length);
-  semverParts(version);
+  // buildDeploymentTag validates semver; round-trip through it for a clear error.
+  buildDeploymentTag(network, PKG.name, version);
 
   const taggedLock = JSON.parse(git(['show', `${name}:dars/dars.lock`], cwd)) as DarsLock;
   const key = getDarLockKey(PKG.name, version, PKG.darName);
@@ -111,7 +99,8 @@ function assertLatestDevnetEntry(lock: DarsLock, state: DeploymentState): void {
   const tag = state.latestDevnet;
   if (!tag) return;
   const key = getDarLockKey(PKG.name, tag.version, PKG.darName);
-  if (!sameEntry(getLockEntry(lock, key), tag.entry)) {
+  const current = getLockEntry(lock, key);
+  if (!current || !darLockEntriesEqual(current, tag.entry)) {
     throw new Error(`${tag.name} records an immutable lock entry, but current ${key} differs`);
   }
 }
@@ -161,7 +150,7 @@ export function assertHistoryRetention(
     const currentEntry = getLockEntry(current, key);
     const mutableCandidate =
       key === mutableKey && currentEntry?.networks.length === 0 && (baseEntry?.networks.length ?? 0) === 0;
-    if (!mutableCandidate && (!baseEntry || !sameEntry(currentEntry, baseEntry))) {
+    if (!mutableCandidate && (!baseEntry || !currentEntry || !darLockEntriesEqual(currentEntry, baseEntry))) {
       throw new Error(`Historical DAR lock entry must be retained: ${key}`);
     }
   }

@@ -57,7 +57,7 @@ the source of truth for current versions, dependencies, and automation.
 ```bash
 git submodule update --init --recursive
 npm install
-scripts/install-dpm-sdks.sh
+npx canton-dev-tools install-dpm-sdks
 npm run build
 npm test
 ```

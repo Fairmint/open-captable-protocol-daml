@@ -23,10 +23,11 @@
  * name/version with different package ids, which `upgrade-check` rejects.)
  */
 
-import { execSync } from 'child_process';
-import * as fs from 'fs';
-import * as path from 'path';
+import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 
+import { compareSemver } from '@fairmint/canton-dev-tools/daml';
 import { computeSha256, getDarLockKey, getDarsDir, loadDarsLock } from './dar-utils';
 
 const ROOT_DIR = path.join(__dirname, '..');
@@ -47,18 +48,6 @@ function parsePackageName(name: string): { baseName: string; majorVersion: numbe
     return { baseName: match[1], majorVersion: parseInt(match[2], 10) };
   }
   return { baseName: name, majorVersion: null };
-}
-
-/** Semver compare: negative if a < b, zero if equal, positive if a > b. */
-function compareSemver(a: string, b: string): number {
-  const pa = a.split('.').map((x) => parseInt(x, 10) || 0);
-  const pb = b.split('.').map((x) => parseInt(x, 10) || 0);
-  for (let i = 0; i < 3; i++) {
-    const da = pa[i] ?? 0;
-    const db = pb[i] ?? 0;
-    if (da !== db) return da - db;
-  }
-  return 0;
 }
 
 /** Get all backed-up packages from dars.lock, grouped by exact package name (file must exist on disk). */
