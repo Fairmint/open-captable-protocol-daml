@@ -31,8 +31,8 @@ npm test        # prepare-build -> dpm build --all -> (cd Test && dpm test)
 Splice DARs over the network (packaged MainNet pin from `@fairmint/canton-dev-tools`), so build
 needs outbound access. `libs/` is gitignored and populated by sync.
 
-After changing OpenCapTable, back up its DAR before CI upgrade-compat passes.
-Use the discovery name `OpenCapTable-v34` (not the OCP script alias `ocp`):
+After changing OpenCapTable, back up its DAR before CI upgrade-compat passes. Use the discovery name
+`OpenCapTable-v34` (not the OCP script alias `ocp`):
 
 ```bash
 npm run build
