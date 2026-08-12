@@ -1,20 +1,21 @@
 #!/usr/bin/env tsx
 /**
- * Validates the combined `lib/` after codegen: required bundled paths exist, Nft/Reference does not reintroduce a
- * circular require on root `index.js`, and Node can load `lib/index.js` (consumer smoke test).
+ * Validates the combined `lib/` after codegen: required bundled paths exist and Node can load `lib/index.js` (consumer
+ * smoke test). Also checks `openCapTableDarPath` stays off the browser-safe root entry.
  */
 
 import { spawnSync } from 'child_process';
 import fs from 'fs';
 import path from 'path';
-import { findNftReferenceFilesRequiringPackageRootIndex } from './nft-reference-bridge-rewrite';
 import { getErrorMessage } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
-/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v34 + inlined Shared). */
+/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v34). */
 const REQUIRED_RELATIVE_FILES = [
+  'Fairmint/OpenCapTable/CapTable/module.js',
+  'Fairmint/OpenCapTable/OcpFactory/module.js',
   'Splice/Api/Token/MetadataV1/module.js',
   'Splice/Api/Token/HoldingV1/module.js',
   'DA/Set/Types/module.js',
@@ -27,20 +28,6 @@ function assertRequiredFiles(): void {
     if (!fs.existsSync(abs)) {
       throw new Error(`Missing required file in merged lib: ${rel}`);
     }
-  }
-}
-
-function assertNftReferenceDoesNotRequireRootIndex(): void {
-  const refRoot = path.join(LIB_DIR, 'Nft', 'Reference');
-  if (!fs.existsSync(refRoot)) {
-    return;
-  }
-  const filesRequiringRootIndex = findNftReferenceFilesRequiringPackageRootIndex(refRoot);
-  const firstBadFile = filesRequiringRootIndex[0];
-  if (firstBadFile) {
-    throw new Error(
-      `Circular import risk: ${path.relative(LIB_DIR, firstBadFile)} still references root index.js; use nft-api-v01-package-namespace bridge`
-    );
   }
 }
 
@@ -68,8 +55,11 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (typeof idx.resolveOpenCapTableDarPath !== 'undefined') process.exit(5);
     if (typeof idx.getOpenCapTableDarPath !== 'undefined') process.exit(6);
     if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(7);
-    if (typeof idx.Nft !== 'undefined') process.exit(8);
-    if (typeof idx.CantonPayments !== 'undefined') process.exit(9);
+    if (!idx.OCP_TEMPLATES.issuerAuthorization) process.exit(11);
+    if (!idx.OCP_TEMPLATES.ocpFactory) process.exit(12);
+    if (!idx.Fairmint || !idx.Fairmint.OpenCapTable) process.exit(8);
+    if (typeof idx.Nft !== 'undefined') process.exit(9);
+    if (typeof idx.CantonPayments !== 'undefined') process.exit(10);
   `;
   const result = spawnSync(process.execPath, ['-e', snippet], {
     cwd: ROOT_DIR,
@@ -95,12 +85,9 @@ function main(): void {
 
   try {
     assertRequiredFiles();
-    assertNftReferenceDoesNotRequireRootIndex();
     assertOpenCapTableDarSubpathAndRootSeparation();
     assertNodeLoadsLibIndex();
-    console.log(
-      '✅ Merged lib/ checks passed (files, no Nft/Reference→index cycle, DAR subpath vs root separation, Node require).'
-    );
+    console.log('✅ Merged lib/ checks passed (files, DAR subpath vs root separation, Node require).');
   } catch (error) {
     console.error('❌ verify-merged-lib-runtime failed:', getErrorMessage(error));
     process.exit(1);

@@ -1,8 +1,8 @@
 # open-captable-protocol-daml
 
 See [CLAUDE.md](CLAUDE.md) for canonical build/test/lint commands and the public wiki. Treat
-`multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, and `package.json` as the source of
-truth.
+`multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`, and
+`daml-js-bundle.json` as the source of truth.
 
 ## Cursor Cloud specific instructions
 

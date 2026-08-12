@@ -10,9 +10,10 @@ Read the public wiki before changing contracts or automation:
 
 Keep repository guidance synchronized with the code:
 
-- Treat `multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`, and the
-  implementation in `scripts/` as the current source of truth. Do not copy versions or dependency
-  lists into prose.
+- Treat `multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`,
+  `daml-js-bundle.json`, and the remaining OCP-specific implementation in `scripts/` as the current
+  source of truth. Shared DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions
+  or dependency lists into prose.
 - Run `npm run build` and `npm test` for contract changes. Also run `npm run lint:daml`,
   `npm run check-upgrade-compat`, `npm run codegen`, and `npm run verify-package` when DAML source,
   upgrade compatibility, generated bindings, or the npm surface may change.
@@ -23,5 +24,7 @@ Keep repository guidance synchronized with the code:
   regenerate through the repository scripts (`npm run generate-captable` / `npm run build`).
 - Builds run from `generated/build/` via `canton-dev-tools prepare-build`. Keep source
   `Test/daml.yaml` sibling-relative paths; prepare-build rewrites them for the generated tree.
+- `npm run codegen` uses CDT `codegen-js` → `bundle-dependencies` → `create-root-index` →
+  `fix-splice-refs`, then OCP-only DAR staging (`stage-npm-opencaptable-dar`) and npm-runtime lib.
 - Validate protocol behavior against the official OCF schema, `scripts/schema-gap-checker/`, and
   `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity.
