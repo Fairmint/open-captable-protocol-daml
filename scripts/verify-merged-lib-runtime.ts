@@ -55,6 +55,8 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (typeof idx.resolveOpenCapTableDarPath !== 'undefined') process.exit(5);
     if (typeof idx.getOpenCapTableDarPath !== 'undefined') process.exit(6);
     if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(7);
+    if (!idx.OCP_TEMPLATES.issuerAuthorization) process.exit(11);
+    if (!idx.OCP_TEMPLATES.ocpFactory) process.exit(12);
     if (!idx.Fairmint || !idx.Fairmint.OpenCapTable) process.exit(8);
     if (typeof idx.Nft !== 'undefined') process.exit(9);
     if (typeof idx.CantonPayments !== 'undefined') process.exit(10);
