@@ -1,5 +1,6 @@
 #!/usr/bin/env tsx
 
+import { readFileSync } from 'fs';
 import { access, appendFile, mkdir, writeFile } from 'fs/promises';
 import path from 'path';
 
@@ -468,8 +469,8 @@ async function initializeReplayLedger(
   await context.trafficMeter.start(amuletRules);
 
   await Promise.all([
-    operatorLedger.uploadDarFile({ filePath: darPath }),
-    issuerLedger.uploadDarFile({ filePath: darPath }),
+    operatorLedger.uploadDar({ darFile: readFileSync(darPath) }),
+    issuerLedger.uploadDar({ darFile: readFileSync(darPath) }),
   ]);
   const factory = await createFactory(operatorLedger, {
     systemOperator: systemOperatorParty,

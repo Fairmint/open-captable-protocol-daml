@@ -1,6 +1,7 @@
 #!/usr/bin/env tsx
 
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { access } from 'node:fs/promises';
 import path from 'node:path';
 
@@ -113,8 +114,8 @@ async function main(): Promise<void> {
   const darPath = path.resolve('published-dars/OpenCapTable.dar');
   await access(darPath);
   await Promise.all([
-    provider.ledger.uploadDarFile({ filePath: darPath }),
-    user.ledger.uploadDarFile({ filePath: darPath }),
+    provider.ledger.uploadDar({ darFile: readFileSync(darPath) }),
+    user.ledger.uploadDar({ darFile: readFileSync(darPath) }),
   ]);
 
   const generated = require(path.resolve('lib/index.js')) as {

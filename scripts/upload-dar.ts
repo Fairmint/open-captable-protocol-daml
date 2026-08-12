@@ -64,7 +64,7 @@ async function main() {
     try {
       const client = createLedgerJsonApiClient(network, provider);
       if (noVet) {
-        // Published @fairmint/canton-node-sdk may not yet parse `vetAllPackages` on uploadDarFile (Zod strips unknown
+        // Published @fairmint/canton-node-sdk may not yet parse `vetAllPackages` on uploadDar (Zod strips unknown
         // keys). POST the octet-stream body ourselves with the query flag Canton documents for JSON API uploads.
         const url = `${client.getApiUrl()}/v2/packages?vetAllPackages=false`;
         await client.makePostRequest(url, fs.readFileSync(darPath), {
@@ -72,7 +72,7 @@ async function main() {
           includeBearerToken: true,
         });
       } else {
-        await client.uploadDarFile({ filePath: darPath });
+        await client.uploadDar({ darFile: fs.readFileSync(darPath) });
       }
       console.log(`    ✅ Done`);
     } catch (err) {
