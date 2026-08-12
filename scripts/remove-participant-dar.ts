@@ -66,8 +66,14 @@ function assertHex64(id: string, label: string): void {
 }
 
 function grpcImportArgs(): string[] {
-  if (!fs.existsSync(path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL))) {
-    throw new Error(`Admin proto not found at ${path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL)} — wrong repo layout?`);
+  const protoPath = path.join(ADMIN_PROTO_ROOT, ADMIN_PROTO_REL);
+  if (!fs.existsSync(protoPath)) {
+    throw new Error(
+      `Admin proto not found at ${protoPath}. ` +
+        `sync-splice-dars only materializes DAR artifacts under libs/splice/; ` +
+        `this ops script needs a full Splice checkout (with canton admin-api protos) at libs/splice, ` +
+        `or run the equivalent tooling from a repo that still vendors that tree.`
+    );
   }
   return ['-import-path', ADMIN_PROTO_ROOT, '-proto', ADMIN_PROTO_REL];
 }
