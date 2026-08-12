@@ -2,7 +2,7 @@
 /**
  * Upload a DAR file to devnet or mainnet.
  *
- * Requires a fresh build that exactly matches the committed candidate backup.
+ * Requires a fresh build whose bytes exactly match the committed backup.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
  * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki/DAR-Backup
@@ -15,11 +15,51 @@
  * <main-dalf-id>` (with Canton's **ALLOW_VET_INCOMPATIBLE_UPGRADES** force flag) to vet the new package id.
  */
 
+import { computeSha256, getFreshDarPath, requireBackedUpDar } from '@fairmint/canton-dev-tools/daml';
 import * as fs from 'fs';
-import { computeSha256, getFreshDarPath, requireBackedUpDar } from './dar-utils';
-import { parseNetworkArg, parsePackageArg, printPackageUsage, requireNetwork, requirePackage } from './packages';
+import * as path from 'path';
+import {
+  type PackageConfig,
+  parseNetworkArg,
+  parsePackageArg,
+  printPackageUsage,
+  requireNetwork,
+  requirePackage,
+} from './packages';
 import { LEDGER_SCRIPT_PROVIDERS } from './providers';
 import { createLedgerJsonApiClient } from './utils';
+
+const ROOT_DIR = path.join(__dirname, '..');
+
+/** Require the fresh build to be byte-for-byte identical to the committed backup. */
+function requireMatchingBuild(pkg: PackageConfig): string {
+  const freshPath = getFreshDarPath(ROOT_DIR, pkg.buildDir, pkg.version, pkg.darName);
+  if (!freshPath) {
+    console.error(`❌ Fresh DAR build not found`);
+    console.error(`   Expected: ${pkg.buildDir}/.daml/dist/${pkg.darName}-${pkg.version}.dar`);
+    console.error(`   Run "npm run build" first to build the DAR.`);
+    process.exit(1);
+  }
+
+  let backedUpPath: string;
+  try {
+    backedUpPath = requireBackedUpDar(ROOT_DIR, pkg.name, pkg.version, pkg.darName);
+  } catch (error) {
+    console.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+  const freshHash = computeSha256(freshPath);
+  const backedUpHash = computeSha256(backedUpPath);
+  if (freshHash !== backedUpHash || fs.statSync(freshPath).size !== fs.statSync(backedUpPath).size) {
+    console.error(`❌ Fresh build does not match the committed backup.`);
+    console.error(`   Fresh:  ${freshHash}`);
+    console.error(`   Backup: ${backedUpHash}`);
+    console.error(`   Run: npm run backup-dar -- --package ${pkg.sourceDir} --version ${pkg.version}`);
+    process.exit(1);
+  }
+
+  return backedUpPath;
+}
 
 async function main() {
   // Validate args (show help if missing)
@@ -33,21 +73,7 @@ async function main() {
 
   console.log(`\n📦 Uploading ${pkg.name} v${pkg.version} to ${network}\n`);
 
-  // Upload only the committed backup, after proving the fresh build is byte-identical.
-  const darPath = requireBackedUpDar(pkg.name, pkg.version, pkg.darName);
-  const freshPath = getFreshDarPath(pkg.sourceDir, pkg.version, pkg.darName);
-  if (!freshPath) {
-    console.error(`❌ Fresh DAR not found. Run "npm run build" first.`);
-    process.exit(1);
-  }
-  const backupHash = computeSha256(darPath);
-  const freshHash = computeSha256(freshPath);
-  if (freshHash !== backupHash) {
-    console.error(`❌ Fresh build does not match committed backup.`);
-    console.error(`   Backup: ${backupHash}`);
-    console.error(`   Build:  ${freshHash}`);
-    process.exit(1);
-  }
+  const darPath = requireMatchingBuild(pkg);
 
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
   // does not block the other.
@@ -97,7 +123,6 @@ async function main() {
 
   if (failures.length > 0) {
     console.warn(`\n⚠️  Partial upload: ${failures.length} provider(s) failed; succeeded on others.`);
-    console.warn(`   Not updating dars.lock — upload must succeed on all providers first.\n`);
     process.exit(1);
   }
 
