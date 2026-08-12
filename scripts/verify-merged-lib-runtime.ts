@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
- * Validates the combined `lib/` after codegen: required bundled paths exist and Node can load `lib/index.js`
- * (consumer smoke test). Also checks `openCapTableDarPath` stays off the browser-safe root entry.
+ * Validates the combined `lib/` after codegen: required bundled paths exist and Node can load `lib/index.js` (consumer
+ * smoke test). Also checks `openCapTableDarPath` stays off the browser-safe root entry.
  */
 
 import { spawnSync } from 'child_process';
@@ -85,9 +85,7 @@ function main(): void {
     assertRequiredFiles();
     assertOpenCapTableDarSubpathAndRootSeparation();
     assertNodeLoadsLibIndex();
-    console.log(
-      '✅ Merged lib/ checks passed (files, DAR subpath vs root separation, Node require).'
-    );
+    console.log('✅ Merged lib/ checks passed (files, DAR subpath vs root separation, Node require).');
   } catch (error) {
     console.error('❌ verify-merged-lib-runtime failed:', getErrorMessage(error));
     process.exit(1);

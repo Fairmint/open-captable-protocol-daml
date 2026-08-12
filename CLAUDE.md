@@ -12,8 +12,8 @@ Keep repository guidance synchronized with the code:
 
 - Treat `multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`,
   `daml-js-bundle.json`, and the remaining OCP-specific implementation in `scripts/` as the current
-  source of truth. Shared DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions or
-  dependency lists into prose.
+  source of truth. Shared DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions
+  or dependency lists into prose.
 - Run `npm run build` and `npm test` for contract changes. Also run `npm run lint:daml`,
   `npm run check-upgrade-compat`, `npm run codegen`, and `npm run verify-package` when DAML source,
   upgrade compatibility, generated bindings, or the npm surface may change.

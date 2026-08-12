@@ -4,8 +4,8 @@
  *
  * After Canton 3.4, DAML codegen produces imports like: require('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')
  *
- * These must be replaced with relative paths by `canton-dev-tools bundle-dependencies` before the package is
- * published, otherwise consumers can't use it.
+ * These must be replaced with relative paths by `canton-dev-tools bundle-dependencies` before the package is published,
+ * otherwise consumers can't use it.
  *
  * This script catches the issue in CI before publish.
  */
@@ -87,7 +87,9 @@ function main(): void {
         }
         console.error('');
       }
-      console.error('These imports should have been replaced with relative paths by canton-dev-tools bundle-dependencies.');
+      console.error(
+        'These imports should have been replaced with relative paths by canton-dev-tools bundle-dependencies.'
+      );
       console.error('Check daml-js-bundle.json presets/pins and re-run npm run codegen.');
       process.exit(1);
     }
