@@ -31,11 +31,18 @@ npm test        # prepare-build -> dpm build --all -> (cd Test && dpm test)
 Splice DARs over the network (packaged MainNet pin from `@fairmint/canton-dev-tools`), so build
 needs outbound access. `libs/` is gitignored and populated by sync.
 
-After changing OpenCapTable, back up its DAR before CI upgrade-compat passes:
+After changing OpenCapTable, back up its DAR before CI upgrade-compat passes.
+Use the discovery name `OpenCapTable-v34` (not the OCP script alias `ocp`):
 
 ```bash
 npm run build
 npm run backup-dar -- --package OpenCapTable-v34 --version <version-from-daml.yaml>
+```
+
+Deployment preflight (writes `GITHUB_OUTPUT` when set):
+
+```bash
+npm run check:dar-version-policy -- --deployment <devnet|mainnet> --package OpenCapTable-v34
 ```
 
 Commit `dars/` and `dars/dars.lock` with the backup.
