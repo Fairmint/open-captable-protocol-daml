@@ -2,8 +2,9 @@
 /**
  * Copy the built OpenCapTable DAR to a stable path for npm `exports` (`./opencaptable.dar`).
  *
- * Run automatically at the end of `npm run codegen` (after `npm run build` produces `.daml/dist`). The copied file is
- * gitignored; publish flows run codegen / package:prep so the tarball includes it.
+ * Run automatically at the end of `npm run codegen` (after `npm run build` produces
+ * `generated/build/<pkg>/.daml/dist`). The copied file is gitignored; publish flows run codegen / package:prep so the
+ * tarball includes it.
  */
 
 import * as fs from 'fs';
@@ -18,7 +19,7 @@ function main(): void {
     throw new Error('OpenCapTable (ocp) package config not found');
   }
 
-  const builtDar = path.join(ROOT, pkg.sourceDir, '.daml', 'dist', `${pkg.darName}-${pkg.version}.dar`);
+  const builtDar = path.join(ROOT, pkg.buildDir, '.daml', 'dist', `${pkg.darName}-${pkg.version}.dar`);
   const outDir = path.join(ROOT, 'published-dars');
   const outFile = path.join(outDir, 'OpenCapTable.dar');
 

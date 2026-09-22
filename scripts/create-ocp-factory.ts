@@ -110,7 +110,7 @@ async function main() {
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
-  const darPath = getDarPath(pkg.name, pkg.version, pkg.darName);
+  const darPath = getDarPath(pkg.name, pkg.version, pkg.darName, pkg.buildDir);
   const packageId = inspectDarPackageId(darPath, pkg.name, pkg.version);
   const templateId = `${packageId}:Fairmint.OpenCapTable.OcpFactory:OcpFactory`;
   const templateQuery = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
