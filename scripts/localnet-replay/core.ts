@@ -69,6 +69,98 @@ export interface ReplayFailure {
   message: string;
 }
 
+/**
+ * Failure detail used exclusively by CI-side diagnostics (workflow commands and artifacts).
+ *
+ * Excerpt strings may embed customer identifiers (object IDs and payload values), so they must never be copied into the
+ * public reports or step summaries. The portal and object aliases are per-run HMACs, and `validator` is an ID-free
+ * assert label, so those are safe for run-scoped published surfaces.
+ */
+export interface InternalReplayFailure {
+  portalAlias: string;
+  phase: ReplayFailurePhase;
+  message: string;
+  entityType?: string;
+  objectAlias?: string;
+  validator?: string;
+  excerpt?: string;
+  causeExcerpt?: string;
+}
+
+const CAUSE_EXCERPT_MAX_LENGTH = 400;
+
+export function causeExcerpt(error: unknown, maxLength = CAUSE_EXCERPT_MAX_LENGTH): string {
+  if (error === undefined || error === null) return '';
+  let text: string;
+  if (error instanceof Error) {
+    text = error.message;
+  } else if (typeof error === 'string') {
+    text = error;
+  } else if (error instanceof String) {
+    text = error.valueOf();
+  } else {
+    return '';
+  }
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength - 3)}...` : normalized;
+}
+
+// DAML assert-message prefixes from CapTable.daml.template mapped to the owning validator
+// function. Longest/most-specific prefixes must be matched first; keep in sync with the
+// template. Unmatched messages fall back to the phase plus the raw excerpt.
+const VALIDATOR_CONTEXTS: ReadonlyArray<readonly [prefix: string, validator: string]> = [
+  ['Stock class conversion right for', 'validateStockClassConversionRightReferences'],
+  ['Convertible conversion triggers for', 'validateConvertibleConversionRightReferences'],
+  ['Convertible conversion target', 'validateConvertibleConversionRightReferences'],
+  ['Convertible conversion capitalization definition for', 'validateConvertibleConversionCapitalizationReferences'],
+  ['Convertible conversion trigger not found', 'validateConvertibleConversionTriggerReferences'],
+  ['Convertible conversion security not found', 'validateConvertibleConversionTriggerReferences'],
+  ['Convertible issuance stakeholder', 'validateConvertibleIssuanceReferences'],
+  ['Warrant exercise trigger for', 'validateWarrantConversionRightReferences'],
+  ['Warrant exercise triggers for', 'validateWarrantConversionRightReferences'],
+  ['Warrant exercise trigger not found', 'validateWarrantExerciseTriggerReferences'],
+  ['Warrant exercise security not found', 'validateWarrantExerciseTriggerReferences'],
+  ['Warrant issuance stakeholder', 'validateWarrantIssuanceReferences'],
+  ['Warrant vesting terms', 'validateWarrantIssuanceReferences'],
+  ['Warrant conversion target', 'validateWarrantConversionRightReferences'],
+  ['Valuation stock class', 'validateValuationStockClassReferences'],
+  ['Stock plan stock class for', 'validateStockPlanReferences'],
+  ['Stock issuance stakeholder', 'validateStockIssuanceReferences'],
+  ['Stock issuance stock class', 'validateStockIssuanceReferences'],
+  ['Stock issuance stock legend', 'validateStockIssuanceReferences'],
+  ['Stock issuance stock plan', 'validateStockIssuanceReferences'],
+  ['Stock issuance vesting terms', 'validateStockIssuanceReferences'],
+  ['Equity compensation stakeholder', 'validateEquityCompensationIssuanceReferences'],
+  ['Equity compensation stock class', 'validateEquityCompensationIssuanceReferences'],
+  ['Equity compensation stock plan', 'validateEquityCompensationIssuanceReferences'],
+  ['Equity compensation vesting terms', 'validateEquityCompensationIssuanceReferences'],
+  ['Equity compensation exercise security not found', 'validateEquityCompensationExerciseTemporalEligibility'],
+  ['Stock reissuance split transaction', 'validateStockReissuanceSplitReferences'],
+  ['Vesting transaction security id is ambiguous', 'vestingTermsIdForSecurity'],
+  ['Vesting transaction security not found', 'vestingTermsIdForSecurity'],
+  ['Vesting transaction security has no VestingTerms', 'vestingTermsIdForSecurity'],
+  ['Vesting transaction references missing VestingTerms', 'vestingTermsDataForSecurity'],
+  ['references missing VestingCondition', 'validateVestingTransactionCondition'],
+  ['references missing VestingCondition:', 'vestingConditionReferenceExists'],
+  ['lifecycle event references missing issuance security_id', 'validateSourceSecurityBalances'],
+  ['targets inactive stock security', 'validateActiveSecurityTargets'],
+  ['targets inactive convertible security', 'validateActiveSecurityTargets'],
+  ['targets inactive warrant security', 'validateActiveSecurityTargets'],
+  ['targets inactive equity compensation security', 'validateActiveSecurityTargets'],
+  ['has duplicate conversion trigger IDs', 'validateConvertibleIssuanceTemporalTerms'],
+  ['has duplicate exercise trigger IDs', 'validateWarrantIssuanceTemporalTerms'],
+];
+
+/** Best-effort mapping of a DAML assert excerpt to its owning validator function name. */
+export function validatorFromExcerpt(excerpts: readonly string[]): string | undefined {
+  for (const excerpt of excerpts) {
+    for (const [prefix, validator] of VALIDATOR_CONTEXTS) {
+      if (excerpt.includes(prefix)) return validator;
+    }
+  }
+  return undefined;
+}
+
 export interface PortalReplayResult {
   portalAlias: string;
   sourceObjectCount: number;
@@ -127,6 +219,22 @@ export class ReplayPhaseError extends Error {
       (this as Error & { cause?: unknown }).cause = context.cause;
     }
   }
+}
+
+/** Collect deduplicated excerpt messages from an error's `cause` chain (excluding the error itself). */
+function collectCauseExcerpts(error: unknown): string[] {
+  const excerpts: string[] = [];
+  const seen = new Set<unknown>();
+  const readCause = (value: unknown): unknown =>
+    value instanceof Error ? (value as Error & { cause?: unknown }).cause : undefined;
+  let current = readCause(error);
+  while (current !== undefined && current !== null && !seen.has(current)) {
+    seen.add(current);
+    const excerpt = causeExcerpt(current);
+    if (excerpt.length > 0) excerpts.push(excerpt);
+    current = readCause(current);
+  }
+  return Array.from(new Set(excerpts));
 }
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -428,6 +536,32 @@ export function toReplayFailure(
     portalAlias,
     phase,
     message: PUBLIC_FAILURE_MESSAGES[phase],
+  };
+}
+
+/**
+ * Builds a failure record with customer identifiers and upstream diagnostics for CI-side diagnostics (workflow
+ * `::error` annotations, raw logs, artifacts). It must never be persisted into public reports, step summaries, or other
+ * payload-free surfaces.
+ */
+export function toInternalReplayFailure(
+  portalAlias: string,
+  error: unknown,
+  fallbackPhase: ReplayFailurePhase = 'infrastructure'
+): InternalReplayFailure {
+  const replayError = error instanceof ReplayPhaseError ? error : undefined;
+  const phase = replayError?.phase ?? fallbackPhase;
+  const excerpts = collectCauseExcerpts(error);
+  const validator = validatorFromExcerpt(excerpts);
+  return {
+    portalAlias,
+    phase,
+    message: PUBLIC_FAILURE_MESSAGES[phase],
+    ...(replayError?.entityType ? { entityType: replayError.entityType } : {}),
+    ...(replayError?.objectAlias ? { objectAlias: replayError.objectAlias } : {}),
+    ...(validator ? { validator } : {}),
+    ...(excerpts.length > 0 ? { excerpt: excerpts[0] } : {}),
+    ...(excerpts.length > 1 ? { causeExcerpt: excerpts.slice(1).join(' | ') } : {}),
   };
 }
 

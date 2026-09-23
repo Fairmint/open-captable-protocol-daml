@@ -218,7 +218,7 @@ jobs:
           replay_status=$?
           set -e
           if [ "$replay_status" -ne 0 ]; then
-            echo "::error::OCF replay failed. See the sanitized replay report artifact for details."
+            echo "::error::OCF replay failed. See the raw replay log artifact and the sanitized replay report artifact for details."
           fi
           exit "$replay_status"
         timeout-minutes: 120
@@ -229,16 +229,57 @@ jobs:
         run: ./node_modules/.bin/canton-dev-tools diagnostics || true
 
       # The replay log intentionally omits customer identifiers and payload values; this step
-      # derives a payload-free per-phase failure count from the ::error workflow commands.
-      - name: Extract sanitized failure summary from replay log
+      # derives a payload-free per-portal failure table from the ::error workflow commands.
+      # Raw upstream diagnostics and portal/object identifiers stay in the raw log artifact.
+      - name: Extract sanitized per-portal failure summary from replay log
         if: always()
         run: |
           set +e
           mkdir -p "$OCP_REPLAY_REPORT_DIR"
+          # Per-phase counts (unchanged posture).
           grep -oE '::error title=OCP LocalNet replay \([a-z-]+\)' "$RUNNER_TEMP/ocf-replay.log" \
             | sort | uniq -c | sort -rn \
             > "$OCP_REPLAY_REPORT_DIR/failure-phases.txt" || true
+          # Per-portal rows published by the replay script as
+          # ::error title=OCP LocalNet replay (<phase>)::<message> [portal=<alias> validator=<name|none> object=<alias|none>]
+          # where <alias> values are per-run HMAC digests. This stays payload-free; upstream
+          # excerpts and real identifiers are only in the raw log artifact.
+          grep -oE '::error title=OCP LocalNet replay \([a-z-]+\)::[^[]*\[portal=[^]]+\]' "$RUNNER_TEMP/ocf-replay.log" \
+            | sed -E 's/^::error title=OCP LocalNet replay \(([a-z-]+)\)::([^[]*) \[portal=([^ ]+) validator=([^ ]+) object=[^ ]+\]/\2 | \1 | \3 | \4/' \
+            | sort -u \
+            > "$OCP_REPLAY_REPORT_DIR/failure-portals.txt" || true
           set -e
+
+      - name: Upload raw replay log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocf-replay-raw-log-${{ inputs.database }}
+          path: ${{ runner.temp }}/ocf-replay.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Append sanitized per-portal failure table to job summary
+        if: always()
+        run: |
+          if [ -s "$OCP_REPLAY_REPORT_DIR/failure-portals.txt" ]; then
+            {
+              echo '### OCF replay failures (sanitized; raw detail in the ocf-replay-raw-log artifact)'
+              echo ''
+              echo '| portal alias | phase | validator / function | message |'
+              echo '|---|---|---|---|'
+              while IFS= read -r row; do
+                message="${row%% | *}"
+                row="${row#* | }"
+                phase="${row%% | *}"
+                row="${row#* | }"
+                portal="${row%% | *}"
+                validator="${row#* | }"
+                echo "| \`${portal}\` | ${phase} | ${validator} | ${message} |"
+              done < "$OCP_REPLAY_REPORT_DIR/failure-portals.txt"
+              echo ''
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload sanitized replay report
         if: always()
