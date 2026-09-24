@@ -1,5 +1,5 @@
 name: Replay OCF Database on LocalNet
-run-name: OCF LocalNet replay (${{ inputs.database }}) at ${{ inputs.target_sha }}
+run-name: OCF LocalNet replay (${{ inputs.database }}${{ inputs.target_sha && format(' at {0}', inputs.target_sha) || '' }})
 
 on:
   workflow_dispatch:
@@ -14,7 +14,15 @@ on:
           - production
       target_sha:
         description: Exact contract commit SHA to test
-        required: true
+        required: false
+        type: string
+      portal_id:
+        description: Optional portal UUID to restrict the replay to
+        required: false
+        type: string
+      report_prefix:
+        description: Optional artifact/report subdirectory suffix
+        required: false
         type: string
 
 permissions:
@@ -30,15 +38,18 @@ jobs:
     steps:
       - name: Validate request
         env:
-          EXPECTED_REF: refs/heads/${{ github.event.repository.default_branch }}
           TARGET_SHA: ${{ inputs.target_sha }}
+          PORTAL_ID: ${{ inputs.portal_id }}
         run: |
-          if [ "${{ inputs.database }}" = "production" ] && [ "$GITHUB_REF" != "$EXPECTED_REF" ]; then
-            echo "::error::Production database replays may only run from the repository default branch."
+          if [ "${{ inputs.database }}" = "production" ]; then
+            echo "Production replay protection is enforced by the production-data environment (required reviewer + deployment branch policy)."
+          fi
+          if [ -n "$TARGET_SHA" ] && ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::target_sha must be an exact lowercase 40-character Git commit SHA when provided."
             exit 1
           fi
-          if ! [[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]]; then
-            echo "::error::target_sha must be an exact lowercase 40-character Git commit SHA."
+          if [ -n "$PORTAL_ID" ] && ! [[ "$PORTAL_ID" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]]; then
+            echo "::error::portal_id must be a UUID when provided."
             exit 1
           fi
 
@@ -46,21 +57,25 @@ jobs:
     needs: validate-request
     runs-on: ubuntu-latest
     timeout-minutes: 240
-    # Both environments require approval and expose only a dedicated database_ro connection.
+    # Production replays are protected by the production-data environment (required reviewer
+    # HardlyDifficult + deployment branch policy), not by an in-workflow ref check.
     environment:
       name: ${{ inputs.database == 'production' && 'production-data' || 'development-data' }}
     env:
       CANTON_LOCALNET_AUTH_MODE: shared-secret
       CANTON_LOCALNET_INFRA_ONLY: 'true'
-      CANTON_LOCALNET_QUICKSTART_REF: 5c90cf4d0eb934712fd8c269b56e6272b605ccad
+      CANTON_LOCALNET_QUICKSTART_REF: 2f4edfc17621a7dfb6d44357050c22f4b3914c89
       CANTON_DEBUG: 'false'
       DISABLE_FILE_LOGGER: 'true'
+      OCP_REPLAY_REPORT_DIR: ${{ inputs.report_prefix != '' && format('artifacts/ocf-localnet-replay/{0}', inputs.report_prefix) || 'artifacts/ocf-localnet-replay' }}
+      OCP_REPLAY_PORTAL_ID: ${{ inputs.portal_id }}
 
     steps:
       - name: Checkout contracts
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
         with:
-          ref: ${{ inputs.target_sha }}
+          # Exact-sha replays test that contract commit; branch dispatches replay the dispatching branch's rules.
+          ref: ${{ inputs.target_sha != '' && inputs.target_sha || github.ref }}
           lfs: true
           persist-credentials: false
           submodules: false
@@ -70,7 +85,7 @@ jobs:
           TARGET_SHA: ${{ inputs.target_sha }}
         run: |
           actual_sha=$(git rev-parse HEAD)
-          if [ "$actual_sha" != "$TARGET_SHA" ]; then
+          if [ -n "$TARGET_SHA" ] && [ "$actual_sha" != "$TARGET_SHA" ]; then
             echo "::error::Checked out $actual_sha instead of requested $TARGET_SHA."
             exit 1
           fi
@@ -181,7 +196,7 @@ jobs:
         timeout-minutes: 45
 
       - name: Smoke test LocalNet
-        run: ./node_modules/.bin/canton-dev-tools smoke
+        run: ./node_modules/.bin/canton-dev-tools readiness
 
       - name: Verify cross-participant traffic accounting
         run: npm run test:localnet-traffic
@@ -194,12 +209,16 @@ jobs:
           POSTGRES_SSL_CA: ${{ secrets.OCP_REPLAY_SSL_CA }}
         run: |
           set +e
-          GITHUB_SHA="$OCP_REPLAY_TARGET_SHA" npm run replay-ocf:localnet -- --database "${{ inputs.database }}" \
+          replay_args=(--database "${{ inputs.database }}" --report-dir "$OCP_REPLAY_REPORT_DIR")
+          if [ -n "$OCP_REPLAY_PORTAL_ID" ]; then
+            replay_args+=(--portal-id "$OCP_REPLAY_PORTAL_ID")
+          fi
+          GITHUB_SHA="$OCP_REPLAY_TARGET_SHA" npm run replay-ocf:localnet -- "${replay_args[@]}" \
             > "$RUNNER_TEMP/ocf-replay.log" 2>&1
           replay_status=$?
           set -e
           if [ "$replay_status" -ne 0 ]; then
-            echo "::error::OCF replay failed. See the sanitized replay report artifact for details."
+            echo "::error::OCF replay failed. See the raw replay log artifact and the sanitized replay report artifact for details."
           fi
           exit "$replay_status"
         timeout-minutes: 120
@@ -207,19 +226,72 @@ jobs:
       # Canton command logs may contain submitted OCF payloads. Only inspect them when replay never started.
       - name: Show LocalNet startup logs
         if: failure() && steps.replay.outcome == 'skipped'
-        run: ./node_modules/.bin/canton-dev-tools logs || true
+        run: ./node_modules/.bin/canton-dev-tools diagnostics || true
+
+      # The replay log intentionally omits customer identifiers and payload values; this step
+      # derives a payload-free per-portal failure table from the ::error workflow commands.
+      # Raw upstream diagnostics and portal/object identifiers stay in the raw log artifact.
+      - name: Extract sanitized per-portal failure summary from replay log
+        if: always()
+        run: |
+          set +e
+          mkdir -p "$OCP_REPLAY_REPORT_DIR"
+          # Per-phase counts (unchanged posture).
+          grep -oE '::error title=OCP LocalNet replay \([a-z-]+\)' "$RUNNER_TEMP/ocf-replay.log" \
+            | sort | uniq -c | sort -rn \
+            > "$OCP_REPLAY_REPORT_DIR/failure-phases.txt" || true
+          # Per-portal rows published by the replay script as
+          # ::error title=OCP LocalNet replay (<phase>)::<message> [portal=<alias> validator=<name|none> object=<alias|none>]
+          # where <alias> values are per-run HMAC digests. This stays payload-free; upstream
+          # excerpts and real identifiers are only in the raw log artifact.
+          grep -oE '::error title=OCP LocalNet replay \([a-z-]+\)::[^[]*\[portal=[^]]+\]' "$RUNNER_TEMP/ocf-replay.log" \
+            | sed -E 's/^::error title=OCP LocalNet replay \(([a-z-]+)\)::([^[]*) \[portal=([^ ]+) validator=([^ ]+) object=[^ ]+\]/\2 | \1 | \3 | \4/' \
+            | sort -u \
+            > "$OCP_REPLAY_REPORT_DIR/failure-portals.txt" || true
+          set -e
+
+      - name: Upload raw replay log
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ocf-replay-raw-log-${{ inputs.database }}
+          path: ${{ runner.temp }}/ocf-replay.log
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Append sanitized per-portal failure table to job summary
+        if: always()
+        run: |
+          if [ -s "$OCP_REPLAY_REPORT_DIR/failure-portals.txt" ]; then
+            {
+              echo '### OCF replay failures (sanitized; raw detail in the ocf-replay-raw-log artifact)'
+              echo ''
+              echo '| portal alias | phase | validator / function | message |'
+              echo '|---|---|---|---|'
+              while IFS= read -r row; do
+                message="${row%% | *}"
+                row="${row#* | }"
+                phase="${row%% | *}"
+                row="${row#* | }"
+                portal="${row%% | *}"
+                validator="${row#* | }"
+                echo "| \`${portal}\` | ${phase} | ${validator} | ${message} |"
+              done < "$OCP_REPLAY_REPORT_DIR/failure-portals.txt"
+              echo ''
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: Upload sanitized replay report
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: ocf-localnet-replay-${{ inputs.database }}-${{ github.run_id }}
-          path: artifacts/ocf-localnet-replay/
+          name: ocf-localnet-replay-${{ inputs.database }}-${{ inputs.report_prefix || github.run_id }}
+          path: ${{ inputs.report_prefix != '' && format('artifacts/ocf-localnet-replay/{0}/', inputs.report_prefix) || 'artifacts/ocf-localnet-replay/' }}
           if-no-files-found: warn
           retention-days: 7
 
       - name: Stop LocalNet
         if: always()
         run: |
-          ./node_modules/.bin/canton-dev-tools stop || true
+          ./node_modules/.bin/canton-dev-tools teardown || true
           docker volume prune --force || true

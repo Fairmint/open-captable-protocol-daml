@@ -11,6 +11,7 @@ import {
   renderReplayMarkdown,
   ReplayPhaseError,
   resolveDatabaseUrl,
+  toInternalReplayFailure,
   toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
@@ -372,6 +373,39 @@ async function run(): Promise<void> {
     new ReplayPhaseError('batch', 'Sensitive Person and stakeholder-secret-id failed')
   );
   assert.equal(failure.phase, 'batch');
+  assert.doesNotMatch(failure.message, /Sensitive Person|stakeholder-secret-id/);
+
+  // Internal CI diagnostics may carry IDs and upstream excerpts, but must never leak into
+  // the public failure message or reports.
+  const underlying = new Error('DAML interpretation error: Conversion issuance conv-issuer-secret-id not found');
+  const internalFailure = toInternalReplayFailure(
+    'portal-run-local',
+    new ReplayPhaseError('batch', 'An atomic full-cap-table replay failed on LocalNet.', { cause: underlying })
+  );
+  assert.equal(internalFailure.phase, 'batch');
+  assert.equal(
+    internalFailure.excerpt,
+    'DAML interpretation error: Conversion issuance conv-issuer-secret-id not found'
+  );
+  assert.doesNotMatch(internalFailure.message, /conv-issuer-secret-id/);
+
+  const unmappedInternal = toInternalReplayFailure('portal-run-local', new Error('plain infrastructure failure'));
+  assert.equal(unmappedInternal.phase, 'infrastructure');
+  assert.equal(unmappedInternal.validator, undefined);
+
+  const mappedValidator = toInternalReplayFailure(
+    'portal-run-local',
+    new ReplayPhaseError('batch', 'An atomic full-cap-table replay failed on LocalNet.', {
+      cause: new Error(
+        'Convertible issuance stakeholder not found: stakeholder-secret-id (from issuance conv-issuer-secret-id)'
+      ),
+    })
+  );
+  assert.equal(mappedValidator.validator, 'validateConvertibleIssuanceReferences');
+  assert.equal(
+    mappedValidator.excerpt,
+    'Convertible issuance stakeholder not found: stakeholder-secret-id (from issuance conv-issuer-secret-id)'
+  );
   assert.doesNotMatch(failure.message, /Sensitive Person|stakeholder-secret-id/);
 
   const privateReport: ReplayReport = {

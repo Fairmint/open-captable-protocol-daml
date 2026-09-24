@@ -35,6 +35,7 @@ import {
   toOcfCreateOperation,
   toPublicReplayReport,
   toReplayFailure,
+  toInternalReplayFailure,
   type DatabaseOcfRow,
   type PortalReplayResult,
   type PreparedOcfObject,
@@ -737,8 +738,23 @@ async function run(options: ReplayOptions): Promise<ReplayReport> {
           success: false,
           failure,
         });
+        const internalFailure = toInternalReplayFailure(portalAlias, error);
+        const internalDetail = [
+          internalFailure.validator,
+          internalFailure.objectAlias,
+          internalFailure.excerpt,
+          internalFailure.causeExcerpt,
+        ].filter((part): part is string => typeof part === 'string' && part.length > 0);
+        // Raw diagnostics (portal UUID, real object IDs, upstream excerpts) go only to the
+        // replay log, which CI publishes as the ocf-replay-raw-log-* artifact. They must
+        // never reach public reports, step summaries, or workflow annotations.
         console.error(
-          `::error title=OCP LocalNet replay (${failure.phase})::${escapeWorkflowCommand(failure.message)}`
+          `[ocf-replay-failure] portal=${portalRows[0].portalId} alias=${internalFailure.portalAlias} ` +
+            `phase=${failure.phase}${internalDetail.length > 0 ? ` detail=${internalDetail.join(' | ')}` : ''}`
+        );
+        console.error(
+          `::error title=OCP LocalNet replay (${failure.phase})::${escapeWorkflowCommand(failure.message)} ` +
+            `[portal=${internalFailure.portalAlias} validator=${internalFailure.validator ?? 'none'} object=${internalFailure.objectAlias ?? 'none'}]`
         );
       }
     }
