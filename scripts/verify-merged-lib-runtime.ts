@@ -12,7 +12,7 @@ import { getErrorMessage } from './types';
 const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
-/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v34). */
+/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v35). */
 const REQUIRED_RELATIVE_FILES = [
   'Fairmint/OpenCapTable/CapTable/module.js',
   'Fairmint/OpenCapTable/OcpFactory/module.js',

@@ -46,7 +46,7 @@ for exact resolution behavior.
 The public [GitHub wiki](https://github.com/Fairmint/open-captable-protocol-daml/wiki) is the
 canonical guide for contract architecture, OCF validation, development, testing, DAR backup, and
 release policy. The active package's
-[`daml.yaml`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/OpenCapTable-v34/daml.yaml),
+[`daml.yaml`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/OpenCapTable-v35/daml.yaml),
 [`multi-package.yaml`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/multi-package.yaml),
 [`package.json`](https://github.com/Fairmint/open-captable-protocol-daml/blob/main/package.json),
 and [`scripts/`](https://github.com/Fairmint/open-captable-protocol-daml/tree/main/scripts) remain

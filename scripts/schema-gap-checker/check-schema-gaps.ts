@@ -5,7 +5,7 @@
  * schemas, compares DAML fields against OCF properties, and reports any missing fields.
  *
  * Usage: npx tsx scripts/schema-gap-checker/check-schema-gaps.ts npx tsx
- * scripts/schema-gap-checker/check-schema-gaps.ts --package OpenCapTable-v34 npx tsx
+ * scripts/schema-gap-checker/check-schema-gaps.ts --package OpenCapTable-v35 npx tsx
  * scripts/schema-gap-checker/check-schema-gaps.ts --ocf-schema-dir /path/to/schema
  */
 

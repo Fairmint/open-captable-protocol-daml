@@ -215,14 +215,14 @@ async function run(): Promise<void> {
   assert.equal(
     matchesLedgerTemplateId(
       '534319ff0f8e273fce07984ee471fa86c19b15528e177f7e3e42ba858d89ed8d:Fairmint.OpenCapTable.CapTable:CapTable',
-      '#OpenCapTable-v34:Fairmint.OpenCapTable.CapTable:CapTable'
+      '#OpenCapTable-v35:Fairmint.OpenCapTable.CapTable:CapTable'
     ),
     true
   );
   assert.equal(
     matchesLedgerTemplateId(
       '534319ff0f8e273fce07984ee471fa86c19b15528e177f7e3e42ba858d89ed8d:Fairmint.OpenCapTable.OCF.Issuer:Issuer',
-      '#OpenCapTable-v34:Fairmint.OpenCapTable.CapTable:CapTable'
+      '#OpenCapTable-v35:Fairmint.OpenCapTable.CapTable:CapTable'
     ),
     false
   );
