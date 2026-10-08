@@ -132,7 +132,7 @@ async function main() {
     return;
   }
 
-  const response = await client.submitAndWaitForTransactionTree({
+  const response = await client.submitAndWaitForTransaction({
     commands: [
       {
         CreateCommand: {
@@ -150,13 +150,13 @@ const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 
 
 function finishCreate(
   network: 'devnet' | 'mainnet',
-  response: { transactionTree: { eventsById: Record<string, unknown> } },
+  response: unknown,
   outputPath: string,
   pkg: { name: string; version: string; sourceDir: string }
 ): void {
   const { created } = extractEventsFromTransaction(response);
   if (created.length !== 1) {
-    throw new Error(`Expected exactly 1 CreatedTreeEvent, got ${created.length}`);
+    throw new Error(`Expected exactly 1 CreatedEvent, got ${created.length}`);
   }
 
   const { contractId, templateId: resultTemplateId } = created[0];

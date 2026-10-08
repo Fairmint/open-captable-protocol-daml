@@ -6,6 +6,7 @@ import path from 'path';
 
 import {
   Canton,
+  findCreatedEventByTemplateId,
   type LedgerJsonApiClient,
   type ScanApiClient,
   type ValidatorApiClient,
@@ -24,7 +25,6 @@ import {
   escapeWorkflowCommand,
   groupRowsByPortal,
   hashIdentifier,
-  matchesLedgerTemplateId,
   parseReplayOptions,
   preparePortal,
   renderReplayMarkdown,
@@ -100,13 +100,6 @@ interface ContractDetails {
   templateId: string;
   createdEventBlob: string;
   synchronizerId: string;
-}
-
-interface CreatedEventValue {
-  contractId: string;
-  templateId: string;
-  createdEventBlob?: string;
-  createArgument?: unknown;
 }
 
 type TrafficCounters = readonly [number | undefined, number | undefined];
@@ -373,17 +366,6 @@ async function loadLocalContractArtifacts(): Promise<{ templates: LocalTemplates
   };
 }
 
-function findCreatedEvent(response: unknown, expectedTemplateId: string): CreatedEventValue {
-  const { transactionTree } = response as { transactionTree?: { eventsById?: Record<string, unknown> } };
-  const { eventsById: events = {} } = transactionTree ?? {};
-  for (const event of Object.values(events)) {
-    if (!event || typeof event !== 'object' || !('CreatedTreeEvent' in event)) continue;
-    const created = (event as { CreatedTreeEvent?: { value?: CreatedEventValue } }).CreatedTreeEvent?.value;
-    if (created?.templateId && matchesLedgerTemplateId(created.templateId, expectedTemplateId)) return created;
-  }
-  throw new Error('Expected created contract event was not present in the transaction tree');
-}
-
 async function ensureActAsRight(ledger: LedgerJsonApiClient, actAsRights: Set<string>, party: string): Promise<void> {
   if (actAsRights.has(party)) return;
   await ledger.grantUserRights({
@@ -504,7 +486,7 @@ async function allocateIssuerParty(context: ReplayLedgerContext, portalAlias: st
 
 async function authorizeIssuer(context: ReplayLedgerContext, issuerParty: string): Promise<ContractDetails> {
   try {
-    const response = await context.operatorLedger.submitAndWaitForTransactionTree({
+    const response = await context.operatorLedger.submitAndWaitForTransaction({
       commands: [
         {
           ExerciseCommand: {
@@ -517,7 +499,10 @@ async function authorizeIssuer(context: ReplayLedgerContext, issuerParty: string
       ],
       actAs: [context.systemOperatorParty],
     });
-    const created = findCreatedEvent(response, context.templates.issuerAuthorization);
+    const created = findCreatedEventByTemplateId(response, context.templates.issuerAuthorization);
+    if (!created) {
+      throw new Error('Expected IssuerAuthorization create event was not present in the transaction');
+    }
     const contractEvents = await context.operatorLedger.getEventsByContractId({
       contractId: created.contractId,
       readAs: [context.systemOperatorParty],
@@ -530,7 +515,7 @@ async function authorizeIssuer(context: ReplayLedgerContext, issuerParty: string
       contractId: created.contractId,
       templateId: created.templateId,
       createdEventBlob: createdEvent.createdEventBlob,
-      synchronizerId: response.transactionTree.synchronizerId,
+      synchronizerId: response.transaction.synchronizerId,
     };
   } catch (error) {
     throw new ReplayPhaseError('authorization', 'Failed to authorize a LocalNet issuer', { cause: error });
@@ -549,12 +534,15 @@ async function createCapTable(
       issuerParty,
       issuerData: issuer.data as unknown as OcfIssuer,
     });
-    const response = await context.issuerLedger.submitAndWaitForTransactionTree({
+    const response = await context.issuerLedger.submitAndWaitForTransaction({
       commands: [built.command],
       actAs: [issuerParty],
       disclosedContracts: built.disclosedContracts.filter((contract) => contract.createdEventBlob.length > 0),
     });
-    const created = findCreatedEvent(response, context.templates.capTable);
+    const created = findCreatedEventByTemplateId(response, context.templates.capTable);
+    if (!created) {
+      throw new Error('Expected CapTable create event was not present in the transaction');
+    }
     return { contractId: created.contractId, templateId: created.templateId };
   } catch (error) {
     throw new ReplayPhaseError('issuer', 'Failed to create the issuer and empty CapTable', {

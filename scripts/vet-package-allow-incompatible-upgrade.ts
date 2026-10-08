@@ -63,7 +63,7 @@ function parseArgs(): {
   return { network, provider, packageId, dryRun, synchronizerId };
 }
 
-/** JSON body for POST /v2/package-vetting (matches Ledger JSON OpenAPI / ScalaPB relaxed codecs). */
+/** JSON body for POST /v2/package-vetting/update (matches Ledger JSON OpenAPI / ScalaPB relaxed codecs). */
 function buildUpdateVettedPackagesBody(
   packageId: string,
   dryRun: boolean,
@@ -96,7 +96,7 @@ function buildUpdateVettedPackagesBody(
 async function main(): Promise<void> {
   const { network, provider, packageId, dryRun, synchronizerId } = parseArgs();
   const client = createLedgerJsonApiClient(network, provider);
-  const url = `${client.getApiUrl()}/v2/package-vetting`;
+  const url = `${client.getApiUrl()}/v2/package-vetting/update`;
   const body = buildUpdateVettedPackagesBody(packageId, dryRun, synchronizerId);
 
   console.log(`\nPOST ${url}`);
