@@ -5,7 +5,12 @@ import { readFileSync } from 'node:fs';
 import { access } from 'node:fs/promises';
 import path from 'node:path';
 
-import { Canton, type LedgerJsonApiClient, type ScanApiClient } from '@fairmint/canton-node-sdk';
+import {
+  Canton,
+  findCreatedEventByTemplateId,
+  type LedgerJsonApiClient,
+  type ScanApiClient,
+} from '@fairmint/canton-node-sdk';
 import { OcpClient, toCantonConfig } from '@open-captable-protocol/canton';
 import { createFactory } from '@open-captable-protocol/canton/replication';
 
@@ -14,11 +19,6 @@ const LOCALNET_USER_ID = 'ledger-api-user';
 // two-sided OCP flow until both authoritative extra-traffic counters become non-zero.
 const MAX_INTERACTIONS = 125;
 const TRAFFIC_POLL_INTERVAL = 5;
-
-interface CreatedEventValue {
-  contractId: string;
-  templateId: string;
-}
 
 interface TrafficSnapshot {
   extraConsumed: number;
@@ -41,16 +41,6 @@ function localnetClient(provider: 'app-provider' | 'app-user'): Canton {
       scanApiUrl: 'http://scan.localhost:4000/api/scan',
     })
   );
-}
-
-function findCreatedEvent(response: unknown, expectedTemplateId: string): CreatedEventValue {
-  const { transactionTree } = response as { transactionTree?: { eventsById?: Record<string, unknown> } };
-  for (const event of Object.values(transactionTree?.eventsById ?? {})) {
-    if (!event || typeof event !== 'object' || !('CreatedTreeEvent' in event)) continue;
-    const created = (event as { CreatedTreeEvent?: { value?: CreatedEventValue } }).CreatedTreeEvent?.value;
-    if (created?.templateId.endsWith(expectedTemplateId.slice(expectedTemplateId.indexOf(':')))) return created;
-  }
-  throw new Error(`Expected ${expectedTemplateId} creation was not present in the transaction tree`);
 }
 
 async function findLocalParty(ledger: LedgerJsonApiClient, marker: string): Promise<string> {
@@ -138,7 +128,7 @@ async function main(): Promise<void> {
   let interactions = 0;
 
   for (let index = 1; index <= MAX_INTERACTIONS; index += 1) {
-    const authorizationResponse = await provider.ledger.submitAndWaitForTransactionTree({
+    const authorizationResponse = await provider.ledger.submitAndWaitForTransaction({
       commands: [
         {
           ExerciseCommand: {
@@ -151,7 +141,8 @@ async function main(): Promise<void> {
       ],
       actAs: [systemOperatorParty],
     });
-    const authorization = findCreatedEvent(authorizationResponse, templates.issuerAuthorization);
+    const authorization = findCreatedEventByTemplateId(authorizationResponse, templates.issuerAuthorization);
+    assert(authorization, `Expected ${templates.issuerAuthorization} create event was not present in the transaction`);
     const authorizationEvents = await provider.ledger.getEventsByContractId({
       contractId: authorization.contractId,
       readAs: [systemOperatorParty],
@@ -164,7 +155,7 @@ async function main(): Promise<void> {
         contractId: authorization.contractId,
         templateId: authorization.templateId,
         createdEventBlob: authorizationBlob,
-        synchronizerId: authorizationResponse.transactionTree.synchronizerId,
+        synchronizerId: authorizationResponse.transaction.synchronizerId,
       },
       issuerParty,
       issuerData: {
@@ -175,12 +166,13 @@ async function main(): Promise<void> {
         country_of_formation: 'US',
       },
     });
-    const capTableResponse = await user.ledger.submitAndWaitForTransactionTree({
+    const capTableResponse = await user.ledger.submitAndWaitForTransaction({
       commands: [built.command],
       actAs: [issuerParty],
       disclosedContracts: built.disclosedContracts,
     });
-    const capTable = findCreatedEvent(capTableResponse, templates.capTable);
+    const capTable = findCreatedEventByTemplateId(capTableResponse, templates.capTable);
+    assert(capTable, `Expected ${templates.capTable} create event was not present in the transaction`);
     if (index === 1) {
       const batch = ocp.OpenCapTable.capTable.update({
         capTableContractId: capTable.contractId,
