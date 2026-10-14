@@ -6,14 +6,21 @@
 -- (StockTransfer and StockIssuance) that are not listed in the CapTable root and, on request,
 -- creates a `TransferReceipt`. No choice here fetches the CapTable root or any other holder's
 -- position.
+--
+-- Holds are data on lots (`LotHold`): quantity holds reserve part of a lot for one pending
+-- register transfer or a scrip mint, and stops lock a whole lot. A transfer without a hold
+-- reference draws only free quantity (a lot's quantity less its quantity holds, nothing while it is
+-- stopped); a transfer under a reference draws exactly the register-settlement holds with that
+-- reference and removes them. Holds never expire on the ledger: a transfer or `Registry_Release`
+-- ends them.
 module Fairmint.OpenCapTable.Positions where
 
-import DA.Action (foldlA, unless)
+import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_)
 import DA.List (head, unique)
 import qualified DA.Map as Map
 import DA.Map (Map)
-import DA.Optional (isNone)
+import DA.Optional (isNone, isSome, mapOptional)
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary)
@@ -48,7 +55,8 @@ data HoldReleaseCode
   | ReleaseCodeCounterpartyWithdrew
     -- ^ a holder revoked an approval
   | ReleaseCodeStopTransfer
-    -- ^ a stop was placed on the lot (set by `Registry_Hold`, never passed by a caller)
+    -- ^ a stop was placed on a lot of the transfer: set by `Registry_Hold` on the holds the stop
+    -- releases; a caller passes it to `Registry_Release` for the transfer's holds on other lots
   | ReleaseCodeCorporateAction
     -- ^ a corporate action on the class
   | ReleaseCodeStopLifted
@@ -141,9 +149,60 @@ data TransferResult = TransferResult with
       -- ^ Some exactly when the caller requested a receipt
   deriving (Eq, Show)
 
+-- | Whether a lot is fully vested as of a date: every inline vesting is dated on or before it, and
+-- a lot on a vesting schedule (`vesting_terms_id`) has its full vesting recorded on or before it
+-- (`Registry_RecordFullyVested`). The position does not hold vesting terms or events, so the
+-- ledger cannot compute a schedule itself; until the issuer records full vesting, such a lot
+-- counts as unvested.
 lotIsVested : Time -> PositionLot -> Bool
 lotIsVested asOf lot =
-  isNone lot.issuance.vesting_terms_id && all (\v -> v.date <= asOf) lot.issuance.vestings
+  all (\v -> v.date <= asOf) lot.issuance.vestings
+  && (isNone lot.issuance.vesting_terms_id || optional False (<= asOf) lot.fully_vested_on)
+
+-- | Whether a hold holds a quantity (`HoldPurposeRegisterSettlement`, `HoldPurposeScripMint`)
+-- rather than locking the whole lot (`HoldPurposeStopTransfer`).
+isQuantityHold : LotHold -> Bool
+isQuantityHold h = case h.purpose of
+  HoldPurposeRegisterSettlement -> True
+  HoldPurposeScripMint -> True
+  HoldPurposeStopTransfer -> False
+
+-- | Whether a hold has this purpose and reference.
+holdMatches : HoldPurpose -> Text -> LotHold -> Bool
+holdMatches purpose reference h = h.purpose == purpose && h.reference == reference
+
+-- | The lot's hold with this purpose and reference, if any ((purpose, reference) is unique on a
+-- lot).
+lotHoldFor : HoldPurpose -> Text -> PositionLot -> Optional LotHold
+lotHoldFor purpose reference lot = find (holdMatches purpose reference) lot.holds
+
+-- | Whether the lot carries any stop. A stopped lot cannot be drawn and has no free quantity.
+lotIsStopped : PositionLot -> Bool
+lotIsStopped lot = any (\h -> h.purpose == HoldPurposeStopTransfer) lot.holds
+
+-- | The sum of the lot's quantity holds. Stops hold no quantity.
+lotHeldQuantity : PositionLot -> Decimal
+lotHeldQuantity lot = sum (mapOptional (.quantity) (filter isQuantityHold lot.holds))
+
+-- | What a transfer without a hold reference, or a new quantity hold, may take from the lot:
+-- nothing while the lot is stopped, else its quantity less its quantity holds.
+lotFreeQuantity : PositionLot -> Decimal
+lotFreeQuantity lot = if lotIsStopped lot then 0.0 else lot.issuance.quantity - lotHeldQuantity lot
+
+-- | A hold is well formed: it has a reference, and a positive quantity exactly when it is a
+-- quantity hold (a stop locks the whole lot and carries none).
+holdOk : LotHold -> Bool
+holdOk h =
+  h.reference /= ""
+  && if isQuantityHold h then optional False (> 0.0) h.quantity else isNone h.quantity
+
+-- | A lot's holds are well formed, unique by (purpose, reference), and its quantity holds do not
+-- exceed its quantity.
+lotHoldsOk : PositionLot -> Bool
+lotHoldsOk lot =
+  all holdOk lot.holds
+  && unique (map (\h -> (h.purpose, h.reference)) lot.holds)
+  && lotHeldQuantity lot <= lot.issuance.quantity
 
 positionOk : Text -> Text -> Map Text PositionLot -> Bool
 positionOk stockClassId stakeholderId lots =
@@ -152,7 +211,8 @@ positionOk stockClassId stakeholderId lots =
       sid == l.issuance.security_id
       && l.issuance.quantity > 0.0
       && l.issuance.stakeholder_id == stakeholderId
-      && l.issuance.stock_class_id == stockClassId)
+      && l.issuance.stock_class_id == stockClassId
+      && lotHoldsOk l)
     (Map.toList lots)
 
 template StockPosition
@@ -255,12 +315,29 @@ template PositionRegistry
                 None -> abort ("lot " <> d.security_id <> " is not in the transferor's position")
               assertMsg ("draw quantity must be positive for " <> d.security_id) (d.quantity > 0.0)
               assertMsg ("draw exceeds lot quantity for " <> d.security_id) (d.quantity <= lot.issuance.quantity)
+              -- A stop locks the whole lot, even against the transfer its own holds were placed for.
+              assertMsg ("lot " <> d.security_id <> " is stopped") (not (lotIsStopped lot))
               assertMsg ("lot " <> d.security_id <> " is not fully vested") (lotIsVested date lot)
               assertMsg ("lot " <> d.security_id <> " was issued after the transfer date") (lot.issuance.date <= date)
+              -- Held quantity serves only the transfer under its reference, and a transfer under a
+              -- reference draws exactly its holds, never free quantity. `otherHolds` are the holds
+              -- this draw leaves on the lot: all of them, less the drawn one.
+              otherHolds <- case reference of
+                None -> do
+                  assertMsg ("draw exceeds the free quantity of lot " <> d.security_id)
+                    (d.quantity <= lotFreeQuantity lot)
+                  pure lot.holds
+                Some r -> case lotHoldFor HoldPurposeRegisterSettlement r lot of
+                  None -> abort ("lot " <> d.security_id <> " carries no register-settlement hold with reference " <> r)
+                  Some h -> do
+                    assertMsg ("draw on lot " <> d.security_id <> " must equal its register-settlement hold with reference " <> r)
+                      (h.quantity == Some d.quantity)
+                    pure (filter (not . holdMatches HoldPurposeRegisterSettlement r) lot.holds)
               let toSec = recordId "B" i
                   remaining = lot.issuance.quantity - d.quantity
                   remainderSec = if remaining > 0.0 then Some (recordId "R" i) else None
                   childAncestry = lot.ancestry ++ [lot.issuance.security_id]
+                  -- Only fully vested lots are drawn, so the transferee's lot carries no vesting.
                   toIssuance = lot.issuance with
                     id = recordId "ISS-B" i
                     custom_id = toSec
@@ -270,6 +347,7 @@ template PositionRegistry
                     share_price = share_price
                     stakeholder_id = transferee.stakeholder_id
                     vestings = []
+                    vesting_terms_id = None
                     share_numbers_issued = []
                     comments = []
                     consideration_text = None
@@ -281,6 +359,10 @@ template PositionRegistry
                     ancestry = childAncestry
                     holds = []
                     fully_vested_on = None
+              -- Unreachable under the checks above (only a lot whose sole hold is the drawn one can
+              -- be drawn in full), but a lot's holds must never vanish with it.
+              when (isNone remainderSec) $
+                assertMsg ("lot " <> d.security_id <> " carries other holds") (null otherHolds)
               assertMsg ("lot id " <> toSec <> " already exists in the transferee's position") (not (Map.member toSec toLots))
               forA_ remainderSec \r ->
                 assertMsg ("lot id " <> r <> " already exists in the transferor's position") (not (Map.member r fromLots))
@@ -299,6 +381,9 @@ template PositionRegistry
               (fromLots', extra) <- case remainderSec of
                 None -> pure (Map.delete d.security_id fromLots, [])
                 Some rsec -> do
+                  -- The drawn lot was fully vested, so its remainder carries no vesting either.
+                  -- The remainder keeps the lot's other holds (with their references), so their
+                  -- transfers need no new placement.
                   let remIssuance = lot.issuance with
                         id = recordId "ISS-R" i
                         custom_id = rsec
@@ -306,6 +391,7 @@ template PositionRegistry
                         quantity = remaining
                         security_id = rsec
                         vestings = []
+                        vesting_terms_id = None
                         share_numbers_issued = []
                         comments = []
                       remLot = PositionLot with
@@ -313,7 +399,7 @@ template PositionRegistry
                         origin_security_id = lot.origin_security_id
                         origin_date = lot.origin_date
                         ancestry = childAncestry
-                        holds = lot.holds
+                        holds = otherHolds
                         fully_vested_on = None
                   ricid <- create StockIssuance with context; issuance_data = remIssuance
                   pure (Map.insert rsec remLot (Map.delete d.security_id fromLots), [ricid])
@@ -331,6 +417,15 @@ template PositionRegistry
 
         (fromLots, toLots, transfers, newIssuances, _) <-
           foldlA step (tp.lots, toBase, [], [], 0) draws
+
+        -- A transfer under a reference settles all of its holds or none: a lot it leaves undrawn
+        -- would keep a hold that no transfer can settle any more.
+        forA_ reference \r -> do
+          let drawn = map (.security_id) draws
+          forA_ (Map.toList tp.lots) \(sid, lot) ->
+            when (isSome (lotHoldFor HoldPurposeRegisterSettlement r lot)) $
+              assertMsg ("lot " <> sid <> " carries a register-settlement hold with reference " <> r <> " but is not drawn")
+                (sid `elem` drawn)
 
         archive transferor_position
         fromNew <- if Map.null fromLots
@@ -434,7 +529,63 @@ template PositionRegistry
         lots : [HoldLot]
       controller context.issuer
       do
-        abort "Registry_Hold: not implemented"
+        assertMsg "hold at least one lot" (not (null lots))
+        assertMsg "each lot is held at most once" (unique (map (.security_id) lots))
+        assertMsg "hold reference must be non-empty" (reference /= "")
+        -- A register-settlement hold is drawn by one transfer, so it obeys the transfer's lot cap.
+        when (purpose == HoldPurposeRegisterSettlement) $
+          assertMsg ("a register-settlement hold covers at most " <> show maxLotsPerTransfer <> " lots")
+            (length lots <= maxLotsPerTransfer)
+
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+
+        let holdQuantity : Text -> Optional Decimal -> Update Decimal
+            holdQuantity sid q = case q of
+              None -> abort ("hold quantity must be given for lot " <> sid)
+              Some x -> do
+                assertMsg ("hold quantity must be positive for lot " <> sid) (x > 0.0)
+                pure x
+            place (acc, released) hl = do
+              let sid = hl.security_id
+              lot <- case Map.lookup sid acc of
+                Some l -> pure l
+                None -> abort ("lot " <> sid <> " is not in the position")
+              assertMsg ("lot " <> sid <> " already carries a " <> show purpose <> " hold with reference " <> reference)
+                (isNone (lotHoldFor purpose reference lot))
+              -- `kept`: the lot's holds that stay beside the new one.
+              (kept, releasedHere) <- case purpose of
+                HoldPurposeRegisterSettlement -> do
+                  -- The transfer checks, applied now so the transfer under this reference can
+                  -- draw the hold later.
+                  q <- holdQuantity sid hl.quantity
+                  assertMsg ("lot " <> sid <> " is stopped") (not (lotIsStopped lot))
+                  assertMsg ("lot " <> sid <> " is not fully vested") (lotIsVested date lot)
+                  assertMsg ("lot " <> sid <> " was issued after the hold date") (lot.issuance.date <= date)
+                  assertMsg ("hold exceeds the free quantity of lot " <> sid) (q <= lotFreeQuantity lot)
+                  pure (lot.holds, [])
+                HoldPurposeScripMint -> do
+                  -- A stopped lot has no free quantity, so this also keeps scrip holds off
+                  -- stopped lots.
+                  q <- holdQuantity sid hl.quantity
+                  assertMsg ("hold exceeds the free quantity of lot " <> sid) (q <= lotFreeQuantity lot)
+                  pure (lot.holds, [])
+                HoldPurposeStopTransfer -> do
+                  -- A stop needs only the lot, whatever its vesting or eligibility. The lot's
+                  -- register-settlement holds can no longer settle, so the stop releases them;
+                  -- scrip-mint holds and other stops stay.
+                  assertMsg ("a stop locks the whole lot: no quantity may be given for lot " <> sid)
+                    (isNone hl.quantity)
+                  let (settling, others) = partition (\h -> h.purpose == HoldPurposeRegisterSettlement) lot.holds
+                  pure (others, map (\h -> ReleasedHold with security_id = sid; hold = h; code = ReleaseCodeStopTransfer) settling)
+              let newHold = LotHold with purpose; reference; quantity = hl.quantity; date
+              pure (Map.insert sid (lot with holds = kept ++ [newHold]) acc, released ++ releasedHere)
+
+        (newLots, released) <- foldlA place (p.lots, []) lots
+        archive position
+        newPosition <- create p with lots = newLots
+        pure HoldResult with position = newPosition; released
 
     -- | Remove the holds with this purpose and reference from one position: from the listed lots
     -- (`Some`), or from every lot that carries one (`None`). Fails when it removes nothing.
@@ -447,7 +598,34 @@ template PositionRegistry
         security_ids : Optional [Text]
       controller context.issuer
       do
-        abort "Registry_Release: not implemented"
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+        let matches = holdMatches purpose reference
+        targets <- case security_ids of
+          None -> pure (Map.keys p.lots)
+          Some ids -> do
+            assertMsg "each lot is released at most once" (unique ids)
+            -- A listed lot without the hold means the caller's view of the position is stale.
+            forA_ ids \sid -> case Map.lookup sid p.lots of
+              None -> abort ("lot " <> sid <> " is not in the position")
+              Some lot ->
+                assertMsg ("lot " <> sid <> " carries no " <> show purpose <> " hold with reference " <> reference)
+                  (any matches lot.holds)
+            pure ids
+        let releaseLot (acc, released) sid = case Map.lookup sid acc of
+              None -> (acc, released)
+              Some lot ->
+                let (gone, kept) = partition matches lot.holds
+                in if null gone
+                  then (acc, released)
+                  else (Map.insert sid (lot with holds = kept) acc,
+                        released ++ map (\h -> ReleasedHold with security_id = sid; hold = h; code) gone)
+            (newLots, released) = foldl releaseLot (p.lots, []) targets
+        assertMsg "no hold to release" (not (null released))
+        archive position
+        newPosition <- create p with lots = newLots
+        pure ReleaseResult with position = newPosition; released
 
     -- | Record that lots on a vesting schedule (`vesting_terms_id`) fully vested by `date`, as the
     -- issuer computed from their vesting terms and events, so that a transfer on or after `date`
@@ -459,4 +637,20 @@ template PositionRegistry
         date : Time
       controller context.issuer
       do
-        abort "Registry_RecordFullyVested: not implemented"
+        assertMsg "record at least one lot" (not (null security_ids))
+        assertMsg "each lot is recorded at most once" (unique security_ids)
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+        newLots <- foldlA (\acc sid -> do
+            lot <- case Map.lookup sid acc of
+              Some l -> pure l
+              None -> abort ("lot " <> sid <> " is not in the position")
+            -- A lot without vesting terms vests by its inline vestings alone.
+            assertMsg ("lot " <> sid <> " has no vesting terms") (isSome lot.issuance.vesting_terms_id)
+            -- Recorded once: a later date would silently make a drawable lot undrawable again.
+            assertMsg ("full vesting of lot " <> sid <> " is already recorded") (isNone lot.fully_vested_on)
+            pure (Map.insert sid (lot with fully_vested_on = Some date) acc))
+          p.lots security_ids
+        archive position
+        create p with lots = newLots

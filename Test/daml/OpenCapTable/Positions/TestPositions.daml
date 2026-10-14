@@ -286,15 +286,29 @@ test_T4_newTransfereePositionAndMerge = do
   Some m <- queryContractId env.bob merged
   Map.keys m.lots === ["S-B1", "T4a-B-0", "T4b-B-0"]
 
+-- | Place register-settlement holds with this reference on lots of a position, at the transfer
+-- date, so that a transfer under the reference can draw them.
+holdForTransfer : Env -> ContractId StockPosition -> Text -> [(Text, Decimal)] -> Script (ContractId StockPosition)
+holdForTransfer env pos ref lots = do
+  r <- submit env.book.issuer $ exerciseCmd env.registry Registry_Hold with
+    position = pos; purpose = HoldPurposeRegisterSettlement; reference = ref; date = dTransfer
+    lots = map (\(s, q) -> HoldLot with security_id = s; quantity = Some q) lots
+  pure r.position
+
 -- R1: a transfer that requests a receipt creates exactly one, holding the delivered terms and the
--- IDs of the records the transfer wrote. The holders cannot see it.
+-- IDs of the records the transfer wrote. The holders cannot see it. The transfer runs under a hold
+-- reference, so the holds are placed first, and it removes them.
 test_R1_receiptOnRequest : Script ()
 test_R1_receiptOnRequest = do
   env <- setup
   let b = env.book
+  held <- holdForTransfer env env.posA "REF-R1" [("S-A1", 60.0), ("S-A2", 20.0)]
   r <- submit b.issuer $ exerciseCmd env.registry
-    ((transfer env "R1" env.posA (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)]) with
+    ((transfer env "R1" held (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)]) with
       reference = Some "REF-R1"; request_receipt = True)
+  Some fromPos <- pure r.transferor_position
+  Some a <- queryContractId b.issuer fromPos
+  map (\l -> l.holds) (Map.values a.lots) === [[], [], []]
   [(rc, receipt)] <- query @TransferReceipt b.issuer
   r.receipt === Some rc
   receipt === TransferReceipt with
@@ -318,12 +332,13 @@ test_R1_receiptOnRequest = do
   seenByBob <- query @TransferReceipt env.bob
   (seenByAlice, seenByBob) === ([], [])
 
--- R2: a transfer that does not request a receipt creates none, even with a reference.
+-- R2: a transfer that does not request a receipt creates none, even under a hold reference.
 test_R2_noReceiptUnlessRequested : Script ()
 test_R2_noReceiptUnlessRequested = do
   env <- setup
+  held <- holdForTransfer env env.posA "REF-R2" [("S-A1", 10.0)]
   r <- submit env.book.issuer $ exerciseCmd env.registry
-    ((transfer env "R2" env.posA None 10.0 [("S-A1", 10.0)]) with reference = Some "REF-R2")
+    ((transfer env "R2" held None 10.0 [("S-A1", 10.0)]) with reference = Some "REF-R2")
   r.receipt === None
   receipts <- query @TransferReceipt env.book.issuer
   receipts === []
