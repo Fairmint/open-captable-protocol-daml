@@ -1,0 +1,319 @@
+-- | Migration provenance: `MigrateToPositions` gives each lot the origin security, origin date and
+-- ancestry of its root stock history, and rejects history it cannot attribute to one parent.
+module OpenCapTable.Positions.TestMigrationProvenance where
+
+import DA.Assert
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import DA.Optional (fromOptional)
+import DA.Time (time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+
+-- Dates of the provenance books: issuances at dA, later records at dB, dC and dD.
+dA : Time
+dA = time (D.date 2024 Jan 01) 0 0 0
+
+dB : Time
+dB = time (D.date 2024 Jun 01) 0 0 0
+
+dC : Time
+dC = time (D.date 2025 Jan 01) 0 0 0
+
+dD : Time
+dD = time (D.date 2025 Jun 01) 0 0 0
+
+-- Root records with an explicit date.
+
+stock : Text -> Text -> Text -> Time -> Decimal -> CT.OcfCreateData
+stock cls sec sh date qty = CT.OcfCreateStockIssuance ((mkIssuance cls sec sh qty) with date = date)
+
+transferOf : Text -> Time -> Text -> Decimal -> [Text] -> Optional Text -> CT.OcfCreateData
+transferOf tid date sec qty resulting balance =
+  CT.OcfCreateStockTransfer ((mkTransfer tid sec qty resulting balance) with date = date)
+
+cancellationOf : Text -> Time -> Text -> Decimal -> Optional Text -> CT.OcfCreateData
+cancellationOf cid date sec qty balance = CT.OcfCreateStockCancellation StockCancellationOcfData with
+  id = cid; date = date; quantity = qty; reason_text = "Cancelled"; security_id = sec; comments = []
+  balance_security_id = balance
+
+repurchaseOf : Text -> Time -> Text -> Decimal -> Optional Text -> CT.OcfCreateData
+repurchaseOf rid date sec qty balance = CT.OcfCreateStockRepurchase StockRepurchaseOcfData with
+  id = rid; date = date; price = usd 1.0; quantity = qty; security_id = sec; comments = []
+  balance_security_id = balance; consideration_text = None
+
+conversionOf : Text -> Time -> Text -> Decimal -> [Text] -> Optional Text -> CT.OcfCreateData
+conversionOf cid date sec qty resulting balance = CT.OcfCreateStockConversion StockConversionOcfData with
+  id = cid; date = date; quantity_converted = qty; security_id = sec; comments = []
+  resulting_security_ids = resulting; balance_security_id = balance
+
+reissuanceOf : Text -> Time -> Text -> [Text] -> CT.OcfCreateData
+reissuanceOf rid date sec resulting = CT.OcfCreateStockReissuance StockReissuanceOcfData with
+  id = rid; date = date; security_id = sec; comments = []; resulting_security_ids = resulting
+  reason_text = None; split_transaction_id = None
+
+consolidationOf : Text -> Time -> [Text] -> Text -> CT.OcfCreateData
+consolidationOf cid date secs resulting = CT.OcfCreateStockConsolidation StockConsolidationOcfData with
+  id = cid; date = date; security_ids = secs; resulting_security_id = resulting; comments = []
+  reason_text = None
+
+optionGrant : Text -> Text -> Decimal -> CT.OcfCreateData
+optionGrant sec sh qty = CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
+  id = "ISS-" <> sec; custom_id = "EC-" <> sec; date = dA; compensation_type = OcfCompensationTypeOptionNSO
+  quantity = qty; security_id = sec; stakeholder_id = sh; comments = []; security_law_exemptions = []
+  vestings = []; termination_exercise_windows = []; base_price = None; board_approval_date = None
+  consideration_text = None; early_exercisable = None; exercise_price = Some (usd 1.0)
+  expiration_date = None; stock_class_id = None; stock_plan_id = None; stockholder_approval_date = None
+  vesting_terms_id = None
+
+exerciseOf : Text -> Time -> Text -> Decimal -> [Text] -> CT.OcfCreateData
+exerciseOf eid date sec qty resulting = CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+  id = eid; date = date; quantity = qty; security_id = sec; comments = []
+  resulting_security_ids = resulting; consideration_text = None
+
+-- | A book with classes SC (position-managed) and PREF, stakeholders SH-A, SH-B and SH-C, and the
+-- given records; positions are enabled for SC.
+provenanceBook : [CT.OcfCreateData] -> Script Book
+provenanceBook records = do
+  b0 <- newBook
+  b1 <- update b0
+    ([ CT.OcfCreateStockClass (mkStockClass "SC")
+     , CT.OcfCreateStockClass (mkStockClass "PREF")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-C")
+     ] ++ records) [] []
+  (root, _) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
+  pure b1 with root = root
+
+migration : Text -> Party -> [Text] -> CT.PositionMigration
+migration sh holder sids = CT.PositionMigration with stakeholder_id = sh; holder; security_ids = sids
+
+migrate : Book -> [CT.PositionMigration] -> Script (Book, [ContractId StockPosition])
+migrate b migrations = do
+  (root, positions) <- submit b.issuer $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+  let migrated = b with root = root
+  pure (migrated, positions)
+
+expectMigrationFails : Text -> Text -> Book -> [CT.PositionMigration] -> Script ()
+expectMigrationFails label reason b migrations =
+  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+
+-- | A lot's provenance and quantity: (origin security, origin date, ancestry, quantity).
+provenanceOf : Book -> ContractId StockPosition -> Text -> Script (Text, Time, [Text], Decimal)
+provenanceOf b position sid = do
+  Some p <- queryContractId b.issuer position
+  case Map.lookup sid p.lots of
+    Some l -> pure (l.origin_security_id, l.origin_date, l.ancestry, l.issuance.quantity)
+    None -> fail ("lot missing: " <> sid)
+
+data Chains = Chains with
+    book : Book
+    posA : ContractId StockPosition
+    posB : ContractId StockPosition
+    posC : ContractId StockPosition
+
+-- | Every chain the migration reconstructs, migrated in two batches (SH-A, then SH-B and SH-C):
+--
+-- * S-1: a plain issuance.
+-- * S-2 -> S-3: a full transfer. S-4 -> S-5 + balance S-6: a partial transfer.
+-- * S-10 -> S-11 (transfer) -> S-12 (balance of a partial cancellation) -> S-13 + balance S-14
+--   (partial transfer) -> S-15 (balance of a partial repurchase).
+-- * S-20 (PREF) -> S-21 (SC): a conversion into the class. S-22 -> S-23 (PREF) + balance S-24: a
+--   partial conversion out of it.
+-- * S-30 -> S-31 + S-32: a reissuance into two certificates.
+-- * EC-40 -> S-40 and EC-41 -> S-41 -> S-42: option exercises start a new holding.
+migratedChains : Script Chains
+migratedChains = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  b0 <- provenanceBook
+    [ stock "SC" "S-1" "SH-A" dA 100.0
+    , stock "SC" "S-2" "SH-A" dA 100.0
+    , transferOf "TR-2" dB "S-2" 100.0 ["S-3"] None
+    , stock "SC" "S-3" "SH-B" dB 100.0
+    , stock "SC" "S-4" "SH-A" dA 100.0
+    , transferOf "TR-4" dB "S-4" 30.0 ["S-5"] (Some "S-6")
+    , stock "SC" "S-5" "SH-C" dB 30.0
+    , stock "SC" "S-6" "SH-A" dB 70.0
+    , stock "SC" "S-10" "SH-A" dA 100.0
+    , transferOf "TR-10" dB "S-10" 100.0 ["S-11"] None
+    , stock "SC" "S-11" "SH-B" dB 100.0
+    , cancellationOf "CN-11" dC "S-11" 40.0 (Some "S-12")
+    , stock "SC" "S-12" "SH-B" dC 60.0
+    , transferOf "TR-12" dD "S-12" 50.0 ["S-13"] (Some "S-14")
+    , stock "SC" "S-13" "SH-C" dD 50.0
+    , stock "SC" "S-14" "SH-B" dD 10.0
+    , repurchaseOf "RP-14" dD "S-14" 4.0 (Some "S-15")
+    , stock "SC" "S-15" "SH-B" dD 6.0
+    , stock "PREF" "S-20" "SH-A" dA 100.0
+    , conversionOf "CV-20" dB "S-20" 100.0 ["S-21"] None
+    , stock "SC" "S-21" "SH-A" dB 100.0
+    , stock "SC" "S-22" "SH-B" dA 50.0
+    , conversionOf "CV-22" dB "S-22" 20.0 ["S-23"] (Some "S-24")
+    , stock "PREF" "S-23" "SH-B" dB 20.0
+    , stock "SC" "S-24" "SH-B" dB 30.0
+    , stock "SC" "S-30" "SH-C" dA 100.0
+    , reissuanceOf "RI-30" dB "S-30" ["S-31", "S-32"]
+    , stock "SC" "S-31" "SH-C" dB 60.0
+    , stock "SC" "S-32" "SH-C" dB 40.0
+    , optionGrant "EC-40" "SH-A" 100.0
+    , exerciseOf "EX-40" dB "EC-40" 10.0 ["S-40"]
+    , stock "SC" "S-40" "SH-A" dB 10.0
+    , optionGrant "EC-41" "SH-A" 100.0
+    , exerciseOf "EX-41" dB "EC-41" 20.0 ["S-41"]
+    , stock "SC" "S-41" "SH-A" dB 20.0
+    , transferOf "TR-41" dC "S-41" 20.0 ["S-42"] None
+    , stock "SC" "S-42" "SH-B" dC 20.0
+    ]
+  (b1, [posA]) <- migrate b0 [migration "SH-A" alice ["S-1", "S-6", "S-21", "S-40"]]
+  (book, [posB, posC]) <- migrate b1
+    [ migration "SH-B" bob ["S-3", "S-15", "S-24", "S-42"]
+    , migration "SH-C" carol ["S-5", "S-13", "S-31", "S-32"] ]
+  pure Chains with ..
+
+-- P1: a plain issuance is its own origin; a transfer's resulting security and a partial transfer's
+-- resulting and balance securities tack to the transferred security.
+test_P1_plainIssuanceAndTransfers : Script ()
+test_P1_plainIssuanceAndTransfers = do
+  c <- migratedChains
+  let b = c.book
+  provenanceOf b c.posA "S-1" >>= (=== ("S-1", dA, [], 100.0))
+  provenanceOf b c.posB "S-3" >>= (=== ("S-2", dA, ["S-2"], 100.0))
+  provenanceOf b c.posC "S-5" >>= (=== ("S-4", dA, ["S-4"], 30.0))
+  provenanceOf b c.posA "S-6" >>= (=== ("S-4", dA, ["S-4"], 70.0))
+
+-- P2: a chain of a transfer, a partial cancellation, a partial transfer and a partial repurchase
+-- keeps the first issuance's origin and date, with every intermediate security in order.
+test_P2_multiLevelChain : Script ()
+test_P2_multiLevelChain = do
+  c <- migratedChains
+  let b = c.book
+  provenanceOf b c.posC "S-13" >>= (=== ("S-10", dA, ["S-10", "S-11", "S-12"], 50.0))
+  provenanceOf b c.posB "S-15" >>= (=== ("S-10", dA, ["S-10", "S-11", "S-12", "S-14"], 6.0))
+
+-- P3: conversions (resulting and balance securities, across classes) and reissuances tack.
+test_P3_conversionAndReissuance : Script ()
+test_P3_conversionAndReissuance = do
+  c <- migratedChains
+  let b = c.book
+  provenanceOf b c.posA "S-21" >>= (=== ("S-20", dA, ["S-20"], 100.0))
+  provenanceOf b c.posB "S-24" >>= (=== ("S-22", dA, ["S-22"], 30.0))
+  provenanceOf b c.posC "S-31" >>= (=== ("S-30", dA, ["S-30"], 60.0))
+  provenanceOf b c.posC "S-32" >>= (=== ("S-30", dA, ["S-30"], 40.0))
+
+-- P4: stock from an option exercise starts a new holding: its own origin and issuance date, and
+-- the origin of anything transferred from it.
+test_P4_exerciseStartsNewOrigin : Script ()
+test_P4_exerciseStartsNewOrigin = do
+  c <- migratedChains
+  let b = c.book
+  provenanceOf b c.posA "S-40" >>= (=== ("S-40", dB, [], 10.0))
+  provenanceOf b c.posB "S-42" >>= (=== ("S-41", dB, ["S-41"], 20.0))
+  -- only the migrated securities are recorded as migrated, not their ancestors
+  Some root <- queryContractId b.issuer b.root
+  Map.keys (fromOptional Map.empty root.position_migrated_security_ids) ===
+    ["S-1", "S-13", "S-15", "S-21", "S-24", "S-3", "S-31", "S-32", "S-40", "S-42", "S-5", "S-6"]
+
+-- P5: history the migration cannot attribute to a single parent is rejected, wherever it sits in
+-- the ancestry: a consolidation, a security that is the result of two records (of the same or
+-- different kinds), or a cycle.
+test_P5_ambiguousHistory : Script ()
+test_P5_ambiguousHistory = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  b <- provenanceBook
+    [ stock "SC" "S-50" "SH-A" dA 50.0
+    , stock "SC" "S-51" "SH-A" dA 50.0
+    , consolidationOf "CO-50" dB ["S-50", "S-51"] "S-52"
+    , stock "SC" "S-52" "SH-A" dB 100.0
+    , transferOf "TR-52" dC "S-52" 100.0 ["S-53"] None
+    , stock "SC" "S-53" "SH-B" dC 100.0
+    , stock "SC" "S-54" "SH-A" dA 50.0
+    , stock "SC" "S-55" "SH-A" dA 50.0
+    , consolidationOf "CO-54" dB ["S-54", "S-55"] "S-56"
+    , stock "SC" "S-56" "SH-A" dB 100.0
+    , stock "SC" "S-57" "SH-A" dA 10.0
+    , stock "SC" "S-60" "SH-A" dA 100.0
+    , stock "SC" "S-61" "SH-C" dA 100.0
+    , transferOf "TR-60" dB "S-60" 100.0 ["S-62"] None
+    , transferOf "TR-61" dB "S-61" 100.0 ["S-62"] None
+    , stock "SC" "S-62" "SH-B" dB 100.0
+    , optionGrant "EC-7" "SH-A" 100.0
+    , exerciseOf "EX-7" dB "EC-7" 10.0 ["S-70"]
+    , stock "SC" "S-71" "SH-C" dA 10.0
+    , transferOf "TR-71" dB "S-71" 10.0 ["S-70"] None
+    , stock "SC" "S-70" "SH-B" dB 10.0
+    , transferOf "TR-70" dC "S-70" 10.0 ["S-72"] None
+    , stock "SC" "S-72" "SH-C" dC 10.0
+    , stock "SC" "S-80" "SH-A" dA 100.0
+    , transferOf "TR-80" dB "S-80" 100.0 ["S-81"] None
+    , stock "SC" "S-81" "SH-B" dB 100.0
+    , transferOf "TR-81" dC "S-81" 50.0 ["S-80"] (Some "S-82")
+    , stock "SC" "S-82" "SH-B" dC 50.0
+    ]
+  expectMigrationFails "P5a consolidation in the ancestry"
+    "Ambiguous provenance for S-53: S-52 results from stock consolidation CO-50, which has several parents"
+    b [migration "SH-B" bob ["S-53"]]
+  expectMigrationFails "P5b consolidation result migrated directly"
+    "Ambiguous provenance for S-56: S-56 results from stock consolidation CO-54, which has several parents"
+    b [migration "SH-A" alice ["S-56"]]
+  expectMigrationFails "P5c result of two transfers"
+    "Ambiguous provenance for S-62: S-62 is the result of more than one record: stock transfer TR-60, stock transfer TR-61"
+    b [migration "SH-B" bob ["S-62"]]
+  expectMigrationFails "P5d ancestor that is the result of an exercise and a transfer"
+    "Ambiguous provenance for S-72: S-70 is the result of more than one record: equity compensation exercise EX-7, stock transfer TR-71"
+    b [migration "SH-C" carol ["S-72"]]
+  expectMigrationFails "P5e cycle in the ancestry"
+    "Cyclic provenance for S-82 at S-81"
+    b [migration "SH-B" bob ["S-82"]]
+  -- one ambiguous security fails the whole batch, including the holders before it
+  expectMigrationFails "P5f ambiguous security in a later migration of the batch"
+    "Ambiguous provenance for S-62"
+    b [migration "SH-A" alice ["S-57"], migration "SH-B" bob ["S-62"]]
+  -- the existing checks still come first
+  expectMigrationFails "P5g consolidated security that was then transferred" "was transferred"
+    b [migration "SH-A" alice ["S-52"]]
+  -- nothing was migrated
+  Some root <- queryContractId b.issuer b.root
+  root.position_migrated_security_ids === None
+
+-- P6: an ancestor without a stock issuance in the root is rejected. A book written through
+-- UpdateCapTable always has the source issuance of each stock record, so this simulates a legacy
+-- root by creating it directly (issuer and system operator) without the ancestor's issuance.
+test_P6_ancestorWithoutStockIssuance : Script ()
+test_P6_ancestorWithoutStockIssuance = do
+  bob <- allocateParty "bob"
+  b <- provenanceBook
+    [ stock "SC" "S-90" "SH-A" dA 100.0
+    , transferOf "TR-90" dB "S-90" 100.0 ["S-91"] None
+    , stock "SC" "S-91" "SH-A" dB 100.0
+    , transferOf "TR-91" dC "S-91" 100.0 ["S-92"] None
+    , stock "SC" "S-92" "SH-B" dC 100.0
+    ]
+  Some root <- queryContractId b.issuer b.root
+  legacyRoot <- submit (actAs [b.issuer, b.sysop]) $ createCmd root with
+    stock_issuances = Map.delete "ISS-S-90" root.stock_issuances
+    stock_issuances_by_security_id = Map.delete "S-90" root.stock_issuances_by_security_id
+  expectMigrationFails "P6 ancestor without a stock issuance" "Ancestor S-90 of S-92 has no stock issuance"
+    (b with root = legacyRoot) [migration "SH-B" bob ["S-92"]]
+  -- the same history with the issuance in place migrates
+  (b', [position]) <- migrate b [migration "SH-B" bob ["S-92"]]
+  provenanceOf b' position "S-92" >>= (=== ("S-90", dA, ["S-90", "S-91"], 100.0))
