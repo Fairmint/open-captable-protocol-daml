@@ -1,0 +1,140 @@
+-- | Vesting on positions: a lot on a vesting schedule (`vesting_terms_id`) counts as unvested until
+-- the issuer records its full vesting with `Registry_RecordFullyVested`; inline vestings still
+-- apply; transferee and remainder lots carry no vesting.
+module OpenCapTable.Positions.TestVesting where
+
+import DA.Assert
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import DA.Time (addRelTime, days, time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+import OpenCapTable.Positions.TestPositions (Env(..), setup, transfer)
+import OpenCapTable.Positions.TestHolds (lotOf, placeHold, positionOf, runTransfer, settle, settlementArgs)
+
+-- | When the issuer computes that the scheduled lots fully vested (before the transfer date).
+dVested : Time
+dVested = time (D.date 2025 Mar 01) 0 0 0
+
+-- | An inline vesting event after the transfer date.
+dInline : Time
+dInline = time (D.date 2025 Sep 01) 0 0 0
+
+-- | `setup`, plus two lots of 50 issued to alice on vesting terms VT-4Y: S-V1 with no inline
+-- vestings, S-V2 with an inline vesting event on `dInline`.
+vsetup : Script (Env, ContractId StockPosition)
+vsetup = do
+  env <- setup
+  let onSchedule sid = (mkIssuance "SC" sid "SH-A" 50.0) with vesting_terms_id = Some "VT-4Y"
+  (pos, _) <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
+    holder = env.alice; position = Some env.posA
+    issuances = [onSchedule "S-V1", (onSchedule "S-V2") with vestings = [OcfVesting with amount = 50.0; date = dInline]]
+  pure (env, pos)
+
+recordFullyVested : Env -> ContractId StockPosition -> [Text] -> Time -> Commands (ContractId StockPosition)
+recordFullyVested env pos ids d = exerciseCmd env.registry Registry_RecordFullyVested with
+  position = pos; security_ids = ids; date = d
+
+-- V0: the vesting rule as a pure function.
+test_V0_lotIsVested : Script ()
+test_V0_lotIsVested = do
+  let lot vestings terms fully = PositionLot with
+        issuance = (mkIssuance "SC" "S-X1" "SH-X" 100.0) with vestings; vesting_terms_id = terms
+        origin_security_id = "S-X1"; origin_date = d0; ancestry = []; holds = []; fully_vested_on = fully
+      inline = [OcfVesting with amount = 100.0; date = dVested]
+      dayBefore = dVested `addRelTime` days (-1)
+      lots =
+        [ lot [] None None                       -- no vesting at all
+        , lot inline None None                   -- inline vesting only
+        , lot [] (Some "VT") None                -- on a schedule, nothing recorded
+        , lot [] (Some "VT") (Some dVested)      -- on a schedule, recorded
+        , lot inline (Some "VT") (Some d0) ]     -- recorded early, but an inline vesting is later
+  map (lotIsVested dayBefore) lots === [True, False, False, False, False]
+  map (lotIsVested dVested) lots === [True, True, False, True, True]
+  -- a recorded date means nothing without vesting terms
+  lotIsVested dayBefore (lot inline None (Some d0)) === False
+  lotIsVested d0 (lot [] None (Some dVested)) === True
+
+-- V1: a scheduled lot can be neither held for a transfer nor drawn until its full vesting is
+-- recorded, and then only from the recorded date; what a draw leaves and delivers carries no
+-- vesting.
+test_V1_scheduledLotNeedsRecordedVesting : Script ()
+test_V1_scheduledLotNeedsRecordedVesting = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+      dayBefore = dVested `addRelTime` days (-1)
+  expectFail "V1a free transfer of a scheduled lot" "lot S-V1 is not fully vested" i $
+    exerciseCmd reg (transfer env "V1a" pos None 10.0 [("S-V1", 10.0)])
+  expectFail "V1b settlement hold on a scheduled lot" "lot S-V1 is not fully vested" i $
+    exerciseCmd reg (settlementArgs pos "SET-V" [("S-V1", 10.0)])
+  pos2 <- submit env.book.issuer $ recordFullyVested env pos ["S-V1"] dVested
+  p2 <- positionOf env pos2
+  v1 <- lotOf p2 "S-V1"
+  v1.fully_vested_on === Some dVested
+  -- only the listed lot is recorded
+  v2 <- lotOf p2 "S-V2"
+  v2.fully_vested_on === None
+  expectFail "V1c free transfer before the recorded date" "lot S-V1 is not fully vested" i $
+    exerciseCmd reg ((transfer env "V1c" pos2 None 10.0 [("S-V1", 10.0)]) with date = dayBefore)
+  expectFail "V1d settlement hold before the recorded date" "lot S-V1 is not fully vested" i $
+    exerciseCmd reg ((settlementArgs pos2 "SET-V" [("S-V1", 10.0)]) with date = dayBefore)
+  expectFail "V1e the other scheduled lot is still unvested" "lot S-V2 is not fully vested" i $
+    exerciseCmd reg ((transfer env "V1e" pos2 None 10.0 [("S-V2", 10.0)]) with date = dInline)
+  -- from the recorded date on, the lot is held and drawn
+  h <- placeHold env ((settlementArgs pos2 "SET-V" [("S-V1", 20.0)]) with date = dVested)
+  r <- runTransfer env ((settle env "V1" h.position "SET-V" 20.0 [("S-V1", 20.0)]) with date = dVested)
+  Some from <- pure r.transferor_position
+  pf <- positionOf env from
+  remainder <- lotOf pf "V1-R-0"
+  (remainder.issuance.quantity, remainder.issuance.vestings, remainder.issuance.vesting_terms_id, remainder.fully_vested_on, remainder.holds) ===
+    (30.0, [], None, None, [])
+  pb <- positionOf env r.transferee_position
+  delivered <- lotOf pb "V1-B-0"
+  (delivered.issuance.quantity, delivered.issuance.vestings, delivered.issuance.vesting_terms_id, delivered.fully_vested_on, delivered.holds) ===
+    (20.0, [], None, None, [])
+  -- the OCF issuance records say the same
+  issued <- forA r.issuances \c -> do
+    Some s <- queryContractId env.book.issuer c
+    pure s.issuance_data
+  map (\d -> (d.security_id, d.vesting_terms_id, d.vestings)) issued === [("V1-B-0", None, []), ("V1-R-0", None, [])]
+  -- the remainder needs no record of its own to be drawn
+  _ <- runTransfer env ((transfer env "V1-2" from None 30.0 [("V1-R-0", 30.0)]) with date = dVested)
+  pure ()
+
+-- V2: inline vestings still count on a lot whose full vesting is recorded; the remainder of a draw
+-- from a lot with inline vestings carries none.
+test_V2_inlineVestingsStillCount : Script ()
+test_V2_inlineVestingsStillCount = do
+  (env, pos) <- vsetup
+  pos2 <- submit env.book.issuer $ recordFullyVested env pos ["S-V2"] dVested
+  expectFail "V2a recorded, but an inline vesting is later" "lot S-V2 is not fully vested" (actAs env.book.issuer) $
+    exerciseCmd env.registry (transfer env "V2a" pos2 None 10.0 [("S-V2", 10.0)])
+  r <- runTransfer env ((transfer env "V2" pos2 None 10.0 [("S-V2", 10.0)]) with date = dInline)
+  Some from <- pure r.transferor_position
+  pf <- positionOf env from
+  remainder <- lotOf pf "V2-R-0"
+  (remainder.issuance.vestings, remainder.issuance.vesting_terms_id, remainder.fully_vested_on) === ([], None, None)
+
+-- V3: recording full vesting: only for lots of the position on vesting terms, each once.
+test_V3_recordChecks : Script ()
+test_V3_recordChecks = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+  expectFail "V3a no lots" "record at least one lot" i $ recordFullyVested env pos [] dVested
+  expectFail "V3b lot listed twice" "each lot is recorded at most once" i $
+    recordFullyVested env pos ["S-V1", "S-V1"] dVested
+  expectFail "V3c lot not in the position" "lot S-B1 is not in the position" i $
+    recordFullyVested env pos ["S-B1"] dVested
+  expectFail "V3d lot without vesting terms" "lot S-A1 has no vesting terms" i $
+    recordFullyVested env pos ["S-V1", "S-A1"] dVested
+  expectFail "V3e lot with inline vestings only" "lot S-A3 has no vesting terms" i $
+    recordFullyVested env pos ["S-A3"] dVested
+  pos2 <- submit env.book.issuer $ recordFullyVested env pos ["S-V1", "S-V2"] dVested
+  expectFail "V3f recorded twice" "full vesting of lot S-V1 is already recorded" i $
+    recordFullyVested env pos2 ["S-V1"] dTransfer
+  expectFail "V3g a consumed position" "NotActive" i $ recordFullyVested env pos ["S-V1"] dVested
