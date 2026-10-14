@@ -1,12 +1,13 @@
 -- | Migration provenance: `MigrateToPositions` gives each lot the origin security, origin date and
--- ancestry of its root stock history, and rejects history it cannot attribute to one parent.
+-- ancestry of its root stock history, and rejects history it cannot attribute to one parent. A
+-- migrated lot starts without holds or recorded vesting and obeys every hold rule.
 module OpenCapTable.Positions.TestMigrationProvenance where
 
 import DA.Assert
 import DA.Date (Month(..))
 import qualified DA.Date as D
 import qualified DA.Map as Map
-import DA.Optional (fromOptional)
+import DA.Optional (fromOptional, isNone)
 import DA.Time (time)
 import Daml.Script
 
@@ -22,6 +23,7 @@ import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
 import OpenCapTable.Positions.Common
+import OpenCapTable.TestHelpers (defaultVestingTerms)
 
 -- Dates of the provenance books: issuances at dA, later records at dB, dC and dD.
 dA : Time
@@ -317,3 +319,108 @@ test_P6_ancestorWithoutStockIssuance = do
   -- the same history with the issuance in place migrates
   (b', [position]) <- migrate b [migration "SH-B" bob ["S-92"]]
   provenanceOf b' position "S-92" >>= (=== ("S-90", dA, ["S-90", "S-91"], 100.0))
+
+-- | The position registry of class SC.
+registryOf : Book -> Script (ContractId PositionRegistry)
+registryOf b = do
+  Some root <- queryContractId b.issuer b.root
+  case Map.lookup "SC" (fromOptional Map.empty root.position_registries) of
+    Some registry -> pure registry
+    None -> fail "positions are not enabled for SC"
+
+-- P7: provenance and holds compose. Migrated chain-derived lots start without holds or recorded
+-- vesting, and every hold rule applies to them: a lot on vesting terms can be neither held nor
+-- drawn until its full vesting is recorded, a stop locks a lot until it is lifted, and held
+-- quantity is not free. A transfer under a reference then draws exactly the migrated lots' holds,
+-- and the lots it writes keep the reconstructed origin, origin date and ancestry.
+test_P7_migratedChainHeldAndTransferred : Script ()
+test_P7_migratedChainHeldAndTransferred = do
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  b0 <- provenanceBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , stock "SC" "S-100" "SH-A" dA 100.0
+    , transferOf "TR-100" dB "S-100" 100.0 ["S-101"] None
+    , stock "SC" "S-101" "SH-B" dB 100.0
+    , cancellationOf "CN-101" dC "S-101" 40.0 (Some "S-102")
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-102" "SH-B" 60.0) with
+        date = dC; vesting_terms_id = Some "VT-1")
+    , stock "SC" "S-110" "SH-A" dA 50.0
+    , transferOf "TR-110" dB "S-110" 30.0 ["S-111"] (Some "S-112")
+    , stock "SC" "S-111" "SH-B" dB 30.0
+    , stock "SC" "S-112" "SH-A" dB 20.0
+    ]
+  (b, [pos0]) <- migrate b0 [migration "SH-B" bob ["S-102", "S-111"]]
+  registry <- registryOf b
+  let i = actAs b.issuer
+      holdOn pos purpose ref lots = exerciseCmd registry Registry_Hold with
+        position = pos; purpose; reference = ref; date = dD
+        lots = map (\(s, q) -> HoldLot with security_id = s; quantity = q) lots
+      settlementHoldOn pos lots = holdOn pos HoldPurposeRegisterSettlement "SET-M" (map (\(s, q) -> (s, Some q)) lots)
+      transferToCarol tid pos ref qty draws = exerciseCmd registry Registry_Transfer with
+        transfer_id = tid; date = dD; transferor_position = pos
+        transferee = Transferee with stakeholder_id = "SH-C"; party = carol; position = None
+        quantity = qty; share_price = usd 3.0
+        draws = map (\(s, q) -> LotDraw with security_id = s; quantity = q) draws
+        reference = ref; request_receipt = False
+      lotsOf pos = do
+        Some p <- queryContractId b.issuer pos
+        pure p.lots
+
+  -- migrated lots: reconstructed provenance, no holds, no recorded vesting
+  provenanceOf b pos0 "S-102" >>= (=== ("S-100", dA, ["S-100", "S-101"], 60.0))
+  provenanceOf b pos0 "S-111" >>= (=== ("S-110", dA, ["S-110"], 30.0))
+  lots0 <- lotsOf pos0
+  map (\l -> (l.issuance.vesting_terms_id, l.holds, l.fully_vested_on)) (Map.values lots0) ===
+    [(Some "VT-1", [], None), (None, [], None)]
+
+  -- a migrated lot on vesting terms is unvested until its full vesting is recorded
+  expectFail "P7a settlement hold on a migrated lot on vesting terms" "lot S-102 is not fully vested" i $
+    settlementHoldOn pos0 [("S-102", 40.0)]
+  expectFail "P7b free transfer of a migrated lot on vesting terms" "lot S-102 is not fully vested" i $
+    transferToCarol "P7b" pos0 None 10.0 [("S-102", 10.0)]
+
+  -- a stop locks a migrated lot until it is lifted
+  stopped <- submit b.issuer $ holdOn pos0 HoldPurposeStopTransfer "STOP-M" [("S-111", None)]
+  stopped.released === []
+  expectFail "P7c free transfer of a stopped migrated lot" "lot S-111 is stopped" i $
+    transferToCarol "P7c" stopped.position None 10.0 [("S-111", 10.0)]
+  expectFail "P7d settlement hold on a stopped migrated lot" "lot S-111 is stopped" i $
+    settlementHoldOn stopped.position [("S-111", 30.0)]
+  lifted <- submit b.issuer $ exerciseCmd registry Registry_Release with
+    position = stopped.position; purpose = HoldPurposeStopTransfer; reference = "STOP-M"
+    code = ReleaseCodeStopLifted; security_ids = Some ["S-111"]
+  map (.security_id) lifted.released === ["S-111"]
+
+  -- recorded vesting, then holds on both migrated lots under one reference
+  vested <- submit b.issuer $ exerciseCmd registry Registry_RecordFullyVested with
+    position = lifted.position; security_ids = ["S-102"]; date = dC
+  held <- submit b.issuer $ settlementHoldOn vested [("S-102", 40.0), ("S-111", 30.0)]
+  heldLots <- lotsOf held.position
+  map (\l -> (l.issuance.security_id, map (.reference) l.holds, lotFreeQuantity l)) (Map.values heldLots) ===
+    [("S-102", ["SET-M"], 20.0), ("S-111", ["SET-M"], 0.0)]
+
+  -- held quantity is not free, and the transfer under the reference draws all of its holds
+  expectFail "P7e free transfer of held quantity on a migrated lot" "draw exceeds the free quantity of lot S-102" i $
+    transferToCarol "P7e" held.position None 30.0 [("S-102", 30.0)]
+  expectFail "P7f transfer under the reference leaving a held migrated lot undrawn"
+    "lot S-111 carries a register-settlement hold with reference SET-M but is not drawn" i $
+    transferToCarol "P7f" held.position (Some "SET-M") 40.0 [("S-102", 40.0)]
+
+  result <- submit b.issuer $ transferToCarol "P7" held.position (Some "SET-M") 70.0 [("S-102", 40.0), ("S-111", 30.0)]
+  let summary l = (l.issuance.security_id, l.issuance.quantity, l.origin_security_id, l.origin_date, l.ancestry)
+      unencumbered l = null l.holds && null l.issuance.vestings && isNone l.issuance.vesting_terms_id
+        && isNone l.fully_vested_on
+  -- the remainder of S-102 keeps its origin and is free of holds and vesting; S-111 was drawn in full
+  case result.transferor_position of
+    None -> fail "the transferor's position should keep the remainder of S-102"
+    Some from -> do
+      fromLots <- lotsOf from
+      map summary (Map.values fromLots) === [("P7-R-0", 20.0, "S-100", dA, ["S-100", "S-101", "S-102"])]
+      map unencumbered (Map.values fromLots) === [True]
+  -- the transferee's lots tack to the reconstructed origins
+  toLots <- lotsOf result.transferee_position
+  map summary (Map.values toLots) ===
+    [ ("P7-B-0", 40.0, "S-100", dA, ["S-100", "S-101", "S-102"])
+    , ("P7-B-1", 30.0, "S-110", dA, ["S-110", "S-111"]) ]
+  map unencumbered (Map.values toLots) === [True, True]
