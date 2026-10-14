@@ -14,7 +14,7 @@ import DA.Map (Map)
 import qualified DA.Map as Map
 import DA.List (sortOn, unique)
 import DA.Action (foldlA, when)
-import DA.Foldable (mapA_)
+import DA.Foldable (forA_, mapA_)
 import DA.Optional (fromOptional, isNone, isSome)
 import qualified DA.Date as Date
 
@@ -24,6 +24,8 @@ import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIss
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
+-- Position register (positions, holds and the registry trade path)
+import Fairmint.OpenCapTable.Positions (StockPosition(..), PositionRegistry(..), PositionLot(..))
 
 -- OCF Types
 {{#each types_alpha}}
@@ -1627,6 +1629,116 @@ validateActiveSecurityTargets maps = do
 -- CapTable Template
 -- =============================================================================
 
+
+-- =============================================================================
+-- Position register support
+-- =============================================================================
+
+data PositionMigration = PositionMigration with
+    stakeholder_id : Text
+    holder : Party
+    security_ids : [Text]
+  deriving (Eq, Show)
+
+positionManagedError : Text -> Text
+positionManagedError what = "Position-managed holding: " <> what <> "; use the PositionRegistry choices"
+
+-- | For an edit or delete, fetch the stored record (if any) and check the IDs it references.
+checkStoredRecord : (HasFetch t) => (Text -> Bool) -> Text -> Map Text (ContractId t) -> Text -> (t -> [Text]) -> Update ()
+checkStoredRecord forbidden what objects objectId refs = case Map.lookup objectId objects of
+  None -> pure ()
+  Some cid -> do
+    obj <- fetch cid
+    forA_ (refs obj) \r ->
+      assertMsg (positionManagedError (what <> " " <> objectId <> " references " <> r)) (not (forbidden r))
+
+-- | UpdateCapTable may not write stock-holding records for securities that were migrated into
+-- positions, nor issuances, splits or ratio adjustments in a position-managed class. Costs
+-- nothing on a root without positions, and O(batch) otherwise (one fetch per edit or delete of a
+-- stock-holding record).
+validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
+validatePositionManagedWrites ct creates edits deletes = do
+  let classes = fromOptional Map.empty ct.position_registries
+      migrated = fromOptional Map.empty ct.position_migrated_security_ids
+      managedClass c = Map.member c classes
+      migratedSec s = Map.member s migrated
+      noSec what s = assertMsg (positionManagedError (what <> " on " <> s)) (not (migratedSec s))
+      noClass what c = assertMsg (positionManagedError (what <> " in class " <> c)) (not (managedClass c))
+  when (not (Map.null classes) || not (Map.null migrated)) $ do
+    forA_ creates \c -> case c of
+      OcfCreateStockIssuance d -> noClass "stock issuance" d.stock_class_id
+      OcfCreateStockClassSplit d -> noClass "stock class split" d.stock_class_id
+      OcfCreateStockClassConversionRatioAdjustment d -> noClass "conversion ratio adjustment" d.stock_class_id
+      OcfCreateStockTransfer d -> noSec "stock transfer" d.security_id
+      OcfCreateStockCancellation d -> noSec "stock cancellation" d.security_id
+      OcfCreateStockRepurchase d -> noSec "stock repurchase" d.security_id
+      OcfCreateStockRetraction d -> noSec "stock retraction" d.security_id
+      OcfCreateStockReissuance d -> noSec "stock reissuance" d.security_id
+      OcfCreateStockConversion d -> noSec "stock conversion" d.security_id
+      OcfCreateStockAcceptance d -> noSec "stock acceptance" d.security_id
+      OcfCreateStockConsolidation d -> forA_ d.security_ids (noSec "stock consolidation")
+      _ -> pure ()
+    forA_ edits \e -> case e of
+      OcfEditStockIssuance d -> do
+        noSec "stock issuance edit" d.security_id
+        checkStoredRecord migratedSec "stock issuance" ct.stock_issuances d.id (\o -> [o.issuance_data.security_id])
+      OcfEditStockClassSplit d -> do
+        noClass "stock class split edit" d.stock_class_id
+        checkStoredRecord managedClass "stock class split" ct.stock_class_splits d.id (\o -> [o.split_data.stock_class_id])
+      OcfEditStockClassConversionRatioAdjustment d -> do
+        noClass "conversion ratio adjustment edit" d.stock_class_id
+        checkStoredRecord managedClass "conversion ratio adjustment" ct.stock_class_conversion_ratio_adjustments d.id (\o -> [o.adjustment_data.stock_class_id])
+      OcfEditStockTransfer d -> do
+        noSec "stock transfer edit" d.security_id
+        checkStoredRecord migratedSec "stock transfer" ct.stock_transfers d.id (\o -> o.transfer_data.security_id :: o.transfer_data.resulting_security_ids ++ optional [] pure o.transfer_data.balance_security_id)
+      OcfEditStockCancellation d -> do
+        noSec "stock cancellation edit" d.security_id
+        checkStoredRecord migratedSec "stock cancellation" ct.stock_cancellations d.id (\o -> o.cancellation_data.security_id :: optional [] pure o.cancellation_data.balance_security_id)
+      OcfEditStockRepurchase d -> do
+        noSec "stock repurchase edit" d.security_id
+        checkStoredRecord migratedSec "stock repurchase" ct.stock_repurchases d.id (\o -> o.repurchase_data.security_id :: optional [] pure o.repurchase_data.balance_security_id)
+      OcfEditStockRetraction d -> do
+        noSec "stock retraction edit" d.security_id
+        checkStoredRecord migratedSec "stock retraction" ct.stock_retractions d.id (\o -> [o.retraction_data.security_id])
+      OcfEditStockReissuance d -> do
+        noSec "stock reissuance edit" d.security_id
+        checkStoredRecord migratedSec "stock reissuance" ct.stock_reissuances d.id (\o -> o.reissuance_data.security_id :: o.reissuance_data.resulting_security_ids)
+      OcfEditStockConversion d -> do
+        noSec "stock conversion edit" d.security_id
+        checkStoredRecord migratedSec "stock conversion" ct.stock_conversions d.id (\o -> o.conversion_data.security_id :: o.conversion_data.resulting_security_ids ++ optional [] pure o.conversion_data.balance_security_id)
+      OcfEditStockAcceptance d -> do
+        noSec "stock acceptance edit" d.security_id
+        checkStoredRecord migratedSec "stock acceptance" ct.stock_acceptances d.id (\o -> [o.acceptance_data.security_id])
+      OcfEditStockConsolidation d -> do
+        forA_ d.security_ids (noSec "stock consolidation edit")
+        checkStoredRecord migratedSec "stock consolidation" ct.stock_consolidations d.id (\o -> o.consolidation_data.resulting_security_id :: o.consolidation_data.security_ids)
+      _ -> pure ()
+    forA_ deletes \d -> case d of
+      OcfDeleteStockIssuance i -> checkStoredRecord migratedSec "stock issuance" ct.stock_issuances i (\o -> [o.issuance_data.security_id])
+      OcfDeleteStockClassSplit i -> checkStoredRecord managedClass "stock class split" ct.stock_class_splits i (\o -> [o.split_data.stock_class_id])
+      OcfDeleteStockClassConversionRatioAdjustment i -> checkStoredRecord managedClass "conversion ratio adjustment" ct.stock_class_conversion_ratio_adjustments i (\o -> [o.adjustment_data.stock_class_id])
+      OcfDeleteStockTransfer i -> checkStoredRecord migratedSec "stock transfer" ct.stock_transfers i (\o -> o.transfer_data.security_id :: o.transfer_data.resulting_security_ids ++ optional [] pure o.transfer_data.balance_security_id)
+      OcfDeleteStockCancellation i -> checkStoredRecord migratedSec "stock cancellation" ct.stock_cancellations i (\o -> o.cancellation_data.security_id :: optional [] pure o.cancellation_data.balance_security_id)
+      OcfDeleteStockRepurchase i -> checkStoredRecord migratedSec "stock repurchase" ct.stock_repurchases i (\o -> o.repurchase_data.security_id :: optional [] pure o.repurchase_data.balance_security_id)
+      OcfDeleteStockRetraction i -> checkStoredRecord migratedSec "stock retraction" ct.stock_retractions i (\o -> [o.retraction_data.security_id])
+      OcfDeleteStockReissuance i -> checkStoredRecord migratedSec "stock reissuance" ct.stock_reissuances i (\o -> o.reissuance_data.security_id :: o.reissuance_data.resulting_security_ids)
+      OcfDeleteStockConversion i -> checkStoredRecord migratedSec "stock conversion" ct.stock_conversions i (\o -> o.conversion_data.security_id :: o.conversion_data.resulting_security_ids ++ optional [] pure o.conversion_data.balance_security_id)
+      OcfDeleteStockAcceptance i -> checkStoredRecord migratedSec "stock acceptance" ct.stock_acceptances i (\o -> [o.acceptance_data.security_id])
+      OcfDeleteStockConsolidation i -> checkStoredRecord migratedSec "stock consolidation" ct.stock_consolidations i (\o -> o.consolidation_data.resulting_security_id :: o.consolidation_data.security_ids)
+      _ -> pure ()
+
+-- | Remaining balance of a root stock issuance after every recorded lifecycle event and split.
+remainingStockBalance : Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent] -> StockIssuance -> Update Decimal
+remainingStockBalance stockEvents splitEvents issuance = do
+  let sid = issuance.issuance_data.security_id
+      events = fromOptional [] (Map.lookup sid stockEvents)
+      splits = filter
+        (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
+        (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents))
+      allEvents = events ++ splits
+  validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
+  foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
+
 template CapTable
   with
     context: Context
@@ -1649,6 +1761,12 @@ template CapTable
 {{#each types_appended}}
     {{map_field}}: Optional (Map Text (ContractId {{name}}))
 {{/each}}
+
+    -- Appended Optional fields for the position register; None on pre-0.0.4 payloads.
+    -- stock_class_id -> registry, for classes whose holdings live in StockPosition contracts.
+    position_registries: Optional (Map Text (ContractId PositionRegistry))
+    -- security_id -> stakeholder_id of every root issuance migrated into a position.
+    position_migrated_security_ids: Optional (Map Text Text)
 
   where
     signatory context.issuer, context.system_operator
@@ -1677,6 +1795,9 @@ template CapTable
         -- Empty batches only rotate the CapTable CID; require a create, edit, or delete.
         assertMsg "UpdateCapTable requires at least one create, edit, or delete"
           (creates /= [] || edits /= [] || deletes /= [])
+
+        -- No root writes to position-managed holdings. O(batch).
+        validatePositionManagedWrites this creates edits deletes
 
         -- Start with current maps
         let initialMaps = toMaps this
@@ -1802,3 +1923,84 @@ template CapTable
         archive issuer
         -- CapTable self-archives (consuming choice)
         pure ()
+
+    -- ==========================================================================
+    -- Position register
+    -- ==========================================================================
+
+    -- | Make one stock class position-managed: create its registry and record it in the root.
+    choice EnablePositions : (ContractId CapTable, ContractId PositionRegistry)
+      with
+        stock_class_id : Text
+        cash_settlement_required : Bool
+      controller context.issuer
+      do
+        assertMsg ("Unknown stock class " <> stock_class_id) (Map.member stock_class_id stock_classes)
+        let registries = fromOptional Map.empty position_registries
+        assertMsg ("Positions already enabled for " <> stock_class_id) (not (Map.member stock_class_id registries))
+        registryCid <- create PositionRegistry with context; stock_class_id; cash_settlement_required
+        rootCid <- create this with position_registries = Some (Map.insert stock_class_id registryCid registries)
+        pure (rootCid, registryCid)
+
+    -- | Build positions from the root's active stock issuances, one batch of holders at a time.
+    -- Each migrated lot keeps its issuance data with the quantity set to its remaining balance,
+    -- computed from every recorded transfer, cancellation, repurchase, conversion, retirement
+    -- and split (O(book) fetches per batch). Migrated security IDs are recorded in the root, which
+    -- blocks a second migration and any later root write against them.
+    choice MigrateToPositions : (ContractId CapTable, [ContractId StockPosition])
+      with
+        stock_class_id : Text
+        migrations : [PositionMigration]
+      controller context.issuer
+      do
+        assertMsg "Nothing to migrate" (not (null migrations))
+        let registries = fromOptional Map.empty position_registries
+        assertMsg ("Positions are not enabled for " <> stock_class_id) (Map.member stock_class_id registries)
+        let maps = toMaps this
+        stockEvents <- stockBalanceEventsBySecurityId maps
+        splitEvents <- splitEventsByStockClassId maps
+        (migratedFinal, positionCids) <- foldlA
+          (\(migrated, cids) m -> do
+            assertMsg ("Unknown stakeholder " <> m.stakeholder_id) (Map.member m.stakeholder_id stakeholders)
+            assertMsg ("No securities to migrate for " <> m.stakeholder_id) (not (null m.security_ids))
+            (migrated', lots) <- foldlA
+              (\(mig, acc) sid -> do
+                assertMsg ("Security already migrated " <> sid) (not (Map.member sid mig))
+                issuanceCid <- case Map.lookup sid stock_issuances_by_security_id of
+                  Some c -> pure c
+                  None -> abort ("Unknown stock security " <> sid)
+                issuance <- fetch issuanceCid
+                assertMsg ("Security " <> sid <> " is not held by " <> m.stakeholder_id)
+                  (issuance.issuance_data.stakeholder_id == m.stakeholder_id)
+                assertMsg ("Security " <> sid <> " is not in class " <> stock_class_id)
+                  (issuance.issuance_data.stock_class_id == stock_class_id)
+                -- OCF semantics: a transfer, cancellation, repurchase or conversion consumes the
+                -- source security (any remainder lives in its balance security). Only securities
+                -- without such an event are active lots; legacy partial reductions without a
+                -- balance security are ambiguous and must be fixed before migration.
+                let isReduction ev = case ev of
+                      SecurityBalanceReduction {} -> True
+                      _ -> False
+                assertMsg ("Security " <> sid <> " was transferred, cancelled, repurchased or converted; migrate its resulting or balance security")
+                  (not (any isReduction (fromOptional [] (Map.lookup sid stockEvents))))
+                remaining <- remainingStockBalance stockEvents splitEvents issuance
+                assertMsg ("Security " <> sid <> " has no remaining balance") (remaining > 0.0)
+                let lot = PositionLot with
+                      issuance = issuance.issuance_data with quantity = remaining
+                      origin_security_id = sid
+                      origin_date = issuance.issuance_data.date
+                      ancestry = []
+                pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
+              (migrated, Map.empty)
+              m.security_ids
+            positionCid <- create StockPosition with
+              context
+              stock_class_id
+              stakeholder_id = m.stakeholder_id
+              holder = m.holder
+              lots
+            pure (migrated', cids ++ [positionCid]))
+          (fromOptional Map.empty position_migrated_security_ids, [])
+          migrations
+        rootCid <- create this with position_migrated_security_ids = Some migratedFinal
+        pure (rootCid, positionCids)

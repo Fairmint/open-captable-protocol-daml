@@ -1,0 +1,302 @@
+-- Position register for one stock class of one issuer.
+--
+-- A `StockPosition` is one contract per holder and stock class (by convention; Canton 3.x has no
+-- keys). The holder's lots are data inside it. A trade consumes and recreates only the seller's
+-- and the buyer's positions, writes create-only OCF history records (StockTransfer and
+-- StockIssuance) that are not listed in the CapTable root, and may run the cash settlement hook.
+-- No choice here fetches the CapTable root or any other holder's position.
+module Fairmint.OpenCapTable.Positions where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.List (head, sort, unique)
+import qualified DA.Map as Map
+import DA.Map (Map)
+import DA.Optional (isNone, isSome)
+
+import Splice.Api.Token.MetadataV1 (ExtraArgs)
+import qualified Splice.Api.Token.AllocationV2 as V2
+
+import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary)
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer(..), StockTransferOcfData(..))
+import Fairmint.OpenCapTable.Settlement.BuyerAcceptance
+
+-- | Policy cap on lots drawn by one trade (explicit rejection above it; never split a trade).
+maxLotsPerTrade : Int
+maxLotsPerTrade = 50
+
+-- | One lot of a holder, kept as data.
+--
+-- `issuance` is the lot's own OCF stock issuance (its security_id, current quantity, issue date,
+-- legends, exemptions, vestings, plan, share price). `origin_security_id` and `origin_date` are
+-- those of the first issuance in the chain (for holding-period tacking); `ancestry` lists the
+-- security IDs from the origin to the direct parent.
+data PositionLot = PositionLot with
+    issuance : StockIssuanceOcfData
+    origin_security_id : Text
+    origin_date : Time
+    ancestry : [Text]
+  deriving (Eq, Show)
+
+-- | A TA-selected draw from one seller lot.
+data LotDraw = LotDraw with
+    security_id : Text
+    quantity : Decimal
+  deriving (Eq, Show)
+
+-- | Buyer side of a trade.
+data TradeBuyer = TradeBuyer with
+    stakeholder_id : Text
+    party : Party
+    position : Optional (ContractId StockPosition)
+      -- ^ None: open a new position (the TA can use this to avoid buyer-side contention and
+      -- merge later with Registry_MergePositions).
+  deriving (Eq, Show)
+
+-- | The cash leg to run as part of the trade.
+data SettlementHookCall = SettlementHookCall with
+    acceptance : ContractId BuyerAcceptance
+    buyer_allocation : ContractId V2.Allocation
+    seller_allocation : ContractId V2.Allocation
+    extra_args : ExtraArgs
+  deriving (Eq, Show)
+
+data TradeResult = TradeResult with
+    seller_position : Optional (ContractId StockPosition)
+    buyer_position : ContractId StockPosition
+    transfers : [ContractId StockTransfer]
+    issuances : [ContractId StockIssuance]
+    cash : Optional V2.SettlementFactory_SettleBatchResult
+  deriving (Eq, Show)
+
+lotIsVested : Time -> PositionLot -> Bool
+lotIsVested asOf lot =
+  isNone lot.issuance.vesting_terms_id && all (\v -> v.date <= asOf) lot.issuance.vestings
+
+positionOk : Text -> Text -> Map Text PositionLot -> Bool
+positionOk stockClassId stakeholderId lots =
+  stockClassId /= "" && stakeholderId /= "" && not (Map.null lots)
+  && all (\(sid, l) ->
+      sid == l.issuance.security_id
+      && l.issuance.quantity > 0.0
+      && l.issuance.stakeholder_id == stakeholderId
+      && l.issuance.stock_class_id == stockClassId)
+    (Map.toList lots)
+
+template StockPosition
+  with
+    context : Context
+    stock_class_id : Text
+    stakeholder_id : Text
+    holder : Party
+    lots : Map Text PositionLot
+      -- ^ keyed by the lot's security_id
+  where
+    signatory context.issuer, context.system_operator
+    observer holder
+    ensure positionOk stock_class_id stakeholder_id lots
+
+-- | Per-issuer, per-class registry. Created by `CapTable.EnablePositions`; never consumed by trades.
+template PositionRegistry
+  with
+    context : Context
+    stock_class_id : Text
+    cash_settlement_required : Bool
+      -- ^ True: every trade must run the settlement hook (no share-only trade path).
+  where
+    signatory context.issuer, context.system_operator
+
+    nonconsuming choice Registry_Trade : TradeResult
+      with
+        trade_id : Text
+        date : Time
+        seller_position : ContractId StockPosition
+        buyer : TradeBuyer
+        quantity : Decimal
+        share_price : OcfMonetary
+        draws : [LotDraw]
+        bucket_legend_ids : Optional [Text]
+          -- ^ Some ls: every drawn lot must carry exactly these legends (restriction bucket).
+        settlement : Optional SettlementHookCall
+      controller context.issuer
+      do
+        assertMsg "trade_id must be non-empty" (trade_id /= "")
+        assertMsg "quantity must be positive" (quantity > 0.0)
+        assertMsg "a trade draws at least one lot" (not (null draws))
+        assertMsg ("a trade draws at most " <> show maxLotsPerTrade <> " lots") (length draws <= maxLotsPerTrade)
+        assertMsg "each lot is drawn at most once" (unique (map (.security_id) draws))
+        assertMsg "drawn quantities must sum to the trade quantity" (sum (map (.quantity) draws) == quantity)
+        when cash_settlement_required $
+          assertMsg "this registry requires the cash settlement hook" (isSome settlement)
+
+        sp <- fetch seller_position
+        assertMsg "seller position belongs to another registry"
+          (sp.context == context && sp.stock_class_id == stock_class_id)
+        assertMsg "seller and buyer must differ" (sp.stakeholder_id /= buyer.stakeholder_id)
+
+        -- Move lots.
+        let step (sellerLots, buyerLots, transfers, newIssuances, i) d = do
+              lot <- case Map.lookup d.security_id sellerLots of
+                Some l -> pure l
+                None -> abort ("lot " <> d.security_id <> " is not in the seller's position")
+              assertMsg ("draw quantity must be positive for " <> d.security_id) (d.quantity > 0.0)
+              assertMsg ("draw exceeds lot quantity for " <> d.security_id) (d.quantity <= lot.issuance.quantity)
+              assertMsg ("lot " <> d.security_id <> " is not fully vested") (lotIsVested date lot)
+              assertMsg ("lot " <> d.security_id <> " predates its own issuance") (lot.issuance.date <= date)
+              forA_ bucket_legend_ids \ls ->
+                assertMsg ("lot " <> d.security_id <> " is outside the signed restriction bucket")
+                  (sort lot.issuance.stock_legend_ids == sort ls)
+              let suffix = "-" <> show i
+                  buyerSec = trade_id <> "-B" <> suffix
+                  remaining = lot.issuance.quantity - d.quantity
+                  remainderSec = if remaining > 0.0 then Some (trade_id <> "-R" <> suffix) else None
+                  childAncestry = lot.ancestry ++ [lot.issuance.security_id]
+                  buyerIssuance = lot.issuance with
+                    id = trade_id <> "-ISS-B" <> suffix
+                    custom_id = buyerSec
+                    date = date
+                    quantity = d.quantity
+                    security_id = buyerSec
+                    share_price = share_price
+                    stakeholder_id = buyer.stakeholder_id
+                    vestings = []
+                    share_numbers_issued = []
+                    comments = []
+                    consideration_text = None
+                    cost_basis = None
+                  buyerLot = PositionLot with
+                    issuance = buyerIssuance
+                    origin_security_id = lot.origin_security_id
+                    origin_date = lot.origin_date
+                    ancestry = childAncestry
+              assertMsg ("lot id " <> buyerSec <> " already exists in the buyer's position") (not (Map.member buyerSec buyerLots))
+              forA_ remainderSec \r ->
+                assertMsg ("lot id " <> r <> " already exists in the seller's position") (not (Map.member r sellerLots))
+              tcid <- create StockTransfer with
+                context
+                transfer_data = StockTransferOcfData with
+                  id = trade_id <> "-TR" <> suffix
+                  date
+                  quantity = d.quantity
+                  security_id = lot.issuance.security_id
+                  comments = []
+                  resulting_security_ids = [buyerSec]
+                  balance_security_id = remainderSec
+                  consideration_text = None
+              bicid <- create StockIssuance with context; issuance_data = buyerIssuance
+              (sellerLots', extra) <- case remainderSec of
+                None -> pure (Map.delete d.security_id sellerLots, [])
+                Some rsec -> do
+                  let remIssuance = lot.issuance with
+                        id = trade_id <> "-ISS-R" <> suffix
+                        custom_id = rsec
+                        date = date
+                        quantity = remaining
+                        security_id = rsec
+                        vestings = []
+                        share_numbers_issued = []
+                        comments = []
+                      remLot = PositionLot with
+                        issuance = remIssuance
+                        origin_security_id = lot.origin_security_id
+                        origin_date = lot.origin_date
+                        ancestry = childAncestry
+                  ricid <- create StockIssuance with context; issuance_data = remIssuance
+                  pure (Map.insert rsec remLot (Map.delete d.security_id sellerLots), [ricid])
+              pure (sellerLots', Map.insert buyerSec buyerLot buyerLots, tcid :: transfers,
+                    extra ++ (bicid :: newIssuances), i + 1)
+
+        (buyerBase, buyerOld) <- case buyer.position of
+          None -> pure (Map.empty, None)
+          Some cid -> do
+            bp <- fetch cid
+            assertMsg "buyer position does not match the buyer"
+              (bp.context == context && bp.stock_class_id == stock_class_id
+                && bp.stakeholder_id == buyer.stakeholder_id && bp.holder == buyer.party)
+            pure (bp.lots, Some cid)
+
+        (sellerLots, buyerLots, transfers, newIssuances, _) <-
+          foldlA step (sp.lots, buyerBase, [], [], 0) draws
+
+        archive seller_position
+        sellerNew <- if Map.null sellerLots
+          then pure None
+          else Some <$> create sp with lots = sellerLots
+        forA_ buyerOld archive
+        buyerNew <- create StockPosition with
+          context; stock_class_id
+          stakeholder_id = buyer.stakeholder_id
+          holder = buyer.party
+          lots = buyerLots
+
+        -- Settlement hook (concrete, package-pinned template).
+        cash <- case settlement of
+          None -> pure None
+          Some call -> do
+            r <- exercise call.acceptance Acceptance_SettleOnDelivery with
+              delivered = TradeShareTerms with
+                trade_id; stock_class_id
+                seller_stakeholder_id = sp.stakeholder_id
+                buyer_stakeholder_id = buyer.stakeholder_id
+                buyer = buyer.party
+                quantity; share_price
+              buyer_allocation = call.buyer_allocation
+              seller_allocation = call.seller_allocation
+              extra_args = call.extra_args
+            pure (Some r)
+
+        pure TradeResult with
+          seller_position = sellerNew
+          buyer_position = buyerNew
+          transfers = reverse transfers
+          issuances = reverse newIssuances
+          cash
+
+    -- | Primary issuance into a holder's position (the position-managed replacement for
+    -- `OcfCreateStockIssuance` in this class). Creates the OCF issuance history record.
+    nonconsuming choice Registry_Issue : (ContractId StockPosition, [ContractId StockIssuance])
+      with
+        holder : Party
+        position : Optional (ContractId StockPosition)
+        issuances : [StockIssuanceOcfData]
+      controller context.issuer
+      do
+        assertMsg "issue at least one lot" (not (null issuances))
+        assertMsg "issuances must be for this class" (all (\d -> d.stock_class_id == stock_class_id) issuances)
+        let stakeholderId = (head issuances).stakeholder_id
+        base <- case position of
+          None -> pure Map.empty
+          Some cid -> do
+            p <- fetch cid
+            assertMsg "position does not match" (p.context == context && p.stock_class_id == stock_class_id
+              && p.stakeholder_id == stakeholderId && p.holder == holder)
+            archive cid
+            pure p.lots
+        (lots, cids) <- foldlA (\(acc, cs) d -> do
+            assertMsg ("duplicate lot " <> d.security_id) (not (Map.member d.security_id acc))
+            c <- create StockIssuance with context; issuance_data = d
+            pure (Map.insert d.security_id (PositionLot with
+              issuance = d; origin_security_id = d.security_id; origin_date = d.date; ancestry = []) acc, c :: cs))
+          (base, []) issuances
+        p <- create StockPosition with context; stock_class_id; stakeholder_id = stakeholderId; holder; lots
+        pure (p, reverse cids)
+
+    -- | Merge several positions of one holder into one (e.g. after contention-free buys).
+    nonconsuming choice Registry_MergePositions : ContractId StockPosition
+      with
+        positions : [ContractId StockPosition]
+      controller context.issuer
+      do
+        assertMsg "merge at least two positions" (length positions >= 2)
+        ps <- forA positions fetch
+        let p0 = head ps
+        forA_ ps \p -> assertMsg "positions must share registry and holder"
+          (p.context == context && p.stock_class_id == stock_class_id
+            && p.stakeholder_id == p0.stakeholder_id && p.holder == p0.holder)
+        forA_ positions archive
+        let merged = foldl (\acc p -> Map.union acc p.lots) Map.empty ps
+        unless (Map.size merged == sum (map (\p -> Map.size p.lots) ps)) $
+          abort "positions share a lot"
+        create p0 with lots = merged

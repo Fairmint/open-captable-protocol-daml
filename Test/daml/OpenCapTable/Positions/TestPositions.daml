@@ -1,0 +1,212 @@
+-- | Migration, root guard and trade path of the position register (no cash leg).
+module OpenCapTable.Positions.TestPositions where
+
+import DA.Assert
+import DA.List (head)
+import DA.Optional (fromOptional)
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import DA.Time (time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+
+data Env = Env with
+    book : Book
+    alice : Party
+    bob : Party
+    carol : Party
+    registry : ContractId PositionRegistry
+    posA : ContractId StockPosition
+    posB : ContractId StockPosition
+
+-- Root book: class SC; A holds S-A1 60, S-A2 40, S-A3 100 (vesting in 2030), S-A4 100 (received
+-- from C by transfer TR-C); B holds S-B1 10; C's S-C1 was fully transferred.
+setup : Script Env
+setup = do
+  b0 <- newBook
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  let unvested = (mkIssuance "SC" "S-A3" "SH-A" 100.0) with
+        vestings = [OcfVesting with amount = 100.0; date = time (D.date 2030 Jan 01) 0 0 0]
+  b1 <- update b0
+    [ CT.OcfCreateStockClass (mkStockClass "SC")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-C")
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A1" "SH-A" 60.0)
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A2" "SH-A" 40.0)
+    , CT.OcfCreateStockIssuance unvested
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-B1" "SH-B" 10.0)
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-C1" "SH-C" 100.0)
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-A4" "SH-A" 100.0) with date = dTrade)
+    , CT.OcfCreateStockTransfer (mkTransfer "TR-C" "S-C1" 100.0 ["S-A4"] None)
+    ] [] []
+  (root2, registry) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with
+    stock_class_id = "SC"; cash_settlement_required = False
+  (root3, [posA, posB]) <- submit b1.issuer $ exerciseCmd root2 CT.MigrateToPositions with
+    stock_class_id = "SC"
+    migrations =
+      [ CT.PositionMigration with stakeholder_id = "SH-A"; holder = alice; security_ids = ["S-A1", "S-A2", "S-A3", "S-A4"]
+      , CT.PositionMigration with stakeholder_id = "SH-B"; holder = bob; security_ids = ["S-B1"] ]
+  let book = b1 with root = root3
+  pure Env with book; alice; bob; carol; registry; posA; posB
+
+lotQty : StockPosition -> Text -> Decimal
+lotQty p sid = case Map.lookup sid p.lots of
+  Some l -> l.issuance.quantity
+  None -> 0.0
+
+trade : Env -> Text -> ContractId StockPosition -> Optional (ContractId StockPosition) -> Decimal -> [(Text, Decimal)] -> Registry_Trade
+trade env tid sellerPos buyerPos qty draws = Registry_Trade with
+  trade_id = tid; date = dTrade; seller_position = sellerPos
+  buyer = TradeBuyer with stakeholder_id = "SH-B"; party = env.bob; position = buyerPos
+  quantity = qty; share_price = usd 2.5
+  draws = map (\(s, q) -> LotDraw with security_id = s; quantity = q) draws
+  bucket_legend_ids = None; settlement = None
+
+-- M1: migration builds one position per holder with lots as data.
+test_M1_migration : Script ()
+test_M1_migration = do
+  env <- setup
+  Some a <- queryContractId env.alice env.posA
+  Map.keys a.lots === ["S-A1", "S-A2", "S-A3", "S-A4"]
+  lotQty a "S-A1" === 60.0
+  lotQty a "S-A4" === 100.0
+  Some b <- queryContractId env.bob env.posB
+  lotQty b "S-B1" === 10.0
+  -- holders see only their own position
+  none <- queryContractId env.bob env.posA
+  none === None
+  root <- queryContractId env.book.issuer env.book.root
+  case root of
+    Some r -> Map.size (fromOptional Map.empty r.position_migrated_security_ids) === 5
+    None -> fail "root missing"
+
+-- M2..M4: migration and root guards.
+test_M2_migrationGuards : Script ()
+test_M2_migrationGuards = do
+  env <- setup
+  let b = env.book
+  expectFail "M2 migrate a security that was transferred" "was transferred"
+    (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
+      stock_class_id = "SC"
+      migrations = [CT.PositionMigration with stakeholder_id = "SH-C"; holder = env.carol; security_ids = ["S-C1"]]
+  expectFail "M3 migrate a security twice" "already migrated"
+    (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
+      stock_class_id = "SC"
+      migrations = [CT.PositionMigration with stakeholder_id = "SH-A"; holder = env.alice; security_ids = ["S-A1"]]
+  expectFail "M4a root transfer on a migrated security" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance ((mkIssuance "SC2x" "S-X" "SH-B" 1.0)), CT.OcfCreateStockTransfer (mkTransfer "TR-X" "S-A1" 10.0 ["S-X"] None)]
+      edits = []; deletes = []
+  expectFail "M4b root issuance in a position-managed class" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockIssuance (mkIssuance "SC" "S-NEW" "SH-B" 5.0)]; edits = []; deletes = []
+  expectFail "M4c root split of a position-managed class" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+        id = "SPLIT-1"; date = dTrade; stock_class_id = "SC"; comments = []
+        split_ratio = OcfRatio with numerator = 2.0; denominator = 1.0]
+      edits = []; deletes = []
+  expectFail "M4d root delete of a migrated issuance" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = []; edits = []; deletes = [CT.OcfDeleteStockIssuance "ISS-S-A1"]
+  expectFail "M4e root edit of a migrated issuance" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = []; edits = [CT.OcfEditStockIssuance ((mkIssuance "SC" "S-A1" "SH-A" 61.0))]; deletes = []
+  expectFail "M4f root delete of the transfer that fed a migrated security's balance" "Position-managed holding"
+    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
+      creates = []; edits = []; deletes = [CT.OcfDeleteStockTransfer "TR-C"]
+  -- unrelated root writes still work
+  _ <- update b [CT.OcfCreateStakeholder (mkStakeholder "SH-D")] [] []
+  pure ()
+
+-- T1: a multi-lot trade 60 + 20 -> 80 with a partial remainder, and its history records.
+test_T1_multiLotTrade : Script ()
+test_T1_multiLotTrade = do
+  env <- setup
+  r <- submit env.book.issuer $ exerciseCmd env.registry (trade env "T1" env.posA (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)])
+  Some sellerPos <- pure r.seller_position
+  Some a <- queryContractId env.alice sellerPos
+  Map.keys a.lots === ["S-A3", "S-A4", "T1-R-1"]
+  lotQty a "T1-R-1" === 20.0
+  case Map.lookup "T1-R-1" a.lots of
+    Some l -> do
+      l.ancestry === ["S-A2"]
+      l.origin_security_id === "S-A2"
+    None -> fail "remainder lot missing"
+  Some b <- queryContractId env.bob r.buyer_position
+  Map.keys b.lots === ["S-B1", "T1-B-0", "T1-B-1"]
+  lotQty b "T1-B-0" === 60.0
+  lotQty b "T1-B-1" === 20.0
+  length r.transfers === 2
+  length r.issuances === 3
+  trs <- forA r.transfers \c -> do
+    Some t <- queryContractId env.book.issuer c
+    pure t.transfer_data
+  map (\t -> (t.security_id, t.quantity, t.resulting_security_ids, t.balance_security_id)) trs ===
+    [("S-A1", 60.0, ["T1-B-0"], None), ("S-A2", 20.0, ["T1-B-1"], Some "T1-R-1")]
+  -- holders cannot see the history records
+  none <- queryContractId env.bob (head r.transfers)
+  none === None
+  -- the root was not touched
+  Some _ <- queryContractId env.book.issuer env.book.root
+  pure ()
+
+-- T2: double spend: the second trade on the consumed seller position fails.
+test_T2_doubleSpend : Script ()
+test_T2_doubleSpend = do
+  env <- setup
+  _ <- submit env.book.issuer $ exerciseCmd env.registry (trade env "T2a" env.posA None 60.0 [("S-A1", 60.0)])
+  expectFail "T2 reuse of the consumed seller position" "contract"
+    (actAs env.book.issuer) $ exerciseCmd env.registry (trade env "T2b" env.posA None 60.0 [("S-A1", 60.0)])
+
+-- T3: per-lot checks.
+test_T3_lotChecks : Script ()
+test_T3_lotChecks = do
+  env <- setup
+  let i = actAs env.book.issuer
+  expectFail "T3a sum != trade quantity" "sum to the trade quantity" i $
+    exerciseCmd env.registry (trade env "T3a" env.posA None 70.0 [("S-A1", 60.0), ("S-A2", 20.0)])
+  expectFail "T3b lot not in the seller's position" "is not in the seller's position" i $
+    exerciseCmd env.registry (trade env "T3b" env.posA None 10.0 [("S-B1", 10.0)])
+  expectFail "T3c same lot twice" "at most once" i $
+    exerciseCmd env.registry (trade env "T3c" env.posA None 20.0 [("S-A1", 10.0), ("S-A1", 10.0)])
+  expectFail "T3d draw above lot quantity" "exceeds lot quantity" i $
+    exerciseCmd env.registry (trade env "T3d" env.posA None 61.0 [("S-A1", 61.0)])
+  expectFail "T3e unvested lot" "not fully vested" i $
+    exerciseCmd env.registry (trade env "T3e" env.posA None 10.0 [("S-A3", 10.0)])
+  expectFail "T3f lot outside the signed bucket" "outside the signed restriction bucket" i $
+    exerciseCmd env.registry (trade env "T3f" env.posA None 10.0 [("S-A1", 10.0)]) with bucket_legend_ids = Some ["LEGEND-144"]
+  expectFail "T3g more than 50 lots" "at most 50 lots" i $
+    exerciseCmd env.registry (trade env "T3g" env.posA None 51.0 [("L" <> show n, 1.0) | n <- [1..51]])
+  expectFail "T3h buyer position of another holder" "buyer position does not match" i $
+    exerciseCmd env.registry (trade env "T3h" env.posA (Some env.posA) 10.0 [("S-A1", 10.0)])
+  expectFail "T3i self-trade" "seller and buyer must differ" i $
+    exerciseCmd env.registry (trade env "T3i" env.posB None 10.0 [("S-B1", 10.0)])
+  -- the TA (or anyone but the issuer) cannot run the registry
+  expectFail "T3j holder submits a trade" "requires authorizers" (actAs env.alice <> readAs env.book.issuer) $
+    exerciseCmd env.registry (trade env "T3j" env.posA None 10.0 [("S-A1", 10.0)])
+  pure ()
+
+-- T4: concurrent-style trades on disjoint holders do not share any consumed contract; a buyer
+-- without a position gets a new one; merge folds positions.
+test_T4_newBuyerPositionAndMerge : Script ()
+test_T4_newBuyerPositionAndMerge = do
+  env <- setup
+  r1 <- submit env.book.issuer $ exerciseCmd env.registry (trade env "T4a" env.posA None 10.0 [("S-A1", 10.0)])
+  Some sp <- pure r1.seller_position
+  r2 <- submit env.book.issuer $ exerciseCmd env.registry (trade env "T4b" sp None 5.0 [("S-A2", 5.0)])
+  merged <- submit env.book.issuer $ exerciseCmd env.registry Registry_MergePositions with
+    positions = [env.posB, r1.buyer_position, r2.buyer_position]
+  Some m <- queryContractId env.bob merged
+  Map.keys m.lots === ["S-B1", "T4a-B-0", "T4b-B-0"]
