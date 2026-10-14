@@ -1,0 +1,382 @@
+-- | The transfer receipt, with the test-only trade stand-in (OpenCapTable.Positions.TradeStandIn)
+-- and TestTokenV2 (Splice 398919a5, published DAR built with SDK 3.5.2): V2 allocations with
+-- executors = [TA, buyer], a buyer-signed acceptance that settles only against a matching
+-- receipt, a pinned factory and authenticated allocations, run by the stand-in desk in the same
+-- transaction as Registry_Transfer.
+module OpenCapTable.Positions.TestTransferReceipt where
+
+import DA.Assert
+import DA.Optional (isNone, isSome)
+import qualified DA.Map as Map
+import qualified DA.TextMap as TextMap
+import DA.Time
+import Daml.Script
+
+import Splice.Api.Token.MetadataV1
+import qualified Splice.Api.Token.HoldingV2 as H2
+import qualified Splice.Api.Token.AllocationV2 as V2
+import qualified Splice.Api.Token.AllocationInstructionV2 as V2
+import qualified Splice.Testing.Tokens.TestTokenV2 as TT
+import qualified Splice.Testing.Tokens.TestTokenV2.Util as TTU
+
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+import OpenCapTable.Positions.TradeStandIn
+
+data HEnv = HEnv with
+    book : Book
+    ta : Party
+    admin : Party
+    alice : Party
+    bob : Party
+    registry : ContractId PositionRegistry
+    posA : ContractId StockPosition
+    desk : ContractId StandInDesk
+    rules : ContractId TT.TokenRules
+    ctxArgs : ExtraArgs
+    now : Time
+
+hsetup : Script HEnv
+hsetup = do
+  b0 <- newBook
+  ta <- allocateParty "ta"
+  admin <- allocateParty "cashAdmin"
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  b1 <- update b0
+    [ CT.OcfCreateStockClass (mkStockClass "SC")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A1" "SH-A" 100.0)
+    ] [] []
+  (root2, registry) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
+  (root3, [posA]) <- submit b1.issuer $ exerciseCmd root2 CT.MigrateToPositions with
+    stock_class_id = "SC"
+    migrations = [CT.PositionMigration with stakeholder_id = "SH-A"; holder = alice; security_ids = ["S-A1"]]
+  desk <- submit (actAs [b1.issuer, ta]) $ createCmd StandInDesk with context = b1.ctx; ta
+  now <- getTime
+  passTime (seconds 1)
+  rules <- submit admin $ createCmd TT.TokenRules with admin
+  let ctxArgs = ExtraArgs with
+        context = ChoiceContext with
+          values = TextMap.fromList [(TTU.tokenRulesContextKey, AV_ContractId (coerceContractId rules))]
+        meta = emptyMetadata
+  let book = b1 with root = root3
+  pure HEnv with book; ta; admin; alice; bob; registry; posA; desk; rules; ctxArgs; now
+
+pinnedFactory : HEnv -> ContractId V2.SettlementFactory
+pinnedFactory env = toInterfaceContractId env.rules
+
+mint : HEnv -> Party -> Decimal -> Script (ContractId TT.Token)
+mint env p amt = submit (actAs [env.admin, p]) $ createCmd TT.Token with
+  holding = H2.HoldingView with
+    account = basicAccount p
+    instrumentId = H2.InstrumentId with admin = env.admin; id = "USD"
+    amount = amt; lock = None; meta = emptyMetadata
+
+allocate : HEnv -> Party -> V2.SettlementInfo -> V2.AllocationSpecification -> [ContractId H2.Holding] -> Script (ContractId V2.Allocation)
+allocate env p settlement allocation inputs = do
+  r <- submit (actAs p <> readAs env.admin) $
+    exerciseCmd (toInterfaceContractId @V2.AllocationFactory env.rules) V2.AllocationFactory_Allocate with
+      settlement; allocation; requestedAt = env.now; inputHoldingCids = inputs; extraArgs = env.ctxArgs; actors = [p]
+  case r.output of
+    V2.AllocationInstructionResult_Completed cid -> pure cid
+    o -> fail ("unexpected allocation result " <> show o)
+
+unlocked : HEnv -> Party -> Script Decimal
+unlocked env p = do
+  toks <- query @TT.Token p
+  pure $ sum [ x.holding.amount | (_, x) <- toks, x.holding.account == basicAccount p, isNone x.holding.lock ]
+
+locked : HEnv -> Party -> Script Decimal
+locked env p = do
+  toks <- query @TT.Token p
+  pure $ sum [ x.holding.amount | (_, x) <- toks, x.holding.account == basicAccount p, isSome x.holding.lock ]
+
+data Deal = Deal with
+    terms : TradeShareTerms
+    cash : CashLegTerms
+    buyerAlloc : ContractId V2.Allocation
+    sellerAlloc : ContractId V2.Allocation
+    acceptance : ContractId BuyerAcceptance
+
+-- | Buyer funds 100, commits qty*price with executors = [TA, buyer]; seller's receipt allocation;
+-- issuer + TA propose the exact terms; the buyer accepts.
+mkDeal : HEnv -> Text -> Decimal -> Decimal -> Script Deal
+mkDeal env tid qty price = do
+  tok <- mint env env.bob 100.0
+  let settlement = V2.SettlementInfo with executors = [env.ta, env.bob]; id = tid; cid = None; meta = emptyMetadata
+      leg = V2.TransferLeg with
+        transferLegId = "cash"; sender = basicAccount env.bob; receiver = basicAccount env.alice
+        amount = qty * price; instrumentId = "USD"; meta = emptyMetadata
+      deadline = env.now `addRelTime` days 1
+      side s o = V2.TransferLegSide with
+        transferLegId = "cash"; side = s; otherside = o; amount = qty * price; instrumentId = "USD"; meta = emptyMetadata
+  buyerAlloc <- allocate env env.bob settlement V2.AllocationSpecification with
+      admin = env.admin; authorizer = basicAccount env.bob
+      transferLegSides = [side V2.SenderSide (basicAccount env.alice)]
+      settlementDeadline = Some deadline; nextIterationFunding = None; committed = True; meta = emptyMetadata
+    [toInterfaceContractId tok]
+  sellerAlloc <- allocate env env.alice settlement V2.AllocationSpecification with
+      admin = env.admin; authorizer = basicAccount env.alice
+      transferLegSides = [side V2.ReceiverSide (basicAccount env.bob)]
+      settlementDeadline = Some deadline; nextIterationFunding = None; committed = False; meta = emptyMetadata
+    []
+  let terms = TradeShareTerms with
+        trade_id = tid; stock_class_id = "SC"; seller_stakeholder_id = "SH-A"; buyer_stakeholder_id = "SH-B"
+        buyer = env.bob; quantity = qty; share_price = usd price
+      cash = CashLegTerms with cash_admin = env.admin; factory = pinnedFactory env; settlement; cash_leg = leg
+  prop <- submit (actAs [env.book.issuer, env.ta]) $ createCmd BuyerAcceptanceProposal with
+    context = env.book.ctx; ta = env.ta; buyer = env.bob; seller = env.alice; terms; cash
+  acceptance <- submit env.bob $ exerciseCmd prop Proposal_Accept
+  pure Deal with ..
+
+-- | The TA's submission: it reads the register and the cash registry, and acts only as the TA.
+taSubmit : HEnv -> SubmitOptions
+taSubmit env = actAs env.ta <> readAs [env.book.issuer, env.admin]
+
+-- | Settle a deal through the stand-in desk: transfer qty shares from lot S-A1 of the seller's
+-- position to a new position of the buyer, then settle the cash against the receipt.
+settleCmd : HEnv -> Deal -> Decimal -> StandInDesk_Settle
+settleCmd env d qty = StandInDesk_Settle with
+  registry = env.registry
+  settlement_id = d.terms.trade_id
+  date = dTrade
+  seller_position = env.posA
+  buyer = Transferee with stakeholder_id = "SH-B"; party = env.bob; position = None
+  quantity = qty
+  share_price = d.terms.share_price
+  draws = [LotDraw with security_id = "S-A1"; quantity = qty]
+  acceptance = d.acceptance
+  buyer_allocation = d.buyerAlloc
+  seller_allocation = d.sellerAlloc
+  extra_args = env.ctxArgs
+
+-- | The acceptance's settle choice with a given receipt (the TA exercising it outside the desk).
+settleWith : HEnv -> Deal -> ContractId TransferReceipt -> Acceptance_SettleOnDelivery
+settleWith env d receipt = Acceptance_SettleOnDelivery with
+  receipt; buyer_allocation = d.buyerAlloc; seller_allocation = d.sellerAlloc; extra_args = env.ctxArgs
+
+-- | A transfer by the issuer outside the desk (no cash), from one lot of the seller's position.
+plainTransfer : HEnv -> Text -> ContractId StockPosition -> Text -> Decimal -> Bool -> Registry_Transfer
+plainTransfer env tid sellerPos lot qty withReceipt = Registry_Transfer with
+  transfer_id = tid; date = dTrade; transferor_position = sellerPos
+  transferee = Transferee with stakeholder_id = "SH-B"; party = env.bob; position = None
+  quantity = qty; share_price = usd 4.0
+  draws = [LotDraw with security_id = lot; quantity = qty]
+  reference = Some tid; request_receipt = withReceipt
+
+receiptsOf : Party -> Script [(ContractId TransferReceipt, TransferReceipt)]
+receiptsOf p = query @TransferReceipt p
+
+-- H1: the stand-in desk moves shares and cash in one transaction, and consumes the receipt and
+-- the acceptance.
+test_H1_settleThroughDesk : Script ()
+test_H1_settleThroughDesk = do
+  env <- hsetup
+  d <- mkDeal env "TR-1" 10.0 4.0
+  r <- submit (taSubmit env) $ exerciseCmd env.desk (settleCmd env d 10.0)
+  s <- unlocked env env.alice
+  s === 40.0
+  l <- locked env env.bob
+  l === 0.0
+  Some b <- queryContractId env.bob r.transfer.transferee_position
+  Map.keys b.lots === ["TR-1-B-0"]
+  Some sellerPos <- pure r.transfer.transferor_position
+  Some a <- queryContractId env.alice sellerPos
+  Map.keys a.lots === ["TR-1-R-0"]
+  Some receipt <- pure r.transfer.receipt
+  None <- queryContractId env.book.issuer receipt
+  None <- queryContractId env.bob d.acceptance
+  rs <- receiptsOf env.book.issuer
+  rs === []
+
+-- H2: a 9-share transfer against a 10-share acceptance rolls everything back (shares, receipt
+-- and cash).
+test_H2_mismatchRollsBack : Script ()
+test_H2_mismatchRollsBack = do
+  env <- hsetup
+  d <- mkDeal env "TR-2" 10.0 4.0
+  expectFail "H2 transfer 9 shares against a 10-share acceptance" "receipt quantity differs from the accepted terms"
+    (taSubmit env) $ exerciseCmd env.desk (settleCmd env d 9.0)
+  Some _ <- queryContractId env.alice env.posA
+  l <- locked env env.bob
+  l === 40.0
+  rs <- receiptsOf env.book.issuer
+  rs === []
+
+-- H3a: without a receipt the cash does not move. A TA that settles the acceptance directly
+-- (its controller) must pass a TransferReceipt; any other contract, here the seller's position
+-- with the same signatories, is rejected by the receipt fetch.
+test_H3a_settleWithoutReceipt : Script ()
+test_H3a_settleWithoutReceipt = do
+  env <- hsetup
+  d <- mkDeal env "TR-3A" 10.0 4.0
+  expectFail "H3a settle with no receipt" "wrong template type"
+    (taSubmit env) $ exerciseCmd d.acceptance (settleWith env d (coerceContractId env.posA))
+  l <- locked env env.bob
+  l === 40.0
+
+-- H3b: a receipt of a real transfer that differs from the accepted terms is rejected, field by
+-- field; so is a receipt the issuer signs with a system operator party of its own.
+test_H3b_mismatchedReceipt : Script ()
+test_H3b_mismatchedReceipt = do
+  env <- hsetup
+  d <- mkDeal env "TR-3B" 10.0 4.0
+  -- Real transfers outside the desk, each with a receipt that differs in one field.
+  r1 <- submit env.book.issuer $ exerciseCmd env.registry
+    ((plainTransfer env "X1" env.posA "S-A1" 10.0 True) with reference = Some "OTHER")
+  Some pos1 <- pure r1.transferor_position
+  Some rc1 <- pure r1.receipt
+  expectFail "H3b reference differs" "receipt reference differs from the settlement ID"
+    (taSubmit env) $ exerciseCmd d.acceptance (settleWith env d rc1)
+  r2 <- submit env.book.issuer $ exerciseCmd env.registry
+    ((plainTransfer env "X2" pos1 "X1-R-0" 10.0 True) with reference = Some "TR-3B"; share_price = usd 3.0)
+  Some pos2 <- pure r2.transferor_position
+  Some rc2 <- pure r2.receipt
+  expectFail "H3b share price differs" "receipt share price differs from the accepted terms"
+    (taSubmit env) $ exerciseCmd d.acceptance (settleWith env d rc2)
+  carol <- allocateParty "carol"
+  r3 <- submit env.book.issuer $ exerciseCmd env.registry
+    ((plainTransfer env "X3" pos2 "X2-R-0" 10.0 True) with
+      reference = Some "TR-3B"
+      transferee = Transferee with stakeholder_id = "SH-C"; party = carol; position = None)
+  Some rc3 <- pure r3.receipt
+  expectFail "H3b transferee differs" "receipt transferee differs from the buyer"
+    (taSubmit env) $ exerciseCmd d.acceptance (settleWith env d rc3)
+  -- A receipt with the accepted terms, signed by the issuer and a party it controls as system
+  -- operator (no transfer at all).
+  ownSysop <- allocateParty "issuerControlledSysop"
+  forged <- submit (actAs [env.book.issuer, ownSysop]) $ createCmd TransferReceipt with
+    context = Context with issuer = env.book.issuer; system_operator = ownSysop
+    stock_class_id = "SC"
+    transferor = env.alice; transferor_stakeholder_id = "SH-A"
+    transferee = env.bob; transferee_stakeholder_id = "SH-B"
+    quantity = 10.0; share_price = usd 4.0; reference = Some "TR-3B"; date = dTrade
+    transfer_ids = []; issuance_ids = []
+  expectFail "H3b receipt of another system operator" "receipt issuer or system operator differs"
+    (taSubmit env) $ exerciseCmd d.acceptance (settleWith env d forged)
+  l <- locked env env.bob
+  l === 40.0
+
+-- H3c: a redeemed receipt cannot settle again (here: a duplicate acceptance of the same trade).
+test_H3c_redeemedReceipt : Script ()
+test_H3c_redeemedReceipt = do
+  env <- hsetup
+  d <- mkDeal env "TR-3C" 10.0 4.0
+  duplicate <- mkDeal env "TR-3C" 10.0 4.0
+  r <- submit (taSubmit env) $ exerciseCmd env.desk (settleCmd env d 10.0)
+  Some receipt <- pure r.transfer.receipt
+  expectFail "H3c settle with an already-redeemed receipt" "NotActive"
+    (taSubmit env) $ exerciseCmd duplicate.acceptance (settleWith env duplicate receipt)
+  l <- locked env env.bob
+  l === 40.0
+
+-- H3d: a receipt cannot be created directly without the system operator's authority: issuer
+-- alone, TA alone, issuer + TA, issuer + TA + buyer. (In OpenCapTable only Registry_Transfer
+-- creates one.)
+test_H3d_receiptNotCreatableDirectly : Script ()
+test_H3d_receiptNotCreatableDirectly = do
+  env <- hsetup
+  let receipt = TransferReceipt with
+        context = env.book.ctx; stock_class_id = "SC"
+        transferor = env.alice; transferor_stakeholder_id = "SH-A"
+        transferee = env.bob; transferee_stakeholder_id = "SH-B"
+        quantity = 10.0; share_price = usd 4.0; reference = Some "TR-3D"; date = dTrade
+        transfer_ids = []; issuance_ids = []
+      i = env.book.issuer
+  expectFail "H3d issuer alone" "requires authorizers" (actAs i) $ createCmd receipt
+  expectFail "H3d TA alone" "requires authorizers" (actAs env.ta) $ createCmd receipt
+  expectFail "H3d issuer + TA" "requires authorizers" (actAs [i, env.ta]) $ createCmd receipt
+  expectFail "H3d issuer + TA + buyer" "requires authorizers" (actAs [i, env.ta, env.bob]) $ createCmd receipt
+  rs <- receiptsOf env.book.sysop
+  rs === []
+
+-- H4: Registry_Transfer is generic: with no cash involved it moves shares, creates a receipt only
+-- on request, and the receipt records only the delivered terms.
+test_H4_transferWithoutCash : Script ()
+test_H4_transferWithoutCash = do
+  env <- hsetup
+  r1 <- submit env.book.issuer $ exerciseCmd env.registry (plainTransfer env "P1" env.posA "S-A1" 10.0 False)
+  r1.receipt === None
+  rs <- receiptsOf env.book.issuer
+  rs === []
+  Some b1 <- queryContractId env.bob r1.transferee_position
+  Map.keys b1.lots === ["P1-B-0"]
+  Some pos1 <- pure r1.transferor_position
+  r2 <- submit env.book.issuer $ exerciseCmd env.registry (plainTransfer env "P2" pos1 "P1-R-0" 15.0 True)
+  Some rc <- pure r2.receipt
+  -- The holders do not see the receipt (no observers).
+  None <- queryContractId env.alice rc
+  None <- queryContractId env.bob rc
+  Some _ <- queryContractId env.book.sysop rc
+  -- Redeeming returns what it recorded and archives it.
+  delivered <- submit env.book.issuer $ exerciseCmd rc TransferReceipt_Redeem
+  delivered === TransferReceipt with
+    context = env.book.ctx; stock_class_id = "SC"
+    transferor = env.alice; transferor_stakeholder_id = "SH-A"
+    transferee = env.bob; transferee_stakeholder_id = "SH-B"
+    quantity = 15.0; share_price = usd 4.0; reference = Some "P2"; date = dTrade
+    transfer_ids = ["P2-TR-0"]; issuance_ids = ["P2-ISS-B-0"]
+  None <- queryContractId env.book.issuer rc
+  expectFail "H4 redeem twice" "NotActive" (actAs env.book.issuer) $ exerciseCmd rc TransferReceipt_Redeem
+  Some b2 <- queryContractId env.bob r2.transferee_position
+  Map.keys b2.lots === ["P2-B-0"]
+
+-- H5: TA cleanup without holder action returns the buyer's cash.
+test_H5_taCancel : Script ()
+test_H5_taCancel = do
+  env <- hsetup
+  d <- mkDeal env "TR-5" 10.0 4.0
+  _ <- submit (actAs env.ta <> readAs env.admin) $ exerciseCmd d.acceptance Acceptance_Cancel with
+    allocations = [d.buyerAlloc, d.sellerAlloc]; extra_args = env.ctxArgs
+  b <- unlocked env env.bob
+  b === 100.0
+
+-- H6: an allocation of another trade is rejected before the buyer's authority reaches it.
+test_H6_allocationAuthenticated : Script ()
+test_H6_allocationAuthenticated = do
+  env <- hsetup
+  d <- mkDeal env "TR-6" 10.0 4.0
+  other <- mkDeal env "TR-6b" 10.0 4.0
+  expectFail "H6 buyer allocation of another settlement" "allocation settlement mismatch"
+    (taSubmit env) $ exerciseCmd env.desk ((settleCmd env d 10.0) with buyer_allocation = other.buyerAlloc)
+  Some _ <- queryContractId env.alice env.posA
+  pure ()
+
+-- H7: the acceptance is single use; a second settlement with the same acceptance fails.
+test_H7_singleUse : Script ()
+test_H7_singleUse = do
+  env <- hsetup
+  d <- mkDeal env "TR-7" 10.0 4.0
+  r <- submit (taSubmit env) $ exerciseCmd env.desk (settleCmd env d 10.0)
+  Some sp <- pure r.transfer.transferor_position
+  expectFail "H7 reuse of a consumed acceptance" "NotActive"
+    (taSubmit env) $ exerciseCmd env.desk
+      ((settleCmd env d 90.0) with seller_position = sp; draws = [LotDraw with security_id = "TR-7-R-0"; quantity = 90.0])
+
+-- H8: the buyer revokes her acceptance before settlement. The settlement then fails. FINDING
+-- (unchanged): the revoke also removes the TA's cleanup path (Acceptance_Cancel), and a committed
+-- allocation with executors = [TA, buyer] cannot be cancelled by the TA alone, so the buyer's
+-- cash stays locked until the settlement deadline. The revoke should cancel the allocations
+-- itself.
+test_H8_buyerRevoke : Script ()
+test_H8_buyerRevoke = do
+  env <- hsetup
+  d <- mkDeal env "TR-8" 10.0 4.0
+  submit env.bob $ exerciseCmd d.acceptance Acceptance_BuyerRevoke
+  expectFail "H8a settlement after the buyer revoked" "NotActive"
+    (taSubmit env) $ exerciseCmd env.desk (settleCmd env d 10.0)
+  expectFail "H8b TA cleanup after the revoke" "NotActive"
+    (actAs env.ta <> readAs env.admin) $ exerciseCmd d.acceptance Acceptance_Cancel with
+      allocations = [d.buyerAlloc, d.sellerAlloc]; extra_args = env.ctxArgs
+  expectFail "H8c TA alone cancels the committed allocation at the root" "requires authorizers"
+    (actAs env.ta <> readAs [env.admin, env.bob]) $ exerciseCmd d.buyerAlloc V2.Allocation_Cancel with
+      actors = [env.ta, env.bob]; extraArgs = env.ctxArgs
+  Some _ <- queryContractId env.alice env.posA
+  l <- locked env env.bob
+  l === 40.0
+  note "H8: after a buyer revoke the buyer's 40.0 stays locked until the settlement deadline"

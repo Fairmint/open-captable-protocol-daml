@@ -15,7 +15,7 @@ import qualified DA.Map as Map
 import DA.List (sortOn, unique)
 import DA.Action (foldlA, when)
 import DA.Foldable (forA_, mapA_)
-import DA.Optional (fromOptional, isNone, isSome)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import qualified DA.Date as Date
 
 import Fairmint.OpenCapTable.Types.Core (Context)
@@ -24,7 +24,7 @@ import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIss
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
--- Position register (positions, holds and the registry trade path)
+-- Position register (positions and their registry)
 import Fairmint.OpenCapTable.Positions (StockPosition(..), PositionRegistry(..), PositionLot(..))
 
 -- OCF Types
@@ -1626,11 +1626,6 @@ validateActiveSecurityTargets maps = do
 
 
 -- =============================================================================
--- CapTable Template
--- =============================================================================
-
-
--- =============================================================================
 -- Position register support
 -- =============================================================================
 
@@ -1643,89 +1638,199 @@ data PositionMigration = PositionMigration with
 positionManagedError : Text -> Text
 positionManagedError what = "Position-managed holding: " <> what <> "; use the PositionRegistry choices"
 
--- | For an edit or delete, fetch the stored record (if any) and check the IDs it references.
-checkStoredRecord : (HasFetch t) => (Text -> Bool) -> Text -> Map Text (ContractId t) -> Text -> (t -> [Text]) -> Update ()
-checkStoredRecord forbidden what objects objectId refs = case Map.lookup objectId objects of
-  None -> pure ()
-  Some cid -> do
-    obj <- fetch cid
-    forA_ (refs obj) \r ->
-      assertMsg (positionManagedError (what <> " " <> objectId <> " references " <> r)) (not (forbidden r))
+-- | What one version of a root record says about position-managed holdings: the stock class it
+-- writes into (stock issuances, splits and conversion-ratio adjustments) and every stock
+-- security it names as its source, resulting or balance security. Records of warrants,
+-- convertibles and equity compensation name stock only as their resulting securities; vesting
+-- records name a stock, warrant or equity compensation security.
+data PositionRefs = PositionRefs with
+    label : Text
+    stock_class_ids : [Text]
+    security_ids : [Text]
 
--- | UpdateCapTable may not write stock-holding records for securities that were migrated into
--- positions, nor issuances, splits or ratio adjustments in a position-managed class. Costs
--- nothing on a root without positions, and O(batch) otherwise (one fetch per edit or delete of a
--- stock-holding record).
+stockIssuanceRefs : StockIssuanceOcfData -> PositionRefs
+stockIssuanceRefs d = PositionRefs ("stock issuance " <> d.id) [d.stock_class_id] [d.security_id]
+
+stockClassSplitRefs : StockClassSplitOcfData -> PositionRefs
+stockClassSplitRefs d = PositionRefs ("stock class split " <> d.id) [d.stock_class_id] []
+
+conversionRatioAdjustmentRefs : StockClassConversionRatioAdjustmentOcfData -> PositionRefs
+conversionRatioAdjustmentRefs d = PositionRefs ("conversion ratio adjustment " <> d.id) [d.stock_class_id] []
+
+stockTransferRefs : StockTransferOcfData -> PositionRefs
+stockTransferRefs d = PositionRefs ("stock transfer " <> d.id) []
+  (d.security_id :: d.resulting_security_ids ++ optionalToList d.balance_security_id)
+
+stockCancellationRefs : StockCancellationOcfData -> PositionRefs
+stockCancellationRefs d = PositionRefs ("stock cancellation " <> d.id) []
+  (d.security_id :: optionalToList d.balance_security_id)
+
+stockRepurchaseRefs : StockRepurchaseOcfData -> PositionRefs
+stockRepurchaseRefs d = PositionRefs ("stock repurchase " <> d.id) []
+  (d.security_id :: optionalToList d.balance_security_id)
+
+stockRetractionRefs : StockRetractionOcfData -> PositionRefs
+stockRetractionRefs d = PositionRefs ("stock retraction " <> d.id) [] [d.security_id]
+
+stockReissuanceRefs : StockReissuanceOcfData -> PositionRefs
+stockReissuanceRefs d = PositionRefs ("stock reissuance " <> d.id) [] (d.security_id :: d.resulting_security_ids)
+
+stockConversionRefs : StockConversionOcfData -> PositionRefs
+stockConversionRefs d = PositionRefs ("stock conversion " <> d.id) []
+  (d.security_id :: d.resulting_security_ids ++ optionalToList d.balance_security_id)
+
+stockAcceptanceRefs : StockAcceptanceOcfData -> PositionRefs
+stockAcceptanceRefs d = PositionRefs ("stock acceptance " <> d.id) [] [d.security_id]
+
+stockConsolidationRefs : StockConsolidationOcfData -> PositionRefs
+stockConsolidationRefs d = PositionRefs ("stock consolidation " <> d.id) [] (d.resulting_security_id :: d.security_ids)
+
+warrantExerciseRefs : WarrantExerciseOcfData -> PositionRefs
+warrantExerciseRefs d = PositionRefs ("warrant exercise " <> d.id) [] d.resulting_security_ids
+
+convertibleConversionRefs : ConvertibleConversionOcfData -> PositionRefs
+convertibleConversionRefs d = PositionRefs ("convertible conversion " <> d.id) [] d.resulting_security_ids
+
+equityCompensationExerciseRefs : EquityCompensationExerciseOcfData -> PositionRefs
+equityCompensationExerciseRefs d = PositionRefs ("equity compensation exercise " <> d.id) [] d.resulting_security_ids
+
+equityCompensationReleaseRefs : EquityCompensationReleaseOcfData -> PositionRefs
+equityCompensationReleaseRefs d = PositionRefs ("equity compensation release " <> d.id) [] d.resulting_security_ids
+
+vestingStartRefs : VestingStartOcfData -> PositionRefs
+vestingStartRefs d = PositionRefs ("vesting start " <> d.id) [] [d.security_id]
+
+vestingEventRefs : VestingEventOcfData -> PositionRefs
+vestingEventRefs d = PositionRefs ("vesting event " <> d.id) [] [d.security_id]
+
+vestingAccelerationRefs : VestingAccelerationOcfData -> PositionRefs
+vestingAccelerationRefs d = PositionRefs ("vesting acceleration " <> d.id) [] [d.security_id]
+
+-- | The proposed version of a created record (no fetch).
+createdRefs : OcfCreateData -> Optional PositionRefs
+createdRefs c = case c of
+  OcfCreateStockIssuance d -> Some (stockIssuanceRefs d)
+  OcfCreateStockClassSplit d -> Some (stockClassSplitRefs d)
+  OcfCreateStockClassConversionRatioAdjustment d -> Some (conversionRatioAdjustmentRefs d)
+  OcfCreateStockTransfer d -> Some (stockTransferRefs d)
+  OcfCreateStockCancellation d -> Some (stockCancellationRefs d)
+  OcfCreateStockRepurchase d -> Some (stockRepurchaseRefs d)
+  OcfCreateStockRetraction d -> Some (stockRetractionRefs d)
+  OcfCreateStockReissuance d -> Some (stockReissuanceRefs d)
+  OcfCreateStockConversion d -> Some (stockConversionRefs d)
+  OcfCreateStockAcceptance d -> Some (stockAcceptanceRefs d)
+  OcfCreateStockConsolidation d -> Some (stockConsolidationRefs d)
+  OcfCreateWarrantExercise d -> Some (warrantExerciseRefs d)
+  OcfCreateConvertibleConversion d -> Some (convertibleConversionRefs d)
+  OcfCreateEquityCompensationExercise d -> Some (equityCompensationExerciseRefs d)
+  OcfCreateEquityCompensationRelease d -> Some (equityCompensationReleaseRefs d)
+  OcfCreateVestingStart d -> Some (vestingStartRefs d)
+  OcfCreateVestingEvent d -> Some (vestingEventRefs d)
+  OcfCreateVestingAcceleration d -> Some (vestingAccelerationRefs d)
+  _ -> None
+
+-- | The proposed version of an edited record (no fetch).
+editedRefs : OcfEditData -> Optional PositionRefs
+editedRefs e = case e of
+  OcfEditStockIssuance d -> Some (stockIssuanceRefs d)
+  OcfEditStockClassSplit d -> Some (stockClassSplitRefs d)
+  OcfEditStockClassConversionRatioAdjustment d -> Some (conversionRatioAdjustmentRefs d)
+  OcfEditStockTransfer d -> Some (stockTransferRefs d)
+  OcfEditStockCancellation d -> Some (stockCancellationRefs d)
+  OcfEditStockRepurchase d -> Some (stockRepurchaseRefs d)
+  OcfEditStockRetraction d -> Some (stockRetractionRefs d)
+  OcfEditStockReissuance d -> Some (stockReissuanceRefs d)
+  OcfEditStockConversion d -> Some (stockConversionRefs d)
+  OcfEditStockAcceptance d -> Some (stockAcceptanceRefs d)
+  OcfEditStockConsolidation d -> Some (stockConsolidationRefs d)
+  OcfEditWarrantExercise d -> Some (warrantExerciseRefs d)
+  OcfEditConvertibleConversion d -> Some (convertibleConversionRefs d)
+  OcfEditEquityCompensationExercise d -> Some (equityCompensationExerciseRefs d)
+  OcfEditEquityCompensationRelease d -> Some (equityCompensationReleaseRefs d)
+  OcfEditVestingStart d -> Some (vestingStartRefs d)
+  OcfEditVestingEvent d -> Some (vestingEventRefs d)
+  OcfEditVestingAcceleration d -> Some (vestingAccelerationRefs d)
+  _ -> None
+
+-- | The stored record an edit replaces, named the way a delete of it would name it.
+editedRecord : OcfEditData -> Optional OcfDeleteData
+editedRecord e = case e of
+  OcfEditStockIssuance d -> Some (OcfDeleteStockIssuance d.id)
+  OcfEditStockClassSplit d -> Some (OcfDeleteStockClassSplit d.id)
+  OcfEditStockClassConversionRatioAdjustment d -> Some (OcfDeleteStockClassConversionRatioAdjustment d.id)
+  OcfEditStockTransfer d -> Some (OcfDeleteStockTransfer d.id)
+  OcfEditStockCancellation d -> Some (OcfDeleteStockCancellation d.id)
+  OcfEditStockRepurchase d -> Some (OcfDeleteStockRepurchase d.id)
+  OcfEditStockRetraction d -> Some (OcfDeleteStockRetraction d.id)
+  OcfEditStockReissuance d -> Some (OcfDeleteStockReissuance d.id)
+  OcfEditStockConversion d -> Some (OcfDeleteStockConversion d.id)
+  OcfEditStockAcceptance d -> Some (OcfDeleteStockAcceptance d.id)
+  OcfEditStockConsolidation d -> Some (OcfDeleteStockConsolidation d.id)
+  OcfEditWarrantExercise d -> Some (OcfDeleteWarrantExercise d.id)
+  OcfEditConvertibleConversion d -> Some (OcfDeleteConvertibleConversion d.id)
+  OcfEditEquityCompensationExercise d -> Some (OcfDeleteEquityCompensationExercise d.id)
+  OcfEditEquityCompensationRelease d -> Some (OcfDeleteEquityCompensationRelease d.id)
+  OcfEditVestingStart d -> Some (OcfDeleteVestingStart d.id)
+  OcfEditVestingEvent d -> Some (OcfDeleteVestingEvent d.id)
+  OcfEditVestingAcceleration d -> Some (OcfDeleteVestingAcceleration d.id)
+  _ -> None
+
+-- | Fetch the stored version of a record (one fetch). An unknown ID has no stored version; the
+-- edit or delete then fails in UpdateCapTable itself.
+storedVersion : (HasFetch t) => Map Text (ContractId t) -> Text -> (t -> PositionRefs) -> Update (Optional PositionRefs)
+storedVersion objects objectId refs = case Map.lookup objectId objects of
+  None -> pure None
+  Some cid -> Some . refs <$> fetch cid
+
+-- | The stored version of the record an edit replaces or a delete removes.
+storedRefs : CapTable -> OcfDeleteData -> Update (Optional PositionRefs)
+storedRefs ct r = case r of
+  OcfDeleteStockIssuance i -> storedVersion ct.stock_issuances i (stockIssuanceRefs . (.issuance_data))
+  OcfDeleteStockClassSplit i -> storedVersion ct.stock_class_splits i (stockClassSplitRefs . (.split_data))
+  OcfDeleteStockClassConversionRatioAdjustment i -> storedVersion ct.stock_class_conversion_ratio_adjustments i (conversionRatioAdjustmentRefs . (.adjustment_data))
+  OcfDeleteStockTransfer i -> storedVersion ct.stock_transfers i (stockTransferRefs . (.transfer_data))
+  OcfDeleteStockCancellation i -> storedVersion ct.stock_cancellations i (stockCancellationRefs . (.cancellation_data))
+  OcfDeleteStockRepurchase i -> storedVersion ct.stock_repurchases i (stockRepurchaseRefs . (.repurchase_data))
+  OcfDeleteStockRetraction i -> storedVersion ct.stock_retractions i (stockRetractionRefs . (.retraction_data))
+  OcfDeleteStockReissuance i -> storedVersion ct.stock_reissuances i (stockReissuanceRefs . (.reissuance_data))
+  OcfDeleteStockConversion i -> storedVersion ct.stock_conversions i (stockConversionRefs . (.conversion_data))
+  OcfDeleteStockAcceptance i -> storedVersion ct.stock_acceptances i (stockAcceptanceRefs . (.acceptance_data))
+  OcfDeleteStockConsolidation i -> storedVersion ct.stock_consolidations i (stockConsolidationRefs . (.consolidation_data))
+  OcfDeleteWarrantExercise i -> storedVersion ct.warrant_exercises i (warrantExerciseRefs . (.exercise_data))
+  OcfDeleteConvertibleConversion i -> storedVersion ct.convertible_conversions i (convertibleConversionRefs . (.conversion_data))
+  OcfDeleteEquityCompensationExercise i -> storedVersion ct.equity_compensation_exercises i (equityCompensationExerciseRefs . (.exercise_data))
+  OcfDeleteEquityCompensationRelease i -> storedVersion ct.equity_compensation_releases i (equityCompensationReleaseRefs . (.release_data))
+  OcfDeleteVestingStart i -> storedVersion ct.vesting_starts i (vestingStartRefs . (.vesting_data))
+  OcfDeleteVestingEvent i -> storedVersion ct.vesting_events i (vestingEventRefs . (.vesting_data))
+  OcfDeleteVestingAcceleration i -> storedVersion ct.vesting_accelerations i (vestingAccelerationRefs . (.acceleration_data))
+  _ -> pure None
+
+-- | Root guard for position-managed holdings. Every record a batch writes is checked in its
+-- proposed version (creates and edits) and in its stored version (edits and deletes): no
+-- version may be a stock issuance, split or conversion-ratio adjustment in a position-managed
+-- class, or name a migrated security as its source, resulting or balance security. So an edit
+-- can move a root record neither into nor out of a managed class. Costs nothing on a root
+-- without positions, and O(batch) otherwise: one fetch per edit or delete of a guarded record.
 validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
 validatePositionManagedWrites ct creates edits deletes = do
   let classes = fromOptional Map.empty ct.position_registries
       migrated = fromOptional Map.empty ct.position_migrated_security_ids
-      managedClass c = Map.member c classes
-      migratedSec s = Map.member s migrated
-      noSec what s = assertMsg (positionManagedError (what <> " on " <> s)) (not (migratedSec s))
-      noClass what c = assertMsg (positionManagedError (what <> " in class " <> c)) (not (managedClass c))
+      check version refs = do
+        forA_ refs.stock_class_ids \c ->
+          assertMsg (positionManagedError (refs.label <> " (" <> version <> ") is in position-managed class " <> c))
+            (not (Map.member c classes))
+        forA_ refs.security_ids \s ->
+          assertMsg (positionManagedError (refs.label <> " (" <> version <> ") references migrated security " <> s))
+            (not (Map.member s migrated))
+      checkStored r = do
+        stored <- storedRefs ct r
+        forA_ stored (check "stored")
   when (not (Map.null classes) || not (Map.null migrated)) $ do
-    forA_ creates \c -> case c of
-      OcfCreateStockIssuance d -> noClass "stock issuance" d.stock_class_id
-      OcfCreateStockClassSplit d -> noClass "stock class split" d.stock_class_id
-      OcfCreateStockClassConversionRatioAdjustment d -> noClass "conversion ratio adjustment" d.stock_class_id
-      OcfCreateStockTransfer d -> noSec "stock transfer" d.security_id
-      OcfCreateStockCancellation d -> noSec "stock cancellation" d.security_id
-      OcfCreateStockRepurchase d -> noSec "stock repurchase" d.security_id
-      OcfCreateStockRetraction d -> noSec "stock retraction" d.security_id
-      OcfCreateStockReissuance d -> noSec "stock reissuance" d.security_id
-      OcfCreateStockConversion d -> noSec "stock conversion" d.security_id
-      OcfCreateStockAcceptance d -> noSec "stock acceptance" d.security_id
-      OcfCreateStockConsolidation d -> forA_ d.security_ids (noSec "stock consolidation")
-      _ -> pure ()
-    forA_ edits \e -> case e of
-      OcfEditStockIssuance d -> do
-        noSec "stock issuance edit" d.security_id
-        checkStoredRecord migratedSec "stock issuance" ct.stock_issuances d.id (\o -> [o.issuance_data.security_id])
-      OcfEditStockClassSplit d -> do
-        noClass "stock class split edit" d.stock_class_id
-        checkStoredRecord managedClass "stock class split" ct.stock_class_splits d.id (\o -> [o.split_data.stock_class_id])
-      OcfEditStockClassConversionRatioAdjustment d -> do
-        noClass "conversion ratio adjustment edit" d.stock_class_id
-        checkStoredRecord managedClass "conversion ratio adjustment" ct.stock_class_conversion_ratio_adjustments d.id (\o -> [o.adjustment_data.stock_class_id])
-      OcfEditStockTransfer d -> do
-        noSec "stock transfer edit" d.security_id
-        checkStoredRecord migratedSec "stock transfer" ct.stock_transfers d.id (\o -> o.transfer_data.security_id :: o.transfer_data.resulting_security_ids ++ optional [] pure o.transfer_data.balance_security_id)
-      OcfEditStockCancellation d -> do
-        noSec "stock cancellation edit" d.security_id
-        checkStoredRecord migratedSec "stock cancellation" ct.stock_cancellations d.id (\o -> o.cancellation_data.security_id :: optional [] pure o.cancellation_data.balance_security_id)
-      OcfEditStockRepurchase d -> do
-        noSec "stock repurchase edit" d.security_id
-        checkStoredRecord migratedSec "stock repurchase" ct.stock_repurchases d.id (\o -> o.repurchase_data.security_id :: optional [] pure o.repurchase_data.balance_security_id)
-      OcfEditStockRetraction d -> do
-        noSec "stock retraction edit" d.security_id
-        checkStoredRecord migratedSec "stock retraction" ct.stock_retractions d.id (\o -> [o.retraction_data.security_id])
-      OcfEditStockReissuance d -> do
-        noSec "stock reissuance edit" d.security_id
-        checkStoredRecord migratedSec "stock reissuance" ct.stock_reissuances d.id (\o -> o.reissuance_data.security_id :: o.reissuance_data.resulting_security_ids)
-      OcfEditStockConversion d -> do
-        noSec "stock conversion edit" d.security_id
-        checkStoredRecord migratedSec "stock conversion" ct.stock_conversions d.id (\o -> o.conversion_data.security_id :: o.conversion_data.resulting_security_ids ++ optional [] pure o.conversion_data.balance_security_id)
-      OcfEditStockAcceptance d -> do
-        noSec "stock acceptance edit" d.security_id
-        checkStoredRecord migratedSec "stock acceptance" ct.stock_acceptances d.id (\o -> [o.acceptance_data.security_id])
-      OcfEditStockConsolidation d -> do
-        forA_ d.security_ids (noSec "stock consolidation edit")
-        checkStoredRecord migratedSec "stock consolidation" ct.stock_consolidations d.id (\o -> o.consolidation_data.resulting_security_id :: o.consolidation_data.security_ids)
-      _ -> pure ()
-    forA_ deletes \d -> case d of
-      OcfDeleteStockIssuance i -> checkStoredRecord migratedSec "stock issuance" ct.stock_issuances i (\o -> [o.issuance_data.security_id])
-      OcfDeleteStockClassSplit i -> checkStoredRecord managedClass "stock class split" ct.stock_class_splits i (\o -> [o.split_data.stock_class_id])
-      OcfDeleteStockClassConversionRatioAdjustment i -> checkStoredRecord managedClass "conversion ratio adjustment" ct.stock_class_conversion_ratio_adjustments i (\o -> [o.adjustment_data.stock_class_id])
-      OcfDeleteStockTransfer i -> checkStoredRecord migratedSec "stock transfer" ct.stock_transfers i (\o -> o.transfer_data.security_id :: o.transfer_data.resulting_security_ids ++ optional [] pure o.transfer_data.balance_security_id)
-      OcfDeleteStockCancellation i -> checkStoredRecord migratedSec "stock cancellation" ct.stock_cancellations i (\o -> o.cancellation_data.security_id :: optional [] pure o.cancellation_data.balance_security_id)
-      OcfDeleteStockRepurchase i -> checkStoredRecord migratedSec "stock repurchase" ct.stock_repurchases i (\o -> o.repurchase_data.security_id :: optional [] pure o.repurchase_data.balance_security_id)
-      OcfDeleteStockRetraction i -> checkStoredRecord migratedSec "stock retraction" ct.stock_retractions i (\o -> [o.retraction_data.security_id])
-      OcfDeleteStockReissuance i -> checkStoredRecord migratedSec "stock reissuance" ct.stock_reissuances i (\o -> o.reissuance_data.security_id :: o.reissuance_data.resulting_security_ids)
-      OcfDeleteStockConversion i -> checkStoredRecord migratedSec "stock conversion" ct.stock_conversions i (\o -> o.conversion_data.security_id :: o.conversion_data.resulting_security_ids ++ optional [] pure o.conversion_data.balance_security_id)
-      OcfDeleteStockAcceptance i -> checkStoredRecord migratedSec "stock acceptance" ct.stock_acceptances i (\o -> [o.acceptance_data.security_id])
-      OcfDeleteStockConsolidation i -> checkStoredRecord migratedSec "stock consolidation" ct.stock_consolidations i (\o -> o.consolidation_data.resulting_security_id :: o.consolidation_data.security_ids)
-      _ -> pure ()
+    forA_ creates \c -> forA_ (createdRefs c) (check "proposed")
+    forA_ edits \e -> do
+      forA_ (editedRefs e) (check "proposed")
+      forA_ (editedRecord e) checkStored
+    forA_ deletes checkStored
 
 -- | Remaining balance of a root stock issuance after every recorded lifecycle event and split.
 remainingStockBalance : Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent] -> StockIssuance -> Update Decimal
@@ -1738,6 +1843,10 @@ remainingStockBalance stockEvents splitEvents issuance = do
       allEvents = events ++ splits
   validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
   foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
+
+-- =============================================================================
+-- CapTable Template
+-- =============================================================================
 
 template CapTable
   with
@@ -1932,13 +2041,12 @@ template CapTable
     choice EnablePositions : (ContractId CapTable, ContractId PositionRegistry)
       with
         stock_class_id : Text
-        cash_settlement_required : Bool
       controller context.issuer
       do
         assertMsg ("Unknown stock class " <> stock_class_id) (Map.member stock_class_id stock_classes)
         let registries = fromOptional Map.empty position_registries
         assertMsg ("Positions already enabled for " <> stock_class_id) (not (Map.member stock_class_id registries))
-        registryCid <- create PositionRegistry with context; stock_class_id; cash_settlement_required
+        registryCid <- create PositionRegistry with context; stock_class_id
         rootCid <- create this with position_registries = Some (Map.insert stock_class_id registryCid registries)
         pure (rootCid, registryCid)
 
