@@ -13,8 +13,9 @@ import Daml.Script
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfSecurityExemption(..), OcfShareNumberRange(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
@@ -285,6 +286,99 @@ test_T4_newTransfereePositionAndMerge = do
     positions = [env.posB, r1.transferee_position, r2.transferee_position]
   Some m <- queryContractId env.bob merged
   Map.keys m.lots === ["S-B1", "T4a-B-0", "T4b-B-0"]
+
+-- T5: the transferee and remainder lots of a partial draw keep the source lot's legends,
+-- exemptions, plan, issuance type and approval dates, and so do their StockIssuance records. The
+-- transferee lot resets share numbers, cost basis, consideration and comments and takes the
+-- transfer's price and date; the remainder keeps the lot's price and resets share numbers and
+-- comments.
+test_T5_transfereeAndRemainderKeepProvenance : Script ()
+test_T5_transfereeAndRemainderKeepProvenance = do
+  env <- setup
+  let regD = OcfSecurityExemption with description = "Reg D 506(b)"; jurisdiction = "US"
+      approved = d0 `addRelTime` days (-10)
+      src = (mkIssuance "SC" "S-L1" "SH-A" 50.0) with
+        stock_legend_ids = ["LEG-1", "LEG-2"]; security_law_exemptions = [regD]
+        stock_plan_id = Some "PLAN-1"; issuance_type = Some OcfStockIssuanceRSA
+        board_approval_date = Some approved; stockholder_approval_date = Some approved
+        share_numbers_issued = [OcfShareNumberRange with starting_share_number = 1.0; ending_share_number = 50.0]
+        cost_basis = Some (usd 0.5); consideration_text = Some "cash"; comments = ["note"]
+      -- nested pairs: there is no Show instance for a 6-tuple
+      kept i = ((i.stock_legend_ids, i.security_law_exemptions, i.stock_plan_id),
+                (i.issuance_type, i.board_approval_date, i.stockholder_approval_date))
+      expected = kept src
+  (pos, _) <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
+    holder = env.alice; position = Some env.posA; issuances = [src]
+  r <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T5" pos None 30.0 [("S-L1", 30.0)])
+  Some b <- queryContractId env.bob r.transferee_position
+  Some toLot <- pure (Map.lookup "T5-B-0" b.lots)
+  kept toLot.issuance === expected
+  ((toLot.issuance.share_numbers_issued, toLot.issuance.cost_basis, toLot.issuance.consideration_text),
+    (toLot.issuance.comments, toLot.issuance.share_price, toLot.issuance.date))
+    === (([], None, None), ([], usd 2.5, dTransfer))
+  (toLot.origin_security_id, toLot.ancestry) === ("S-L1", ["S-L1"])
+  Some fromPos <- pure r.transferor_position
+  Some a <- queryContractId env.alice fromPos
+  Some remLot <- pure (Map.lookup "T5-R-0" a.lots)
+  kept remLot.issuance === expected
+  (remLot.issuance.share_numbers_issued, remLot.issuance.comments, remLot.issuance.share_price, remLot.issuance.quantity)
+    === ([], [], usd 1.0, 20.0)
+  -- the StockIssuance history records carry the same data as the lots
+  issued <- forA r.issuances \c -> do
+    Some s <- queryContractId env.book.issuer c
+    pure s.issuance_data
+  issued === [toLot.issuance, remLot.issuance]
+
+-- T6: Registry_Issue adds lots with their OCF issuance records, and it and Registry_MergePositions
+-- reject bad arguments. A security ID can reach two positions of one holder (Registry_Issue checks
+-- duplicates only within the position it is given), so a merge must reject overlapping lots rather
+-- than drop one.
+test_T6_issueAndMergeChecks : Script ()
+test_T6_issueAndMergeChecks = do
+  env <- setup
+  let i = actAs env.book.issuer
+      issue holder position issuances = exerciseCmd env.registry Registry_Issue with holder; position; issuances
+      merge positions = exerciseCmd env.registry Registry_MergePositions with positions
+      new5 = mkIssuance "SC" "S-A5" "SH-A" 5.0
+      new6 = (mkIssuance "SC" "S-A6" "SH-A" 6.0) with date = dTransfer
+  -- an issue into an existing position keeps its lots, adds one lot per issuance as its own
+  -- origin, and returns the issuance records in order
+  (pos, issued) <- submit env.book.issuer $ issue env.alice (Some env.posA) [new5, new6]
+  Some a <- queryContractId env.alice pos
+  Map.keys a.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6"]
+  map (\sid -> fmap (\l -> ((l.issuance, l.origin_security_id, l.origin_date), (l.ancestry, l.holds, l.fully_vested_on)))
+      (Map.lookup sid a.lots)) ["S-A5", "S-A6"]
+    === [Some ((new5, "S-A5", d0), ([], [], None)), Some ((new6, "S-A6", dTransfer), ([], [], None))]
+  records <- forA issued \c -> do
+    Some s <- queryContractId env.book.issuer c
+    pure s.issuance_data
+  records === [new5, new6]
+  -- Registry_Issue argument checks
+  let one = [mkIssuance "SC" "S-A9" "SH-A" 1.0]
+  expectFail "T6a issue nothing" "issue at least one lot" i $ issue env.alice (Some pos) []
+  expectFail "T6b issue into another class" "issuances must be for this class" i $
+    issue env.alice (Some pos) [mkIssuance "OTHER" "S-A9" "SH-A" 1.0]
+  expectFail "T6c issue a lot already in the position" "duplicate lot S-A1" i $
+    issue env.alice (Some pos) [mkIssuance "SC" "S-A1" "SH-A" 1.0]
+  expectFail "T6d issue one lot twice" "duplicate lot S-A9" i $ issue env.alice None (one ++ one)
+  expectFail "T6e issue into another holder's position" "position does not match" i $ issue env.alice (Some env.posB) one
+  expectFail "T6f issue to another party into the position" "position does not match" i $ issue env.bob (Some pos) one
+  -- Registry_MergePositions argument checks
+  (dup, _) <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A1" "SH-A" 7.0]
+  expectFail "T6g merge positions that share a lot" "positions share a lot" i $ merge [pos, dup]
+  expectFail "T6h merge one position" "merge at least two positions" i $ merge [pos]
+  expectFail "T6i merge positions of two holders" "positions must share registry and holder" i $ merge [pos, env.posB]
+  -- a position of the same holder in another class (another registry)
+  b1 <- update env.book [CT.OcfCreateStockClass (mkStockClass "SC3")] [] []
+  (_, registry3) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC3"
+  (pos3, _) <- submit b1.issuer $ exerciseCmd registry3 Registry_Issue with
+    holder = env.alice; position = None; issuances = [mkIssuance "SC3" "S-A30" "SH-A" 3.0]
+  expectFail "T6j merge positions of two classes" "positions must share registry and holder" i $ merge [pos, pos3]
+  -- the rejected calls changed nothing: a merge of disjoint positions still works
+  (extra, _) <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A8" "SH-A" 8.0]
+  merged <- submit env.book.issuer $ merge [pos, extra]
+  Some m <- queryContractId env.alice merged
+  Map.keys m.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6", "S-A8"]
 
 -- | Place register-settlement holds with this reference on lots of a position, at the transfer
 -- date, so that a transfer under the reference can draw them.

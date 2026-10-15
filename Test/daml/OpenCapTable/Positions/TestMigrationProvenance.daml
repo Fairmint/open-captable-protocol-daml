@@ -14,7 +14,9 @@ import Daml.Script
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
 import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
@@ -80,6 +82,11 @@ optionGrant sec sh qty = CT.OcfCreateEquityCompensationIssuance EquityCompensati
   consideration_text = None; early_exercisable = None; exercise_price = Some (usd 1.0)
   expiration_date = None; stock_class_id = None; stock_plan_id = None; stockholder_approval_date = None
   vesting_terms_id = None
+
+classSplit : Text -> Time -> Decimal -> Decimal -> CT.OcfCreateData
+classSplit sid date numerator denominator = CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+  id = sid; date = date; stock_class_id = "SC"; comments = []
+  split_ratio = OcfRatio with numerator; denominator
 
 exerciseOf : Text -> Time -> Text -> Decimal -> [Text] -> CT.OcfCreateData
 exerciseOf eid date sec qty resulting = CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
@@ -424,3 +431,45 @@ test_P7_migratedChainHeldAndTransferred = do
     [ ("P7-B-0", 40.0, "S-100", dA, ["S-100", "S-101", "S-102"])
     , ("P7-B-1", 30.0, "S-110", dA, ["S-110", "S-111"]) ]
   map unencumbered (Map.values toLots) === [True, True]
+
+-- | Each lot of a position as (security, quantity, share price).
+lotQuantities : Book -> ContractId StockPosition -> Script [(Text, Decimal, Decimal)]
+lotQuantities b position = do
+  Some p <- queryContractId b.issuer position
+  pure (map (\l -> (l.issuance.security_id, l.issuance.quantity, l.issuance.share_price.amount)) (Map.values p.lots))
+
+-- P8: splits of the class recorded before EnablePositions set the migrated quantities, as v34's own
+-- balance functions compute them: a later split applies to an issuance; on the issuance's own date
+-- a forward split is taken as already in its recorded quantity, and a reverse split as following
+-- it (the lowest balance any intra-day order allows, which also bounds what the root lets a later
+-- record reduce). Securities issued after a split, such as a post-split transfer's resulting and
+-- balance securities, are not multiplied again. Each lot keeps its issuance's recorded share price.
+test_P8_splitsBeforeEnabling : Script ()
+test_P8_splitsBeforeEnabling = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  forwardBook <- provenanceBook
+    [ stock "SC" "S-1" "SH-A" dA 100.0
+    , classSplit "SPLIT-F" dB 2.0 1.0
+    , stock "SC" "S-2" "SH-A" dB 50.0
+    , stock "SC" "S-3" "SH-B" dA 100.0
+    , transferOf "TR-3" dC "S-3" 200.0 ["S-4"] None
+    , stock "SC" "S-4" "SH-A" dC 200.0
+    , stock "SC" "S-5" "SH-B" dA 100.0
+    , transferOf "TR-5" dC "S-5" 150.0 ["S-6"] (Some "S-7")
+    , stock "SC" "S-6" "SH-A" dC 150.0
+    , stock "SC" "S-7" "SH-B" dC 50.0
+    ]
+  (fb, [fa, fbob]) <- migrate forwardBook
+    [migration "SH-A" alice ["S-1", "S-2", "S-4", "S-6"], migration "SH-B" bob ["S-7"]]
+  lotQuantities fb fa >>= (=== [("S-1", 200.0, 1.0), ("S-2", 50.0, 1.0), ("S-4", 200.0, 1.0), ("S-6", 150.0, 1.0)])
+  lotQuantities fb fbob >>= (=== [("S-7", 50.0, 1.0)])
+  provenanceOf fb fbob "S-7" >>= (=== ("S-5", dA, ["S-5"], 50.0))
+  reverseBook <- provenanceBook
+    [ stock "SC" "S-10" "SH-A" dA 100.0
+    , classSplit "SPLIT-R" dB 1.0 4.0
+    , stock "SC" "S-11" "SH-A" dB 40.0
+    , stock "SC" "S-12" "SH-A" dC 8.0
+    ]
+  (rb, [ra]) <- migrate reverseBook [migration "SH-A" alice ["S-10", "S-11", "S-12"]]
+  lotQuantities rb ra >>= (=== [("S-10", 25.0, 1.0), ("S-11", 10.0, 1.0), ("S-12", 8.0, 1.0)])
