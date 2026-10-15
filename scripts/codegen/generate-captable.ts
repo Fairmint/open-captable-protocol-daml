@@ -388,11 +388,12 @@ function generate(): void {
     console.error(`  ERROR: position_class_writes names unknown types: ${unknownClassWrites.join(', ')}`);
     process.exit(1);
   }
-  // The root guard reads every guarded type's root map directly, so none may be an Optional (appended) map
+  // The root guard reads every guarded type's root map directly, so it cannot guard an Optional (appended) map yet.
+  // An appended type must stay appended for upgrade compatibility; extend the guard rather than un-append it.
   const appendedGuards = types.filter((t) => t.position_guard && t.is_upgrade_append);
   if (appendedGuards.length > 0) {
     console.error(
-      `  ERROR: Root-guarded types must not be upgrade-appended (Optional root map): ${appendedGuards.map((t) => t.name).join(', ')}`
+      `  ERROR: The root guard does not read upgrade-appended (Optional) root maps yet, so it cannot guard: ${appendedGuards.map((t) => t.name).join(', ')}. Extend the guard to handle Optional maps; do not un-append the type.`
     );
     process.exit(1);
   }
