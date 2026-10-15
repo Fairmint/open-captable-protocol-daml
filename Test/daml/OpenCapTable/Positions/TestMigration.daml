@@ -1,8 +1,9 @@
--- | Migration: `MigrateToPositions` moves root stock issuances of a position-managed class into
--- positions at their remaining balance under v34's own balance rules. A security that a record
--- consumed or retired does not migrate (its resulting or balance security does), and no security
--- migrates twice. A migrated lot starts without holds or a vesting snapshot and obeys every hold
--- and vesting rule. TestRootGuard covers the root guard after migration.
+-- | Migration: `EnablePositions` refuses a class with a root issuance that could then be neither
+-- migrated nor fixed, and `MigrateToPositions` moves root stock issuances of a position-managed
+-- class into positions at their remaining balance under v34's own balance rules. A security that
+-- a record consumed or retired does not migrate (its resulting or balance security does), and no
+-- security migrates twice. A migrated lot starts without holds or a vesting snapshot and obeys
+-- every hold and vesting rule. TestRootGuard covers the root guard after migration.
 module OpenCapTable.Positions.TestMigration where
 
 import DA.Assert
@@ -76,19 +77,27 @@ classSplit sid date numerator denominator = CT.OcfCreateStockClassSplit StockCla
   id = sid; date = date; stock_class_id = "SC"; comments = []
   split_ratio = OcfRatio with numerator; denominator
 
--- | A book with classes SC (position-managed) and PREF, stakeholders SH-A, SH-B and SH-C, and the
--- given records; positions are enabled for SC.
-migrationBook : [CT.OcfCreateData] -> Script Book
-migrationBook records = do
+-- | A book with classes SC and PREF, stakeholders SH-A, SH-B and SH-C, and the given records.
+migrationRecords : [CT.OcfCreateData] -> Script Book
+migrationRecords records = do
   b0 <- newBook
-  b1 <- update b0
+  update b0
     ([ CT.OcfCreateStockClass (mkStockClass "SC")
      , CT.OcfCreateStockClass (mkStockClass "PREF")
      , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
      , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
      , CT.OcfCreateStakeholder (mkStakeholder "SH-C")
      ] ++ records) [] []
-  (root, _) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
+
+-- | `EnablePositions` for class SC.
+enableSC : Book -> Commands (ContractId CT.CapTable, ContractId PositionRegistry)
+enableSC b = exerciseCmd b.root CT.EnablePositions with stock_class_id = "SC"
+
+-- | `migrationRecords` with positions enabled for SC (position-managed).
+migrationBook : [CT.OcfCreateData] -> Script Book
+migrationBook records = do
+  b1 <- migrationRecords records
+  (root, _) <- submit b1.issuer (enableSC b1)
   pure b1 with root = root
 
 -- | Each lot of a position as (security, quantity, share price).
@@ -306,8 +315,7 @@ test_MG5_splitsBeforeEnabling = do
 
 -- MG6: a migrated lot's tranches are scaled by the splits that scaled its quantity. The shares
 -- vested by each tranche date scale exactly as the quantity does, so the tranches still cover the
--- lot and a reverse split does not leave more shares vested than the lot's share of them. A
--- security whose tranches cover only part of it does not migrate.
+-- lot and a reverse split does not leave more shares vested than the lot's share of them.
 test_MG6_splitTranches : Script ()
 test_MG6_splitTranches = do
   alice <- allocateParty "alice"
@@ -317,12 +325,9 @@ test_MG6_splitTranches = do
   b <- migrationBook
     [ withTranches "S-1" 100.0 [vesting 60.0 dD, vesting 40.0 dB]
     , withTranches "S-2" 2.0 [vesting 1.0 dB, vesting 1.0 dD]
-    , withTranches "S-3" 100.0 [vesting 25.0 dB]
     , classSplit "SPLIT-F" dB 2.0 1.0
     , classSplit "SPLIT-R" dC 1.0 3.0
     ]
-  expectMigrationFails "MG6 tranches below the quantity" "Security S-3 has vesting tranches that do not cover its quantity"
-    b [migration "SH-A" alice ["S-3"]]
   (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1", "S-2"]]
   Some p <- queryContractId mb.issuer pa
   map (\l -> (l.issuance.security_id, l.issuance.quantity, l.issuance.vestings)) (Map.values p.lots) ===
@@ -378,3 +383,42 @@ test_MG7_registryDatesAfterLastSplit = do
   _ <- submit mb.issuer (transferFrom "MG7" dC vested.position)
   pure ()
 
+-- MG8: once a class is enabled, the guard freezes its root issuances, so `EnablePositions` refuses,
+-- by name, a root issuance of the class with a remaining balance that could then be neither
+-- migrated nor fixed: one whose tranches cover only part of it, and one that a reduction without
+-- a balance security left with a balance. Securities consumed in full, reductions with a balance
+-- security and other classes do not stop it. Once the records are fixed, the class is enabled and
+-- migrates.
+test_MG8_enableRefusesUnmigratableIssuances : Script ()
+test_MG8_enableRefusesUnmigratableIssuances = do
+  alice <- allocateParty "alice"
+  let vesting amount date = OcfVesting with amount; date
+      withTranches cls sec qty vestings = (mkIssuance cls sec "SH-A" qty) with date = dA; vestings
+      cancellationCN2 balance = StockCancellationOcfData with
+        id = "CN-2"; date = dB; quantity = 30.0; reason_text = "Cancelled"; security_id = "S-2"
+        comments = []; balance_security_id = balance
+  b0 <- migrationRecords
+    [ CT.OcfCreateStockIssuance (withTranches "SC" "S-1" 100.0 [vesting 25.0 dB])
+    , stock "SC" "S-2" "SH-A" dA 100.0
+    , CT.OcfCreateStockCancellation (cancellationCN2 None)
+    -- none of these stops it
+    , CT.OcfCreateStockIssuance (withTranches "PREF" "S-3" 100.0 [vesting 25.0 dB])
+    , CT.OcfCreateStockIssuance (withTranches "SC" "S-4" 100.0 [vesting 25.0 dB])
+    , transferOf "TR-4" dB "S-4" 100.0 ["S-5"] None
+    , stock "SC" "S-5" "SH-B" dB 100.0
+    , stock "SC" "S-6" "SH-A" dA 100.0
+    , repurchaseOf "RP-6" dB "S-6" 40.0 (Some "S-7")
+    , stock "SC" "S-7" "SH-A" dB 60.0
+    ]
+  expectFail "MG8a tranches that cover part of an issuance"
+    "Cannot enable positions for SC: security S-1 has vesting tranches that do not cover its quantity"
+    (actAs b0.issuer) (enableSC b0)
+  b1 <- update b0 []
+    [CT.OcfEditStockIssuance (withTranches "SC" "S-1" 100.0 [vesting 25.0 dB, vesting 75.0 dC])] []
+  expectFail "MG8b balance left without a balance security"
+    "Cannot enable positions for SC: security S-2 keeps a balance after a transfer, cancellation, repurchase or conversion without a balance security"
+    (actAs b1.issuer) (enableSC b1)
+  b2 <- update b1 [stock "SC" "S-8" "SH-A" dB 70.0] [CT.OcfEditStockCancellation (cancellationCN2 (Some "S-8"))] []
+  (root, _) <- submit b2.issuer (enableSC b2)
+  (mb, [pa]) <- migrate (b2 with root) [migration "SH-A" alice ["S-1", "S-7", "S-8"]]
+  lotQuantities mb pa >>= (=== [("S-1", 100.0, 1.0), ("S-7", 60.0, 1.0), ("S-8", 70.0, 1.0)])

@@ -1751,6 +1751,32 @@ remainingStockBalance stockEvents splitEvents issuance = do
   validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
   foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
 
+-- | Whether a balance event consumes its security (a transfer, cancellation, repurchase or
+-- conversion), leaving any remainder in a balance security.
+isBalanceReduction : SecurityBalanceEvent -> Bool
+isBalanceReduction event = case event of
+  SecurityBalanceReduction {} -> True
+  _ -> False
+
+-- | Whether an issuance's tranches, when it has any, cover its quantity (as a position lot's must).
+vestingsCoverQuantity : StockIssuanceOcfData -> Bool
+vestingsCoverQuantity d = null d.vestings || ocfVestingAmountTotal d.vestings == d.quantity
+
+-- | The stock securities that a transfer, cancellation, repurchase or conversion leaves a balance
+-- security. One fetch per such record.
+stockSecuritiesWithBalanceSecurity : CapTableMaps -> Update [Text]
+stockSecuritiesWithBalanceSecurity maps = do
+  let withBalance pairs = [s | (s, Some _) <- pairs]
+  transfers <- forA (Map.values maps.stock_transfers)
+    (fmap (\r -> (r.transfer_data.security_id, r.transfer_data.balance_security_id)) . fetch)
+  cancellations <- forA (Map.values maps.stock_cancellations)
+    (fmap (\r -> (r.cancellation_data.security_id, r.cancellation_data.balance_security_id)) . fetch)
+  repurchases <- forA (Map.values maps.stock_repurchases)
+    (fmap (\r -> (r.repurchase_data.security_id, r.repurchase_data.balance_security_id)) . fetch)
+  conversions <- forA (Map.values maps.stock_conversions)
+    (fmap (\r -> (r.conversion_data.security_id, r.conversion_data.balance_security_id)) . fetch)
+  pure (withBalance (transfers ++ cancellations ++ repurchases ++ conversions))
+
 -- | The splits of its class that apply to a root stock issuance (see `remainingStockBalance`), in
 -- the order the balance rules apply them.
 issuanceSplits : Map Text [SecurityBalanceEvent] -> StockIssuance -> [SecurityBalanceEvent]
@@ -1972,7 +1998,12 @@ template CapTable
     -- ==========================================================================
 
     -- | Make one stock class position-managed: create its registry and record it in the root. The
-    -- registry keeps the date of the class's latest split (O(splits) fetches).
+    -- registry keeps the date of the class's latest split. Once the class is enabled, the guard
+    -- freezes its root issuances, so this refuses, by name, a root issuance of the class with a
+    -- remaining balance that `MigrateToPositions` would refuse and only a root write could fix:
+    -- one whose tranches do not cover its quantity, and one that a transfer, cancellation,
+    -- repurchase or conversion left with a balance but no balance security to migrate. One scan
+    -- of the root (O(book) fetches).
     choice EnablePositions : (ContractId CapTable, ContractId PositionRegistry)
       with
         stock_class_id : Text
@@ -1981,7 +2012,22 @@ template CapTable
         assertMsg ("Unknown stock class " <> stock_class_id) (Map.member stock_class_id stock_classes)
         let registries = fromOptional Map.empty position_registries
         assertMsg ("Positions already enabled for " <> stock_class_id) (not (Map.member stock_class_id registries))
-        splitEvents <- splitEventsByStockClassId (toMaps this)
+        let maps = toMaps this
+            refuse sid what = abort ("Cannot enable positions for " <> stock_class_id <> ": security " <> sid <> " " <> what)
+        splitEvents <- splitEventsByStockClassId maps
+        stockEvents <- stockBalanceEventsBySecurityId maps
+        balanced <- stockSecuritiesWithBalanceSecurity maps
+        forA_ (Map.values stock_issuances) \issuanceCid -> do
+          issuance <- fetch issuanceCid
+          let d = issuance.issuance_data
+          when (d.stock_class_id == stock_class_id) $ do
+            remaining <- remainingStockBalance stockEvents splitEvents issuance
+            when (remaining > 0.0) $
+              if any isBalanceReduction (fromOptional [] (Map.lookup d.security_id stockEvents))
+                then unless (d.security_id `elem` balanced) $
+                  refuse d.security_id "keeps a balance after a transfer, cancellation, repurchase or conversion without a balance security"
+                else unless (vestingsCoverQuantity d) $
+                  refuse d.security_id "has vesting tranches that do not cover its quantity"
         let last_split_date = case fromOptional [] (Map.lookup stock_class_id splitEvents) of
               [] -> None
               e :: es -> Some (foldl max (securityBalanceEventDate e) (map securityBalanceEventDate es))
@@ -1995,11 +2041,12 @@ template CapTable
     -- migrates instead) and a positive remaining balance. Its lot keeps the issuance data with the
     -- quantity set to that balance, computed by v34's own balance rules from every recorded
     -- lifecycle event and split (`remainingStockBalance`); the share price stays the recorded
-    -- issuance price, the vesting terms stay, and the tranches, which must cover the recorded
-    -- quantity, are scaled by the same splits (`splitVestings`). A lot on vesting terms starts
-    -- without a vesting snapshot, so it counts as unvested until `Registry_RecordVesting` records
-    -- one. The root records each migrated security, which stops a second migration. One scan of
-    -- the root per batch (O(book) fetches) builds the balance events.
+    -- issuance price, the vesting terms stay, and the tranches, which cover the recorded quantity
+    -- (`EnablePositions` checked), are scaled by the same splits (`splitVestings`). A lot on
+    -- vesting terms starts without a vesting snapshot, so it counts as unvested until
+    -- `Registry_RecordVesting` records one. The root records each migrated security, which stops a
+    -- second migration. One scan of the root per batch (O(book) fetches) builds the balance
+    -- events.
     choice MigrateToPositions : (ContractId CapTable, [ContractId StockPosition])
       with
         stock_class_id : Text
@@ -2029,24 +2076,18 @@ template CapTable
                   (issuance.issuance_data.stock_class_id == stock_class_id)
                 -- OCF semantics: a transfer, cancellation, repurchase or conversion consumes the
                 -- source security (any remainder lives in its balance security). Only securities
-                -- without such an event are active lots; legacy partial reductions without a
-                -- balance security are ambiguous and must be fixed before migration.
-                let isReduction ev = case ev of
-                      SecurityBalanceReduction {} -> True
-                      _ -> False
+                -- without such an event are active lots (`EnablePositions` refused a class with a
+                -- remainder that has no balance security).
                 assertMsg ("Security " <> sid <> " was transferred, cancelled, repurchased or converted; migrate its resulting or balance security")
-                  (not (any isReduction (fromOptional [] (Map.lookup sid stockEvents))))
+                  (not (any isBalanceReduction (fromOptional [] (Map.lookup sid stockEvents))))
                 remaining <- remainingStockBalance stockEvents splitEvents issuance
                 assertMsg ("Security " <> sid <> " has no remaining balance") (remaining > 0.0)
-                -- A position lot's tranches cover it (see `positionOk`); a partial list leaves
-                -- shares whose vesting the record does not say.
-                let vestings = issuance.issuance_data.vestings
-                assertMsg ("Security " <> sid <> " has vesting tranches that do not cover its quantity")
-                  (null vestings || ocfVestingAmountTotal vestings == issuance.issuance_data.quantity)
+                -- `EnablePositions` checked that the tranches cover the issuance, and the scaled
+                -- tranches cover the lot (the position's ensure checks it again).
                 let lot = PositionLot with
                       issuance = issuance.issuance_data with
                         quantity = remaining
-                        vestings = splitVestings (issuanceSplits splitEvents issuance) vestings
+                        vestings = splitVestings (issuanceSplits splitEvents issuance) issuance.issuance_data.vestings
                       holds = []
                       vesting_snapshot = None
                 pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
