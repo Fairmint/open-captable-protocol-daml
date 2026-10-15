@@ -295,7 +295,6 @@ template PositionRegistry
       controller context.issuer
       do
         assertMsg "transfer_id must be non-empty" (transfer_id /= "")
-        assertMsg "quantity must be positive" (quantity > 0.0)
         assertMsg "a transfer draws at least one lot" (not (null draws))
         assertMsg ("a transfer draws at most " <> show maxLotsPerTransfer <> " lots") (length draws <= maxLotsPerTransfer)
         assertMsg "each lot is drawn at most once" (unique (map (.security_id) draws))
@@ -314,8 +313,6 @@ template PositionRegistry
               lot <- case Map.lookup d.security_id fromLots of
                 Some l -> pure l
                 None -> abort ("lot " <> d.security_id <> " is not in the transferor's position")
-              assertMsg ("draw quantity must be positive for " <> d.security_id) (d.quantity > 0.0)
-              assertMsg ("draw exceeds lot quantity for " <> d.security_id) (d.quantity <= lot.issuance.quantity)
               -- A stop locks the whole lot, even against the transfer its own holds were placed for.
               assertMsg ("lot " <> d.security_id <> " is stopped") (not (lotIsStopped lot))
               assertMsg ("lot " <> d.security_id <> " is not fully vested") (lotIsVested date lot)
@@ -360,10 +357,6 @@ template PositionRegistry
                     ancestry = childAncestry
                     holds = []
                     fully_vested_on = None
-              -- Unreachable under the checks above (only a lot whose sole hold is the drawn one can
-              -- be drawn in full), but a lot's holds must never vanish with it.
-              when (isNone remainderSec) $
-                assertMsg ("lot " <> d.security_id <> " carries other holds") (null otherHolds)
               assertMsg ("lot id " <> toSec <> " already exists in the transferee's position") (not (Map.member toSec toLots))
               forA_ remainderSec \r ->
                 assertMsg ("lot id " <> r <> " already exists in the transferor's position") (not (Map.member r fromLots))
@@ -469,7 +462,6 @@ template PositionRegistry
       controller context.issuer
       do
         assertMsg "issue at least one lot" (not (null issuances))
-        assertMsg "issuances must be for this class" (all (\d -> d.stock_class_id == stock_class_id) issuances)
         let stakeholderId = (head issuances).stakeholder_id
         base <- case position of
           None -> pure Map.empty
@@ -509,18 +501,15 @@ template PositionRegistry
 
     -- | Place holds of one purpose and reference on lots of one position. Checks by purpose:
     --
-    -- * `HoldPurposeRegisterSettlement`: each lot gets the transfer checks (in the position,
-    --   unstopped, fully vested and issued by `date`) and a positive quantity within its free
-    --   quantity; at most `maxLotsPerTransfer` lots.
-    -- * `HoldPurposeScripMint`: each lot is in the position, with a positive quantity within its
-    --   free quantity.
-    -- * `HoldPurposeStopTransfer`: each lot is in the position, whatever its vesting or
-    --   eligibility, and no quantity is given (a stop locks the whole lot). Placing a stop releases
-    --   the lot's `HoldPurposeRegisterSettlement` holds with `ReleaseCodeStopTransfer` and keeps
-    --   its scrip-mint holds and other stops.
+    -- * `HoldPurposeRegisterSettlement`: the lot is unstopped, fully vested and issued by `date`,
+    --   the quantity fits its free quantity, at most `maxLotsPerTransfer` lots.
+    -- * `HoldPurposeScripMint`: the lot is unstopped and the quantity fits its free quantity.
+    -- * `HoldPurposeStopTransfer`: any lot of the position; it releases the lot's
+    --   register-settlement holds with `ReleaseCodeStopTransfer` and keeps the others.
     --
-    -- Each lot appears once, and a lot never gets a second hold with the same purpose and
-    -- reference.
+    -- The position's ensure (`holdOk`, `lotHoldsOk`) rejects an empty reference, a missing or
+    -- non-positive quantity on a quantity hold, a quantity on a stop, a second hold with the same
+    -- purpose and reference on a lot, and quantity holds above the lot's quantity.
     nonconsuming choice Registry_Hold : HoldResult
       with
         position : ContractId StockPosition
@@ -531,8 +520,6 @@ template PositionRegistry
       controller context.issuer
       do
         assertMsg "hold at least one lot" (not (null lots))
-        assertMsg "each lot is held at most once" (unique (map (.security_id) lots))
-        assertMsg "hold reference must be non-empty" (reference /= "")
         -- A register-settlement hold is drawn by one transfer, so it obeys the transfer's lot cap.
         when (purpose == HoldPurposeRegisterSettlement) $
           assertMsg ("a register-settlement hold covers at most " <> show maxLotsPerTransfer <> " lots")
@@ -542,44 +529,31 @@ template PositionRegistry
         assertMsg "position belongs to another registry"
           (p.context == context && p.stock_class_id == stock_class_id)
 
-        let holdQuantity : Text -> Optional Decimal -> Update Decimal
-            holdQuantity sid q = case q of
-              None -> abort ("hold quantity must be given for lot " <> sid)
-              Some x -> do
-                assertMsg ("hold quantity must be positive for lot " <> sid) (x > 0.0)
-                pure x
-            place (acc, released) hl = do
+        let place (acc, released) hl = do
               let sid = hl.security_id
               lot <- case Map.lookup sid acc of
                 Some l -> pure l
                 None -> abort ("lot " <> sid <> " is not in the position")
-              assertMsg ("lot " <> sid <> " already carries a " <> show purpose <> " hold with reference " <> reference)
-                (isNone (lotHoldFor purpose reference lot))
               -- `kept`: the lot's holds that stay beside the new one.
               (kept, releasedHere) <- case purpose of
-                HoldPurposeRegisterSettlement -> do
-                  -- The transfer checks, applied now so the transfer under this reference can
-                  -- draw the hold later.
-                  q <- holdQuantity sid hl.quantity
-                  assertMsg ("lot " <> sid <> " is stopped") (not (lotIsStopped lot))
-                  assertMsg ("lot " <> sid <> " is not fully vested") (lotIsVested date lot)
-                  assertMsg ("lot " <> sid <> " was issued after the hold date") (lot.issuance.date <= date)
-                  assertMsg ("hold exceeds the free quantity of lot " <> sid) (q <= lotFreeQuantity lot)
-                  pure (lot.holds, [])
-                HoldPurposeScripMint -> do
-                  -- A stopped lot has no free quantity, so this also keeps scrip holds off
-                  -- stopped lots.
-                  q <- holdQuantity sid hl.quantity
-                  assertMsg ("hold exceeds the free quantity of lot " <> sid) (q <= lotFreeQuantity lot)
-                  pure (lot.holds, [])
                 HoldPurposeStopTransfer -> do
                   -- A stop needs only the lot, whatever its vesting or eligibility. The lot's
                   -- register-settlement holds can no longer settle, so the stop releases them;
                   -- scrip-mint holds and other stops stay.
-                  assertMsg ("a stop locks the whole lot: no quantity may be given for lot " <> sid)
-                    (isNone hl.quantity)
                   let (settling, others) = partition (\h -> h.purpose == HoldPurposeRegisterSettlement) lot.holds
                   pure (others, map (\h -> ReleasedHold with security_id = sid; hold = h; code = ReleaseCodeStopTransfer) settling)
+                _ -> do
+                  assertMsg ("lot " <> sid <> " is stopped") (not (lotIsStopped lot))
+                  -- The transfer checks, applied now so the transfer under this reference can
+                  -- draw the hold later.
+                  when (purpose == HoldPurposeRegisterSettlement) do
+                    assertMsg ("lot " <> sid <> " is not fully vested") (lotIsVested date lot)
+                    assertMsg ("lot " <> sid <> " was issued after the hold date") (lot.issuance.date <= date)
+                  -- The ensure would reject this too; checking it here names the lot a second
+                  -- reservation of the same shares fails on.
+                  assertMsg ("hold exceeds the free quantity of lot " <> sid)
+                    (optional True (<= lotFreeQuantity lot) hl.quantity)
+                  pure (lot.holds, [])
               let newHold = LotHold with purpose; reference; quantity = hl.quantity; date
               pure (Map.insert sid (lot with holds = kept ++ [newHold]) acc, released ++ releasedHere)
 
