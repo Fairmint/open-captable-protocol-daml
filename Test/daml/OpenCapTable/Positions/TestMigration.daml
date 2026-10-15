@@ -21,6 +21,8 @@ import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
@@ -331,23 +333,28 @@ test_MG6_splitTranches = do
   map (`vestedQuantity` s1) [dC, dD] === [26.6666666667, 66.6666666667]
 
 -- MG7: position quantities are in units after the class's last split, which an OCF replay applies
--- to anything dated on or before its day, so the registry records nothing dated then: no transfer,
--- hold or issue. A later date works.
+-- to any quantity dated on or before its day, so the registry records no transfer, hold, issue or
+-- vesting acceleration dated then. A later date works, and a vesting start, which carries no
+-- quantity, may predate the split.
 test_MG7_registryDatesAfterLastSplit : Script ()
 test_MG7_registryDatesAfterLastSplit = do
   alice <- allocateParty "alice"
   bob <- allocateParty "bob"
-  b <- migrationBook [stock "SC" "S-1" "SH-A" dA 100.0, classSplit "SPLIT-F" dB 2.0 1.0]
+  b <- migrationBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-1" "SH-A" 100.0) with date = dA; vesting_terms_id = Some "VT-1")
+    , classSplit "SPLIT-F" dB 2.0 1.0 ]
   (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1"]]
   [(registry, r)] <- query @PositionRegistry mb.issuer
   r.last_split_date === Some dB
   let i = actAs mb.issuer
-      transferOn tid date = exerciseCmd registry Registry_Transfer with
-        transfer_id = tid; date; transferor_position = pa
+      transferFrom tid date pos = exerciseCmd registry Registry_Transfer with
+        transfer_id = tid; date; transferor_position = pos
         transferee = Transferee with stakeholder_id = "SH-B"; party = bob; position = None
         quantity = 200.0; share_price = usd 1.0
         draws = [LotDraw with security_id = "S-1"; quantity = 200.0]
         reference = None; request_receipt = False
+      transferOn tid date = transferFrom tid date pa
   expectFail "MG7a transfer before the split" "the transfer date must be after the class's last split" i $
     transferOn "MG7a" (dB `addRelTime` days (-1))
   expectFail "MG7b transfer later on the split's day" "the transfer date must be after the class's last split" i $
@@ -357,6 +364,17 @@ test_MG7_registryDatesAfterLastSplit = do
   expectFail "MG7d issue dated on the split's day" "the issue date of lot S-9 must be after the class's last split" i $
     exerciseCmd registry Registry_Issue with
       holder = alice; position = None; issuances = [(mkIssuance "SC" "S-9" "SH-A" 1.0) with date = dB]
-  _ <- submit mb.issuer (transferOn "MG7" dC)
+  let recordVesting records = exerciseCmd registry Registry_RecordVesting with
+        position = pa; as_of = dC; records
+        lots = [LotVestingSnapshot with security_id = "S-1"; vested_quantity = 200.0]
+      acceleration aid date = PositionVestingAcceleration VestingAccelerationOcfData with
+        id = aid; date; quantity = 50.0; reason_text = "Accelerated"; security_id = "S-1"; comments = []
+      start = PositionVestingStart VestingStartOcfData with
+        id = "VS-1"; date = dA; security_id = "S-1"; vesting_condition_id = "start"; comments = []
+  expectFail "MG7e vesting acceleration later on the split's day" "the date of vesting acceleration VA-1 must be after the class's last split" i $
+    recordVesting [start, acceleration "VA-1" (dB `addRelTime` hours 12)]
+  vested <- submit mb.issuer (recordVesting [start, acceleration "VA-2" dC])
+  (length vested.vesting_starts, length vested.vesting_accelerations) === (1, 1)
+  _ <- submit mb.issuer (transferFrom "MG7" dC vested.position)
   pure ()
 
