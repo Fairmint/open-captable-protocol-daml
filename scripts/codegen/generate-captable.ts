@@ -22,6 +22,8 @@ interface Config {
   validations: Record<string, string[]>;
   // Types that write into the stock class named by their stock_class_id (root guard)
   position_class_writes?: string[];
+  // Security fields the root guard checks although no validation ties them to stock_issuances_by_security_id
+  position_security_refs?: Record<string, string[]>;
 }
 
 interface Validation {
@@ -200,7 +202,8 @@ function renderSecurityIds(parts: SecurityIdsPart[]): string {
 
 /**
  * The root guard of a type: the stock securities its validations check against stock_issuances_by_security_id (a stock
- * issuance also names its own security_id) and, for position_class_writes, the stock class it writes into.
+ * issuance also names its own security_id) or position_security_refs lists and, for position_class_writes, the stock
+ * class it writes into.
  */
 function positionGuard(name: string, validations: Validation[], config: Config): PositionGuard | null {
   const parts: SecurityIdsPart[] = [];
@@ -212,6 +215,7 @@ function positionGuard(name: string, validations: Validation[], config: Config):
     else if (v.is_optional) parts.push({ expr: `optionalToList d.${v.field}`, singleton: false });
     else parts.push({ expr: `d.${v.field}`, singleton: true });
   }
+  for (const field of config.position_security_refs?.[name] ?? []) parts.push({ expr: `d.${field}`, singleton: true });
   const writes = (config.position_class_writes ?? []).includes(name);
   if (parts.length === 0 && !writes) return null;
   return {
@@ -383,9 +387,14 @@ function generate(): void {
     process.exit(1);
   }
 
-  const unknownClassWrites = (config.position_class_writes ?? []).filter((n) => !types.some((t) => t.name === n));
+  const unknownClassWrites = [
+    ...(config.position_class_writes ?? []),
+    ...Object.keys(config.position_security_refs ?? {}),
+  ].filter((n) => !types.some((t) => t.name === n));
   if (unknownClassWrites.length > 0) {
-    console.error(`  ERROR: position_class_writes names unknown types: ${unknownClassWrites.join(', ')}`);
+    console.error(
+      `  ERROR: position_class_writes or position_security_refs names unknown types: ${unknownClassWrites.join(', ')}`
+    );
     process.exit(1);
   }
   // The root guard reads every guarded type's root map directly, so it cannot guard an Optional (appended) map yet.
