@@ -20,6 +20,8 @@ import * as yaml from 'yaml';
 interface Config {
   tiers: Record<number, string[]>;
   validations: Record<string, string[]>;
+  // Types that write into the stock class named by their stock_class_id (root guard)
+  position_class_writes?: string[];
 }
 
 interface Validation {
@@ -45,10 +47,25 @@ const SECURITY_ID_INDEX_MAPS: Record<string, string> = {
   WarrantIssuance: 'warrant_issuances_by_security_id',
 };
 
+// The security_id index map of stock issuances: the stock securities the root guard checks
+const STOCK_SECURITY_MAP = 'stock_issuances_by_security_id';
+
 const OBJECT_TYPE_CONSTRUCTOR_OVERRIDES: Record<string, string> = {
   StakeholderRelationshipChangeEvent: 'OcfObjCeStakeholderRelationship',
   StakeholderStatusChangeEvent: 'OcfObjCeStakeholderStatus',
 };
+
+// One version of a root record as the position guard sees it (validatePositionManagedWrites)
+interface PositionGuard {
+  // Name of the generated Daml function, e.g. stockTransferRefs
+  fn: string;
+  // Record label in guard errors, e.g. "stock transfer"
+  label: string;
+  // Daml expression for the stock class the record writes into
+  writes_into: string;
+  // Daml expression for the stock securities the record names
+  security_ids: string;
+}
 
 interface TypeDef {
   name: string;
@@ -66,6 +83,8 @@ interface TypeDef {
   object_type_constructor: string;
   // For issuance types, the name of the security_id index map (e.g., 'stock_issuances_by_security_id')
   security_id_index_map: string | null;
+  // Root guard for position-managed classes; null when the type names no stock security and writes into no class
+  position_guard: PositionGuard | null;
 }
 
 const REPO_ROOT = process.cwd();
@@ -166,6 +185,43 @@ function buildTierMap(config: Config): Map<string, number> {
   return tierMap;
 }
 
+interface SecurityIdsPart {
+  expr: string;
+  singleton: boolean;
+}
+
+/** Render the parts as one Daml list: x :: rest for a singleton, xs ++ rest for a list, [] for none */
+function renderSecurityIds(parts: SecurityIdsPart[]): string {
+  if (parts.length === 0) return '[]';
+  const [first, ...rest] = parts;
+  if (rest.length === 0) return first.singleton ? `[${first.expr}]` : first.expr;
+  return `${first.expr} ${first.singleton ? '::' : '++'} ${renderSecurityIds(rest)}`;
+}
+
+/**
+ * The root guard of a type: the stock securities its validations check against stock_issuances_by_security_id (a stock
+ * issuance also names its own security_id) and, for position_class_writes, the stock class it writes into.
+ */
+function positionGuard(name: string, validations: Validation[], config: Config): PositionGuard | null {
+  const parts: SecurityIdsPart[] = [];
+  if (SECURITY_ID_INDEX_MAPS[name] === STOCK_SECURITY_MAP) parts.push({ expr: 'd.security_id', singleton: true });
+  for (const v of validations) {
+    const maps = v.or_maps ? [v.firstMap, v.secondMap, v.thirdMap] : [v.map];
+    if (!maps.includes(STOCK_SECURITY_MAP)) continue;
+    if (v.is_array) parts.push({ expr: `d.${v.field}`, singleton: false });
+    else if (v.is_optional) parts.push({ expr: `optionalToList d.${v.field}`, singleton: false });
+    else parts.push({ expr: `d.${v.field}`, singleton: true });
+  }
+  const writes = (config.position_class_writes ?? []).includes(name);
+  if (parts.length === 0 && !writes) return null;
+  return {
+    fn: `${name.charAt(0).toLowerCase()}${name.slice(1)}Refs`,
+    label: name.replace(/([a-z])([A-Z])/g, '$1 $2').toLowerCase(),
+    writes_into: writes ? 'Some d.stock_class_id' : 'None',
+    security_ids: renderSecurityIds(parts),
+  };
+}
+
 /**
  * Discover all types from DAML files in OCF/ subdirectory. Issuer is excluded because it's handled specially - it's
  * edit-only (no create/delete) and stored as a single reference, not in a map. Issuer edits are handled via
@@ -198,7 +254,7 @@ function discoverTypes(config: Config): TypeDef[] {
     const snakeName = toSnakeCase(name);
     const validationFields = config.validations[name] ?? [];
 
-    const typeDef: TypeDef = {
+    const typeDef: Omit<TypeDef, 'position_guard'> = {
       name,
       module: `Fairmint.OpenCapTable.OCF.${name}`,
       data_type: typeInfo.dataType,
@@ -272,7 +328,7 @@ function discoverTypes(config: Config): TypeDef[] {
       security_id_index_map: SECURITY_ID_INDEX_MAPS[name] ?? null,
     };
 
-    types.push(typeDef);
+    types.push({ ...typeDef, position_guard: positionGuard(name, typeDef.validations, config) });
   }
 
   return types;
@@ -324,6 +380,20 @@ function generate(): void {
   const missingFromTiers = types.filter((t) => !allTierTypes.includes(t.name));
   if (missingFromTiers.length > 0) {
     console.error(`  ERROR: Types not in any tier: ${missingFromTiers.map((t) => t.name).join(', ')}`);
+    process.exit(1);
+  }
+
+  const unknownClassWrites = (config.position_class_writes ?? []).filter((n) => !types.some((t) => t.name === n));
+  if (unknownClassWrites.length > 0) {
+    console.error(`  ERROR: position_class_writes names unknown types: ${unknownClassWrites.join(', ')}`);
+    process.exit(1);
+  }
+  // The root guard reads every guarded type's root map directly, so none may be an Optional (appended) map
+  const appendedGuards = types.filter((t) => t.position_guard && t.is_upgrade_append);
+  if (appendedGuards.length > 0) {
+    console.error(
+      `  ERROR: Root-guarded types must not be upgrade-appended (Optional root map): ${appendedGuards.map((t) => t.name).join(', ')}`
+    );
     process.exit(1);
   }
 
