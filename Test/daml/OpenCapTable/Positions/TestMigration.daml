@@ -15,6 +15,7 @@ import DA.Time (time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
@@ -300,3 +301,32 @@ test_MG5_splitsBeforeEnabling = do
     ]
   (rb, [ra]) <- migrate reverseBook [migration "SH-A" alice ["S-10", "S-11", "S-12"]]
   lotQuantities rb ra >>= (=== [("S-10", 25.0, 1.0), ("S-11", 10.0, 1.0), ("S-12", 8.0, 1.0)])
+
+-- MG6: a migrated lot's tranches are scaled by the splits that scaled its quantity. The shares
+-- vested by each tranche date scale exactly as the quantity does, so the tranches still cover the
+-- lot and a reverse split does not leave more shares vested than the lot's share of them. A
+-- security whose tranches cover only part of it does not migrate.
+test_MG6_splitTranches : Script ()
+test_MG6_splitTranches = do
+  alice <- allocateParty "alice"
+  let vesting amount date = OcfVesting with amount; date
+      withTranches sec qty vestings =
+        CT.OcfCreateStockIssuance ((mkIssuance "SC" sec "SH-A" qty) with date = dA; vestings)
+  b <- migrationBook
+    [ withTranches "S-1" 100.0 [vesting 60.0 dD, vesting 40.0 dB]
+    , withTranches "S-2" 2.0 [vesting 1.0 dB, vesting 1.0 dD]
+    , withTranches "S-3" 100.0 [vesting 25.0 dB]
+    , classSplit "SPLIT-F" dB 2.0 1.0
+    , classSplit "SPLIT-R" dC 1.0 3.0
+    ]
+  expectMigrationFails "MG6 tranches below the quantity" "Security S-3 has vesting tranches that do not cover its quantity"
+    b [migration "SH-A" alice ["S-3"]]
+  (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1", "S-2"]]
+  Some p <- queryContractId mb.issuer pa
+  map (\l -> (l.issuance.security_id, l.issuance.quantity, l.issuance.vestings)) (Map.values p.lots) ===
+    [ ("S-1", 66.6666666667, [vesting 26.6666666667 dB, vesting 40.0 dD])
+    -- scaled one by one, each tranche would round up to 0.6666666667 and overrun the quantity
+    , ("S-2", 1.3333333333, [vesting 0.6666666667 dB, vesting 0.6666666666 dD]) ]
+  Some s1 <- pure (Map.lookup "S-1" p.lots)
+  map (`vestedQuantity` s1) [dC, dD] === [26.6666666667, 66.6666666667]
+

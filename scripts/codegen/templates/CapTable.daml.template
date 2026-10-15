@@ -26,7 +26,7 @@ import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObj
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
 -- Position register (positions and their registry)
 import Fairmint.OpenCapTable.Positions (StockPosition(..), PositionRegistry(..), PositionLot(..))
-import Fairmint.OpenCapTable.Types.Vesting (ocfVestingAmountTotal)
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..), ocfVestingAmountTotal)
 
 -- OCF Types
 {{#each types_alpha}}
@@ -1747,12 +1747,33 @@ remainingStockBalance : Map Text [SecurityBalanceEvent] -> Map Text [SecurityBal
 remainingStockBalance stockEvents splitEvents issuance = do
   let sid = issuance.issuance_data.security_id
       events = fromOptional [] (Map.lookup sid stockEvents)
-      splits = filter
-        (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
-        (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents))
-      allEvents = events ++ splits
+      allEvents = events ++ issuanceSplits splitEvents issuance
   validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
   foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
+
+-- | The splits of its class that apply to a root stock issuance (see `remainingStockBalance`), in
+-- the order the balance rules apply them.
+issuanceSplits : Map Text [SecurityBalanceEvent] -> StockIssuance -> [SecurityBalanceEvent]
+issuanceSplits splitEvents issuance =
+  sortOn securityBalanceEventSortKey (filter
+    (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
+    (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents)))
+
+-- | An issuance's tranches in the units of its quantity after these splits (in this order). The
+-- shares vested by each tranche date scale exactly as the quantity does, with the same arithmetic,
+-- so tranches that covered the recorded quantity cover the split quantity; a tranche that rounds to
+-- nothing is dropped.
+splitVestings : [SecurityBalanceEvent] -> [OcfVesting] -> [OcfVesting]
+splitVestings splits vestings = reverse scaled
+  where
+    scale x = foldl (\acc event -> case event of
+        SecurityBalanceMultiplier with numerator; denominator -> acc * numerator / denominator
+        _ -> acc) x splits
+    (_, scaled) = foldl (\(vestedBefore, acc) v ->
+        let vestedBy = vestedBefore + v.amount
+            amount = scale vestedBy - scale vestedBefore
+        in (vestedBy, if amount > 0.0 then (v with amount = amount) :: acc else acc))
+      (0.0, []) (sortOn (.date) vestings)
 
 -- =============================================================================
 -- CapTable Template
@@ -1969,7 +1990,8 @@ template CapTable
     -- migrates instead) and a positive remaining balance. Its lot keeps the issuance data with the
     -- quantity set to that balance, computed by v34's own balance rules from every recorded
     -- lifecycle event and split (`remainingStockBalance`); the share price stays the recorded
-    -- issuance price, and the tranches and vesting terms stay too. A lot on vesting terms starts
+    -- issuance price, the vesting terms stay, and the tranches, which must cover the recorded
+    -- quantity, are scaled by the same splits (`splitVestings`). A lot on vesting terms starts
     -- without a vesting snapshot, so it counts as unvested until `Registry_RecordVesting` records
     -- one. The root records each migrated security, which stops a second migration. One scan of
     -- the root per batch (O(book) fetches) builds the balance events.
@@ -2017,7 +2039,9 @@ template CapTable
                 assertMsg ("Security " <> sid <> " has vesting tranches that do not cover its quantity")
                   (null vestings || ocfVestingAmountTotal vestings == issuance.issuance_data.quantity)
                 let lot = PositionLot with
-                      issuance = issuance.issuance_data with quantity = remaining
+                      issuance = issuance.issuance_data with
+                        quantity = remaining
+                        vestings = splitVestings (issuanceSplits splitEvents issuance) vestings
                       holds = []
                       vesting_snapshot = None
                 pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
