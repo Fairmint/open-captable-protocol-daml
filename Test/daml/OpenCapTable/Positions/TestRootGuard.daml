@@ -1,6 +1,5 @@
 -- | The root guard on books with a position-managed class: no root write may name a stock security
--- of a managed class, migrated or not, or a security in a migrated lot's provenance (including
--- ancestors in other classes), and a managed class cannot be deleted. Writes that name only
+-- of a managed class, migrated or not, and a managed class cannot be deleted. Writes that name only
 -- securities of unmanaged classes still pass, and migration batches still work after enabling.
 module OpenCapTable.Positions.TestRootGuard where
 
@@ -12,13 +11,13 @@ import DA.Optional (fromOptional)
 import DA.Time (time)
 import Daml.Script
 
-import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
 import OpenCapTable.Positions.Common
-import OpenCapTable.Positions.TestMigrationProvenance
+import OpenCapTable.Positions.TestMigration
 
 -- | A date before every other record of the guard book.
 dOld : Time
@@ -26,32 +25,21 @@ dOld = time (D.date 2015 Jan 01) 0 0 0
 
 -- | Classes SC (position-managed) and PREF, stakeholders SH-A to SH-D, and:
 --
--- * S-A -> TR-AB -> S-B -> TR-BC -> S-C: a chain inside SC.
+-- * S-A -> TR-AB -> S-B: a transfer inside SC.
 -- * S-D1 and S-D2: plain SC issuances.
 -- * S-E1 and S-Y: plain PREF issuances.
--- * S-X (PREF) -> TR-X -> S-P (PREF) -> CV-P -> S-Q (SC) -> TR-Q -> S-R (SC): a chain that enters
---   SC by conversion, so S-R's origin and one more ancestor are PREF securities.
 --
 -- Positions are enabled for SC; nothing is migrated yet.
 guardBook : Script Book
-guardBook = provenanceBook
+guardBook = migrationBook
   [ CT.OcfCreateStakeholder (mkStakeholder "SH-D")
   , stock "SC" "S-A" "SH-A" dA 100.0
   , transferOf "TR-AB" dB "S-A" 100.0 ["S-B"] None
   , stock "SC" "S-B" "SH-B" dB 100.0
-  , transferOf "TR-BC" dC "S-B" 100.0 ["S-C"] None
-  , stock "SC" "S-C" "SH-C" dC 100.0
   , stock "SC" "S-D1" "SH-D" dA 30.0
   , stock "SC" "S-D2" "SH-D" dA 20.0
   , stock "PREF" "S-E1" "SH-B" dA 50.0
   , stock "PREF" "S-Y" "SH-A" dA 5.0
-  , stock "PREF" "S-X" "SH-A" dA 10.0
-  , transferOf "TR-X" dB "S-X" 10.0 ["S-P"] None
-  , stock "PREF" "S-P" "SH-B" dB 10.0
-  , conversionOf "CV-P" dC "S-P" 10.0 ["S-Q"] None
-  , stock "SC" "S-Q" "SH-B" dC 10.0
-  , transferOf "TR-Q" dD "S-Q" 10.0 ["S-R"] None
-  , stock "SC" "S-R" "SH-C" dD 10.0
   ]
 
 -- | TR-AB with its comments changed (an edit must change something).
@@ -88,27 +76,31 @@ test_G2_editStoredManagedIssuance = do
 -- convertible and vesting records.
 test_G3_proposedSecurityReferences : Script ()
 test_G3_proposedSecurityReferences = do
-  (b, _) <- migratedGuardBook
+  bob <- allocateParty "bob"
+  b0 <- guardBook
+  (b, _) <- migrate b0 [migration "SH-B" bob ["S-B"]]
   expectRootWriteFails "G3a root transfer whose balance security is migrated"
-    "stock transfer TR-G3 (proposed) references migrated security S-C"
-    b [CT.OcfCreateStockTransfer (mkTransfer "TR-G3" "S-E1" 1.0 [] (Some "S-C"))] [] []
+    "stock transfer TR-G3 (proposed) references migrated security S-B"
+    b [CT.OcfCreateStockTransfer (mkTransfer "TR-G3" "S-E1" 1.0 [] (Some "S-B"))] [] []
   expectRootWriteFails "G3b equity compensation exercise resulting in a migrated security"
-    "equity compensation exercise EX-G3 (proposed) references migrated security S-C"
-    b [exerciseOf "EX-G3" dTransfer "EC-1" 1.0 ["S-C"]] [] []
+    "equity compensation exercise EX-G3 (proposed) references migrated security S-B"
+    b [CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+      id = "EX-G3"; date = dTransfer; quantity = 1.0; security_id = "EC-1"; comments = []
+      resulting_security_ids = ["S-B"]; consideration_text = None] [] []
   expectRootWriteFails "G3c vesting start on a migrated security"
-    "vesting start VS-G3 (proposed) references migrated security S-C"
+    "vesting start VS-G3 (proposed) references migrated security S-B"
     b [CT.OcfCreateVestingStart VestingStartOcfData with
-      id = "VS-G3"; date = dTransfer; security_id = "S-C"; vesting_condition_id = "start"; comments = []] [] []
+      id = "VS-G3"; date = dTransfer; security_id = "S-B"; vesting_condition_id = "start"; comments = []] [] []
 
 -- G4: before any migration, a root write that names an unmigrated security of the managed class is
 -- rejected, whichever record it is and whether the security is its source or its result. Writes
 -- that name only PREF securities pass, and migration batches still work after enabling.
 test_G4_unmigratedSecuritiesOfManagedClass : Script ()
 test_G4_unmigratedSecuritiesOfManagedClass = do
-  carol <- allocateParty "carol"
+  bob <- allocateParty "bob"
   dave <- allocateParty "dave"
   b <- guardBook
-  -- the A -> B transfer of an A -> B -> C chain, as a delete and as an edit
+  -- the A -> B transfer, as a delete and as an edit
   expectRootWriteFails "G4a delete a transfer inside the managed class"
     "stock transfer TR-AB (stored) references security S-A of position-managed class SC"
     b [] [] [CT.OcfDeleteStockTransfer "TR-AB"]
@@ -136,72 +128,20 @@ test_G4_unmigratedSecuritiesOfManagedClass = do
         date = dC; comments = ["corrected"])
     , CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-Y" "SH-A" 6.0) with date = dA) ] []
   -- migration batches still work after enabling and after the rejected writes
-  (b3, [posC]) <- migrate b2 [migration "SH-C" carol ["S-C"]]
+  (b3, [posB]) <- migrate b2 [migration "SH-B" bob ["S-B"]]
   (b4, [posD]) <- migrate b3 [migration "SH-D" dave ["S-D1", "S-D2"]]
-  provenanceOf b4 posC "S-C" >>= (=== ("S-A", dA, ["S-A", "S-B"], 100.0))
-  provenanceOf b4 posD "S-D1" >>= (=== ("S-D1", dA, [], 30.0))
-  provenanceOf b4 posD "S-D2" >>= (=== ("S-D2", dA, [], 20.0))
+  lotQuantities b4 posB >>= (=== [("S-B", 100.0, 1.0)])
+  lotQuantities b4 posD >>= (=== [("S-D1", 30.0, 1.0), ("S-D2", 20.0, 1.0)])
   -- the migrated securities are then guarded as migrated
   expectRootWriteFails "G4f new cancellation of a migrated security"
     "stock cancellation CN-D1 (proposed) references migrated security S-D1"
     b4 [cancellationOf "CN-D1" dB "S-D1" 30.0 None] [] []
 
--- | The guard book with S-C and S-R migrated to carol.
-migratedGuardBook : Script (Book, ContractId StockPosition)
-migratedGuardBook = do
-  carol <- allocateParty "carol"
-  b <- guardBook
-  (migrated, [posC]) <- migrate b [migration "SH-C" carol ["S-C", "S-R"]]
-  pure (migrated, posC)
-
--- G5: migration freezes the history each lot's provenance came from. A root write that names an
--- ancestor is rejected, even an ancestor in another class, so the OCF log and the lot's origin,
--- origin date and ancestry cannot diverge, and an ancestor cannot come back as a second lot.
-test_G5_migratedProvenanceFrozen : Script ()
-test_G5_migratedProvenanceFrozen = do
-  alice <- allocateParty "alice"
-  (b, posC) <- migratedGuardBook
-  provenanceOf b posC "S-C" >>= (=== ("S-A", dA, ["S-A", "S-B"], 100.0))
-  provenanceOf b posC "S-R" >>= (=== ("S-X", dA, ["S-X", "S-P", "S-Q"], 10.0))
-  -- inside the class: the A -> B transfer of the A -> B -> C chain where only C is migrated
-  expectRootWriteFails "G5a delete an ancestor transfer"
-    "stock transfer TR-AB (stored) references security S-A in the provenance of migrated security S-C"
-    b [] [] [CT.OcfDeleteStockTransfer "TR-AB"]
-  expectRootWriteFails "G5b edit an ancestor transfer"
-    "stock transfer TR-AB (proposed) references security S-A in the provenance of migrated security S-C"
-    b [] [editedTransferAB] []
-  -- the origin stays consumed, so it cannot migrate as a second lot
-  expectMigrationFails "G5c migrate the origin of a migrated lot" "Security S-A was transferred"
-    b [migration "SH-A" alice ["S-A"]]
-  -- ancestors in another class: the origin's issuance (its date is the lot's origin date), the
-  -- transfer above the conversion, and the conversion into the class
-  expectRootWriteFails "G5d edit the origin's issuance in another class"
-    "stock issuance ISS-S-X (proposed) references security S-X in the provenance of migrated security S-R"
-    b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-X" "SH-A" 10.0) with date = dB)] []
-  expectRootWriteFails "G5e edit an ancestor's issuance in another class"
-    "stock issuance ISS-S-P (proposed) references security S-P in the provenance of migrated security S-R"
-    b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-P" "SH-B" 10.0) with date = dA)] []
-  expectRootWriteFails "G5f delete an ancestor transfer in another class"
-    "stock transfer TR-X (stored) references security S-X in the provenance of migrated security S-R"
-    b [] [] [CT.OcfDeleteStockTransfer "TR-X"]
-  expectRootWriteFails "G5g edit the conversion into the class"
-    "stock conversion CV-P (proposed) references security S-P in the provenance of migrated security S-R"
-    b [] [CT.OcfEditStockConversion StockConversionOcfData with
-      id = "CV-P"; date = dC; quantity_converted = 10.0; security_id = "S-P"; comments = ["corrected"]
-      resulting_security_ids = ["S-Q"]; balance_security_id = None] []
-  -- the root records each ancestor with the first migrated security whose lot names it
-  Some root <- queryContractId b.issuer b.root
-  Map.toList (fromOptional Map.empty root.position_ancestor_security_ids) ===
-    [("S-A", "S-C"), ("S-B", "S-C"), ("S-P", "S-R"), ("S-Q", "S-R"), ("S-X", "S-R")]
-  -- PREF records outside every migrated lot's provenance stay writable
-  _ <- update b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-Y" "SH-A" 6.0) with date = dA)] []
-  pure ()
-
--- G6: a position-managed stock class cannot be deleted from the root, even when no root record
+-- G5: a position-managed stock class cannot be deleted from the root, even when no root record
 -- references it (its holdings were issued through the registry), and a root with position
 -- registries cannot be archived.
-test_G6_managedClassCannotBeDeleted : Script ()
-test_G6_managedClassCannotBeDeleted = do
+test_G5_managedClassCannotBeDeleted : Script ()
+test_G5_managedClassCannotBeDeleted = do
   alice <- allocateParty "alice"
   b0 <- newBook
   b1 <- update b0
@@ -212,7 +152,7 @@ test_G6_managedClassCannotBeDeleted = do
   let b = b1 with root
   _ <- submit b.issuer $ exerciseCmd registry Registry_Issue with
     holder = alice; position = None; issuances = [mkIssuance "SC" "S-N1" "SH-A" 10.0]
-  expectRootWriteFails "G6a delete the managed class"
+  expectRootWriteFails "G5a delete the managed class"
     "stock class SC is position-managed"
     b [] [] [CT.OcfDeleteStockClass "SC"]
   -- an unmanaged class can still be deleted
@@ -223,5 +163,5 @@ test_G6_managedClassCannotBeDeleted = do
   -- that still has a registry (created directly, like a corrupt legacy root) is not archived
   emptied <- submit (actAs [b2.issuer, b2.sysop]) $ createCmd r with
     stock_classes = Map.empty; stakeholders = Map.empty
-  expectFail "G6b archive a root with a position registry" "Cannot archive: position_registries is not empty"
+  expectFail "G5b archive a root with a position registry" "Cannot archive: position_registries is not empty"
     (actAs b2.sysop) $ exerciseCmd emptied CT.ArchiveCapTable

@@ -12,12 +12,11 @@ module Fairmint.OpenCapTable.CapTable where
 
 import DA.Map (Map)
 import qualified DA.Map as Map
-import DA.List (dedup, sort, sortOn, unique)
+import DA.List (sortOn, unique)
 import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_, mapA_)
 import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import qualified DA.Date as Date
-import qualified DA.Text as T
 
 import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition, OcfConversionMechanism(..), OcfConversionTrigger(..), OcfConversionTriggerType(..), OcfConvertibleConversionMechanism(..), validateOcfConversionTriggerFields, validateOcfInterestRateSchedule)
@@ -769,69 +768,93 @@ validateSecurityEventReferences securityType issuancesBySecurityId eventsBySecur
         (isSome (Map.lookup securityId issuancesBySecurityId)))
     (Map.toList eventsBySecurityId)
 
--- | What a single scan of the root's stock lifecycle maps does with each kind of record: fold its
--- data into an accumulator. A record of functions, so it is not a serializable type (see the
--- position guard's per-type tables).
-data StockLifecycleStep acc = StockLifecycleStep with
-    onCancellation : acc -> StockCancellationOcfData -> acc
-    onRepurchase : acc -> StockRepurchaseOcfData -> acc
-    onTransfer : acc -> StockTransferOcfData -> acc
-    onConversion : acc -> StockConversionOcfData -> acc
-    onReissuance : acc -> StockReissuanceOcfData -> acc
-    onConsolidation : acc -> StockConsolidationOcfData -> acc
-    onRetraction : acc -> StockRetractionOcfData -> acc
-
--- | Two steps run side by side in one scan.
-bothStockLifecycleSteps : StockLifecycleStep a -> StockLifecycleStep b -> StockLifecycleStep (a, b)
-bothStockLifecycleSteps x y = StockLifecycleStep with
-    onCancellation = \(a, b) d -> (x.onCancellation a d, y.onCancellation b d)
-    onRepurchase = \(a, b) d -> (x.onRepurchase a d, y.onRepurchase b d)
-    onTransfer = \(a, b) d -> (x.onTransfer a d, y.onTransfer b d)
-    onConversion = \(a, b) d -> (x.onConversion a d, y.onConversion b d)
-    onReissuance = \(a, b) d -> (x.onReissuance a d, y.onReissuance b d)
-    onConsolidation = \(a, b) d -> (x.onConsolidation a d, y.onConsolidation b d)
-    onRetraction = \(a, b) d -> (x.onRetraction a d, y.onRetraction b d)
-
--- | Fetch every record of one root map once, folding each record's data into an accumulator.
-foldRecords : (HasFetch t) => (t -> r) -> (acc -> r -> acc) -> acc -> Map Text (ContractId t) -> Update acc
-foldRecords project step initial records =
-  foldlA (\acc cid -> step acc . project <$> fetch cid) initial (Map.values records)
-
--- | Fold over the root's stock lifecycle records, fetching each record once, in a fixed order:
--- cancellations, repurchases, transfers, conversions, reissuances, consolidations, retractions.
-foldStockLifecycleRecords : CapTableMaps -> StockLifecycleStep acc -> acc -> Update acc
-foldStockLifecycleRecords maps step initial = do
-  afterCancellations <- foldRecords (.cancellation_data) step.onCancellation initial maps.stock_cancellations
-  afterRepurchases <- foldRecords (.repurchase_data) step.onRepurchase afterCancellations maps.stock_repurchases
-  afterTransfers <- foldRecords (.transfer_data) step.onTransfer afterRepurchases maps.stock_transfers
-  afterConversions <- foldRecords (.conversion_data) step.onConversion afterTransfers maps.stock_conversions
-  afterReissuances <- foldRecords (.reissuance_data) step.onReissuance afterConversions maps.stock_reissuances
-  afterConsolidations <- foldRecords (.consolidation_data) step.onConsolidation afterReissuances maps.stock_consolidations
-  foldRecords (.retraction_data) step.onRetraction afterConsolidations maps.stock_retractions
-
--- | The balance events each stock lifecycle record adds: a transfer, cancellation, repurchase or
--- conversion reduces its source security; a reissuance, consolidation or retraction retires it.
-addStockBalanceEvents : StockLifecycleStep (Map Text [SecurityBalanceEvent])
-addStockBalanceEvents = StockLifecycleStep with
-    onCancellation = \index d -> reduction index d.security_id d.date d.id d.quantity
-    onRepurchase = \index d -> reduction index d.security_id d.date d.id d.quantity
-    onTransfer = \index d -> reduction index d.security_id d.date d.id d.quantity
-    onConversion = \index d -> reduction index d.security_id d.date d.id d.quantity_converted
-    onReissuance = \index d -> retirement d.date d.id index d.security_id
-    onConsolidation = \index d -> foldl (retirement d.date d.id) index d.security_ids
-    onRetraction = \index d -> retirement d.date d.id index d.security_id
-  where
-    reduction index securityId eventDate eventId quantity =
-      addSecurityBalanceEvent securityId
-        (SecurityBalanceReduction with event_date = eventDate; event_id = eventId; quantity)
-        index
-    retirement eventDate eventId currentIndex securityId =
-      addSecurityBalanceEvent securityId
-        (SecurityBalanceRetirement with event_date = eventDate; event_id = eventId)
-        currentIndex
-
 stockBalanceEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
-stockBalanceEventsBySecurityId maps = foldStockLifecycleRecords maps addStockBalanceEvents Map.empty
+stockBalanceEventsBySecurityId maps = do
+  afterCancellations <- foldlA
+    (\index cancellationCid -> do
+      cancellation <- fetch cancellationCid
+      pure (addSecurityBalanceEvent
+        cancellation.cancellation_data.security_id
+        (SecurityBalanceReduction with
+          event_date = cancellation.cancellation_data.date
+          event_id = cancellation.cancellation_data.id
+          quantity = cancellation.cancellation_data.quantity)
+        index))
+    Map.empty
+    (Map.values maps.stock_cancellations)
+  afterRepurchases <- foldlA
+    (\index repurchaseCid -> do
+      repurchase <- fetch repurchaseCid
+      pure (addSecurityBalanceEvent
+        repurchase.repurchase_data.security_id
+        (SecurityBalanceReduction with
+          event_date = repurchase.repurchase_data.date
+          event_id = repurchase.repurchase_data.id
+          quantity = repurchase.repurchase_data.quantity)
+        index))
+    afterCancellations
+    (Map.values maps.stock_repurchases)
+  afterTransfers <- foldlA
+    (\index transferCid -> do
+      transfer <- fetch transferCid
+      pure (addSecurityBalanceEvent
+        transfer.transfer_data.security_id
+        (SecurityBalanceReduction with
+          event_date = transfer.transfer_data.date
+          event_id = transfer.transfer_data.id
+          quantity = transfer.transfer_data.quantity)
+        index))
+    afterRepurchases
+    (Map.values maps.stock_transfers)
+  afterConversions <- foldlA
+    (\index conversionCid -> do
+      conversion <- fetch conversionCid
+      pure (addSecurityBalanceEvent
+        conversion.conversion_data.security_id
+        (SecurityBalanceReduction with
+          event_date = conversion.conversion_data.date
+          event_id = conversion.conversion_data.id
+          quantity = conversion.conversion_data.quantity_converted)
+        index))
+    afterTransfers
+    (Map.values maps.stock_conversions)
+  afterReissuances <- foldlA
+    (\index reissuanceCid -> do
+      reissuance <- fetch reissuanceCid
+      pure (addSecurityBalanceEvent
+        reissuance.reissuance_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = reissuance.reissuance_data.date
+          event_id = reissuance.reissuance_data.id)
+        index))
+    afterConversions
+    (Map.values maps.stock_reissuances)
+  afterConsolidations <- foldlA
+    (\index consolidationCid -> do
+      consolidation <- fetch consolidationCid
+      foldlA
+        (\currentIndex securityId ->
+          pure (addSecurityBalanceEvent
+            securityId
+            (SecurityBalanceRetirement with
+              event_date = consolidation.consolidation_data.date
+              event_id = consolidation.consolidation_data.id)
+            currentIndex))
+        index
+        consolidation.consolidation_data.security_ids)
+    afterReissuances
+    (Map.values maps.stock_consolidations)
+  foldlA
+    (\index retractionCid -> do
+      retraction <- fetch retractionCid
+      pure (addSecurityBalanceEvent
+        retraction.retraction_data.security_id
+        (SecurityBalanceRetirement with
+          event_date = retraction.retraction_data.date
+          event_id = retraction.retraction_data.id)
+        index))
+    afterConsolidations
+    (Map.values maps.stock_retractions)
 
 warrantBalanceEventsBySecurityId : CapTableMaps -> Update (Map Text [SecurityBalanceEvent])
 warrantBalanceEventsBySecurityId maps = do
@@ -1631,8 +1654,8 @@ storedVersion objects objectId refs = case Map.lookup objectId objects of
 -- stock_issuances_by_security_id (a stock issuance on its own security_id), and the types in
 -- `position_class_writes` write into their stock_class_id.
 --
--- The guard and migration helpers use tuples and records of functions, not serializable data
--- types of their own: a serializable type is upgrade API, which later versions could only extend.
+-- The guard uses tuples, not a serializable data type of its own: a serializable type is upgrade
+-- API, which later versions could only extend.
 {{#each types_alpha}}
 {{#if position_guard}}
 {{position_guard.fn}} : {{data_type}} -> (Text, Optional Text, [Text])
@@ -1677,31 +1700,27 @@ deletedRefs ct r = case r of
 -- may:
 --
 -- * be a stock issuance, split or conversion-ratio adjustment in a position-managed class;
--- * name, as its source, resulting or balance security, a migrated security or a security in the
---   provenance (origin or ancestry) of a migrated lot;
+-- * name, as its source, resulting or balance security, a migrated security;
 -- * name a stock security whose root stock issuance is in a position-managed class, migrated or
 --   not.
 --
 -- A position-managed stock class cannot be deleted either. So an edit can move a root record
 -- neither into nor out of a managed class, and no root write can edit, delete or extend the
--- history of a managed class or of a migrated lot's provenance. The generator picks up any OCF
--- type whose validations name stock securities. A type added in a v34 patch has an
--- upgrade-appended (Optional) root map, which this guard does not read, so codegen refuses such a
--- type until the guard handles Optional maps. Costs nothing on a root without positions.
--- Otherwise O(batch): one fetch per edit or delete of a guarded record, plus one lookup and at
--- most one fetch (the root stock issuance) per security a version names.
+-- history of a managed class. The generator picks up any OCF type whose validations name stock
+-- securities. A type added in a v34 patch has an upgrade-appended (Optional) root map, which this
+-- guard does not read, so codegen refuses such a type until the guard handles Optional maps.
+-- Costs nothing on a root without positions. Otherwise O(batch): one fetch per edit or delete of
+-- a guarded record, plus one lookup and at most one fetch (the root stock issuance) per security
+-- a version names.
 validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
 validatePositionManagedWrites ct creates edits deletes = do
   let classes = fromOptional Map.empty ct.position_registries
       migrated = fromOptional Map.empty ct.position_migrated_security_ids
-      ancestors = fromOptional Map.empty ct.position_ancestor_security_ids
       check version (label, writesInto, securityIds) = do
         let reject what = assertMsg (positionManagedError (label <> " (" <> version <> ") " <> what))
         forA_ writesInto \c -> reject ("is in position-managed class " <> c) (not (Map.member c classes))
         forA_ securityIds \s -> do
           reject ("references migrated security " <> s) (not (Map.member s migrated))
-          forA_ (Map.lookup s ancestors) \m ->
-            reject ("references security " <> s <> " in the provenance of migrated security " <> m) False
           -- A record that writes into a class names only the security it issues there, and that
           -- class was checked above.
           when (isNone writesInto) $
@@ -1718,7 +1737,7 @@ validatePositionManagedWrites ct creates edits deletes = do
             assertMsg (positionManagedError ("stock class " <> c <> " is position-managed")) (not (Map.member c classes))
           _ -> pure ()
         checkStored r
-  unless (Map.null classes && Map.null migrated && Map.null ancestors) $ do
+  unless (Map.null classes && Map.null migrated) $ do
     forA_ creates \c -> forA_ (createdRefs c) (check "proposed")
     forA_ edits \e -> do
       versions <- editedRefs ct e
@@ -1742,129 +1761,6 @@ remainingStockBalance stockEvents splitEvents issuance = do
       allEvents = events ++ splits
   validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
   foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
-
--- | What one root record says about where a stock security came from, as
--- `(label, parent, starts_new_origin)`; `label` names the record ("stock transfer TR-1").
---
--- * `(label, Some parent, False)`: a stock transfer, cancellation, repurchase, conversion or
---   reissuance. Its resulting or balance security continues the holding of its source security,
---   `parent`.
--- * `(label, None, False)`: a stock consolidation. Its resulting security has several parents.
--- * `(label, None, True)`: a warrant exercise, convertible conversion or equity compensation
---   exercise or release. Its resulting stock starts a new holding.
-provenanceFromParent : Text -> Text -> (Text, Optional Text, Bool)
-provenanceFromParent label parent = (label, Some parent, False)
-
-provenanceFromSeveral : Text -> (Text, Optional Text, Bool)
-provenanceFromSeveral label = (label, None, False)
-
-provenanceNewOrigin : Text -> (Text, Optional Text, Bool)
-provenanceNewOrigin label = (label, None, True)
-
--- | Record `link` for each security a record results in (once per record).
-addProvenanceLinks
-  : (Text, Optional Text, Bool) -> [Text] -> Map Text [(Text, Optional Text, Bool)]
-  -> Map Text [(Text, Optional Text, Bool)]
-addProvenanceLinks link securityIds index =
-  foldl
-    (\current securityId -> Map.insert securityId (link :: fromOptional [] (Map.lookup securityId current)) current)
-    index
-    (dedup securityIds)
-
--- | The provenance links each stock lifecycle record adds, keyed by the security it results in.
-addStockProvenanceLinks : StockLifecycleStep (Map Text [(Text, Optional Text, Bool)])
-addStockProvenanceLinks = StockLifecycleStep with
-    onTransfer = \index d ->
-      fromParent index ("stock transfer " <> d.id) d.security_id (d.resulting_security_ids ++ optionalToList d.balance_security_id)
-    onCancellation = \index d ->
-      fromParent index ("stock cancellation " <> d.id) d.security_id (optionalToList d.balance_security_id)
-    onRepurchase = \index d ->
-      fromParent index ("stock repurchase " <> d.id) d.security_id (optionalToList d.balance_security_id)
-    onConversion = \index d ->
-      fromParent index ("stock conversion " <> d.id) d.security_id (d.resulting_security_ids ++ optionalToList d.balance_security_id)
-    onReissuance = \index d ->
-      fromParent index ("stock reissuance " <> d.id) d.security_id d.resulting_security_ids
-    onConsolidation = \index d ->
-      addProvenanceLinks (provenanceFromSeveral ("stock consolidation " <> d.id)) [d.resulting_security_id] index
-    onRetraction = const
-  where
-    fromParent index label parent resulting = addProvenanceLinks (provenanceFromParent label parent) resulting index
-
--- | The provenance links of a record that turns another instrument into stock.
-addNewOriginLinks
-  : Text -> Text -> [Text] -> Map Text [(Text, Optional Text, Bool)] -> Map Text [(Text, Optional Text, Bool)]
-addNewOriginLinks kind recordId = addProvenanceLinks (provenanceNewOrigin (kind <> " " <> recordId))
-
--- | Balance events by stock security (as `stockBalanceEventsBySecurityId`) and provenance links by
--- resulting stock security, from one scan of the root's stock lifecycle records plus one scan of
--- the records that turn another instrument into stock. O(book) fetches.
-stockBalanceEventsAndProvenance
-  : CapTableMaps -> Update (Map Text [SecurityBalanceEvent], Map Text [(Text, Optional Text, Bool)])
-stockBalanceEventsAndProvenance maps = do
-  (events, stockLinks) <- foldStockLifecycleRecords maps
-    (bothStockLifecycleSteps addStockBalanceEvents addStockProvenanceLinks)
-    (Map.empty, Map.empty)
-  afterWarrantExercises <- foldRecords (.exercise_data)
-    (\index d -> addNewOriginLinks "warrant exercise" d.id d.resulting_security_ids index)
-    stockLinks maps.warrant_exercises
-  afterConvertibleConversions <- foldRecords (.conversion_data)
-    (\index d -> addNewOriginLinks "convertible conversion" d.id d.resulting_security_ids index)
-    afterWarrantExercises maps.convertible_conversions
-  afterEquityCompensationExercises <- foldRecords (.exercise_data)
-    (\index d -> addNewOriginLinks "equity compensation exercise" d.id d.resulting_security_ids index)
-    afterConvertibleConversions maps.equity_compensation_exercises
-  allLinks <- foldRecords (.release_data)
-    (\index d -> addNewOriginLinks "equity compensation release" d.id d.resulting_security_ids index)
-    afterEquityCompensationExercises maps.equity_compensation_releases
-  pure (events, allLinks)
-
--- | Longest ancestry that migration reconstructs; a deeper chain is treated as corrupt history.
-maxProvenanceDepth : Int
-maxProvenanceDepth = 1000
-
--- | Walk a root stock issuance's provenance links back to its origin. Returns where its holding
--- started, as `(origin_security_id, origin_date, ancestry)`: the origin security, the origin's
--- stock issuance date and the security IDs from the origin to the direct parent (empty when the
--- security is its own origin). Every step must be unambiguous: a security that is the result of
--- more than one record, or of a consolidation, is rejected, and so is an ancestor without a stock
--- issuance in the root, a cycle, or a chain deeper than `maxProvenanceDepth`. O(depth) map lookups
--- and at most one fetch (the origin's issuance).
-stockProvenance
-  : Map Text (ContractId StockIssuance) -> Map Text [(Text, Optional Text, Bool)] -> StockIssuanceOcfData
-  -> Update (Text, Time, [Text])
-stockProvenance issuancesBySecurityId links issuance =
-  walkProvenance issuancesBySecurityId links issuance issuance.security_id None [] 0 (Map.singleton issuance.security_id ())
-
--- | One step of `stockProvenance` at security `current` (`currentIssuance` is its stock issuance,
--- `None` for the migrated security itself). `ancestry` grows from the direct parent upwards, so it
--- lists the origin first; `visited` holds every security walked so far.
-walkProvenance
-  : Map Text (ContractId StockIssuance) -> Map Text [(Text, Optional Text, Bool)] -> StockIssuanceOcfData
-  -> Text -> Optional (ContractId StockIssuance) -> [Text] -> Int -> Map Text () -> Update (Text, Time, [Text])
-walkProvenance issuancesBySecurityId links issuance current currentIssuance ancestry depth visited =
-  case fromOptional [] (Map.lookup current links) of
-    [] -> origin
-    [(_, _, True)] -> origin
-    [(label, None, False)] -> ambiguous ("results from " <> label <> ", which has several parents")
-    [(_, Some parent, False)] -> do
-      assertMsg ("Cyclic provenance for " <> sid <> " at " <> parent) (not (Map.member parent visited))
-      assertMsg ("Provenance of " <> sid <> " is deeper than " <> show maxProvenanceDepth <> " records")
-        (depth < maxProvenanceDepth)
-      parentIssuance <- case Map.lookup parent issuancesBySecurityId of
-        Some cid -> pure cid
-        None -> abort ("Ancestor " <> parent <> " of " <> sid <> " has no stock issuance")
-      walkProvenance issuancesBySecurityId links issuance
-        parent (Some parentIssuance) (parent :: ancestry) (depth + 1) (Map.insert parent () visited)
-    several ->
-      ambiguous ("is the result of more than one record: " <> T.intercalate ", " (sort (map (\(label, _, _) -> label) several)))
-  where
-    sid = issuance.security_id
-    ambiguous what = abort ("Ambiguous provenance for " <> sid <> ": " <> current <> " " <> what)
-    origin = case currentIssuance of
-      None -> pure (sid, issuance.date, [])
-      Some cid -> do
-        originIssuance <- fetch cid
-        pure (current, originIssuance.issuance_data.date, ancestry)
 
 -- =============================================================================
 -- CapTable Template
@@ -1893,15 +1789,11 @@ template CapTable
     {{map_field}}: Optional (Map Text (ContractId {{name}}))
 {{/each}}
 
-    -- Appended Optional fields for the position register; None on pre-0.0.4 payloads.
-    -- stock_class_id -> registry, for classes whose holdings live in StockPosition contracts.
+    -- Position register, appended as Optional fields (None on pre-0.0.4 payloads).
+    -- stock_class_id -> registry: which classes are position-managed, for the root guard.
     position_registries: Optional (Map Text (ContractId PositionRegistry))
-    -- security_id -> stakeholder_id of every root issuance migrated into a position.
+    -- security_id -> stakeholder_id: stops a second migration; shows readers it lives in a position.
     position_migrated_security_ids: Optional (Map Text Text)
-    -- security_id -> the first migrated security_id whose lot has it as origin or ancestor. Root
-    -- records naming one are frozen like the migrated security's own, so the root history that a
-    -- lot's provenance was built from cannot change.
-    position_ancestor_security_ids: Optional (Map Text Text)
 
   where
     signatory context.issuer, context.system_operator
@@ -2080,23 +1972,15 @@ template CapTable
         pure (rootCid, registryCid)
 
     -- | Build positions from the root's active stock issuances, one batch of holders at a time.
-    -- Each migrated lot keeps its issuance data with the quantity set to its remaining balance,
-    -- computed from every recorded transfer, cancellation, repurchase, conversion, retirement
-    -- and split (`remainingStockBalance`); the share price stays the recorded issuance price, and
-    -- the tranches and vesting terms stay too. A lot on vesting terms starts without a vesting
-    -- snapshot, so it counts as unvested until `Registry_RecordVesting` records one.
-    -- Its provenance comes from the root's history: a resulting or balance security
-    -- of a stock transfer, cancellation, repurchase, conversion or reissuance tacks to that
-    -- record's source security, back to the origin (a security no stock record results in, or
-    -- the stock result of an exercise, release or convertible conversion). The lot takes the
-    -- origin's security ID and stock issuance date and the ancestry from the origin to its direct
-    -- parent. Ambiguous history (a security resulting from several records or a consolidation, an
-    -- ancestor without a stock issuance, a cycle) is rejected. One scan of the root per batch
-    -- (O(book) fetches) builds the balance events and the provenance links. Migrated security IDs
-    -- are recorded in the root, which blocks a second migration and any later root write against
-    -- them. So are the IDs in each lot's origin and ancestry (O(depth) inserts, no fetch): the root
-    -- guard then rejects any write to the history the lot's provenance came from, including
-    -- ancestors in other classes.
+    -- Each security must be a root stock issuance of the holder in this class, not yet migrated,
+    -- with no transfer, cancellation, repurchase or conversion (its resulting or balance security
+    -- migrates instead) and a positive remaining balance. Its lot keeps the issuance data with the
+    -- quantity set to that balance, computed by v34's own balance rules from every recorded
+    -- lifecycle event and split (`remainingStockBalance`); the share price stays the recorded
+    -- issuance price, and the tranches and vesting terms stay too. A lot on vesting terms starts
+    -- without a vesting snapshot, so it counts as unvested until `Registry_RecordVesting` records
+    -- one. The root records each migrated security, which stops a second migration. One scan of
+    -- the root per batch (O(book) fetches) builds the balance events.
     choice MigrateToPositions : (ContractId CapTable, [ContractId StockPosition])
       with
         stock_class_id : Text
@@ -2107,14 +1991,14 @@ template CapTable
         let registries = fromOptional Map.empty position_registries
         assertMsg ("Positions are not enabled for " <> stock_class_id) (Map.member stock_class_id registries)
         let maps = toMaps this
-        (stockEvents, provenanceLinks) <- stockBalanceEventsAndProvenance maps
+        stockEvents <- stockBalanceEventsBySecurityId maps
         splitEvents <- splitEventsByStockClassId maps
-        (migratedFinal, ancestorsFinal, positionCids) <- foldlA
-          (\(migrated, ancestors, cids) m -> do
+        (migratedFinal, positionCids) <- foldlA
+          (\(migrated, cids) m -> do
             assertMsg ("Unknown stakeholder " <> m.stakeholder_id) (Map.member m.stakeholder_id stakeholders)
             assertMsg ("No securities to migrate for " <> m.stakeholder_id) (not (null m.security_ids))
-            (migrated', ancestors', lots) <- foldlA
-              (\(mig, anc, acc) sid -> do
+            (migrated', lots) <- foldlA
+              (\(mig, acc) sid -> do
                 assertMsg ("Security already migrated " <> sid) (not (Map.member sid mig))
                 issuanceCid <- case Map.lookup sid stock_issuances_by_security_id of
                   Some c -> pure c
@@ -2135,19 +2019,12 @@ template CapTable
                   (not (any isReduction (fromOptional [] (Map.lookup sid stockEvents))))
                 remaining <- remainingStockBalance stockEvents splitEvents issuance
                 assertMsg ("Security " <> sid <> " has no remaining balance") (remaining > 0.0)
-                (originSecurityId, originDate, ancestry) <-
-                  stockProvenance stock_issuances_by_security_id provenanceLinks issuance.issuance_data
                 let lot = PositionLot with
                       issuance = issuance.issuance_data with quantity = remaining
-                      origin_security_id = originSecurityId
-                      origin_date = originDate
-                      ancestry
                       holds = []
                       vesting_snapshot = None
-                    -- Keep the first migrated security that froze an ancestor.
-                    anc' = foldl (\a ancestor -> Map.insertWith (\_ first -> first) ancestor sid a) anc ancestry
-                pure (Map.insert sid m.stakeholder_id mig, anc', Map.insert sid lot acc))
-              (migrated, ancestors, Map.empty)
+                pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
+              (migrated, Map.empty)
               m.security_ids
             positionCid <- create StockPosition with
               context
@@ -2155,10 +2032,8 @@ template CapTable
               stakeholder_id = m.stakeholder_id
               holder = m.holder
               lots
-            pure (migrated', ancestors', cids ++ [positionCid]))
-          (fromOptional Map.empty position_migrated_security_ids, fromOptional Map.empty position_ancestor_security_ids, [])
+            pure (migrated', cids ++ [positionCid]))
+          (fromOptional Map.empty position_migrated_security_ids, [])
           migrations
-        rootCid <- create this with
-          position_migrated_security_ids = Some migratedFinal
-          position_ancestor_security_ids = Some ancestorsFinal
+        rootCid <- create this with position_migrated_security_ids = Some migratedFinal
         pure (rootCid, positionCids)
