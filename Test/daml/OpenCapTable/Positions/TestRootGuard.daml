@@ -1,7 +1,8 @@
 -- | The root guard on books with a position-managed class: no root write may name a stock security
 -- of a managed class, migrated or not, a managed class cannot be deleted, and vesting terms behind
 -- position lots stay as they are. Writes that name only securities of unmanaged classes still pass,
--- and migration batches still work after enabling.
+-- even where a migrated lot's history runs through them, and migration batches still work after
+-- enabling.
 module OpenCapTable.Positions.TestRootGuard where
 
 import DA.Assert
@@ -13,6 +14,7 @@ import DA.Time (time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockPlanReturnToPool (StockPlanReturnToPoolOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingTerms (VestingTermsOcfData(..), OcfVestingTrigger(..))
@@ -241,3 +243,31 @@ test_G7_vestingTermsBehindPositions = do
     [CT.OcfDeleteVestingTerms "VT-3"]
   Some r <- queryContractId b1.issuer b1.root
   Map.keys r.vesting_terms === ["VT-1", "VT-2", "VT-4"]
+
+-- G8: records that name only securities of an unmanaged class stay the root's, even where a
+-- migrated lot's history runs through them. S-P (PREF) converted by CV-P into S-Q (SC), and S-Q
+-- migrated. CV-P names S-Q, so it stays as it is; but S-P's own issuance can be backdated, and new
+-- PREF transfers can give S-P a parent, and then a further one. The engine computes the holding
+-- period from the OCF log as it stands, and flags a security with several parents.
+test_G8_otherClassHistoryOfMigratedLot : Script ()
+test_G8_otherClassHistoryOfMigratedLot = do
+  alice <- allocateParty "alice"
+  b0 <- migrationBook
+    [ stock "PREF" "S-P" "SH-A" dA 100.0
+    , conversionOf "CV-P" dB "S-P" 100.0 ["S-Q"] None
+    , stock "SC" "S-Q" "SH-A" dB 100.0 ]
+  (b, [pos]) <- migrate b0 [migration "SH-A" alice ["S-Q"]]
+  expectRootWriteFails "G8a edit of the conversion that resulted in the migrated lot"
+    "stock conversion CV-P (proposed) references security S-Q of position-managed class SC"
+    b [] [CT.OcfEditStockConversion StockConversionOcfData with
+      id = "CV-P"; date = dB; quantity_converted = 100.0; security_id = "S-P"; comments = ["corrected"]
+      resulting_security_ids = ["S-Q"]; balance_security_id = None] []
+  b1 <- update b
+    [stock "PREF" "S-Z" "SH-B" dOld 100.0, transferOf "TR-Z" dOld "S-Z" 100.0 ["S-P"] None]
+    [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-P" "SH-A" 100.0) with date = dOld)] []
+  b2 <- update b1
+    [stock "PREF" "S-Z2" "SH-C" dOld 100.0, transferOf "TR-Z2" dOld "S-Z2" 100.0 ["S-P"] None] [] []
+  transfers <- transferRecords b2.issuer (const True)
+  [t.id | t <- transfers, "S-P" `elem` t.resulting_security_ids] === ["TR-Z", "TR-Z2"]
+  -- the migrated lot is unchanged
+  lotQuantities b2 pos >>= (=== [("S-Q", 100.0, 1.0)])
