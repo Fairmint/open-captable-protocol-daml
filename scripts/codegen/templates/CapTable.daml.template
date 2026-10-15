@@ -1700,14 +1700,16 @@ deletedRefs ct r = case r of
 -- proposed version (creates and edits) and in its stored version (edits and deletes). No version
 -- may be a stock issuance, split or conversion-ratio adjustment in a position-managed class, or
 -- name a stock security whose root stock issuance is in one (as a migrated security's is). A
--- position-managed stock class cannot be deleted either. So an edit can move a root record
--- neither into nor out of a managed class, and no root write can edit, delete or extend the
--- history of a managed class. The generator picks up any OCF type whose validations name stock
--- securities. A type added in a v34 patch has an upgrade-appended (Optional) root map, which this
--- guard does not read, so codegen refuses such a type until the guard handles Optional maps.
+-- position-managed stock class cannot be deleted either, and vesting terms behind position lots
+-- stay as they are (`validatePositionVestingTerms`). So an edit can move a root record neither
+-- into nor out of a managed class, and no root write can edit, delete or extend the history of a
+-- managed class. The generator picks up any OCF type whose validations name stock securities. A
+-- type added in a v34 patch has an upgrade-appended (Optional) root map, which this guard does
+-- not read, so codegen refuses such a type until the guard handles Optional maps.
 -- Costs nothing on a root without positions. Otherwise O(batch): one fetch per edit or delete of
 -- a guarded record, plus one lookup and at most one fetch (the root stock issuance) per security
--- a version names.
+-- a version names; a batch that edits or deletes vesting terms adds one fetch per root stock
+-- issuance and per edited vesting terms.
 validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
 validatePositionManagedWrites ct creates edits deletes = do
   let classes = fromOptional Map.empty ct.position_registries
@@ -1737,6 +1739,33 @@ validatePositionManagedWrites ct creates edits deletes = do
         check "proposed" proposed
         forA_ stored (check "stored")
     forA_ deletes checkDelete
+    validatePositionVestingTerms ct classes edits deletes
+
+-- | Vesting terms behind position lots. A lot keeps its issuance's vesting_terms_id, and the
+-- snapshots and OCF vesting records the registry writes are computed from those terms and name
+-- their conditions. So vesting terms that a root stock issuance of a managed class names (every
+-- migrated lot's terms among them) can be neither edited nor deleted, and no edit of other
+-- vesting terms may drop a condition ID, which a registry-written vesting start or event may
+-- name. The root cannot see terms that only registry-issued lots name; root writers
+-- (CapTableBatch, replication) must not edit or delete those.
+validatePositionVestingTerms
+  : CapTable -> Map Text (ContractId PositionRegistry) -> [OcfEditData] -> [OcfDeleteData] -> Update ()
+validatePositionVestingTerms ct classes edits deletes = do
+  let edited = [d | OcfEditVestingTerms d <- edits]
+      touched = map (.id) edited ++ [i | OcfDeleteVestingTerms i <- deletes]
+  unless (null touched) $ do
+    forA_ (Map.values ct.stock_issuances) \issuanceCid -> do
+      d <- (.issuance_data) <$> fetch issuanceCid
+      forA_ d.vesting_terms_id \t ->
+        when (t `elem` touched && Map.member d.stock_class_id classes) $
+          abort (positionManagedError ("vesting terms " <> t <> " are named by security " <> d.security_id
+            <> " of position-managed class " <> d.stock_class_id))
+    forA_ edited \d -> forA_ (Map.lookup d.id ct.vesting_terms) \termsCid -> do
+      stored <- fetch termsCid
+      let kept = map (.id) d.vesting_conditions
+      forA_ stored.vesting_terms_data.vesting_conditions \c ->
+        unless (c.id `elem` kept) $
+          abort (positionManagedError ("vesting terms " <> d.id <> " (proposed) removes vesting condition " <> c.id))
 
 -- | Remaining balance of a root stock issuance after every recorded lifecycle event and split, under
 -- v34's own balance rules: a split dated after the issuance applies; on the issuance's own date a

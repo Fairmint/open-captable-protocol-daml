@@ -1,6 +1,7 @@
 -- | The root guard on books with a position-managed class: no root write may name a stock security
--- of a managed class, migrated or not, and a managed class cannot be deleted. Writes that name only
--- securities of unmanaged classes still pass, and migration batches still work after enabling.
+-- of a managed class, migrated or not, a managed class cannot be deleted, and vesting terms behind
+-- position lots stay as they are. Writes that name only securities of unmanaged classes still pass,
+-- and migration batches still work after enabling.
 module OpenCapTable.Positions.TestRootGuard where
 
 import DA.Assert
@@ -14,12 +15,13 @@ import Daml.Script
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockPlanReturnToPool (StockPlanReturnToPoolOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (VestingTermsOcfData(..), OcfVestingTrigger(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
 import OpenCapTable.Positions.Common
 import OpenCapTable.Positions.TestMigration
-import OpenCapTable.TestHelpers (defaultStockPlan)
+import OpenCapTable.TestHelpers (defaultStockPlan, defaultVestingCondition, defaultVestingTerms, defaultVestingTermsWithConditions)
 
 -- | A date before every other record of the guard book.
 dOld : Time
@@ -194,3 +196,48 @@ test_G6_returnToPoolNamingManagedSecurity = do
   _ <- update b [] [CT.OcfEditStockPlanReturnToPool ((returnToPool "RTP-2" "S-2") with comments = ["corrected"])] []
   pure ()
 
+-- G7: vesting terms behind position lots stay as they are. Terms that a root issuance of the
+-- managed class names, migrated (VT-1, S-1) or not (VT-4, S-2), can be neither edited nor
+-- deleted, since lots keep them and the registry's snapshots and vesting records follow them. No
+-- edit of other terms may drop a condition ID either, since a registry-written vesting start or
+-- event may name it. Other edits of terms that only an unmanaged class names, edits that add a
+-- condition, and the deletion of unused terms still pass.
+test_G7_vestingTermsBehindPositions : Script ()
+test_G7_vestingTermsBehindPositions = do
+  alice <- allocateParty "alice"
+  let onTerms cls sec sh terms = CT.OcfCreateStockIssuance ((mkIssuance cls sec sh 100.0) with
+        date = dA; vesting_terms_id = Some terms)
+      renamed terms = defaultVestingTermsWithConditions terms [defaultVestingCondition "begin" OcfVestingStartTrigger []]
+  b0 <- migrationBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-2")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-3")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-4")
+    , onTerms "SC" "S-1" "SH-A" "VT-1"
+    , onTerms "SC" "S-2" "SH-B" "VT-4"
+    , onTerms "PREF" "S-P" "SH-A" "VT-2" ]
+  (b, _) <- migrate b0 [migration "SH-A" alice ["S-1"]]
+  expectRootWriteFails "G7a edit of a migrated lot's terms"
+    "vesting terms VT-1 are named by security S-1 of position-managed class SC"
+    b [] [CT.OcfEditVestingTerms ((defaultVestingTerms "VT-1") with description = "corrected")] []
+  expectRootWriteFails "G7b delete of a migrated lot's terms"
+    "vesting terms VT-1 are named by security S-1 of position-managed class SC"
+    b [] [] [CT.OcfDeleteVestingTerms "VT-1"]
+  expectRootWriteFails "G7c delete of an unmigrated managed issuance's terms"
+    "vesting terms VT-4 are named by security S-2 of position-managed class SC"
+    b [] [] [CT.OcfDeleteVestingTerms "VT-4"]
+  expectRootWriteFails "G7d edit renaming a condition of terms only an unmanaged class names"
+    "vesting terms VT-2 (proposed) removes vesting condition start"
+    b [] [CT.OcfEditVestingTerms (renamed "VT-2")] []
+  expectRootWriteFails "G7e edit renaming a condition of unused terms"
+    "vesting terms VT-3 (proposed) removes vesting condition start"
+    b [] [CT.OcfEditVestingTerms (renamed "VT-3")] []
+  -- an edit that keeps every condition, adding one, and a delete of unused terms still pass
+  b1 <- update b []
+    [ CT.OcfEditVestingTerms ((defaultVestingTerms "VT-2") with
+        description = "corrected"
+        vesting_conditions = [ defaultVestingCondition "start" OcfVestingStartTrigger []
+                             , defaultVestingCondition "begin" OcfVestingStartTrigger [] ]) ]
+    [CT.OcfDeleteVestingTerms "VT-3"]
+  Some r <- queryContractId b1.issuer b1.root
+  Map.keys r.vesting_terms === ["VT-1", "VT-2", "VT-4"]
