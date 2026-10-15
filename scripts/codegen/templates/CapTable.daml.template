@@ -1791,31 +1791,54 @@ storedRefs ct r = case r of
   _ -> pure None
 
 -- | Root guard for position-managed holdings. Every record a batch writes is checked in its
--- proposed version (creates and edits) and in its stored version (edits and deletes): no
--- version may be a stock issuance, split or conversion-ratio adjustment in a position-managed
--- class, or name a migrated security as its source, resulting or balance security. So an edit
--- can move a root record neither into nor out of a managed class. Costs nothing on a root
--- without positions, and O(batch) otherwise: one fetch per edit or delete of a guarded record.
+-- proposed version (creates and edits) and in its stored version (edits and deletes). No version
+-- may:
+--
+-- * be a stock issuance, split or conversion-ratio adjustment in a position-managed class;
+-- * name, as its source, resulting or balance security, a migrated security or a security in the
+--   provenance (origin or ancestry) of a migrated lot;
+-- * name a stock security whose root stock issuance is in a position-managed class, migrated or
+--   not.
+--
+-- A position-managed stock class cannot be deleted either. So an edit can move a root record
+-- neither into nor out of a managed class, and no root write can edit, delete or extend the
+-- history of a managed class or of a migrated lot's provenance. Costs nothing on a root without
+-- positions. Otherwise O(batch): one fetch per edit or delete of a guarded record, plus one lookup
+-- and at most one fetch (the root stock issuance) per security a version names.
 validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
 validatePositionManagedWrites ct creates edits deletes = do
   let classes = fromOptional Map.empty ct.position_registries
       migrated = fromOptional Map.empty ct.position_migrated_security_ids
+      ancestors = fromOptional Map.empty ct.position_ancestor_security_ids
       check version (label, writesInto, securityIds) = do
-        forA_ writesInto \c ->
-          assertMsg (positionManagedError (label <> " (" <> version <> ") is in position-managed class " <> c))
-            (not (Map.member c classes))
-        forA_ securityIds \s ->
-          assertMsg (positionManagedError (label <> " (" <> version <> ") references migrated security " <> s))
-            (not (Map.member s migrated))
+        let reject what = assertMsg (positionManagedError (label <> " (" <> version <> ") " <> what))
+        forA_ writesInto \c -> reject ("is in position-managed class " <> c) (not (Map.member c classes))
+        forA_ securityIds \s -> do
+          reject ("references migrated security " <> s) (not (Map.member s migrated))
+          forA_ (Map.lookup s ancestors) \m ->
+            reject ("references security " <> s <> " in the provenance of migrated security " <> m) False
+          -- A record that writes into a class names only the security it issues there, and that
+          -- class was checked above.
+          when (isNone writesInto) $
+            forA_ (Map.lookup s ct.stock_issuances_by_security_id) \issuanceCid -> do
+              issuance <- fetch issuanceCid
+              let c = issuance.issuance_data.stock_class_id
+              reject ("references security " <> s <> " of position-managed class " <> c) (not (Map.member c classes))
       checkStored r = do
         stored <- storedRefs ct r
         forA_ stored (check "stored")
-  when (not (Map.null classes) || not (Map.null migrated)) $ do
+      checkDelete r = do
+        case r of
+          OcfDeleteStockClass c ->
+            assertMsg (positionManagedError ("stock class " <> c <> " is position-managed")) (not (Map.member c classes))
+          _ -> pure ()
+        checkStored r
+  when (not (Map.null classes && Map.null migrated && Map.null ancestors)) $ do
     forA_ creates \c -> forA_ (createdRefs c) (check "proposed")
     forA_ edits \e -> do
       forA_ (editedRefs e) (check "proposed")
       forA_ (editedRecord e) checkStored
-    forA_ deletes checkStored
+    forA_ deletes checkDelete
 
 -- | Remaining balance of a root stock issuance after every recorded lifecycle event and split.
 remainingStockBalance : Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent] -> StockIssuance -> Update Decimal
@@ -1984,6 +2007,10 @@ template CapTable
     position_registries: Optional (Map Text (ContractId PositionRegistry))
     -- security_id -> stakeholder_id of every root issuance migrated into a position.
     position_migrated_security_ids: Optional (Map Text Text)
+    -- security_id -> the first migrated security_id whose lot has it as origin or ancestor. Root
+    -- records naming one are frozen like the migrated security's own, so the root history that a
+    -- lot's provenance was built from cannot change.
+    position_ancestor_security_ids: Optional (Map Text Text)
 
   where
     signatory context.issuer, context.system_operator
@@ -2136,6 +2163,9 @@ template CapTable
 {{#each types_appended}}
         assertMsg "Cannot archive: {{map_field}} is not empty" (Map.null (fromOptional Map.empty {{map_field}}))
 {{/each}}
+        -- Positions outlive no root: their teardown is not defined, so a root with position
+        -- registries stays (a managed stock class cannot be deleted either).
+        assertMsg "Cannot archive: position_registries is not empty" (Map.null (fromOptional Map.empty position_registries))
         -- Archive the issuer contract (separate contract referenced by CapTable)
         archive issuer
         -- CapTable self-archives (consuming choice)
@@ -2170,7 +2200,9 @@ template CapTable
     -- ancestor without a stock issuance, a cycle) is rejected. One scan of the root per batch
     -- (O(book) fetches) builds the balance events and the provenance links. Migrated security IDs
     -- are recorded in the root, which blocks a second migration and any later root write against
-    -- them.
+    -- them. So are the IDs in each lot's origin and ancestry (O(depth) inserts, no fetch): the root
+    -- guard then rejects any write to the history the lot's provenance came from, including
+    -- ancestors in other classes.
     choice MigrateToPositions : (ContractId CapTable, [ContractId StockPosition])
       with
         stock_class_id : Text
@@ -2183,12 +2215,12 @@ template CapTable
         let maps = toMaps this
         (stockEvents, provenanceLinks) <- stockBalanceEventsAndProvenance maps
         splitEvents <- splitEventsByStockClassId maps
-        (migratedFinal, positionCids) <- foldlA
-          (\(migrated, cids) m -> do
+        (migratedFinal, ancestorsFinal, positionCids) <- foldlA
+          (\(migrated, ancestors, cids) m -> do
             assertMsg ("Unknown stakeholder " <> m.stakeholder_id) (Map.member m.stakeholder_id stakeholders)
             assertMsg ("No securities to migrate for " <> m.stakeholder_id) (not (null m.security_ids))
-            (migrated', lots) <- foldlA
-              (\(mig, acc) sid -> do
+            (migrated', ancestors', lots) <- foldlA
+              (\(mig, anc, acc) sid -> do
                 assertMsg ("Security already migrated " <> sid) (not (Map.member sid mig))
                 issuanceCid <- case Map.lookup sid stock_issuances_by_security_id of
                   Some c -> pure c
@@ -2218,8 +2250,10 @@ template CapTable
                       ancestry
                       holds = []
                       fully_vested_on = None
-                pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
-              (migrated, Map.empty)
+                    -- Keep the first migrated security that froze an ancestor.
+                    anc' = foldl (\a ancestor -> Map.insertWith (\_ first -> first) ancestor sid a) anc ancestry
+                pure (Map.insert sid m.stakeholder_id mig, anc', Map.insert sid lot acc))
+              (migrated, ancestors, Map.empty)
               m.security_ids
             positionCid <- create StockPosition with
               context
@@ -2227,8 +2261,10 @@ template CapTable
               stakeholder_id = m.stakeholder_id
               holder = m.holder
               lots
-            pure (migrated', cids ++ [positionCid]))
-          (fromOptional Map.empty position_migrated_security_ids, [])
+            pure (migrated', ancestors', cids ++ [positionCid]))
+          (fromOptional Map.empty position_migrated_security_ids, fromOptional Map.empty position_ancestor_security_ids, [])
           migrations
-        rootCid <- create this with position_migrated_security_ids = Some migratedFinal
+        rootCid <- create this with
+          position_migrated_security_ids = Some migratedFinal
+          position_ancestor_security_ids = Some ancestorsFinal
         pure (rootCid, positionCids)
