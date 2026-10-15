@@ -11,7 +11,7 @@ import qualified DA.Date as D
 import DA.Foldable (forA_)
 import qualified DA.Map as Map
 import DA.Optional (fromOptional)
-import DA.Time (time)
+import DA.Time (addRelTime, days, hours, time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
@@ -329,4 +329,34 @@ test_MG6_splitTranches = do
     , ("S-2", 1.3333333333, [vesting 0.6666666667 dB, vesting 0.6666666666 dD]) ]
   Some s1 <- pure (Map.lookup "S-1" p.lots)
   map (`vestedQuantity` s1) [dC, dD] === [26.6666666667, 66.6666666667]
+
+-- MG7: position quantities are in units after the class's last split, which an OCF replay applies
+-- to anything dated on or before its day, so the registry records nothing dated then: no transfer,
+-- hold or issue. A later date works.
+test_MG7_registryDatesAfterLastSplit : Script ()
+test_MG7_registryDatesAfterLastSplit = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  b <- migrationBook [stock "SC" "S-1" "SH-A" dA 100.0, classSplit "SPLIT-F" dB 2.0 1.0]
+  (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1"]]
+  [(registry, r)] <- query @PositionRegistry mb.issuer
+  r.last_split_date === Some dB
+  let i = actAs mb.issuer
+      transferOn tid date = exerciseCmd registry Registry_Transfer with
+        transfer_id = tid; date; transferor_position = pa
+        transferee = Transferee with stakeholder_id = "SH-B"; party = bob; position = None
+        quantity = 200.0; share_price = usd 1.0
+        draws = [LotDraw with security_id = "S-1"; quantity = 200.0]
+        reference = None; request_receipt = False
+  expectFail "MG7a transfer before the split" "the transfer date must be after the class's last split" i $
+    transferOn "MG7a" (dB `addRelTime` days (-1))
+  expectFail "MG7b transfer later on the split's day" "the transfer date must be after the class's last split" i $
+    transferOn "MG7b" (dB `addRelTime` hours 12)
+  expectFail "MG7c hold on the split's day" "the hold date must be after the class's last split" i $
+    exerciseCmd registry ((settlementArgs pa "SET-1" [("S-1", 10.0)]) with date = dB)
+  expectFail "MG7d issue dated on the split's day" "the issue date of lot S-9 must be after the class's last split" i $
+    exerciseCmd registry Registry_Issue with
+      holder = alice; position = None; issuances = [(mkIssuance "SC" "S-9" "SH-A" 1.0) with date = dB]
+  _ <- submit mb.issuer (transferOn "MG7" dC)
+  pure ()
 

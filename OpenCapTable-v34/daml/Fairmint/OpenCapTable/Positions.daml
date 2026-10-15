@@ -22,6 +22,7 @@
 module Fairmint.OpenCapTable.Positions where
 
 import DA.Action (foldlA, unless, when)
+import DA.Date (toDateUTC)
 import DA.Foldable (forA_)
 import DA.List (head, sortOn, unique)
 import qualified DA.Map as Map
@@ -307,12 +308,22 @@ template TransferReceipt
       controller context.issuer
       do pure this
 
+-- | A registry write is dated after the day of the class's last split (`last_split_date`).
+assertAfterSplit : Optional Time -> Text -> Time -> Update ()
+assertAfterSplit lastSplit what date = forA_ lastSplit \split ->
+  assertMsg (what <> " must be after the class's last split on " <> show (toDateUTC split))
+    (toDateUTC date > toDateUTC split)
+
 -- | Per-issuer, per-class registry. Created by `CapTable.EnablePositions`; its choices are
 -- nonconsuming, so transfers never contend on it.
 template PositionRegistry
   with
     context : Context
     stock_class_id : Text
+    last_split_date : Optional Time
+      -- ^ the date of the class's latest split when positions were enabled (the root rejects
+      -- later ones). Position quantities are in units after it, and an OCF replay would apply it
+      -- to anything dated on or before its day, so the registry records nothing dated then.
   where
     signatory context.issuer, context.system_operator
 
@@ -348,6 +359,7 @@ template PositionRegistry
         assertMsg "each lot is drawn at most once" (unique (map (.security_id) draws))
         assertMsg "drawn quantities must sum to the transfer quantity" (sum (map (.quantity) draws) == quantity)
 
+        assertAfterSplit last_split_date "the transfer date" date
         tp <- fetch transferor_position
         assertMsg "transferor position belongs to another registry"
           (tp.context == context && tp.stock_class_id == stock_class_id)
@@ -498,6 +510,7 @@ template PositionRegistry
       controller context.issuer
       do
         assertMsg "issue at least one lot" (not (null issuances))
+        forA_ issuances \d -> assertAfterSplit last_split_date ("the issue date of lot " <> d.security_id) d.date
         let stakeholderId = (head issuances).stakeholder_id
         base <- case position of
           None -> pure Map.empty
@@ -555,6 +568,7 @@ template PositionRegistry
       controller context.issuer
       do
         assertMsg "hold at least one lot" (not (null lots))
+        assertAfterSplit last_split_date "the hold date" date
 
         p <- fetch position
         assertMsg "position belongs to another registry"
