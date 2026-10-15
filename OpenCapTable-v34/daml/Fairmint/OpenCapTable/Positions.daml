@@ -10,7 +10,8 @@
 -- Only vested shares move. A lot's vested quantity as of a date (`vestedQuantity`) comes from its
 -- explicit OCF tranches and, for a lot on vesting terms, from the latest `VestingSnapshot` the
 -- issuer recorded with `Registry_RecordVesting`: the position holds no terms, so the issuer
--- computes a schedule off-ledger from the terms and the OCF vesting records.
+-- computes a schedule off-ledger from the terms and the OCF vesting records, which that choice
+-- writes as create-only history like the transfer records.
 --
 -- Holds are data on lots (`LotHold`): quantity holds reserve part of a lot for one pending
 -- register transfer or a scrip mint, and stops lock a whole lot. Holds count against vested shares
@@ -32,6 +33,9 @@ import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary)
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer(..), StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAcceleration(..), VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingEvent (VestingEvent(..), VestingEventOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStart(..), VestingStartOcfData(..))
 
 -- | Policy cap on lots drawn by one transfer (explicit rejection above it; never split a transfer).
 maxLotsPerTransfer : Int
@@ -160,6 +164,23 @@ data TransferResult = TransferResult with
 data LotVestingSnapshot = LotVestingSnapshot with
     security_id : Text
     vested_quantity : Decimal
+  deriving (Eq, Show)
+
+-- | An OCF vesting transaction behind a snapshot, as passed to `Registry_RecordVesting`, which
+-- writes it as the OCF record of its type.
+data PositionVestingRecord
+  = PositionVestingStart VestingStartOcfData
+  | PositionVestingEvent VestingEventOcfData
+  | PositionVestingAcceleration VestingAccelerationOcfData
+  deriving (Eq, Show)
+
+-- | The position after `Registry_RecordVesting` and the OCF vesting records it wrote, by type, in
+-- the order given.
+data VestingResult = VestingResult with
+    position : ContractId StockPosition
+    vesting_starts : [ContractId VestingStart]
+    vesting_events : [ContractId VestingEvent]
+    vesting_accelerations : [ContractId VestingAcceleration]
   deriving (Eq, Show)
 
 -- | The lot's vested quantity as of a date, the lesser of two bounds:
@@ -627,31 +648,45 @@ template PositionRegistry
         pure ReleaseResult with position = newPosition; released
 
     -- | Record the vesting of lots on vesting terms as of `as_of`, as the issuer computed it from
-    -- the terms and the lots' OCF vesting records. Vesting never goes backwards: a lot's new
-    -- snapshot is dated no earlier and vests no less than its last (a forfeiture changes the lot's
-    -- quantity instead). The position's ensure rejects a snapshot on a lot without vesting terms
-    -- and a vested quantity outside zero to the lot's quantity.
-    nonconsuming choice Registry_RecordVesting : ContractId StockPosition
+    -- the terms and the OCF vesting transactions in `records`, which this choice writes as
+    -- create-only history (not in the CapTable root, like the transfer records), each naming a
+    -- lot of the position. Vesting never goes backwards: a lot's new snapshot is dated no earlier
+    -- and vests no less than its last (a forfeiture changes the lot's quantity instead). The
+    -- position's ensure rejects a snapshot on a lot without vesting terms and a vested quantity
+    -- outside zero to the lot's quantity.
+    nonconsuming choice Registry_RecordVesting : VestingResult
       with
         position : ContractId StockPosition
         as_of : Time
         lots : [LotVestingSnapshot]
+        records : [PositionVestingRecord]
       controller context.issuer
       do
-        assertMsg "record at least one lot" (not (null lots))
+        assertMsg "record at least one vesting snapshot or record" (not (null lots && null records))
         assertMsg "each lot is recorded at most once" (unique (map (.security_id) lots))
         p <- fetch position
         assertMsg "position belongs to another registry"
           (p.context == context && p.stock_class_id == stock_class_id)
-        newLots <- foldlA (\acc s -> do
-            lot <- case Map.lookup s.security_id acc of
+        let lotOf sid = case Map.lookup sid p.lots of
               Some l -> pure l
-              None -> abort ("lot " <> s.security_id <> " is not in the position")
+              None -> abort ("lot " <> sid <> " is not in the position")
+        newLots <- foldlA (\acc s -> do
+            lot <- lotOf s.security_id
             forA_ lot.vesting_snapshot \old ->
               assertMsg ("the vesting of lot " <> s.security_id <> " cannot go backwards")
                 (as_of >= old.as_of && s.vested_quantity >= old.vested_quantity)
             let snapshot = VestingSnapshot with vested_quantity = s.vested_quantity; as_of
             pure (Map.insert s.security_id (lot with vesting_snapshot = Some snapshot) acc))
           p.lots lots
+        vesting_starts <- forA [d | PositionVestingStart d <- records] \d -> do
+          _ <- lotOf d.security_id
+          create VestingStart with context; vesting_data = d
+        vesting_events <- forA [d | PositionVestingEvent d <- records] \d -> do
+          _ <- lotOf d.security_id
+          create VestingEvent with context; vesting_data = d
+        vesting_accelerations <- forA [d | PositionVestingAcceleration d <- records] \d -> do
+          _ <- lotOf d.security_id
+          create VestingAcceleration with context; acceleration_data = d
         archive position
-        create p with lots = newLots
+        newPosition <- create p with lots = newLots
+        pure VestingResult with position = newPosition; vesting_starts; vesting_events; vesting_accelerations

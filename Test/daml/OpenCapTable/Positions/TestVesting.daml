@@ -13,6 +13,10 @@ import DA.Time (addRelTime, days, time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAcceleration, VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingEvent (VestingEvent, VestingEventOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStart, VestingStartOcfData(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
 import OpenCapTable.Positions.Common
@@ -46,14 +50,14 @@ vsetup = do
       , (mkIssuance "SC" "S-V1" "SH-A" 100.0) with vesting_terms_id = Some "VT-4Y" ]
   pure (env, pos)
 
-recordVesting : Env -> ContractId StockPosition -> Time -> [(Text, Decimal)] -> Commands (ContractId StockPosition)
-recordVesting env pos asOf lots = exerciseCmd env.registry Registry_RecordVesting with
-  position = pos; as_of = asOf
+recordVesting : Env -> ContractId StockPosition -> Time -> [(Text, Decimal)] -> [PositionVestingRecord] -> Commands VestingResult
+recordVesting env pos asOf lots records = exerciseCmd env.registry Registry_RecordVesting with
+  position = pos; as_of = asOf; records
   lots = map (\(s, q) -> LotVestingSnapshot with security_id = s; vested_quantity = q) lots
 
--- | Record snapshots and return the new position.
+-- | Record snapshots only and return the new position.
 snapshot : Env -> ContractId StockPosition -> Time -> [(Text, Decimal)] -> Script (ContractId StockPosition)
-snapshot env pos asOf lots = submit env.book.issuer (recordVesting env pos asOf lots)
+snapshot env pos asOf lots = (.position) <$> submit env.book.issuer (recordVesting env pos asOf lots [])
 
 lotOn : Env -> ContractId StockPosition -> Text -> Script PositionLot
 lotOn env pos sid = positionOf env pos >>= (`lotOf` sid)
@@ -146,9 +150,9 @@ test_V5_snapshotMonotonicity = do
   let i = actAs env.book.issuer
   pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
   expectFail "V5a an earlier snapshot" "the vesting of lot S-V1 cannot go backwards" i $
-    recordVesting env pos2 (dSnap `addRelTime` days (-1)) [("S-V1", 50.0)]
+    recordVesting env pos2 (dSnap `addRelTime` days (-1)) [("S-V1", 50.0)] []
   expectFail "V5b less vested" "the vesting of lot S-V1 cannot go backwards" i $
-    recordVesting env pos2 dTransfer [("S-V1", 39.0)]
+    recordVesting env pos2 dTransfer [("S-V1", 39.0)] []
   -- the same snapshot again, then a later and larger one
   pos3 <- snapshot env pos2 dSnap [("S-V1", 40.0)]
   pos4 <- snapshot env pos3 dTransfer [("S-V1", 60.0)]
@@ -161,24 +165,24 @@ test_V6_recordChecks : Script ()
 test_V6_recordChecks = do
   (env, pos) <- vsetup
   let i = actAs env.book.issuer
-  expectFail "V6a nothing to record" "record at least one lot" i $
-    recordVesting env pos dSnap []
+  expectFail "V6a nothing to record" "record at least one vesting snapshot or record" i $
+    recordVesting env pos dSnap [] []
   expectFail "V6b lot listed twice" "each lot is recorded at most once" i $
-    recordVesting env pos dSnap [("S-V1", 10.0), ("S-V1", 20.0)]
+    recordVesting env pos dSnap [("S-V1", 10.0), ("S-V1", 20.0)] []
   expectFail "V6c lot not in the position" "lot S-B1 is not in the position" i $
-    recordVesting env pos dSnap [("S-B1", 10.0)]
+    recordVesting env pos dSnap [("S-B1", 10.0)] []
   expectFail "V6d lot without vesting terms" positionPreconditionViolated i $
-    recordVesting env pos dSnap [("S-V1", 10.0), ("S-A1", 60.0)]
+    recordVesting env pos dSnap [("S-V1", 10.0), ("S-A1", 60.0)] []
   expectFail "V6e lot with tranches only" positionPreconditionViolated i $
-    recordVesting env pos dSnap [("S-T1", 50.0)]
+    recordVesting env pos dSnap [("S-T1", 50.0)] []
   expectFail "V6f negative vested quantity" positionPreconditionViolated i $
-    recordVesting env pos dSnap [("S-V1", -1.0)]
+    recordVesting env pos dSnap [("S-V1", -1.0)] []
   expectFail "V6g above the lot quantity" positionPreconditionViolated i $
-    recordVesting env pos dSnap [("S-V1", 100.5)]
+    recordVesting env pos dSnap [("S-V1", 100.5)] []
   -- none and all of the lot are both fine
   pos2 <- snapshot env pos dSnap [("S-V1", 0.0)]
   _ <- snapshot env pos2 dSnap [("S-V1", 100.0)]
-  expectFail "V6h a consumed position" "NotActive" i $ recordVesting env pos dSnap [("S-V1", 10.0)]
+  expectFail "V6h a consumed position" "NotActive" i $ recordVesting env pos dSnap [("S-V1", 10.0)] []
 
 -- V7: holds of both purposes take only vested shares, together at most the vested part.
 test_V7_holdsLimitedByVested : Script ()
@@ -226,6 +230,44 @@ test_V8_stopLocksUnvestedLot = do
   lifted <- releaseHold env (releaseArgs pos2 HoldPurposeStopTransfer "STOP-1" ReleaseCodeStopLifted None)
   _ <- runTransfer env (transfer env "V8" lifted.position None 40.0 [("S-V1", 40.0)])
   pure ()
+
+-- V9: `Registry_RecordVesting` writes the OCF vesting records it is given as create-only history,
+-- each naming a lot of the position; they stay out of the root, whose guard still rejects root
+-- vesting records on a migrated lot.
+test_V9_vestingRecords : Script ()
+test_V9_vestingRecords = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      start = VestingStartOcfData with
+        id = "VS-1"; date = d0; security_id = "S-V1"; vesting_condition_id = "start"; comments = []
+      event = VestingEventOcfData with
+        id = "VE-1"; date = dSnap; security_id = "S-V1"; vesting_condition_id = "milestone"; comments = []
+      acceleration = VestingAccelerationOcfData with
+        id = "VA-1"; date = dSnap; quantity = 10.0; reason_text = "board approval"; security_id = "S-V1"; comments = []
+  expectFail "V9a record on another holder's lot" "lot S-B1 is not in the position" i $
+    recordVesting env pos dSnap [("S-V1", 40.0)] [PositionVestingEvent event with security_id = "S-B1"]
+  expectFail "V9b record on an unknown lot" "lot S-ZZ is not in the position" i $
+    recordVesting env pos dSnap [] [PositionVestingAcceleration acceleration with security_id = "S-ZZ"]
+  r <- submit env.book.issuer $ recordVesting env pos dSnap [("S-V1", 40.0)]
+    [PositionVestingAcceleration acceleration, PositionVestingStart start, PositionVestingEvent event]
+  starts <- mapA (queryContractId env.book.issuer) r.vesting_starts
+  events <- mapA (queryContractId env.book.issuer) r.vesting_events
+  accelerations <- mapA (queryContractId env.book.issuer) r.vesting_accelerations
+  map (fmap (.vesting_data)) starts === [Some start]
+  map (fmap (.vesting_data)) events === [Some event]
+  map (fmap (.acceleration_data)) accelerations === [Some acceleration]
+  -- records without a snapshot, on any lot of the position
+  r2 <- submit env.book.issuer $ recordVesting env r.position dTransfer []
+    [PositionVestingAcceleration acceleration with id = "VA-2"; security_id = "S-T1"]
+  length r2.vesting_accelerations === 1
+  -- the holder sees none of them, and the root lists none
+  seen <- (,,) <$> query @VestingStart env.alice <*> query @VestingEvent env.alice <*> query @VestingAcceleration env.alice
+  seen === ([], [], [])
+  Some root <- queryContractId env.book.issuer env.book.root
+  (Map.keys root.vesting_starts, Map.keys root.vesting_events, Map.keys root.vesting_accelerations) === ([], [], [])
+  expectRootWriteFails "V9c root vesting event on a migrated lot"
+    "vesting event VE-2 (proposed) references migrated security S-A3"
+    env.book [CT.OcfCreateVestingEvent event with id = "VE-2"; security_id = "S-A3"] [] []
 
 -- V10: the transferee's lots carry no vesting: only vested shares move.
 test_V10_transfereeLotHasNoVesting : Script ()
