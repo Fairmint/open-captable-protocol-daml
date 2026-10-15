@@ -1697,14 +1697,9 @@ deletedRefs ct r = case r of
 
 -- | Root guard for position-managed holdings. Every record a batch writes is checked in its
 -- proposed version (creates and edits) and in its stored version (edits and deletes). No version
--- may:
---
--- * be a stock issuance, split or conversion-ratio adjustment in a position-managed class;
--- * name, as its source, resulting or balance security, a migrated security;
--- * name a stock security whose root stock issuance is in a position-managed class, migrated or
---   not.
---
--- A position-managed stock class cannot be deleted either. So an edit can move a root record
+-- may be a stock issuance, split or conversion-ratio adjustment in a position-managed class, or
+-- name a stock security whose root stock issuance is in one (as a migrated security's is). A
+-- position-managed stock class cannot be deleted either. So an edit can move a root record
 -- neither into nor out of a managed class, and no root write can edit, delete or extend the
 -- history of a managed class. The generator picks up any OCF type whose validations name stock
 -- securities. A type added in a v34 patch has an upgrade-appended (Optional) root map, which this
@@ -1715,29 +1710,25 @@ deletedRefs ct r = case r of
 validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
 validatePositionManagedWrites ct creates edits deletes = do
   let classes = fromOptional Map.empty ct.position_registries
-      migrated = fromOptional Map.empty ct.position_migrated_security_ids
       check version (label, writesInto, securityIds) = do
         let reject what = assertMsg (positionManagedError (label <> " (" <> version <> ") " <> what))
         forA_ writesInto \c -> reject ("is in position-managed class " <> c) (not (Map.member c classes))
-        forA_ securityIds \s -> do
-          reject ("references migrated security " <> s) (not (Map.member s migrated))
-          -- A record that writes into a class names only the security it issues there, and that
-          -- class was checked above.
-          when (isNone writesInto) $
+        -- A record that writes into a class names only the security it issues there, and that
+        -- class was checked above.
+        when (isNone writesInto) $
+          forA_ securityIds \s ->
             forA_ (Map.lookup s ct.stock_issuances_by_security_id) \issuanceCid -> do
               issuance <- fetch issuanceCid
               let c = issuance.issuance_data.stock_class_id
               reject ("references security " <> s <> " of position-managed class " <> c) (not (Map.member c classes))
-      checkStored r = do
-        stored <- deletedRefs ct r
-        forA_ stored (check "stored")
       checkDelete r = do
         case r of
           OcfDeleteStockClass c ->
             assertMsg (positionManagedError ("stock class " <> c <> " is position-managed")) (not (Map.member c classes))
           _ -> pure ()
-        checkStored r
-  unless (Map.null classes && Map.null migrated) $ do
+        stored <- deletedRefs ct r
+        forA_ stored (check "stored")
+  unless (Map.null classes) $ do
     forA_ creates \c -> forA_ (createdRefs c) (check "proposed")
     forA_ edits \e -> do
       versions <- editedRefs ct e
