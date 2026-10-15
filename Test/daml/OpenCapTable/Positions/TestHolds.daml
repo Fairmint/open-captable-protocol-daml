@@ -84,10 +84,11 @@ holdsOn env cid sid = do
   l <- lotOf p sid
   pure l.holds
 
-freeOn : Env -> ContractId StockPosition -> Text -> Script Decimal
-freeOn env cid sid = do
+-- | What a lot can still be drawn or held for at the transfer date.
+drawableOn : Env -> ContractId StockPosition -> Text -> Script Decimal
+drawableOn env cid sid = do
   p <- positionOf env cid
-  lotFreeQuantity <$> lotOf p sid
+  drawableQuantity dTransfer <$> lotOf p sid
 
 -- | The draws of the transfer under reference `r`: every lot of the position that holds
 -- `(HoldPurposeRegisterSettlement, r)`, drawing its hold's quantity, in map order.
@@ -111,15 +112,15 @@ test_HO0_helpers : Script ()
 test_HO0_helpers = do
   let lot holds = PositionLot with
         issuance = mkIssuance "SC" "S-X1" "SH-X" 100.0
-        origin_security_id = "S-X1"; origin_date = d0; ancestry = []; holds; fully_vested_on = None
+        origin_security_id = "S-X1"; origin_date = d0; ancestry = []; holds; vesting_snapshot = None
       free = lot []
       held = lot [settlementHold "SET-1" 30.0, scripHold "SCRIP-1" 20.0]
       stopped = lot [scripHold "SCRIP-1" 20.0, stopHold "STOP-1"]
   map isQuantityHold [settlementHold "SET-1" 1.0, scripHold "SCRIP-1" 1.0, stopHold "STOP-1"] === [True, True, False]
   map lotIsStopped [free, held, stopped] === [False, False, True]
-  map lotHeldQuantity [free, held, stopped] === [0.0, 50.0, 20.0]
-  -- a stopped lot has nothing free, whatever its quantity holds
-  map lotFreeQuantity [free, held, stopped] === [100.0, 50.0, 0.0]
+  map heldQuantity [free, held, stopped] === [0.0, 50.0, 20.0]
+  -- a stopped lot has nothing drawable, whatever its quantity holds
+  map (drawableQuantity dTransfer) [free, held, stopped] === [100.0, 50.0, 0.0]
   lotHoldFor HoldPurposeRegisterSettlement "SET-1" held === Some (settlementHold "SET-1" 30.0)
   -- the lookup is by purpose and reference
   lotHoldFor HoldPurposeScripMint "SET-1" held === None
@@ -139,23 +140,21 @@ test_HO1_placeHolds = do
   holdsOn env r1.position "S-A1" >>= (=== [settlementHold "SET-1" 20.0])
   holdsOn env r1.position "S-A2" >>= (=== [settlementHold "SET-1" 40.0])
   holdsOn env r1.position "S-A3" >>= (=== [])
-  freeOn env r1.position "S-A1" >>= (=== 40.0)
-  -- a hold may take a lot's whole free quantity
-  freeOn env r1.position "S-A2" >>= (=== 0.0)
+  drawableOn env r1.position "S-A1" >>= (=== 40.0)
+  -- a hold may take a lot's whole drawable quantity
+  drawableOn env r1.position "S-A2" >>= (=== 0.0)
   -- a scrip-mint hold; (purpose, reference) is unique, so another purpose may reuse a reference
   r2 <- placeHold env (scripArgs r1.position "SCRIP-1" [("S-A1", 15.0)])
   r3 <- placeHold env (scripArgs r2.position "SET-1" [("S-A1", 5.0)])
   r4 <- placeHold env (settlementArgs r3.position "SET-2" [("S-A1", 20.0)])
   holdsOn env r4.position "S-A1" >>= (===
     [settlementHold "SET-1" 20.0, scripHold "SCRIP-1" 15.0, scripHold "SET-1" 5.0, settlementHold "SET-2" 20.0])
-  freeOn env r4.position "S-A1" >>= (=== 0.0)
-  -- a scrip-mint hold needs no vesting (S-A3 vests in 2030)
-  r5 <- placeHold env (scripArgs r4.position "SCRIP-3" [("S-A3", 100.0)])
+  drawableOn env r4.position "S-A1" >>= (=== 0.0)
   -- a stop on a lot without other holds
-  r6 <- placeHold env (stopArgs r5.position "STOP-1" ["S-A4"])
+  r6 <- placeHold env (stopArgs r4.position "STOP-1" ["S-A4"])
   r6.released === []
   holdsOn env r6.position "S-A4" >>= (=== [stopHold "STOP-1"])
-  freeOn env r6.position "S-A4" >>= (=== 0.0)
+  drawableOn env r6.position "S-A4" >>= (=== 0.0)
   -- the holder sees their position with its holds; another holder does not
   Some seen <- queryContractId env.alice r6.position
   Map.size seen.lots === 4
@@ -205,7 +204,9 @@ test_HO3_foreignPosition = do
   expectFail "HO3b release on a position of another registry" "position belongs to another registry" i $
     exerciseCmd registry2 (releaseArgs r.position HoldPurposeScripMint "SCRIP-1" ReleaseCodeError None)
   expectFail "HO3c vesting record on a position of another registry" "position belongs to another registry" i $
-    exerciseCmd registry2 Registry_RecordFullyVested with position = r.position; security_ids = ["S-A1"]; date = d0
+    exerciseCmd registry2 Registry_RecordVesting with
+      position = r.position; as_of = d0
+      lots = [LotVestingSnapshot with security_id = "S-A1"; vested_quantity = 1.0]
 
 -- HO4: register-settlement holds get the transfer checks.
 test_HO4_settlementHoldChecks : Script ()
@@ -221,25 +222,25 @@ test_HO4_settlementHoldChecks = do
     exerciseCmd reg (settlementArgs env.posA "SET-1" [("S-A1", 0.0)])
   expectFail "HO4d negative quantity" positionPreconditionViolated i $
     exerciseCmd reg (settlementArgs env.posA "SET-1" [("S-A1", 1.0), ("S-A2", -1.0)])
-  expectFail "HO4e unvested lot" "lot S-A3 is not fully vested" i $
+  expectFail "HO4e unvested lot" "hold exceeds the drawable quantity of lot S-A3" i $
     exerciseCmd reg (settlementArgs env.posA "SET-1" [("S-A3", 10.0)])
   expectFail "HO4f lot issued after the hold date" "lot S-A4 was issued after the hold date" i $
     exerciseCmd reg ((settlementArgs env.posA "SET-1" [("S-A4", 10.0)]) with date = dTransfer `addRelTime` days (-1))
-  expectFail "HO4g above the lot quantity" "hold exceeds the free quantity of lot S-A1" i $
+  expectFail "HO4g above the lot quantity" "hold exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (settlementArgs env.posA "SET-1" [("S-A1", 61.0)])
   r1 <- placeHold env (scripArgs env.posA "SCRIP-1" [("S-A1", 30.0)])
   r2 <- placeHold env (settlementArgs r1.position "SET-1" [("S-A1", 20.0)])
-  expectFail "HO4h above the free quantity left by other holds" "hold exceeds the free quantity of lot S-A1" i $
+  expectFail "HO4h above the drawable quantity left by other holds" "hold exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (settlementArgs r2.position "SET-2" [("S-A1", 11.0)])
   r3 <- placeHold env (stopArgs r2.position "STOP-1" ["S-A2"])
   expectFail "HO4i stopped lot" "lot S-A2 is stopped" i $
     exerciseCmd reg (settlementArgs r3.position "SET-2" [("S-A2", 1.0)])
-  -- exactly the free quantity left is fine
+  -- exactly the drawable quantity left is fine
   _ <- placeHold env (settlementArgs r3.position "SET-2" [("S-A1", 10.0)])
   pure ()
 
--- HO5: scrip-mint holds need an unstopped lot and a positive quantity within the free quantity,
--- and nothing else.
+-- HO5: scrip-mint holds need an unstopped lot and a positive quantity within the drawable
+-- quantity, and nothing else.
 test_HO5_scripHoldChecks : Script ()
 test_HO5_scripHoldChecks = do
   env <- setup
@@ -249,17 +250,17 @@ test_HO5_scripHoldChecks = do
     exerciseCmd reg (holdArgs env.posA HoldPurposeScripMint "SCRIP-1" [("S-A1", None)])
   expectFail "HO5b zero quantity" positionPreconditionViolated i $
     exerciseCmd reg (scripArgs env.posA "SCRIP-1" [("S-A1", 0.0)])
-  expectFail "HO5c above the lot quantity" "hold exceeds the free quantity of lot S-A1" i $
+  expectFail "HO5c above the lot quantity" "hold exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (scripArgs env.posA "SCRIP-1" [("S-A1", 60.5)])
   r1 <- placeHold env (settlementArgs env.posA "SET-1" [("S-A1", 50.0)])
-  expectFail "HO5d above the free quantity left by a settlement hold" "hold exceeds the free quantity of lot S-A1" i $
+  expectFail "HO5d above the drawable quantity left by a settlement hold" "hold exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (scripArgs r1.position "SCRIP-1" [("S-A1", 10.5)])
   -- a stopped lot takes no scrip-mint hold
   r2 <- placeHold env (stopArgs r1.position "STOP-1" ["S-A2"])
   expectFail "HO5e stopped lot" "lot S-A2 is stopped" i $
     exerciseCmd reg (scripArgs r2.position "SCRIP-1" [("S-A2", 1.0)])
-  -- unvested and not yet issued lots take one (no transfer checks)
-  _ <- placeHold env ((scripArgs r2.position "SCRIP-1" [("S-A3", 100.0), ("S-A4", 1.0)]) with date = d0)
+  -- a lot not yet issued at the hold date takes one (no transfer checks)
+  _ <- placeHold env ((scripArgs r2.position "SCRIP-1" [("S-A4", 1.0)]) with date = d0)
   pure ()
 
 -- HO6: a stop takes no quantity and needs only the lot; it releases the lot's settlement holds and
@@ -324,7 +325,7 @@ test_HO7_release = do
   rel3.released === [ReleasedHold with security_id = "S-A1"; hold = scripHold "SCRIP-1" 5.0; code = ReleaseCodeScripMintReleased]
   p <- positionOf env rel3.position
   map (\l -> l.holds) (Map.values p.lots) === [[], [], [], []]
-  -- released shares are free again: a free transfer can take the whole lot
+  -- released shares are drawable again: a free transfer can take the whole lot
   _ <- runTransfer env (transfer env "HO7" rel3.position None 60.0 [("S-A1", 60.0)])
   pure ()
 
@@ -336,7 +337,7 @@ test_HO8_positionHoldInvariants = do
       both = actAs [b.issuer, b.sysop]
       lot sid holds = PositionLot with
         issuance = mkIssuance "SC" sid "SH-X" 100.0
-        origin_security_id = sid; origin_date = d0; ancestry = []; holds; fully_vested_on = None
+        origin_security_id = sid; origin_date = d0; ancestry = []; holds; vesting_snapshot = None
       position lots = StockPosition with
         context = b.ctx; stock_class_id = "SC"; stakeholder_id = "SH-X"; holder = env.carol
         lots = Map.fromList [(l.issuance.security_id, l) | l <- lots]
@@ -378,8 +379,8 @@ test_HO9_transferUnderReference = do
     exerciseCmd reg (settle env "HO9b" pos "SET-1" 80.0 [("S-A1", 50.0), ("S-A2", 30.0)])
   expectFail "HO9c draw below the hold" "draw on lot S-A2 must equal its register-settlement hold with reference SET-1" i $
     exerciseCmd reg (settle env "HO9c" pos "SET-1" 70.0 [("S-A1", 60.0), ("S-A2", 10.0)])
-  -- never free quantity: S-A4 is free but holds nothing under SET-1
-  expectFail "HO9d free quantity under a reference" "lot S-A4 carries no register-settlement hold with reference SET-1" i $
+  -- never drawable quantity: S-A4 is drawable but holds nothing under SET-1
+  expectFail "HO9d drawable quantity under a reference" "lot S-A4 carries no register-settlement hold with reference SET-1" i $
     exerciseCmd reg (settle env "HO9d" pos "SET-1" 90.0 [("S-A1", 60.0), ("S-A2", 20.0), ("S-A4", 10.0)])
   -- only register-settlement holds settle
   expectFail "HO9e a scrip-mint hold's reference" "lot S-A2 carries no register-settlement hold with reference SCRIP-1" i $
@@ -408,7 +409,7 @@ test_HO9_transferUnderReference = do
   holdsOn env fromPos2 "HO9-2-R-0" >>= (=== [scripHold "SCRIP-1" 10.0])
 
 -- HO10: impl 14 (proposal 26): a transfer whose holds were released cannot settle, and its reference
--- finds no free quantity.
+-- finds no drawable quantity.
 test_HO10_settleAfterRelease : Script ()
 test_HO10_settleAfterRelease = do
   env <- setup
@@ -419,7 +420,7 @@ test_HO10_settleAfterRelease = do
     (actAs env.book.issuer) $
     exerciseCmd env.registry (settle env "HO10" rel.position "SET-26" 80.0 [("S-A1", 60.0), ("S-A2", 20.0)])
 
--- HO11: free transfers take only free quantity; the remainder keeps the lot's holds.
+-- HO11: free transfers take only drawable quantity; the remainder keeps the lot's holds.
 test_HO11_freeTransferNextToHolds : Script ()
 test_HO11_freeTransferNextToHolds = do
   env <- setup
@@ -428,17 +429,17 @@ test_HO11_freeTransferNextToHolds = do
   r1 <- placeHold env (settlementArgs env.posA "SET-1" [("S-A1", 40.0)])
   r2 <- placeHold env (scripArgs r1.position "SCRIP-1" [("S-A2", 40.0)])
   let pos = r2.position
-  expectFail "HO11a above the free quantity" "draw exceeds the free quantity of lot S-A1" i $
+  expectFail "HO11a above the drawable quantity" "draw exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (transfer env "HO11a" pos None 21.0 [("S-A1", 21.0)])
-  expectFail "HO11b whole lot that carries another hold" "draw exceeds the free quantity of lot S-A1" i $
+  expectFail "HO11b whole lot that carries another hold" "draw exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (transfer env "HO11b" pos None 60.0 [("S-A1", 60.0)])
-  expectFail "HO11c lot fully held by a scrip-mint hold" "draw exceeds the free quantity of lot S-A2" i $
+  expectFail "HO11c lot fully held by a scrip-mint hold" "draw exceeds the drawable quantity of lot S-A2" i $
     exerciseCmd reg (transfer env "HO11c" pos None 1.0 [("S-A2", 1.0)])
-  -- the free part moves; the remainder keeps the hold with its reference and date
+  -- the drawable part moves; the remainder keeps the hold with its reference and date
   r <- runTransfer env (transfer env "HO11" pos None 20.0 [("S-A1", 20.0)])
   Some fromPos <- pure r.transferor_position
   holdsOn env fromPos "HO11-R-0" >>= (=== [settlementHold "SET-1" 40.0])
-  freeOn env fromPos "HO11-R-0" >>= (=== 0.0)
+  drawableOn env fromPos "HO11-R-0" >>= (=== 0.0)
   -- the hold's transfer then draws the whole remainder
   rs <- runTransfer env (settle env "HO11-2" fromPos "SET-1" 40.0 [("HO11-R-0", 40.0)])
   Some fromPos2 <- pure rs.transferor_position
@@ -494,7 +495,7 @@ test_HO13_stopOnHeldLotOfTwoLotTransfer = do
   rel <- releaseHold env (releaseArgs s.position HoldPurposeRegisterSettlement "SET-12" ReleaseCodeStopTransfer None)
   rel.released === [ReleasedHold with security_id = "S-A2"; hold = settlementHold "SET-12" 20.0; code = ReleaseCodeStopTransfer]
   holdsOn env rel.position "S-A1" >>= (=== [stopHold "STOP-12"])
-  freeOn env rel.position "S-A2" >>= (=== 40.0)
+  drawableOn env rel.position "S-A2" >>= (=== 40.0)
 
 -- HO14: impl 13 (proposal 24): a stop on an unvested lot succeeds and blocks every draw and new
 -- register-settlement hold, even once the lot has vested, until it is lifted.
@@ -535,20 +536,20 @@ test_HO15_twoStopsOnScripHeldLot = do
   s2 <- placeHold env (stopArgs s1.position "STOP-2" ["S-A1"])
   s2.released === []
   holdsOn env s2.position "S-A1" >>= (=== [scripHold "SCRIP-25" 30.0, stopHold "STOP-1", stopHold "STOP-2"])
-  freeOn env s2.position "S-A1" >>= (=== 0.0)
+  drawableOn env s2.position "S-A1" >>= (=== 0.0)
   expectFail "HO15a draw with two stops" "lot S-A1 is stopped" i $
     exerciseCmd reg (transfer env "HO15a" s2.position None 10.0 [("S-A1", 10.0)])
   l1 <- releaseHold env (releaseArgs s2.position HoldPurposeStopTransfer "STOP-1" ReleaseCodeStopLifted None)
   l1.released === [ReleasedHold with security_id = "S-A1"; hold = stopHold "STOP-1"; code = ReleaseCodeStopLifted]
-  freeOn env l1.position "S-A1" >>= (=== 0.0)
+  drawableOn env l1.position "S-A1" >>= (=== 0.0)
   expectFail "HO15b draw with one stop left" "lot S-A1 is stopped" i $
     exerciseCmd reg (transfer env "HO15b" l1.position None 10.0 [("S-A1", 10.0)])
   expectFail "HO15c register-settlement hold with one stop left" "lot S-A1 is stopped" i $
     exerciseCmd reg (settlementArgs l1.position "SET-25" [("S-A1", 10.0)])
   l2 <- releaseHold env (releaseArgs l1.position HoldPurposeStopTransfer "STOP-2" ReleaseCodeStopLifted (Some ["S-A1"]))
   holdsOn env l2.position "S-A1" >>= (=== [scripHold "SCRIP-25" 30.0])
-  freeOn env l2.position "S-A1" >>= (=== 30.0)
-  expectFail "HO15d draw above the free quantity" "draw exceeds the free quantity of lot S-A1" i $
+  drawableOn env l2.position "S-A1" >>= (=== 30.0)
+  expectFail "HO15d draw above the drawable quantity" "draw exceeds the drawable quantity of lot S-A1" i $
     exerciseCmd reg (transfer env "HO15d" l2.position None 31.0 [("S-A1", 31.0)])
   r <- runTransfer env (transfer env "HO15" l2.position None 30.0 [("S-A1", 30.0)])
   Some fromPos <- pure r.transferor_position
@@ -594,8 +595,10 @@ test_HO17_holderHasNoRegistryAuthority = do
   denied "Registry_Hold" $ exerciseCmd reg (stopArgs pos "STOP-1" ["S-A1"])
   denied "Registry_Release" $
     exerciseCmd reg (releaseArgs pos HoldPurposeRegisterSettlement "SET-1" ReleaseCodeCounterpartyWithdrew None)
-  denied "Registry_RecordFullyVested" $
-    exerciseCmd reg Registry_RecordFullyVested with position = pos; security_ids = ["S-A3"]; date = d0
+  denied "Registry_RecordVesting" $
+    exerciseCmd reg Registry_RecordVesting with
+      position = pos; as_of = d0
+      lots = [LotVestingSnapshot with security_id = "S-A3"; vested_quantity = 1.0]
   denied "Registry_Transfer" $ exerciseCmd reg (settle env "HO17" pos "SET-1" 10.0 [("S-A1", 10.0)])
   denied "Registry_Issue" $ exerciseCmd reg Registry_Issue with
     holder = env.alice; position = Some pos; issuances = [mkIssuance "SC" "S-A9" "SH-A" 1.0]
