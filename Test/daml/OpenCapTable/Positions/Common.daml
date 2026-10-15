@@ -17,6 +17,7 @@ import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuance
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer(..), StockTransferOcfData(..))
 import Fairmint.OpenCapTable.IssuerAuthorization (IssuerAuthorization(..), CreateCapTable(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
 
 expectFail : Text -> Text -> SubmitOptions -> Commands a -> Script ()
 expectFail label reason opts cmds = do
@@ -114,3 +115,35 @@ issuanceRecords : Party -> (Text -> Bool) -> Script [StockIssuanceOcfData]
 issuanceRecords party keep = do
   records <- query @StockIssuance party
   pure (sortOn (.id) (filter (keep . (.id)) (map (\(_, s) -> s.issuance_data) records)))
+
+-- | `UpdateCapTable` on the book is rejected with `reason`.
+expectRootWriteFails : Text -> Text -> Book -> [CT.OcfCreateData] -> [CT.OcfEditData] -> [CT.OcfDeleteData] -> Script ()
+expectRootWriteFails label reason b creates edits deletes =
+  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with creates; edits; deletes
+
+-- Migration to positions in class SC.
+
+migration : Text -> Party -> [Text] -> CT.PositionMigration
+migration sh holder sids = CT.PositionMigration with stakeholder_id = sh; holder; security_ids = sids
+
+migrate : Book -> [CT.PositionMigration] -> Script (Book, [ContractId StockPosition])
+migrate b migrations = do
+  (root, positions) <- submit b.issuer $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+  let migrated = b with root = root
+  pure (migrated, positions)
+
+expectMigrationFails : Text -> Text -> Book -> [CT.PositionMigration] -> Script ()
+expectMigrationFails label reason b migrations =
+  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+
+-- Holds placed at the transfer date.
+
+holdArgs : ContractId StockPosition -> HoldPurpose -> Text -> [(Text, Optional Decimal)] -> Registry_Hold
+holdArgs pos purpose reference lots = Registry_Hold with
+  position = pos; purpose; reference; date = dTransfer
+  lots = map (\(s, q) -> HoldLot with security_id = s; quantity = q) lots
+
+settlementArgs : ContractId StockPosition -> Text -> [(Text, Decimal)] -> Registry_Hold
+settlementArgs pos ref lots = holdArgs pos HoldPurposeRegisterSettlement ref (map (\(s, q) -> (s, Some q)) lots)

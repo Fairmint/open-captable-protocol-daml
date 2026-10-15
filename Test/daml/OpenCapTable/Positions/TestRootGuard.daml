@@ -13,6 +13,7 @@ import DA.Time (time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
 
@@ -53,15 +54,51 @@ guardBook = provenanceBook
   , stock "SC" "S-R" "SH-C" dD 10.0
   ]
 
--- | `UpdateCapTable` on the book is rejected with `reason`.
-expectRootWriteFails : Text -> Text -> Book -> [CT.OcfCreateData] -> [CT.OcfEditData] -> [CT.OcfDeleteData] -> Script ()
-expectRootWriteFails label reason b creates edits deletes =
-  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with creates; edits; deletes
-
 -- | TR-AB with its comments changed (an edit must change something).
 editedTransferAB : CT.OcfEditData
 editedTransferAB = CT.OcfEditStockTransfer ((mkTransfer "TR-AB" "S-A" 100.0 ["S-B"] None) with
   date = dB; comments = ["corrected"])
+
+-- G1: an edit cannot move an unmigrated root issuance into a position-managed class: the guard
+-- checks the proposed version, not only the stored one.
+test_G1_editIntoManagedClass : Script ()
+test_G1_editIntoManagedClass = do
+  b <- guardBook
+  expectRootWriteFails "G1 edit moves a root issuance into the managed class"
+    "stock issuance ISS-S-E1 (proposed) is in position-managed class SC"
+    b [] [CT.OcfEditStockIssuance ((mkIssuance "SC" "S-E1" "SH-B" 50.0) with date = dA)] []
+  -- an edit that keeps the issuance in its root-managed class still works
+  _ <- update b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-E1" "SH-B" 60.0) with date = dA)] []
+  pure ()
+
+-- G2: an edit or delete of a stored root issuance in a position-managed class is rejected, even
+-- when the issuance was not migrated and the edit would move it out of the class.
+test_G2_editStoredManagedIssuance : Script ()
+test_G2_editStoredManagedIssuance = do
+  b <- guardBook
+  expectRootWriteFails "G2a edit moves an unmigrated issuance out of the managed class"
+    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
+    b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-D1" "SH-D" 30.0) with date = dA)] []
+  expectRootWriteFails "G2b delete of an unmigrated issuance in the managed class"
+    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
+    b [] [] [CT.OcfDeleteStockIssuance "ISS-S-D1"]
+
+-- G3: every security a proposed record names is checked against the migrated set: a balance or
+-- resulting security, and the stock securities named by equity compensation, warrant,
+-- convertible and vesting records.
+test_G3_proposedSecurityReferences : Script ()
+test_G3_proposedSecurityReferences = do
+  (b, _) <- migratedGuardBook
+  expectRootWriteFails "G3a root transfer whose balance security is migrated"
+    "stock transfer TR-G3 (proposed) references migrated security S-C"
+    b [CT.OcfCreateStockTransfer (mkTransfer "TR-G3" "S-E1" 1.0 [] (Some "S-C"))] [] []
+  expectRootWriteFails "G3b equity compensation exercise resulting in a migrated security"
+    "equity compensation exercise EX-G3 (proposed) references migrated security S-C"
+    b [exerciseOf "EX-G3" dTransfer "EC-1" 1.0 ["S-C"]] [] []
+  expectRootWriteFails "G3c vesting start on a migrated security"
+    "vesting start VS-G3 (proposed) references migrated security S-C"
+    b [CT.OcfCreateVestingStart VestingStartOcfData with
+      id = "VS-G3"; date = dTransfer; security_id = "S-C"; vesting_condition_id = "start"; comments = []] [] []
 
 -- G4: before any migration, a root write that names an unmigrated security of the managed class is
 -- rejected, whichever record it is and whether the security is its source or its result. Writes

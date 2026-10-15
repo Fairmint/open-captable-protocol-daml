@@ -1,4 +1,4 @@
--- | Migration, root guard, transfers and transfer receipts of the position register.
+-- | Migration and its guards, transfers and transfer receipts of the position register.
 module OpenCapTable.Positions.TestPositions where
 
 import DA.Assert
@@ -10,11 +10,9 @@ import DA.Time (addRelTime, days, time)
 import Daml.Script
 
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
-import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..))
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer)
-import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfSecurityExemption(..), OcfShareNumberRange(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
 import Fairmint.OpenCapTable.Positions
@@ -94,114 +92,25 @@ test_M1_migration = do
     Some r -> Map.size (fromOptional Map.empty r.position_migrated_security_ids) === 5
     None -> fail "root missing"
 
--- M2..M4: migration and root guards.
+-- M2..M4: migration guards, and root writes into the managed class (TestRootGuard covers the root
+-- guard's other paths).
 test_M2_migrationGuards : Script ()
 test_M2_migrationGuards = do
   env <- setup
   let b = env.book
-  expectFail "M2 migrate a security that was transferred" "was transferred"
-    (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
-      stock_class_id = "SC"
-      migrations = [CT.PositionMigration with stakeholder_id = "SH-C"; holder = env.carol; security_ids = ["S-C1"]]
-  expectFail "M3 migrate a security twice" "already migrated"
-    (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
-      stock_class_id = "SC"
-      migrations = [CT.PositionMigration with stakeholder_id = "SH-A"; holder = env.alice; security_ids = ["S-A1"]]
-  expectFail "M4a root transfer on a migrated security" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance ((mkIssuance "SC2x" "S-X" "SH-B" 1.0)), CT.OcfCreateStockTransfer (mkTransfer "TR-X" "S-A1" 10.0 ["S-X"] None)]
-      edits = []; deletes = []
-  expectFail "M4b root issuance in a position-managed class" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance (mkIssuance "SC" "S-NEW" "SH-B" 5.0)]; edits = []; deletes = []
-  expectFail "M4c root split of a position-managed class" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+  expectMigrationFails "M2 migrate a security that was transferred" "was transferred"
+    b [migration "SH-C" env.carol ["S-C1"]]
+  expectMigrationFails "M3 migrate a security twice" "already migrated"
+    b [migration "SH-A" env.alice ["S-A1"]]
+  expectRootWriteFails "M4b root issuance in a position-managed class" "Position-managed holding"
+    b [CT.OcfCreateStockIssuance (mkIssuance "SC" "S-NEW" "SH-B" 5.0)] [] []
+  expectRootWriteFails "M4c root split of a position-managed class" "Position-managed holding"
+    b [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
         id = "SPLIT-1"; date = dTransfer; stock_class_id = "SC"; comments = []
-        split_ratio = OcfRatio with numerator = 2.0; denominator = 1.0]
-      edits = []; deletes = []
-  expectFail "M4d root delete of a migrated issuance" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = []; deletes = [CT.OcfDeleteStockIssuance "ISS-S-A1"]
-  expectFail "M4e root edit of a migrated issuance" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = [CT.OcfEditStockIssuance ((mkIssuance "SC" "S-A1" "SH-A" 61.0))]; deletes = []
-  expectFail "M4f root delete of the transfer that fed a migrated security's balance" "Position-managed holding"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = []; deletes = [CT.OcfDeleteStockTransfer "TR-C"]
+        split_ratio = OcfRatio with numerator = 2.0; denominator = 1.0] [] []
   -- unrelated root writes still work
   _ <- update b [CT.OcfCreateStakeholder (mkStakeholder "SH-D")] [] []
   pure ()
-
--- Root book for the guard tests: class SC is position-managed, class SC2 stays on the root. SH-A's
--- S-A1 (SC) is migrated; SH-D's S-D1 (SC) is not migrated yet; SH-B's S-E1 is in SC2.
-gsetup : Script Book
-gsetup = do
-  b0 <- newBook
-  alice <- allocateParty "alice"
-  b1 <- update b0
-    [ CT.OcfCreateStockClass (mkStockClass "SC")
-    , CT.OcfCreateStockClass (mkStockClass "SC2")
-    , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
-    , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
-    , CT.OcfCreateStakeholder (mkStakeholder "SH-D")
-    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A1" "SH-A" 60.0)
-    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-D1" "SH-D" 30.0)
-    , CT.OcfCreateStockIssuance (mkIssuance "SC2" "S-E1" "SH-B" 5.0)
-    ] [] []
-  (root2, _) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
-  (root3, _) <- submit b1.issuer $ exerciseCmd root2 CT.MigrateToPositions with
-    stock_class_id = "SC"
-    migrations = [CT.PositionMigration with stakeholder_id = "SH-A"; holder = alice; security_ids = ["S-A1"]]
-  pure b1 with root = root3
-
--- G1: an edit cannot move an unmigrated root issuance into a position-managed class: the guard
--- checks the proposed version, not only the stored one.
-test_G1_editIntoManagedClass : Script ()
-test_G1_editIntoManagedClass = do
-  b <- gsetup
-  expectFail "G1 edit moves a root issuance into the managed class"
-    "stock issuance ISS-S-E1 (proposed) is in position-managed class SC"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = [CT.OcfEditStockIssuance (mkIssuance "SC" "S-E1" "SH-B" 5.0)]; deletes = []
-  -- an edit that keeps the issuance in its root-managed class still works
-  _ <- update b [] [CT.OcfEditStockIssuance (mkIssuance "SC2" "S-E1" "SH-B" 6.0)] []
-  pure ()
-
--- G2: an edit or delete of a stored root issuance in a position-managed class is rejected, even
--- when the issuance was not migrated and the edit would move it out of the class.
-test_G2_editStoredManagedIssuance : Script ()
-test_G2_editStoredManagedIssuance = do
-  b <- gsetup
-  expectFail "G2a edit moves an unmigrated issuance out of the managed class"
-    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = [CT.OcfEditStockIssuance (mkIssuance "SC2" "S-D1" "SH-D" 30.0)]; deletes = []
-  expectFail "G2b delete of an unmigrated issuance in the managed class"
-    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
-    (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with
-      creates = []; edits = []; deletes = [CT.OcfDeleteStockIssuance "ISS-S-D1"]
-
--- G3: every security a proposed record names is checked against the migrated set: a balance or
--- resulting security, and the stock securities named by equity compensation, warrant,
--- convertible and vesting records.
-test_G3_proposedSecurityReferences : Script ()
-test_G3_proposedSecurityReferences = do
-  b <- gsetup
-  let i = actAs b.issuer
-      createOnly cs = CT.UpdateCapTable with creates = cs; edits = []; deletes = []
-  expectFail "G3a root transfer whose balance security is migrated"
-    "stock transfer TR-G3 (proposed) references migrated security S-A1"
-    i $ exerciseCmd b.root (createOnly [CT.OcfCreateStockTransfer (mkTransfer "TR-G3" "S-E1" 1.0 [] (Some "S-A1"))])
-  expectFail "G3b equity compensation exercise resulting in a migrated security"
-    "equity compensation exercise EX-G3 (proposed) references migrated security S-A1"
-    i $ exerciseCmd b.root (createOnly [CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
-      id = "EX-G3"; date = dTransfer; quantity = 1.0; security_id = "EC-1"; comments = []
-      resulting_security_ids = ["S-A1"]; consideration_text = None])
-  expectFail "G3c vesting start on a migrated security"
-    "vesting start VS-G3 (proposed) references migrated security S-A1"
-    i $ exerciseCmd b.root (createOnly [CT.OcfCreateVestingStart VestingStartOcfData with
-      id = "VS-G3"; date = dTransfer; security_id = "S-A1"; vesting_condition_id = "start"; comments = []])
 
 -- T1: a multi-lot transfer 60 + 20 -> 80 with a partial remainder, and its history records.
 test_T1_multiLotTransfer : Script ()
@@ -376,15 +285,6 @@ test_T6_issueAndMergeChecks = do
   Some m <- queryContractId env.alice merged
   Map.keys m.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6", "S-A8"]
 
--- | Place register-settlement holds with this reference on lots of a position, at the transfer
--- date, so that a transfer under the reference can draw them.
-holdForTransfer : Env -> ContractId StockPosition -> Text -> [(Text, Decimal)] -> Script (ContractId StockPosition)
-holdForTransfer env pos ref lots = do
-  r <- submit env.book.issuer $ exerciseCmd env.registry Registry_Hold with
-    position = pos; purpose = HoldPurposeRegisterSettlement; reference = ref; date = dTransfer
-    lots = map (\(s, q) -> HoldLot with security_id = s; quantity = Some q) lots
-  pure r.position
-
 -- R1: a transfer that requests a receipt creates exactly one, holding the delivered terms. The
 -- holders cannot see it. The transfer runs under a hold reference, so the holds are placed first,
 -- and it removes them.
@@ -392,7 +292,8 @@ test_R1_receiptOnRequest : Script ()
 test_R1_receiptOnRequest = do
   env <- setup
   let b = env.book
-  held <- holdForTransfer env env.posA "REF-R1" [("S-A1", 60.0), ("S-A2", 20.0)]
+  held <- (.position) <$> submit env.book.issuer
+    (exerciseCmd env.registry (settlementArgs env.posA "REF-R1" [("S-A1", 60.0), ("S-A2", 20.0)]))
   r <- submit b.issuer $ exerciseCmd env.registry
     ((transfer env "R1" held (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)]) with
       reference = Some "REF-R1"; request_receipt = True)
@@ -421,7 +322,8 @@ test_R1_receiptOnRequest = do
 test_R2_noReceiptUnlessRequested : Script ()
 test_R2_noReceiptUnlessRequested = do
   env <- setup
-  held <- holdForTransfer env env.posA "REF-R2" [("S-A1", 10.0)]
+  held <- (.position) <$> submit env.book.issuer
+    (exerciseCmd env.registry (settlementArgs env.posA "REF-R2" [("S-A1", 10.0)]))
   r <- submit env.book.issuer $ exerciseCmd env.registry
     ((transfer env "R2" held None 10.0 [("S-A1", 10.0)]) with reference = Some "REF-R2")
   r.receipt === None
