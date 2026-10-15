@@ -2,7 +2,6 @@
 module OpenCapTable.Positions.TestPositions where
 
 import DA.Assert
-import DA.List (head)
 import DA.Optional (fromOptional)
 import DA.Date (Month(..))
 import qualified DA.Date as D
@@ -14,6 +13,7 @@ import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer)
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfSecurityExemption(..), OcfShareNumberRange(..))
 import qualified Fairmint.OpenCapTable.CapTable as CT
@@ -222,16 +222,15 @@ test_T1_multiLotTransfer = do
   Map.keys b.lots === ["S-B1", "T1-B-0", "T1-B-1"]
   lotQty b "T1-B-0" === 60.0
   lotQty b "T1-B-1" === 20.0
-  length r.transfers === 2
-  length r.issuances === 3
-  trs <- forA r.transfers \c -> do
-    Some t <- queryContractId env.book.issuer c
-    pure t.transfer_data
-  map (\t -> (t.security_id, t.quantity, t.resulting_security_ids, t.balance_security_id)) trs ===
-    [("S-A1", 60.0, ["T1-B-0"], None), ("S-A2", 20.0, ["T1-B-1"], Some "T1-R-1")]
+  trs <- transferRecords env.book.issuer (writtenBy "T1")
+  map (\t -> (t.id, t.security_id, t.quantity, t.resulting_security_ids, t.balance_security_id)) trs ===
+    [("T1-TR-0", "S-A1", 60.0, ["T1-B-0"], None), ("T1-TR-1", "S-A2", 20.0, ["T1-B-1"], Some "T1-R-1")]
+  -- the transferee's issuances and the remainder's
+  issued <- issuanceRecords env.book.issuer (writtenBy "T1")
+  map (\s -> (s.id, s.security_id, s.quantity)) issued ===
+    [("T1-ISS-B-0", "T1-B-0", 60.0), ("T1-ISS-B-1", "T1-B-1", 20.0), ("T1-ISS-R-1", "T1-R-1", 20.0)]
   -- holders cannot see the history records
-  none <- queryContractId env.bob (head r.transfers)
-  none === None
+  [] <- query @StockTransfer env.bob
   -- the root was not touched
   Some _ <- queryContractId env.book.issuer env.book.root
   pure ()
@@ -308,7 +307,7 @@ test_T5_transfereeAndRemainderKeepProvenance = do
       kept i = ((i.stock_legend_ids, i.security_law_exemptions, i.stock_plan_id),
                 (i.issuance_type, i.board_approval_date, i.stockholder_approval_date))
       expected = kept src
-  (pos, _) <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
+  pos <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
     holder = env.alice; position = Some env.posA; issuances = [src]
   r <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T5" pos None 30.0 [("S-L1", 30.0)])
   Some b <- queryContractId env.bob r.transferee_position
@@ -325,9 +324,7 @@ test_T5_transfereeAndRemainderKeepProvenance = do
   (remLot.issuance.share_numbers_issued, remLot.issuance.comments, remLot.issuance.share_price, remLot.issuance.quantity)
     === ([], [], usd 1.0, 20.0)
   -- the StockIssuance history records carry the same data as the lots
-  issued <- forA r.issuances \c -> do
-    Some s <- queryContractId env.book.issuer c
-    pure s.issuance_data
+  issued <- issuanceRecords env.book.issuer (writtenBy "T5")
   issued === [toLot.issuance, remLot.issuance]
 
 -- T6: Registry_Issue adds lots with their OCF issuance records, and it and Registry_MergePositions
@@ -343,16 +340,14 @@ test_T6_issueAndMergeChecks = do
       new5 = mkIssuance "SC" "S-A5" "SH-A" 5.0
       new6 = (mkIssuance "SC" "S-A6" "SH-A" 6.0) with date = dTransfer
   -- an issue into an existing position keeps its lots, adds one lot per issuance as its own
-  -- origin, and returns the issuance records in order
-  (pos, issued) <- submit env.book.issuer $ issue env.alice (Some env.posA) [new5, new6]
+  -- origin, and writes one issuance record per lot
+  pos <- submit env.book.issuer $ issue env.alice (Some env.posA) [new5, new6]
   Some a <- queryContractId env.alice pos
   Map.keys a.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6"]
   map (\sid -> fmap (\l -> ((l.issuance, l.origin_security_id, l.origin_date), (l.ancestry, l.holds, l.fully_vested_on)))
       (Map.lookup sid a.lots)) ["S-A5", "S-A6"]
     === [Some ((new5, "S-A5", d0), ([], [], None)), Some ((new6, "S-A6", dTransfer), ([], [], None))]
-  records <- forA issued \c -> do
-    Some s <- queryContractId env.book.issuer c
-    pure s.issuance_data
+  records <- issuanceRecords env.book.issuer (`elem` [new5.id, new6.id])
   records === [new5, new6]
   -- Registry_Issue argument checks
   let one = [mkIssuance "SC" "S-A9" "SH-A" 1.0]
@@ -365,18 +360,18 @@ test_T6_issueAndMergeChecks = do
   expectFail "T6e issue into another holder's position" "position does not match" i $ issue env.alice (Some env.posB) one
   expectFail "T6f issue to another party into the position" "position does not match" i $ issue env.bob (Some pos) one
   -- Registry_MergePositions argument checks
-  (dup, _) <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A1" "SH-A" 7.0]
+  dup <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A1" "SH-A" 7.0]
   expectFail "T6g merge positions that share a lot" "positions share a lot" i $ merge [pos, dup]
   expectFail "T6h merge one position" "merge at least two positions" i $ merge [pos]
   expectFail "T6i merge positions of two holders" "positions must share registry and holder" i $ merge [pos, env.posB]
   -- a position of the same holder in another class (another registry)
   b1 <- update env.book [CT.OcfCreateStockClass (mkStockClass "SC3")] [] []
   (_, registry3) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC3"
-  (pos3, _) <- submit b1.issuer $ exerciseCmd registry3 Registry_Issue with
+  pos3 <- submit b1.issuer $ exerciseCmd registry3 Registry_Issue with
     holder = env.alice; position = None; issuances = [mkIssuance "SC3" "S-A30" "SH-A" 3.0]
   expectFail "T6j merge positions of two classes" "positions must share registry and holder" i $ merge [pos, pos3]
   -- the rejected calls changed nothing: a merge of disjoint positions still works
-  (extra, _) <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A8" "SH-A" 8.0]
+  extra <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A8" "SH-A" 8.0]
   merged <- submit env.book.issuer $ merge [pos, extra]
   Some m <- queryContractId env.alice merged
   Map.keys m.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6", "S-A8"]
@@ -411,13 +406,9 @@ test_R1_receiptOnRequest = do
     transferor = env.alice; transferor_stakeholder_id = "SH-A"
     transferee = env.bob; transferee_stakeholder_id = "SH-B"
     quantity = 80.0; share_price = usd 2.5; reference = Some "REF-R1"; date = dTransfer
-  transferIds <- forA r.transfers \c -> do
-    Some t <- queryContractId b.issuer c
-    pure t.transfer_data.id
-  transferIds === ["R1-TR-0", "R1-TR-1"]
-  issued <- forA r.issuances \c -> do
-    Some s <- queryContractId b.issuer c
-    pure s.issuance_data
+  transfers <- transferRecords b.issuer (writtenBy "R1")
+  map (.id) transfers === ["R1-TR-0", "R1-TR-1"]
+  issued <- issuanceRecords b.issuer (writtenBy "R1")
   let toIssuances = filter (\s -> s.stakeholder_id == "SH-B") issued
   map (.id) toIssuances === ["R1-ISS-B-0", "R1-ISS-B-1"]
   sum (map (.quantity) toIssuances) === receipt.quantity

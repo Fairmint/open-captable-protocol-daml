@@ -112,13 +112,9 @@ data ReleasedHold = ReleasedHold with
     code : HoldReleaseCode
   deriving (Eq, Show)
 
-data HoldResult = HoldResult with
-    position : ContractId StockPosition
-    released : [ReleasedHold]
-      -- ^ `HoldPurposeRegisterSettlement` holds that a stop released (code `ReleaseCodeStopTransfer`);
-      -- empty otherwise
-  deriving (Eq, Show)
-
+-- | The position after `Registry_Hold` or `Registry_Release`, and the holds the choice removed
+-- without a draw, each with its code (for `Registry_Hold`, the register-settlement holds a stop
+-- released).
 data ReleaseResult = ReleaseResult with
     position : ContractId StockPosition
     released : [ReleasedHold]
@@ -143,9 +139,6 @@ data TransferResult = TransferResult with
     transferor_position : Optional (ContractId StockPosition)
       -- ^ None when the transfer emptied the transferor's position
     transferee_position : ContractId StockPosition
-    transfers : [ContractId StockTransfer]
-    issuances : [ContractId StockIssuance]
-      -- ^ the transferee's issuances and any remainder issuances, in draw order
     receipt : Optional (ContractId TransferReceipt)
       -- ^ Some exactly when the caller requested a receipt
   deriving (Eq, Show)
@@ -305,7 +298,7 @@ template PositionRegistry
         let recordId kind i = transfer_id <> "-" <> kind <> "-" <> show i
 
         -- Move lots.
-        let step (fromLots, toLots, transfers, newIssuances, i) d = do
+        let step (fromLots, toLots, i) d = do
               lot <- case Map.lookup d.security_id fromLots of
                 Some l -> pure l
                 None -> abort ("lot " <> d.security_id <> " is not in the transferor's position")
@@ -356,7 +349,7 @@ template PositionRegistry
               assertMsg ("lot id " <> toSec <> " already exists in the transferee's position") (not (Map.member toSec toLots))
               forA_ remainderSec \r ->
                 assertMsg ("lot id " <> r <> " already exists in the transferor's position") (not (Map.member r fromLots))
-              tcid <- create StockTransfer with
+              _ <- create StockTransfer with
                 context
                 transfer_data = StockTransferOcfData with
                   id = recordId "TR" i
@@ -367,9 +360,9 @@ template PositionRegistry
                   resulting_security_ids = [toSec]
                   balance_security_id = remainderSec
                   consideration_text = None
-              icid <- create StockIssuance with context; issuance_data = toIssuance
-              (fromLots', extra) <- case remainderSec of
-                None -> pure (Map.delete d.security_id fromLots, [])
+              _ <- create StockIssuance with context; issuance_data = toIssuance
+              fromLots' <- case remainderSec of
+                None -> pure (Map.delete d.security_id fromLots)
                 Some rsec -> do
                   -- The drawn lot was fully vested, so its remainder carries no vesting either.
                   -- The remainder keeps the lot's other holds (with their references), so their
@@ -391,10 +384,9 @@ template PositionRegistry
                         ancestry = childAncestry
                         holds = otherHolds
                         fully_vested_on = None
-                  ricid <- create StockIssuance with context; issuance_data = remIssuance
-                  pure (Map.insert rsec remLot (Map.delete d.security_id fromLots), [ricid])
-              pure (fromLots', Map.insert toSec toLot toLots, tcid :: transfers,
-                    extra ++ (icid :: newIssuances), i + 1)
+                  _ <- create StockIssuance with context; issuance_data = remIssuance
+                  pure (Map.insert rsec remLot (Map.delete d.security_id fromLots))
+              pure (fromLots', Map.insert toSec toLot toLots, i + 1)
 
         (toBase, toOld) <- case transferee.position of
           None -> pure (Map.empty, None)
@@ -405,8 +397,7 @@ template PositionRegistry
                 && p.stakeholder_id == transferee.stakeholder_id && p.holder == transferee.party)
             pure (p.lots, Some cid)
 
-        (fromLots, toLots, transfers, newIssuances, _) <-
-          foldlA step (tp.lots, toBase, [], [], 0) draws
+        (fromLots, toLots, _) <- foldlA step (tp.lots, toBase, 0) draws
 
         -- A transfer under a reference settles all of its holds or none: a lot it leaves undrawn
         -- would keep a hold that no transfer can settle any more.
@@ -438,16 +429,11 @@ template PositionRegistry
             quantity; share_price; reference; date
           else pure None
 
-        pure TransferResult with
-          transferor_position = fromNew
-          transferee_position = toNew
-          transfers = reverse transfers
-          issuances = reverse newIssuances
-          receipt
+        pure TransferResult with transferor_position = fromNew; transferee_position = toNew; receipt
 
     -- | Primary issuance into a holder's position (the position-managed replacement for
     -- `OcfCreateStockIssuance` in this class). Creates the OCF issuance history record.
-    nonconsuming choice Registry_Issue : (ContractId StockPosition, [ContractId StockIssuance])
+    nonconsuming choice Registry_Issue : ContractId StockPosition
       with
         holder : Party
         position : Optional (ContractId StockPosition)
@@ -464,15 +450,14 @@ template PositionRegistry
               && p.stakeholder_id == stakeholderId && p.holder == holder)
             archive cid
             pure p.lots
-        (lots, cids) <- foldlA (\(acc, cs) d -> do
+        lots <- foldlA (\acc d -> do
             assertMsg ("duplicate lot " <> d.security_id) (not (Map.member d.security_id acc))
-            c <- create StockIssuance with context; issuance_data = d
+            _ <- create StockIssuance with context; issuance_data = d
             pure (Map.insert d.security_id (PositionLot with
               issuance = d; origin_security_id = d.security_id; origin_date = d.date; ancestry = []
-              holds = []; fully_vested_on = None) acc, c :: cs))
-          (base, []) issuances
-        p <- create StockPosition with context; stock_class_id; stakeholder_id = stakeholderId; holder; lots
-        pure (p, reverse cids)
+              holds = []; fully_vested_on = None) acc))
+          base issuances
+        create StockPosition with context; stock_class_id; stakeholder_id = stakeholderId; holder; lots
 
     -- | Merge several positions of one holder into one (e.g. after transfers into new positions).
     nonconsuming choice Registry_MergePositions : ContractId StockPosition
@@ -503,7 +488,7 @@ template PositionRegistry
     -- The position's ensure (`holdOk`, `lotHoldsOk`) rejects an empty reference, a missing or
     -- non-positive quantity on a quantity hold, a quantity on a stop, a second hold with the same
     -- purpose and reference on a lot, and quantity holds above the lot's quantity.
-    nonconsuming choice Registry_Hold : HoldResult
+    nonconsuming choice Registry_Hold : ReleaseResult
       with
         position : ContractId StockPosition
         purpose : HoldPurpose
@@ -553,7 +538,7 @@ template PositionRegistry
         (newLots, released) <- foldlA place (p.lots, []) lots
         archive position
         newPosition <- create p with lots = newLots
-        pure HoldResult with position = newPosition; released
+        pure ReleaseResult with position = newPosition; released
 
     -- | Remove the holds with this purpose and reference from one position: from the listed lots
     -- (`Some`), or from every lot that carries one (`None`). Fails when it removes nothing.
