@@ -1,0 +1,149 @@
+module OpenCapTable.Positions.Common where
+
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import DA.List (sortOn)
+import DA.Text qualified as T
+import DA.Time (time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..), OcfInitialSharesAuthorized(..))
+import Fairmint.OpenCapTable.OCF.Issuer (IssuerOcfData(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder (StakeholderOcfData(..), OcfName(..), OcfStakeholderType(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer(..), StockTransferOcfData(..))
+import Fairmint.OpenCapTable.IssuerAuthorization (IssuerAuthorization(..), CreateCapTable(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+expectFail : Text -> Text -> SubmitOptions -> Commands a -> Script ()
+expectFail label reason opts cmds = do
+  r <- trySubmit opts cmds
+  case r of
+    Right _ -> fail ("UNEXPECTED SUCCESS [" <> label <> "]")
+    Left e -> do
+      let msg = show e
+      debugRaw ("EXPECTED-FAILURE [" <> label <> "]: " <> T.take 400 msg)
+      if reason `T.isInfixOf` msg
+        then pure ()
+        else fail ("FAILED FOR THE WRONG REASON [" <> label <> "], expected '" <> reason <> "', got: " <> msg)
+
+-- | The error of a `StockPosition` create that the position's ensure rejects.
+positionPreconditionViolated : Text
+positionPreconditionViolated = "Template precondition violated: StockPosition"
+
+d0 : Time
+d0 = time (D.date 2024 Jan 01) 0 0 0
+
+dTransfer : Time
+dTransfer = time (D.date 2025 Jun 01) 0 0 0
+
+usd : Decimal -> OcfMonetary
+usd a = OcfMonetary with amount = a; currency = "USD"
+
+mkStockClass : Text -> StockClassOcfData
+mkStockClass cid = StockClassOcfData with
+  id = cid; name = "Common " <> cid; class_type = OcfStockClassTypeCommon; default_id_prefix = "CS-"
+  initial_shares_authorized = OcfInitialSharesNumeric 100000000000.0
+  votes_per_share = 1.0; seniority = 1.0; board_approval_date = None; stockholder_approval_date = None
+  par_value = None; price_per_share = None; liquidation_preference_multiple = None
+  participation_cap_multiple = None; conversion_rights = []; comments = []
+
+mkStakeholder : Text -> StakeholderOcfData
+mkStakeholder sid = StakeholderOcfData with
+  id = sid
+  name = OcfName with legal_name = "Holder " <> sid; first_name = None; last_name = None
+  stakeholder_type = OcfStakeholderTypeIndividual
+  issuer_assigned_id = None; current_relationships = []; current_status = None
+  primary_contact = None; contact_info = None; addresses = []; tax_ids = []; comments = []
+
+mkIssuance : Text -> Text -> Text -> Decimal -> StockIssuanceOcfData
+mkIssuance cls sec sh qty = StockIssuanceOcfData with
+  id = "ISS-" <> sec; custom_id = "CS-" <> sec; date = d0; quantity = qty; security_id = sec
+  share_price = usd 1.0; stakeholder_id = sh; stock_class_id = cls
+  comments = []; security_law_exemptions = []; share_numbers_issued = []; stock_legend_ids = []
+  vestings = []; board_approval_date = None; consideration_text = None; cost_basis = None
+  issuance_type = None; stock_plan_id = None; stockholder_approval_date = None; vesting_terms_id = None
+
+mkTransfer : Text -> Text -> Decimal -> [Text] -> Optional Text -> StockTransferOcfData
+mkTransfer tid sec qty resulting balance = StockTransferOcfData with
+  id = tid; date = dTransfer; quantity = qty; security_id = sec; comments = []
+  resulting_security_ids = resulting; balance_security_id = balance; consideration_text = None
+
+data Book = Book with
+    sysop : Party
+    issuer : Party
+    ctx : Context
+    root : ContractId CT.CapTable
+
+newBook : Script Book
+newBook = do
+  sysop <- allocateParty "sysop"
+  issuer <- allocateParty "issuer"
+  let ctx = Context with issuer; system_operator = sysop
+  auth <- submit sysop $ createCmd IssuerAuthorization with context = ctx
+  root <- submit issuer $ exerciseCmd auth CreateCapTable with
+    issuer_data = IssuerOcfData with
+      id = "ISSUER_1"; legal_name = "Proto Issuer Inc."; formation_date = time (D.date 2020 Jan 15) 12 0 0
+      country_of_formation = "US"; country_subdivision_of_formation = None
+      country_subdivision_name_of_formation = None; dba = None; email = None
+      initial_shares_authorized = Some (OcfInitialSharesNumeric 100000000000.0)
+      phone = None; address = None; tax_ids = []; comments = []
+  pure Book with ..
+
+update : Book -> [CT.OcfCreateData] -> [CT.OcfEditData] -> [CT.OcfDeleteData] -> Script Book
+update b creates edits deletes = do
+  r <- submit b.issuer $ exerciseCmd b.root CT.UpdateCapTable with creates; edits; deletes
+  pure b with root = r.updatedCapTableCid
+
+-- | Whether an OCF ID is one that `Registry_Transfer` wrote for this transfer ID
+-- (`<transfer_id>-TR-<i>`, `<transfer_id>-ISS-B-<i>`, `<transfer_id>-ISS-R-<i>`).
+writtenBy : Text -> Text -> Bool
+writtenBy transferId recordId = (transferId <> "-") `T.isPrefixOf` recordId
+
+-- | The StockTransfer records whose OCF ID passes `keep`, sorted by ID, as `party` sees them.
+transferRecords : Party -> (Text -> Bool) -> Script [StockTransferOcfData]
+transferRecords party keep = do
+  records <- query @StockTransfer party
+  pure (sortOn (.id) (filter (keep . (.id)) (map (\(_, t) -> t.transfer_data) records)))
+
+-- | The StockIssuance records whose OCF ID passes `keep`, sorted by ID, as `party` sees them.
+issuanceRecords : Party -> (Text -> Bool) -> Script [StockIssuanceOcfData]
+issuanceRecords party keep = do
+  records <- query @StockIssuance party
+  pure (sortOn (.id) (filter (keep . (.id)) (map (\(_, s) -> s.issuance_data) records)))
+
+-- | `UpdateCapTable` on the book is rejected with `reason`.
+expectRootWriteFails : Text -> Text -> Book -> [CT.OcfCreateData] -> [CT.OcfEditData] -> [CT.OcfDeleteData] -> Script ()
+expectRootWriteFails label reason b creates edits deletes =
+  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.UpdateCapTable with creates; edits; deletes
+
+-- Migration to positions in class SC.
+
+migration : Text -> Party -> [Text] -> CT.PositionMigration
+migration sh holder sids = CT.PositionMigration with stakeholder_id = sh; holder; security_ids = sids
+
+migrate : Book -> [CT.PositionMigration] -> Script (Book, [ContractId StockPosition])
+migrate b migrations = do
+  (root, positions) <- submit b.issuer $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+  let migrated = b with root = root
+  pure (migrated, positions)
+
+expectMigrationFails : Text -> Text -> Book -> [CT.PositionMigration] -> Script ()
+expectMigrationFails label reason b migrations =
+  expectFail label reason (actAs b.issuer) $ exerciseCmd b.root CT.MigrateToPositions with
+    stock_class_id = "SC"; migrations
+
+-- Holds placed at the transfer date.
+
+holdArgs : ContractId StockPosition -> HoldPurpose -> Text -> [(Text, Optional Decimal)] -> Registry_Hold
+holdArgs pos purpose reference lots = Registry_Hold with
+  position = pos; purpose; reference; date = dTransfer
+  lots = map (\(s, q) -> HoldLot with security_id = s; quantity = q) lots
+
+settlementArgs : ContractId StockPosition -> Text -> [(Text, Decimal)] -> Registry_Hold
+settlementArgs pos ref lots = holdArgs pos HoldPurposeRegisterSettlement ref (map (\(s, q) -> (s, Some q)) lots)

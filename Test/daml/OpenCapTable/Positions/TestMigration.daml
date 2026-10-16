@@ -1,0 +1,424 @@
+-- | Migration: `EnablePositions` refuses a class with a root issuance that could then be neither
+-- migrated nor fixed, and `MigrateToPositions` moves root stock issuances of a position-managed
+-- class into positions at their remaining balance under v34's own balance rules. A security that
+-- a record consumed or retired does not migrate (its resulting or balance security does), and no
+-- security migrates twice. A migrated lot starts without holds or a vesting snapshot and obeys
+-- every hold and vesting rule. TestRootGuard covers the root guard after migration.
+module OpenCapTable.Positions.TestMigration where
+
+import DA.Assert
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import qualified DA.Map as Map
+import DA.Optional (fromOptional)
+import DA.Time (addRelTime, days, hours, time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+import OpenCapTable.TestHelpers (defaultVestingTerms)
+
+-- Dates of the migration books: issuances at dA, later records at dB, dC and dD.
+dA : Time
+dA = time (D.date 2024 Jan 01) 0 0 0
+
+dB : Time
+dB = time (D.date 2024 Jun 01) 0 0 0
+
+dC : Time
+dC = time (D.date 2025 Jan 01) 0 0 0
+
+dD : Time
+dD = time (D.date 2025 Jun 01) 0 0 0
+
+-- Root records with an explicit date.
+
+stock : Text -> Text -> Text -> Time -> Decimal -> CT.OcfCreateData
+stock cls sec sh date qty = CT.OcfCreateStockIssuance ((mkIssuance cls sec sh qty) with date = date)
+
+transferOf : Text -> Time -> Text -> Decimal -> [Text] -> Optional Text -> CT.OcfCreateData
+transferOf tid date sec qty resulting balance =
+  CT.OcfCreateStockTransfer ((mkTransfer tid sec qty resulting balance) with date = date)
+
+cancellationOf : Text -> Time -> Text -> Decimal -> Optional Text -> CT.OcfCreateData
+cancellationOf cid date sec qty balance = CT.OcfCreateStockCancellation StockCancellationOcfData with
+  id = cid; date = date; quantity = qty; reason_text = "Cancelled"; security_id = sec; comments = []
+  balance_security_id = balance
+
+repurchaseOf : Text -> Time -> Text -> Decimal -> Optional Text -> CT.OcfCreateData
+repurchaseOf rid date sec qty balance = CT.OcfCreateStockRepurchase StockRepurchaseOcfData with
+  id = rid; date = date; price = usd 1.0; quantity = qty; security_id = sec; comments = []
+  balance_security_id = balance; consideration_text = None
+
+conversionOf : Text -> Time -> Text -> Decimal -> [Text] -> Optional Text -> CT.OcfCreateData
+conversionOf cid date sec qty resulting balance = CT.OcfCreateStockConversion StockConversionOcfData with
+  id = cid; date = date; quantity_converted = qty; security_id = sec; comments = []
+  resulting_security_ids = resulting; balance_security_id = balance
+
+reissuanceOf : Text -> Time -> Text -> [Text] -> CT.OcfCreateData
+reissuanceOf rid date sec resulting = CT.OcfCreateStockReissuance StockReissuanceOcfData with
+  id = rid; date = date; security_id = sec; comments = []; resulting_security_ids = resulting
+  reason_text = None; split_transaction_id = None
+
+classSplit : Text -> Time -> Decimal -> Decimal -> CT.OcfCreateData
+classSplit sid date numerator denominator = CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+  id = sid; date = date; stock_class_id = "SC"; comments = []
+  split_ratio = OcfRatio with numerator; denominator
+
+-- | A book with classes SC and PREF, stakeholders SH-A, SH-B and SH-C, and the given records.
+migrationRecords : [CT.OcfCreateData] -> Script Book
+migrationRecords records = do
+  b0 <- newBook
+  update b0
+    ([ CT.OcfCreateStockClass (mkStockClass "SC")
+     , CT.OcfCreateStockClass (mkStockClass "PREF")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
+     , CT.OcfCreateStakeholder (mkStakeholder "SH-C")
+     ] ++ records) [] []
+
+-- | `EnablePositions` for class SC.
+enableSC : Book -> Commands (ContractId CT.CapTable, ContractId PositionRegistry)
+enableSC b = exerciseCmd b.root CT.EnablePositions with stock_class_id = "SC"
+
+-- | `migrationRecords` with positions enabled for SC (position-managed).
+migrationBook : [CT.OcfCreateData] -> Script Book
+migrationBook records = do
+  b1 <- migrationRecords records
+  (root, _) <- submit b1.issuer (enableSC b1)
+  pure b1 with root = root
+
+-- | Each lot of a position as (security, quantity, share price).
+lotQuantities : Book -> ContractId StockPosition -> Script [(Text, Decimal, Decimal)]
+lotQuantities b position = do
+  Some p <- queryContractId b.issuer position
+  pure (map (\l -> (l.issuance.security_id, l.issuance.quantity, l.issuance.share_price.amount)) (Map.values p.lots))
+
+-- | Every kind of record that consumes or retires an SC security, each leaving resulting or balance
+-- securities:
+--
+-- * S-1: a plain issuance.
+-- * S-2 -> S-3 (SH-B) + balance S-4: a partial transfer.
+-- * S-5 -> balance S-6: a partial cancellation. S-7 -> balance S-8: a partial repurchase.
+-- * S-9 -> S-10 (PREF) + balance S-11: a partial conversion out of the class.
+-- * S-12 -> S-13 + S-14: a reissuance into two certificates, which retires S-12.
+consumedBook : Script Book
+consumedBook = migrationBook
+  [ stock "SC" "S-1" "SH-A" dA 100.0
+  , stock "SC" "S-2" "SH-A" dA 100.0
+  , transferOf "TR-2" dB "S-2" 30.0 ["S-3"] (Some "S-4")
+  , stock "SC" "S-3" "SH-B" dB 30.0
+  , stock "SC" "S-4" "SH-A" dB 70.0
+  , stock "SC" "S-5" "SH-A" dA 100.0
+  , cancellationOf "CN-5" dB "S-5" 40.0 (Some "S-6")
+  , stock "SC" "S-6" "SH-A" dB 60.0
+  , stock "SC" "S-7" "SH-A" dA 10.0
+  , repurchaseOf "RP-7" dB "S-7" 4.0 (Some "S-8")
+  , stock "SC" "S-8" "SH-A" dB 6.0
+  , stock "SC" "S-9" "SH-A" dA 50.0
+  , conversionOf "CV-9" dB "S-9" 20.0 ["S-10"] (Some "S-11")
+  , stock "PREF" "S-10" "SH-A" dB 20.0
+  , stock "SC" "S-11" "SH-A" dB 30.0
+  , stock "SC" "S-12" "SH-A" dA 100.0
+  , reissuanceOf "RI-12" dB "S-12" ["S-13", "S-14"]
+  , stock "SC" "S-13" "SH-A" dB 60.0
+  , stock "SC" "S-14" "SH-A" dB 40.0
+  ]
+
+-- MG1: resulting and balance securities migrate at their balance, one position per holder, and
+-- the root records exactly the migrated securities with their stakeholders.
+test_MG1_balances : Script ()
+test_MG1_balances = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  b0 <- consumedBook
+  (b, [posA, posB]) <- migrate b0
+    [ migration "SH-A" alice ["S-1", "S-4", "S-6", "S-8", "S-11", "S-13", "S-14"]
+    , migration "SH-B" bob ["S-3"] ]
+  lotQuantities b posA >>= (===
+    [ ("S-1", 100.0, 1.0), ("S-11", 30.0, 1.0), ("S-13", 60.0, 1.0), ("S-14", 40.0, 1.0)
+    , ("S-4", 70.0, 1.0), ("S-6", 60.0, 1.0), ("S-8", 6.0, 1.0) ])
+  lotQuantities b posB >>= (=== [("S-3", 30.0, 1.0)])
+  Some root <- queryContractId b.issuer b.root
+  Map.toList (fromOptional Map.empty root.position_migrated_security_ids) ===
+    [ ("S-1", "SH-A"), ("S-11", "SH-A"), ("S-13", "SH-A"), ("S-14", "SH-A"), ("S-3", "SH-B")
+    , ("S-4", "SH-A"), ("S-6", "SH-A"), ("S-8", "SH-A") ]
+
+-- MG2: a security that a transfer, cancellation, repurchase or conversion consumed, or that a
+-- reissuance retired, does not migrate: its resulting or balance security does.
+test_MG2_consumedSecurities : Script ()
+test_MG2_consumedSecurities = do
+  alice <- allocateParty "alice"
+  b <- consumedBook
+  forA_ ["S-2", "S-5", "S-7", "S-9"] \sid ->
+    expectMigrationFails ("MG2 consumed security " <> sid)
+      ("Security " <> sid <> " was transferred, cancelled, repurchased or converted; migrate its resulting or balance security")
+      b [migration "SH-A" alice [sid]]
+  expectMigrationFails "MG2 retired security" "Security S-12 has no remaining balance"
+    b [migration "SH-A" alice ["S-12"]]
+
+-- MG3: no security migrates twice, within one batch or in a later one.
+test_MG3_doubleMigration : Script ()
+test_MG3_doubleMigration = do
+  alice <- allocateParty "alice"
+  b0 <- consumedBook
+  expectMigrationFails "MG3a listed twice for a holder" "Security already migrated S-1"
+    b0 [migration "SH-A" alice ["S-1", "S-1"]]
+  expectMigrationFails "MG3b listed in two migrations of one batch" "Security already migrated S-1"
+    b0 [migration "SH-A" alice ["S-1"], migration "SH-A" alice ["S-1"]]
+  (b, _) <- migrate b0 [migration "SH-A" alice ["S-1"]]
+  expectMigrationFails "MG3c migrated in an earlier batch" "Security already migrated S-1"
+    b [migration "SH-A" alice ["S-1"]]
+
+-- | The position registry of class SC.
+registryOf : Book -> Script (ContractId PositionRegistry)
+registryOf b = do
+  Some root <- queryContractId b.issuer b.root
+  case Map.lookup "SC" (fromOptional Map.empty root.position_registries) of
+    Some registry -> pure registry
+    None -> fail "positions are not enabled for SC"
+
+-- MG4: holds and vesting apply to migrated lots. Migrated lots keep their vesting terms and start
+-- without holds or a vesting snapshot: a lot on vesting terms can be neither held nor drawn until
+-- a snapshot is recorded, and then only its vested part; a stop locks a lot until it is lifted,
+-- and held quantity is not drawable. A transfer under a reference then draws exactly the migrated
+-- lots' holds, and the remainder keeps the unvested shares.
+test_MG4_migratedLotsHeldAndTransferred : Script ()
+test_MG4_migratedLotsHeldAndTransferred = do
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  b0 <- migrationBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-1" "SH-B" 60.0) with vesting_terms_id = Some "VT-1")
+    , stock "SC" "S-2" "SH-B" dA 30.0
+    ]
+  (b, [pos0]) <- migrate b0 [migration "SH-B" bob ["S-1", "S-2"]]
+  registry <- registryOf b
+  let i = actAs b.issuer
+      holdOn pos purpose ref lots = exerciseCmd registry Registry_Hold with
+        position = pos; purpose; reference = ref; date = dD
+        lots = map (\(s, q) -> HoldLot with security_id = s; quantity = q) lots
+      settlementHoldOn pos lots = holdOn pos HoldPurposeRegisterSettlement "SET-M" (map (\(s, q) -> (s, Some q)) lots)
+      transferToCarol tid pos ref qty draws = exerciseCmd registry Registry_Transfer with
+        transfer_id = tid; date = dD; transferor_position = pos
+        transferee = Transferee with stakeholder_id = "SH-C"; party = carol; position = None
+        quantity = qty; share_price = usd 3.0
+        draws = map (\(s, q) -> LotDraw with security_id = s; quantity = q) draws
+        reference = ref; request_receipt = False
+      lotsOf pos = do
+        Some p <- queryContractId b.issuer pos
+        pure p.lots
+
+  -- migrated lots: vesting terms kept, no holds, no snapshot
+  lots0 <- lotsOf pos0
+  map (\l -> (l.issuance.vesting_terms_id, l.holds, l.vesting_snapshot)) (Map.values lots0) ===
+    [(Some "VT-1", [], None), (None, [], None)]
+
+  -- a migrated lot on vesting terms is unvested until a snapshot is recorded
+  expectFail "MG4a settlement hold on a migrated lot on vesting terms" "hold exceeds the drawable quantity of lot S-1" i $
+    settlementHoldOn pos0 [("S-1", 40.0)]
+  expectFail "MG4b free transfer of a migrated lot on vesting terms" "draw exceeds the drawable quantity of lot S-1" i $
+    transferToCarol "MG4b" pos0 None 10.0 [("S-1", 10.0)]
+
+  -- a stop locks a migrated lot until it is lifted
+  stopped <- submit b.issuer $ holdOn pos0 HoldPurposeStopTransfer "STOP-M" [("S-2", None)]
+  stopped.released === []
+  expectFail "MG4c free transfer of a stopped migrated lot" "lot S-2 is stopped" i $
+    transferToCarol "MG4c" stopped.position None 10.0 [("S-2", 10.0)]
+  expectFail "MG4d settlement hold on a stopped migrated lot" "lot S-2 is stopped" i $
+    settlementHoldOn stopped.position [("S-2", 30.0)]
+  lifted <- submit b.issuer $ exerciseCmd registry Registry_Release with
+    position = stopped.position; purpose = HoldPurposeStopTransfer; reference = "STOP-M"
+    code = ReleaseCodeStopLifted; security_ids = Some ["S-2"]
+  map (.security_id) lifted.released === ["S-2"]
+
+  -- a snapshot of 45 vested shares, then holds on both migrated lots under one reference
+  vested <- submit b.issuer $ exerciseCmd registry Registry_RecordVesting with
+    position = lifted.position; as_of = dC; records = []
+    lots = [LotVestingSnapshot with security_id = "S-1"; vested_quantity = 45.0]
+  held <- submit b.issuer $ settlementHoldOn vested.position [("S-1", 40.0), ("S-2", 30.0)]
+  heldLots <- lotsOf held.position
+  map (\l -> (l.issuance.security_id, map (.reference) l.holds, drawableQuantity dD l)) (Map.values heldLots) ===
+    [("S-1", ["SET-M"], 5.0), ("S-2", ["SET-M"], 0.0)]
+
+  -- held quantity is not drawable, and the transfer under the reference draws all of its holds
+  expectFail "MG4e free transfer of held quantity on a migrated lot" "draw exceeds the drawable quantity of lot S-1" i $
+    transferToCarol "MG4e" held.position None 30.0 [("S-1", 30.0)]
+  expectFail "MG4f transfer under the reference leaving a held migrated lot undrawn"
+    "lot S-2 carries a register-settlement hold with reference SET-M but is not drawn" i $
+    transferToCarol "MG4f" held.position (Some "SET-M") 40.0 [("S-1", 40.0)]
+
+  result <- submit b.issuer $ transferToCarol "MG4" held.position (Some "SET-M") 70.0 [("S-1", 40.0), ("S-2", 30.0)]
+  let summary l = (l.issuance.security_id, l.issuance.quantity)
+      vesting l = (l.holds, l.issuance.vestings, l.issuance.vesting_terms_id, l.vesting_snapshot)
+  -- the remainder of S-1 keeps its vesting terms and the 5 vested shares not drawn, and is free of
+  -- holds; S-2 was drawn in full
+  case result.transferor_position of
+    None -> fail "the transferor's position should keep the remainder of S-1"
+    Some from -> do
+      fromLots <- lotsOf from
+      map summary (Map.values fromLots) === [("MG4-R-0", 20.0)]
+      map vesting (Map.values fromLots) ===
+        [([], [], Some "VT-1", Some VestingSnapshot with vested_quantity = 5.0; as_of = dC)]
+  -- the transferee's lots carry no holds and no vesting
+  toLots <- lotsOf result.transferee_position
+  map summary (Map.values toLots) === [("MG4-B-0", 40.0), ("MG4-B-1", 30.0)]
+  map vesting (Map.values toLots) === [([], [], None, None), ([], [], None, None)]
+
+-- MG5: splits of the class recorded before EnablePositions set the migrated quantities, as v34's
+-- own balance functions compute them: a later split applies to an issuance; on the issuance's own
+-- date a forward split is taken as already in its recorded quantity, and a reverse split as
+-- following it (the lowest balance any intra-day order allows, which also bounds what the root
+-- lets a later record reduce). Securities issued after a split, such as a post-split transfer's
+-- resulting and balance securities, are not multiplied again. Each lot keeps its issuance's
+-- recorded share price.
+test_MG5_splitsBeforeEnabling : Script ()
+test_MG5_splitsBeforeEnabling = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  forwardBook <- migrationBook
+    [ stock "SC" "S-1" "SH-A" dA 100.0
+    , classSplit "SPLIT-F" dB 2.0 1.0
+    , stock "SC" "S-2" "SH-A" dB 50.0
+    , stock "SC" "S-3" "SH-B" dA 100.0
+    , transferOf "TR-3" dC "S-3" 200.0 ["S-4"] None
+    , stock "SC" "S-4" "SH-A" dC 200.0
+    , stock "SC" "S-5" "SH-B" dA 100.0
+    , transferOf "TR-5" dC "S-5" 150.0 ["S-6"] (Some "S-7")
+    , stock "SC" "S-6" "SH-A" dC 150.0
+    , stock "SC" "S-7" "SH-B" dC 50.0
+    ]
+  (fb, [fa, fbob]) <- migrate forwardBook
+    [migration "SH-A" alice ["S-1", "S-2", "S-4", "S-6"], migration "SH-B" bob ["S-7"]]
+  lotQuantities fb fa >>= (=== [("S-1", 200.0, 1.0), ("S-2", 50.0, 1.0), ("S-4", 200.0, 1.0), ("S-6", 150.0, 1.0)])
+  lotQuantities fb fbob >>= (=== [("S-7", 50.0, 1.0)])
+  reverseBook <- migrationBook
+    [ stock "SC" "S-10" "SH-A" dA 100.0
+    , classSplit "SPLIT-R" dB 1.0 4.0
+    , stock "SC" "S-11" "SH-A" dB 40.0
+    , stock "SC" "S-12" "SH-A" dC 8.0
+    ]
+  (rb, [ra]) <- migrate reverseBook [migration "SH-A" alice ["S-10", "S-11", "S-12"]]
+  lotQuantities rb ra >>= (=== [("S-10", 25.0, 1.0), ("S-11", 10.0, 1.0), ("S-12", 8.0, 1.0)])
+
+-- MG6: a migrated lot's tranches are scaled by the splits that scaled its quantity. The shares
+-- vested by each tranche date scale exactly as the quantity does, so the tranches still cover the
+-- lot and a reverse split does not leave more shares vested than the lot's share of them.
+test_MG6_splitTranches : Script ()
+test_MG6_splitTranches = do
+  alice <- allocateParty "alice"
+  let vesting amount date = OcfVesting with amount; date
+      withTranches sec qty vestings =
+        CT.OcfCreateStockIssuance ((mkIssuance "SC" sec "SH-A" qty) with date = dA; vestings)
+  b <- migrationBook
+    [ withTranches "S-1" 100.0 [vesting 60.0 dD, vesting 40.0 dB]
+    , withTranches "S-2" 2.0 [vesting 1.0 dB, vesting 1.0 dD]
+    , classSplit "SPLIT-F" dB 2.0 1.0
+    , classSplit "SPLIT-R" dC 1.0 3.0
+    ]
+  (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1", "S-2"]]
+  Some p <- queryContractId mb.issuer pa
+  map (\l -> (l.issuance.security_id, l.issuance.quantity, l.issuance.vestings)) (Map.values p.lots) ===
+    [ ("S-1", 66.6666666667, [vesting 26.6666666667 dB, vesting 40.0 dD])
+    -- scaled one by one, each tranche would round up to 0.6666666667 and overrun the quantity
+    , ("S-2", 1.3333333333, [vesting 0.6666666667 dB, vesting 0.6666666666 dD]) ]
+  Some s1 <- pure (Map.lookup "S-1" p.lots)
+  map (`vestedQuantity` s1) [dC, dD] === [26.6666666667, 66.6666666667]
+
+-- MG7: position quantities are in units after the class's last split, which an OCF replay applies
+-- to any quantity dated on or before its day, so the registry records no transfer, hold, issue or
+-- vesting acceleration dated then. A later date works, and a vesting start, which carries no
+-- quantity, may predate the split.
+test_MG7_registryDatesAfterLastSplit : Script ()
+test_MG7_registryDatesAfterLastSplit = do
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  b <- migrationBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-1" "SH-A" 100.0) with date = dA; vesting_terms_id = Some "VT-1")
+    , classSplit "SPLIT-F" dB 2.0 1.0 ]
+  (mb, [pa]) <- migrate b [migration "SH-A" alice ["S-1"]]
+  [(registry, r)] <- query @PositionRegistry mb.issuer
+  r.last_split_date === Some dB
+  let i = actAs mb.issuer
+      transferFrom tid date pos = exerciseCmd registry Registry_Transfer with
+        transfer_id = tid; date; transferor_position = pos
+        transferee = Transferee with stakeholder_id = "SH-B"; party = bob; position = None
+        quantity = 200.0; share_price = usd 1.0
+        draws = [LotDraw with security_id = "S-1"; quantity = 200.0]
+        reference = None; request_receipt = False
+      transferOn tid date = transferFrom tid date pa
+  expectFail "MG7a transfer before the split" "the transfer date must be after the class's last split" i $
+    transferOn "MG7a" (dB `addRelTime` days (-1))
+  expectFail "MG7b transfer later on the split's day" "the transfer date must be after the class's last split" i $
+    transferOn "MG7b" (dB `addRelTime` hours 12)
+  expectFail "MG7c hold on the split's day" "the hold date must be after the class's last split" i $
+    exerciseCmd registry ((settlementArgs pa "SET-1" [("S-1", 10.0)]) with date = dB)
+  expectFail "MG7d issue dated on the split's day" "the issue date of lot S-9 must be after the class's last split" i $
+    exerciseCmd registry Registry_Issue with
+      holder = alice; position = None; issuances = [(mkIssuance "SC" "S-9" "SH-A" 1.0) with date = dB]
+  let recordVesting records = exerciseCmd registry Registry_RecordVesting with
+        position = pa; as_of = dC; records
+        lots = [LotVestingSnapshot with security_id = "S-1"; vested_quantity = 200.0]
+      acceleration aid date = PositionVestingAcceleration VestingAccelerationOcfData with
+        id = aid; date; quantity = 50.0; reason_text = "Accelerated"; security_id = "S-1"; comments = []
+      start = PositionVestingStart VestingStartOcfData with
+        id = "VS-1"; date = dA; security_id = "S-1"; vesting_condition_id = "start"; comments = []
+  expectFail "MG7e vesting acceleration later on the split's day" "the date of vesting acceleration VA-1 must be after the class's last split" i $
+    recordVesting [start, acceleration "VA-1" (dB `addRelTime` hours 12)]
+  vested <- submit mb.issuer (recordVesting [start, acceleration "VA-2" dC])
+  (length vested.vesting_starts, length vested.vesting_accelerations) === (1, 1)
+  _ <- submit mb.issuer (transferFrom "MG7" dC vested.position)
+  pure ()
+
+-- MG8: once a class is enabled, the guard freezes its root issuances, so `EnablePositions` refuses,
+-- by name, a root issuance of the class with a remaining balance that could then be neither
+-- migrated nor fixed: one whose tranches cover only part of it, and one that a reduction without
+-- a balance security left with a balance. Securities consumed in full, reductions with a balance
+-- security and other classes do not stop it. Once the records are fixed, the class is enabled and
+-- migrates.
+test_MG8_enableRefusesUnmigratableIssuances : Script ()
+test_MG8_enableRefusesUnmigratableIssuances = do
+  alice <- allocateParty "alice"
+  let vesting amount date = OcfVesting with amount; date
+      withTranches cls sec qty vestings = (mkIssuance cls sec "SH-A" qty) with date = dA; vestings
+      cancellationCN2 balance = StockCancellationOcfData with
+        id = "CN-2"; date = dB; quantity = 30.0; reason_text = "Cancelled"; security_id = "S-2"
+        comments = []; balance_security_id = balance
+  b0 <- migrationRecords
+    [ CT.OcfCreateStockIssuance (withTranches "SC" "S-1" 100.0 [vesting 25.0 dB])
+    , stock "SC" "S-2" "SH-A" dA 100.0
+    , CT.OcfCreateStockCancellation (cancellationCN2 None)
+    -- none of these stops it
+    , CT.OcfCreateStockIssuance (withTranches "PREF" "S-3" 100.0 [vesting 25.0 dB])
+    , CT.OcfCreateStockIssuance (withTranches "SC" "S-4" 100.0 [vesting 25.0 dB])
+    , transferOf "TR-4" dB "S-4" 100.0 ["S-5"] None
+    , stock "SC" "S-5" "SH-B" dB 100.0
+    , stock "SC" "S-6" "SH-A" dA 100.0
+    , repurchaseOf "RP-6" dB "S-6" 40.0 (Some "S-7")
+    , stock "SC" "S-7" "SH-A" dB 60.0
+    ]
+  expectFail "MG8a tranches that cover part of an issuance"
+    "Cannot enable positions for SC: security S-1 has vesting tranches that do not cover its quantity"
+    (actAs b0.issuer) (enableSC b0)
+  b1 <- update b0 []
+    [CT.OcfEditStockIssuance (withTranches "SC" "S-1" 100.0 [vesting 25.0 dB, vesting 75.0 dC])] []
+  expectFail "MG8b balance left without a balance security"
+    "Cannot enable positions for SC: security S-2 keeps a balance after a transfer, cancellation, repurchase or conversion without a balance security"
+    (actAs b1.issuer) (enableSC b1)
+  b2 <- update b1 [stock "SC" "S-8" "SH-A" dB 70.0] [CT.OcfEditStockCancellation (cancellationCN2 (Some "S-8"))] []
+  (root, _) <- submit b2.issuer (enableSC b2)
+  (mb, [pa]) <- migrate (b2 with root) [migration "SH-A" alice ["S-1", "S-7", "S-8"]]
+  lotQuantities mb pa >>= (=== [("S-1", 100.0, 1.0), ("S-7", 60.0, 1.0), ("S-8", 70.0, 1.0)])

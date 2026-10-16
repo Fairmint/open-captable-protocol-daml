@@ -1,0 +1,702 @@
+-- Position register for one stock class of one issuer.
+--
+-- A `StockPosition` is one contract per holder and stock class (by convention; Canton 3.x has no
+-- keys). The holder's lots are data inside it. A transfer consumes and recreates only the
+-- transferor's and the transferee's positions, writes create-only OCF history records
+-- (StockTransfer and StockIssuance) that are not listed in the CapTable root and, on request,
+-- creates a `TransferReceipt`. No choice here fetches the CapTable root or any position it does not
+-- consume.
+--
+-- Only vested shares move. A lot's vested quantity as of a date (`vestedQuantity`) comes from its
+-- explicit OCF tranches and, for a lot on vesting terms, from the latest `VestingSnapshot` the
+-- issuer recorded with `Registry_RecordVesting`: the position holds no terms, so the issuer
+-- computes a schedule off-ledger from the terms and the OCF vesting records, which that choice
+-- writes as create-only history like the transfer records.
+--
+-- Holds are data on lots (`LotHold`): quantity holds reserve part of a lot for one pending
+-- register transfer or a scrip mint, and stops lock a whole lot. Holds count against vested shares
+-- first. A transfer without a hold reference draws only drawable quantity (a lot's vested quantity
+-- less its quantity holds, nothing while it is stopped); a transfer under a reference draws
+-- exactly the register-settlement holds with that reference and removes them. Holds never expire
+-- on the ledger: a transfer or `Registry_Release` ends them.
+module Fairmint.OpenCapTable.Positions where
+
+import DA.Action (foldlA, unless, when)
+import DA.Date (toDateUTC)
+import DA.Foldable (forA_)
+import DA.List (head, sortOn, unique)
+import qualified DA.Map as Map
+import DA.Map (Map)
+import DA.Optional (isNone, isSome, mapOptional)
+
+import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary)
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer(..), StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAcceleration(..), VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingEvent (VestingEvent(..), VestingEventOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStart(..), VestingStartOcfData(..))
+
+-- | Policy cap on lots drawn by one transfer (explicit rejection above it; never split a transfer).
+maxLotsPerTransfer : Int
+maxLotsPerTransfer = 50
+
+-- | Why a hold sits on a lot. Holds are position data, not OCF objects (Fairmint's OCF-IMP-004
+-- delta until a reservation schema is adopted).
+data HoldPurpose
+  = HoldPurposeRegisterSettlement
+    -- ^ REGISTER_SETTLEMENT: a quantity held for one pending register transfer; the reference
+    -- identifies it, such as a settlement ID. Only a transfer under that reference draws it.
+  | HoldPurposeStopTransfer
+    -- ^ STOP_TRANSFER: a legal stop. Locks the whole lot (no quantity); the reference is the stop
+    -- reference. No draw on the lot is allowed while any stop is active.
+  | HoldPurposeScripMint
+    -- ^ SCRIP_MINT: a quantity held for a scrip mint; the reference is the scrip reference.
+  deriving (Eq, Ord, Show)
+
+-- | Why a hold was removed without being drawn. Appending constructors is upgrade-compatible.
+data HoldReleaseCode
+  = ReleaseCodeDeclined
+    -- ^ a party declined the transfer
+  | ReleaseCodePreflightFailed
+    -- ^ a compliance or eligibility preflight failed
+  | ReleaseCodeFundingDeadline
+    -- ^ the deadline passed without settlement
+  | ReleaseCodeCounterpartyWithdrew
+    -- ^ a holder revoked an approval
+  | ReleaseCodeStopTransfer
+    -- ^ a stop was placed on a lot of the transfer: set by `Registry_Hold` on the holds the stop
+    -- releases; a caller passes it to `Registry_Release` for the transfer's holds on other lots
+  | ReleaseCodeCorporateAction
+    -- ^ a corporate action on the class
+  | ReleaseCodeStopLifted
+    -- ^ a stop was lifted
+  | ReleaseCodeScripMintReleased
+    -- ^ a scrip-mint hold was released without a mint
+  | ReleaseCodeError
+    -- ^ the hold was placed in error
+  deriving (Eq, Ord, Show)
+
+-- | A hold on one lot. `quantity` is `Some q` (q > 0) for the quantity holds
+-- (`HoldPurposeRegisterSettlement`, `HoldPurposeScripMint`) and `None` for a stop, which locks the
+-- whole lot. A lot's quantity holds never exceed its quantity, and (purpose, reference) is unique
+-- on a lot. Holds never expire on the ledger.
+data LotHold = LotHold with
+    purpose : HoldPurpose
+    reference : Text
+    quantity : Optional Decimal
+  deriving (Eq, Show)
+
+-- | The vested quantity of a lot on vesting terms as of a date, as the issuer computed it from the
+-- terms and the lot's OCF vesting records. Position data, not an OCF object.
+data VestingSnapshot = VestingSnapshot with
+    vested_quantity : Decimal
+      -- ^ from 0 to the lot's quantity
+    as_of : Time
+  deriving (Eq, Show)
+
+-- | One lot of a holder, kept as data.
+data PositionLot = PositionLot with
+    issuance : StockIssuanceOcfData
+      -- ^ the lot's own OCF stock issuance (its security_id, current quantity, issue date, legends,
+      -- exemptions, vestings, plan, share price)
+    holds : [LotHold]
+      -- ^ active holds on this lot
+    vesting_snapshot : Optional VestingSnapshot
+      -- ^ only on a lot on vesting terms (`issuance.vesting_terms_id`): its latest vesting, as
+      -- recorded with `Registry_RecordVesting`. Without one, such a lot counts as unvested.
+  deriving (Eq, Show)
+
+-- | A lot to hold, as passed to `Registry_Hold`: `Some` quantity for a quantity hold, `None` for
+-- a stop (a stop always locks the whole lot).
+data HoldLot = HoldLot with
+    security_id : Text
+    quantity : Optional Decimal
+  deriving (Eq, Show)
+
+-- | A hold that a choice removed without a draw, with the lot it sat on and why.
+data ReleasedHold = ReleasedHold with
+    security_id : Text
+    hold : LotHold
+    code : HoldReleaseCode
+  deriving (Eq, Show)
+
+-- | The position after `Registry_Hold` or `Registry_Release`, and the holds the choice removed
+-- without a draw, each with its code (for `Registry_Hold`, the register-settlement holds a stop
+-- released).
+data ReleaseResult = ReleaseResult with
+    position : ContractId StockPosition
+    released : [ReleasedHold]
+  deriving (Eq, Show)
+
+-- | A draw from one lot of the transferor's position.
+data LotDraw = LotDraw with
+    security_id : Text
+    quantity : Decimal
+  deriving (Eq, Show)
+
+-- | The receiving side of a transfer.
+data Transferee = Transferee with
+    stakeholder_id : Text
+    party : Party
+    position : Optional (ContractId StockPosition)
+      -- ^ None: open a new position (avoids contention on the transferee's position; merge later
+      -- with Registry_MergePositions).
+  deriving (Eq, Show)
+
+data TransferResult = TransferResult with
+    transferor_position : Optional (ContractId StockPosition)
+      -- ^ None when the transfer emptied the transferor's position
+    transferee_position : ContractId StockPosition
+    receipt : Optional (ContractId TransferReceipt)
+      -- ^ Some exactly when the caller requested a receipt
+  deriving (Eq, Show)
+
+-- | A snapshot to record on one lot, as passed to `Registry_RecordVesting`.
+data LotVestingSnapshot = LotVestingSnapshot with
+    security_id : Text
+    vested_quantity : Decimal
+  deriving (Eq, Show)
+
+-- | An OCF vesting transaction behind a snapshot, as passed to `Registry_RecordVesting`, which
+-- writes it as the OCF record of its type.
+data PositionVestingRecord
+  = PositionVestingStart VestingStartOcfData
+  | PositionVestingEvent VestingEventOcfData
+  | PositionVestingAcceleration VestingAccelerationOcfData
+  deriving (Eq, Show)
+
+-- | The position after `Registry_RecordVesting` and the OCF vesting records it wrote, by type, in
+-- the order given.
+data VestingResult = VestingResult with
+    position : ContractId StockPosition
+    vesting_starts : [ContractId VestingStart]
+    vesting_events : [ContractId VestingEvent]
+    vesting_accelerations : [ContractId VestingAcceleration]
+  deriving (Eq, Show)
+
+-- | The lot's vested quantity as of a date, the lesser of two bounds:
+--
+-- * its explicit OCF tranches (`issuance.vestings`) dated on or before the date, capped at its
+--   quantity; its whole quantity when it has none;
+-- * for a lot on vesting terms (`issuance.vesting_terms_id`), its snapshot's vested quantity when
+--   the snapshot is dated on or before the date, else nothing (a later snapshot, or none, proves
+--   nothing about the date); its whole quantity without terms.
+vestedQuantity : Time -> PositionLot -> Decimal
+vestedQuantity asOf lot = min byTranches bySchedule
+  where
+    whole = lot.issuance.quantity
+    byTranches = if null lot.issuance.vestings then whole
+      else min whole (sum [v.amount | v <- lot.issuance.vestings, v.date <= asOf])
+    bySchedule = case (lot.issuance.vesting_terms_id, lot.vesting_snapshot) of
+      (None, _) -> whole
+      (Some _, Some s) | s.as_of <= asOf -> s.vested_quantity
+      _ -> 0.0
+
+-- | Whether a hold holds a quantity (`HoldPurposeRegisterSettlement`, `HoldPurposeScripMint`)
+-- rather than locking the whole lot (`HoldPurposeStopTransfer`).
+isQuantityHold : LotHold -> Bool
+isQuantityHold h = case h.purpose of
+  HoldPurposeRegisterSettlement -> True
+  HoldPurposeScripMint -> True
+  HoldPurposeStopTransfer -> False
+
+-- | Whether a hold has this purpose and reference.
+holdMatches : HoldPurpose -> Text -> LotHold -> Bool
+holdMatches purpose reference h = h.purpose == purpose && h.reference == reference
+
+-- | The lot's hold with this purpose and reference, if any ((purpose, reference) is unique on a
+-- lot).
+lotHoldFor : HoldPurpose -> Text -> PositionLot -> Optional LotHold
+lotHoldFor purpose reference lot = find (holdMatches purpose reference) lot.holds
+
+-- | Whether the lot carries any stop. A stopped lot cannot be drawn and has nothing drawable.
+lotIsStopped : PositionLot -> Bool
+lotIsStopped lot = any (\h -> h.purpose == HoldPurposeStopTransfer) lot.holds
+
+-- | The sum of the lot's quantity holds. Stops hold no quantity.
+heldQuantity : PositionLot -> Decimal
+heldQuantity lot = sum (mapOptional (.quantity) (filter isQuantityHold lot.holds))
+
+-- | What a transfer without a hold reference, or a new quantity hold, may take from the lot as of a
+-- date: nothing while the lot is stopped, else its vested quantity less its quantity holds. Holds
+-- count against vested shares first, so unvested shares never move or back a hold.
+drawableQuantity : Time -> PositionLot -> Decimal
+drawableQuantity asOf lot =
+  if lotIsStopped lot then 0.0 else max 0.0 (vestedQuantity asOf lot - heldQuantity lot)
+
+-- | The tranches left after a draw of vested shares from tranches in date order: the draw comes off
+-- the first tranches, and the tranches it empties are dropped.
+drawTranches : Decimal -> [OcfVesting] -> [OcfVesting]
+drawTranches d (v :: rest) | d > 0.0 =
+  if d >= v.amount then drawTranches (d - v.amount) rest else (v with amount = v.amount - d) :: rest
+drawTranches _ vestings = vestings
+
+-- | A hold is well formed: it has a reference, and a positive quantity exactly when it is a
+-- quantity hold (a stop locks the whole lot and carries none).
+holdOk : LotHold -> Bool
+holdOk h =
+  h.reference /= ""
+  && if isQuantityHold h then optional False (> 0.0) h.quantity else isNone h.quantity
+
+-- | A lot's holds are well formed, unique by (purpose, reference), and its quantity holds do not
+-- exceed its quantity.
+lotHoldsOk : PositionLot -> Bool
+lotHoldsOk lot =
+  all holdOk lot.holds
+  && unique (map (\h -> (h.purpose, h.reference)) lot.holds)
+  && heldQuantity lot <= lot.issuance.quantity
+
+positionOk : Text -> Text -> Map Text PositionLot -> Bool
+positionOk stockClassId stakeholderId lots =
+  stockClassId /= "" && stakeholderId /= "" && not (Map.null lots)
+  && all (\(sid, l) ->
+      sid == l.issuance.security_id
+      && l.issuance.quantity > 0.0
+      && l.issuance.stakeholder_id == stakeholderId
+      && l.issuance.stock_class_id == stockClassId
+      && lotHoldsOk l
+      -- tranches, when a lot has any, cover all of it: a draw that empties them is a full draw,
+      -- so no remainder is left without tranches (which would read as fully vested)
+      && (null l.issuance.vestings || sum (map (.amount) l.issuance.vestings) == l.issuance.quantity)
+      -- a snapshot only on a lot on vesting terms, vesting from none to all of it
+      && optional True (\s -> isSome l.issuance.vesting_terms_id
+          && s.vested_quantity >= 0.0 && s.vested_quantity <= l.issuance.quantity) l.vesting_snapshot)
+    (Map.toList lots)
+  -- one transfer can settle each register-settlement reference: it must draw every lot holding it
+  && all (<= maxLotsPerTransfer) (Map.values (foldl (\counts r -> Map.insertWith (+) r 1 counts) Map.empty
+      [h.reference | l <- Map.values lots, h <- l.holds, h.purpose == HoldPurposeRegisterSettlement]))
+
+template StockPosition
+  with
+    context : Context
+    stock_class_id : Text
+    stakeholder_id : Text
+    holder : Party
+    lots : Map Text PositionLot
+      -- ^ keyed by the lot's security_id
+  where
+    signatory context.issuer, context.system_operator
+    observer holder
+    ensure positionOk stock_class_id stakeholder_id lots
+
+-- | One-time proof that a transfer happened, created by `Registry_Transfer` on request. It records
+-- only the delivered terms, with no other lot detail and nothing about the transferor's remaining
+-- position, because the party that redeems it may show it to others. Creating one needs both the
+-- issuer's and the system operator's authority; in this package only `Registry_Transfer` creates
+-- one.
+template TransferReceipt
+  with
+    context : Context
+    stock_class_id : Text
+    transferor : Party
+    transferor_stakeholder_id : Text
+    transferee : Party
+    transferee_stakeholder_id : Text
+    quantity : Decimal
+    share_price : OcfMonetary
+      -- ^ the price recorded on the transferee's lots
+    reference : Optional Text
+      -- ^ the caller's reference, as passed to Registry_Transfer
+    date : Time
+  where
+    signatory context.issuer, context.system_operator
+
+    -- | Use the receipt: archive it and return what it recorded, so it serves at most once.
+    choice TransferReceipt_Redeem : TransferReceipt
+      controller context.issuer
+      do pure this
+
+-- | A registry write is dated after the day of the class's last split (`last_split_date` says which
+-- writes are checked).
+assertAfterSplit : Optional Time -> Text -> Time -> Update ()
+assertAfterSplit lastSplit what date = forA_ lastSplit \split ->
+  assertMsg (what <> " must be after the class's last split on " <> show (toDateUTC split))
+    (toDateUTC date > toDateUTC split)
+
+-- | Per-issuer, per-class registry. Created by `CapTable.EnablePositions`; its choices are
+-- nonconsuming, so transfers never contend on it.
+template PositionRegistry
+  with
+    context : Context
+    stock_class_id : Text
+    last_split_date : Optional Time
+      -- ^ the date of the class's latest split when positions were enabled (the root rejects
+      -- later ones). Position quantities are in units after it, and an OCF replay would apply it
+      -- to any quantity dated on or before its day, so no transfer, issue, hold or vesting
+      -- acceleration the registry records is dated then. Vesting starts and events carry no
+      -- quantity and may predate it, as may a snapshot's `as_of` (position data, not replayed).
+  where
+    signatory context.issuer, context.system_operator
+
+    -- | General-purpose transfer between two holders' positions in this class. Consumes the
+    -- transferor's position and the transferee's (or opens a new one), moves the drawn lots,
+    -- writes the OCF StockTransfer and transferee StockIssuance records (and a remainder issuance
+    -- after a partial draw) as create-only history and, when asked, creates a `TransferReceipt`.
+    -- It checks generic transfer validity only.
+    nonconsuming choice Registry_Transfer : TransferResult
+      with
+        transfer_id : Text
+          -- ^ prefix of the OCF IDs and security IDs this transfer writes; the caller keeps it
+          -- unique, so that those IDs are new in the issuer's whole book (the registry cannot
+          -- read the root)
+        date : Time
+        transferor_position : ContractId StockPosition
+        transferee : Transferee
+        quantity : Decimal
+        share_price : OcfMonetary
+          -- ^ recorded on the transferee's lots and on the receipt
+        draws : [LotDraw]
+        reference : Optional Text
+          -- ^ `None`: every draw takes only drawable quantity as of `date`. `Some r`: the transfer
+          -- settles the `HoldPurposeRegisterSettlement` holds with reference `r` on the
+          -- transferor's position: each draw equals its lot's hold `r`, every lot holding `r` is
+          -- drawn, the lot's holds are vested as of `date`, and those holds are removed; it never
+          -- draws drawable quantity. Recorded on the receipt.
+        request_receipt : Bool
+          -- ^ True: create a TransferReceipt and return its contract ID
+      controller context.issuer
+      do
+        assertMsg "transfer_id must be non-empty" (transfer_id /= "")
+        assertMsg "a transfer draws at least one lot" (not (null draws))
+        assertMsg ("a transfer draws at most " <> show maxLotsPerTransfer <> " lots") (length draws <= maxLotsPerTransfer)
+        assertMsg "each lot is drawn at most once" (unique (map (.security_id) draws))
+        assertMsg "drawn quantities must sum to the transfer quantity" (sum (map (.quantity) draws) == quantity)
+
+        assertAfterSplit last_split_date "the transfer date" date
+        tp <- fetch transferor_position
+        assertMsg "transferor position belongs to another registry"
+          (tp.context == context && tp.stock_class_id == stock_class_id)
+        assertMsg "transferor and transferee must differ" (tp.stakeholder_id /= transferee.stakeholder_id)
+
+        -- OCF IDs and security IDs written for draw i.
+        let recordId kind i = transfer_id <> "-" <> kind <> "-" <> show i
+
+        -- Move lots.
+        let step (fromLots, toLots, i) d = do
+              -- Look up the submitted position, not the lots moved so far: a remainder this transfer
+              -- creates is not drawable by it (each lot is drawn at most once).
+              lot <- case Map.lookup d.security_id tp.lots of
+                Some l -> pure l
+                None -> abort ("lot " <> d.security_id <> " is not in the transferor's position")
+              -- A stop locks the whole lot, even against the transfer its own holds were placed for.
+              assertMsg ("lot " <> d.security_id <> " is stopped") (not (lotIsStopped lot))
+              assertMsg ("lot " <> d.security_id <> " was issued after the transfer date") (lot.issuance.date <= date)
+              -- Held quantity serves only the transfer under its reference, and a transfer under a
+              -- reference draws exactly its holds, never drawable quantity. `otherHolds` are the
+              -- holds this draw leaves on the lot: all of them, less the drawn one.
+              otherHolds <- case reference of
+                None -> do
+                  assertMsg ("draw exceeds the drawable quantity of lot " <> d.security_id)
+                    (d.quantity <= drawableQuantity date lot)
+                  pure lot.holds
+                Some r -> case lotHoldFor HoldPurposeRegisterSettlement r lot of
+                  None -> abort ("lot " <> d.security_id <> " carries no register-settlement hold with reference " <> r)
+                  Some h -> do
+                    assertMsg ("draw on lot " <> d.security_id <> " must equal its register-settlement hold with reference " <> r)
+                      (h.quantity == Some d.quantity)
+                    -- Holds count against vested shares first: all of them must be vested.
+                    assertMsg ("the holds on lot " <> d.security_id <> " exceed its vested quantity at the transfer date")
+                      (heldQuantity lot <= vestedQuantity date lot)
+                    pure (filter (not . holdMatches HoldPurposeRegisterSettlement r) lot.holds)
+              let toSec = recordId "B" i
+                  remaining = lot.issuance.quantity - d.quantity
+                  remainderSec = if remaining > 0.0 then Some (recordId "R" i) else None
+                  -- Only vested shares are drawn, so the transferee's lot carries no vesting.
+                  toIssuance = lot.issuance with
+                    id = recordId "ISS-B" i
+                    custom_id = toSec
+                    date = date
+                    quantity = d.quantity
+                    security_id = toSec
+                    share_price = share_price
+                    stakeholder_id = transferee.stakeholder_id
+                    vestings = []
+                    vesting_terms_id = None
+                    share_numbers_issued = []
+                    comments = []
+                    consideration_text = None
+                    cost_basis = None
+                  toLot = PositionLot with issuance = toIssuance; holds = []; vesting_snapshot = None
+              assertMsg ("lot id " <> toSec <> " already exists in the transferee's position") (not (Map.member toSec toLots))
+              forA_ remainderSec \r ->
+                assertMsg ("lot id " <> r <> " already exists in the transferor's position") (not (Map.member r fromLots))
+              _ <- create StockTransfer with
+                context
+                transfer_data = StockTransferOcfData with
+                  id = recordId "TR" i
+                  date
+                  quantity = d.quantity
+                  security_id = lot.issuance.security_id
+                  comments = []
+                  resulting_security_ids = [toSec]
+                  balance_security_id = remainderSec
+                  consideration_text = None
+              _ <- create StockIssuance with context; issuance_data = toIssuance
+              fromLots' <- case remainderSec of
+                None -> do
+                  -- Implied by the checks above; a full draw would drop unvested shares.
+                  assertMsg ("lot " <> d.security_id <> " is not fully vested")
+                    (vestedQuantity date lot == lot.issuance.quantity)
+                  pure (Map.delete d.security_id fromLots)
+                Some rsec -> do
+                  -- The remainder keeps the lot's unvested shares, its vesting terms and its other
+                  -- holds (with their references, so their transfers need no new placement). The
+                  -- draw took vested shares: off the earliest tranches and off the snapshot.
+                  let remIssuance = lot.issuance with
+                        id = recordId "ISS-R" i
+                        custom_id = rsec
+                        date = date
+                        quantity = remaining
+                        security_id = rsec
+                        vestings = drawTranches d.quantity (sortOn (.date) lot.issuance.vestings)
+                        share_numbers_issued = []
+                        comments = []
+                      remLot = PositionLot with
+                        issuance = remIssuance
+                        holds = otherHolds
+                        vesting_snapshot = fmap (\s -> s with vested_quantity = s.vested_quantity - d.quantity)
+                          lot.vesting_snapshot
+                  _ <- create StockIssuance with context; issuance_data = remIssuance
+                  pure (Map.insert rsec remLot (Map.delete d.security_id fromLots))
+              pure (fromLots', Map.insert toSec toLot toLots, i + 1)
+
+        (toBase, toOld) <- case transferee.position of
+          None -> pure (Map.empty, None)
+          Some cid -> do
+            p <- fetch cid
+            assertMsg "transferee position does not match the transferee"
+              (p.context == context && p.stock_class_id == stock_class_id
+                && p.stakeholder_id == transferee.stakeholder_id && p.holder == transferee.party)
+            pure (p.lots, Some cid)
+
+        (fromLots, toLots, _) <- foldlA step (tp.lots, toBase, 0) draws
+
+        -- A transfer under a reference settles all of its holds or none: a lot it leaves undrawn
+        -- would keep a hold that no transfer can settle any more.
+        forA_ reference \r -> do
+          let drawn = map (.security_id) draws
+          forA_ (Map.toList tp.lots) \(sid, lot) ->
+            when (isSome (lotHoldFor HoldPurposeRegisterSettlement r lot)) $
+              assertMsg ("lot " <> sid <> " carries a register-settlement hold with reference " <> r <> " but is not drawn")
+                (sid `elem` drawn)
+
+        archive transferor_position
+        fromNew <- if Map.null fromLots
+          then pure None
+          else Some <$> create tp with lots = fromLots
+        forA_ toOld archive
+        toNew <- create StockPosition with
+          context; stock_class_id
+          stakeholder_id = transferee.stakeholder_id
+          holder = transferee.party
+          lots = toLots
+
+        receipt <- if request_receipt
+          then Some <$> create TransferReceipt with
+            context; stock_class_id
+            transferor = tp.holder
+            transferor_stakeholder_id = tp.stakeholder_id
+            transferee = transferee.party
+            transferee_stakeholder_id = transferee.stakeholder_id
+            quantity; share_price; reference; date
+          else pure None
+
+        pure TransferResult with transferor_position = fromNew; transferee_position = toNew; receipt
+
+    -- | Primary issuance into a holder's position (the position-managed replacement for
+    -- `OcfCreateStockIssuance` in this class). Creates the OCF issuance history record. Each
+    -- security ID must be new in the issuer's whole book, root records included; the registry
+    -- cannot read the root, and `MigrateToPositions` cannot read positions, so neither can check
+    -- it and the caller must (a reused root ID would later migrate as a second lot with that ID).
+    nonconsuming choice Registry_Issue : ContractId StockPosition
+      with
+        holder : Party
+        position : Optional (ContractId StockPosition)
+        issuances : [StockIssuanceOcfData]
+      controller context.issuer
+      do
+        assertMsg "issue at least one lot" (not (null issuances))
+        forA_ issuances \d -> assertAfterSplit last_split_date ("the issue date of lot " <> d.security_id) d.date
+        let stakeholderId = (head issuances).stakeholder_id
+        base <- case position of
+          None -> pure Map.empty
+          Some cid -> do
+            p <- fetch cid
+            assertMsg "position does not match" (p.context == context && p.stock_class_id == stock_class_id
+              && p.stakeholder_id == stakeholderId && p.holder == holder)
+            archive cid
+            pure p.lots
+        lots <- foldlA (\acc d -> do
+            assertMsg ("duplicate lot " <> d.security_id) (not (Map.member d.security_id acc))
+            _ <- create StockIssuance with context; issuance_data = d
+            pure (Map.insert d.security_id (PositionLot with issuance = d; holds = []; vesting_snapshot = None) acc))
+          base issuances
+        create StockPosition with context; stock_class_id; stakeholder_id = stakeholderId; holder; lots
+
+    -- | Merge several positions of one holder into one (e.g. after transfers into new positions).
+    nonconsuming choice Registry_MergePositions : ContractId StockPosition
+      with
+        positions : [ContractId StockPosition]
+      controller context.issuer
+      do
+        assertMsg "merge at least two positions" (length positions >= 2)
+        ps <- forA positions fetch
+        let p0 = head ps
+        forA_ ps \p -> assertMsg "positions must share registry and holder"
+          (p.context == context && p.stock_class_id == stock_class_id
+            && p.stakeholder_id == p0.stakeholder_id && p.holder == p0.holder)
+        forA_ positions archive
+        let merged = foldl (\acc p -> Map.union acc p.lots) Map.empty ps
+        unless (Map.size merged == sum (map (\p -> Map.size p.lots) ps)) $
+          abort "positions share a lot"
+        create p0 with lots = merged
+
+    -- | Place holds of one purpose and reference on lots of one position. Checks by purpose:
+    --
+    -- * `HoldPurposeRegisterSettlement`: the lot is unstopped and issued by `date`, and the quantity
+    --   fits its drawable quantity as of `date`.
+    -- * `HoldPurposeScripMint`: the lot is unstopped and the quantity fits its drawable quantity
+    --   as of `date`.
+    -- * `HoldPurposeStopTransfer`: any lot of the position; it releases the lot's
+    --   register-settlement holds with `ReleaseCodeStopTransfer` and keeps the others.
+    --
+    -- The position's ensure (`holdOk`, `lotHoldsOk`) rejects an empty reference, a missing or
+    -- non-positive quantity on a quantity hold, a quantity on a stop, a second hold with the same
+    -- purpose and reference on a lot, quantity holds above the lot's quantity, and a
+    -- register-settlement reference on more than `maxLotsPerTransfer` lots of the position.
+    nonconsuming choice Registry_Hold : ReleaseResult
+      with
+        position : ContractId StockPosition
+        purpose : HoldPurpose
+        reference : Text
+        date : Time
+        lots : [HoldLot]
+      controller context.issuer
+      do
+        assertMsg "hold at least one lot" (not (null lots))
+        assertAfterSplit last_split_date "the hold date" date
+
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+
+        let place (acc, released) hl = do
+              let sid = hl.security_id
+              lot <- case Map.lookup sid acc of
+                Some l -> pure l
+                None -> abort ("lot " <> sid <> " is not in the position")
+              -- `kept`: the lot's holds that stay beside the new one.
+              (kept, releasedHere) <- case purpose of
+                HoldPurposeStopTransfer -> do
+                  -- A stop needs only the lot, whatever its vesting or eligibility. The lot's
+                  -- register-settlement holds can no longer settle, so the stop releases them;
+                  -- scrip-mint holds and other stops stay.
+                  let (settling, others) = partition (\h -> h.purpose == HoldPurposeRegisterSettlement) lot.holds
+                  pure (others, map (\h -> ReleasedHold with security_id = sid; hold = h; code = ReleaseCodeStopTransfer) settling)
+                _ -> do
+                  assertMsg ("lot " <> sid <> " is stopped") (not (lotIsStopped lot))
+                  -- The transfer check, applied now so the transfer under this reference can draw
+                  -- the hold later.
+                  when (purpose == HoldPurposeRegisterSettlement) $
+                    assertMsg ("lot " <> sid <> " was issued after the hold date") (lot.issuance.date <= date)
+                  -- Only vested shares back a quantity hold; this also names the lot a second
+                  -- reservation of the same shares fails on.
+                  assertMsg ("hold exceeds the drawable quantity of lot " <> sid)
+                    (optional True (<= drawableQuantity date lot) hl.quantity)
+                  pure (lot.holds, [])
+              let newHold = LotHold with purpose; reference; quantity = hl.quantity
+              pure (Map.insert sid (lot with holds = kept ++ [newHold]) acc, released ++ releasedHere)
+
+        (newLots, released) <- foldlA place (p.lots, []) lots
+        archive position
+        newPosition <- create p with lots = newLots
+        pure ReleaseResult with position = newPosition; released
+
+    -- | Remove the holds with this purpose and reference from one position: from the listed lots
+    -- (`Some`), or from every lot that carries one (`None`). Fails when it removes nothing.
+    nonconsuming choice Registry_Release : ReleaseResult
+      with
+        position : ContractId StockPosition
+        purpose : HoldPurpose
+        reference : Text
+        code : HoldReleaseCode
+        security_ids : Optional [Text]
+      controller context.issuer
+      do
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+        let matches = holdMatches purpose reference
+        targets <- case security_ids of
+          None -> pure (Map.keys p.lots)
+          Some ids -> do
+            assertMsg "each lot is released at most once" (unique ids)
+            -- A listed lot without the hold means the caller's view of the position is stale.
+            forA_ ids \sid -> case Map.lookup sid p.lots of
+              None -> abort ("lot " <> sid <> " is not in the position")
+              Some lot ->
+                assertMsg ("lot " <> sid <> " carries no " <> show purpose <> " hold with reference " <> reference)
+                  (any matches lot.holds)
+            pure ids
+        let releaseLot (acc, released) sid = case Map.lookup sid acc of
+              None -> (acc, released)
+              Some lot ->
+                let (gone, kept) = partition matches lot.holds
+                in if null gone
+                  then (acc, released)
+                  else (Map.insert sid (lot with holds = kept) acc,
+                        released ++ map (\h -> ReleasedHold with security_id = sid; hold = h; code) gone)
+            (newLots, released) = foldl releaseLot (p.lots, []) targets
+        assertMsg "no hold to release" (not (null released))
+        archive position
+        newPosition <- create p with lots = newLots
+        pure ReleaseResult with position = newPosition; released
+
+    -- | Record the vesting of lots on vesting terms as of `as_of`, as the issuer computed it from
+    -- the terms and the OCF vesting transactions in `records`, which this choice writes as
+    -- create-only history (not in the CapTable root, like the transfer records), each naming a
+    -- lot of the position. An acceleration, the one record with a quantity, is dated after the
+    -- class's last split. Vesting never goes backwards: a lot's new snapshot is dated no earlier
+    -- and vests no less than its last (a forfeiture changes the lot's quantity instead). The
+    -- position's ensure rejects a snapshot on a lot without vesting terms and a vested quantity
+    -- outside zero to the lot's quantity.
+    nonconsuming choice Registry_RecordVesting : VestingResult
+      with
+        position : ContractId StockPosition
+        as_of : Time
+        lots : [LotVestingSnapshot]
+        records : [PositionVestingRecord]
+      controller context.issuer
+      do
+        assertMsg "record at least one vesting snapshot or record" (not (null lots && null records))
+        assertMsg "each lot is recorded at most once" (unique (map (.security_id) lots))
+        p <- fetch position
+        assertMsg "position belongs to another registry"
+          (p.context == context && p.stock_class_id == stock_class_id)
+        let lotOf sid = case Map.lookup sid p.lots of
+              Some l -> pure l
+              None -> abort ("lot " <> sid <> " is not in the position")
+        newLots <- foldlA (\acc s -> do
+            lot <- lotOf s.security_id
+            forA_ lot.vesting_snapshot \old ->
+              assertMsg ("the vesting of lot " <> s.security_id <> " cannot go backwards")
+                (as_of >= old.as_of && s.vested_quantity >= old.vested_quantity)
+            let snapshot = VestingSnapshot with vested_quantity = s.vested_quantity; as_of
+            pure (Map.insert s.security_id (lot with vesting_snapshot = Some snapshot) acc))
+          p.lots lots
+        vesting_starts <- forA [d | PositionVestingStart d <- records] \d -> do
+          _ <- lotOf d.security_id
+          create VestingStart with context; vesting_data = d
+        vesting_events <- forA [d | PositionVestingEvent d <- records] \d -> do
+          _ <- lotOf d.security_id
+          create VestingEvent with context; vesting_data = d
+        vesting_accelerations <- forA [d | PositionVestingAcceleration d <- records] \d -> do
+          _ <- lotOf d.security_id
+          -- Its quantity is in the lot's units, which follow the class's last split.
+          assertAfterSplit last_split_date ("the date of vesting acceleration " <> d.id) d.date
+          create VestingAcceleration with context; acceleration_data = d
+        archive position
+        newPosition <- create p with lots = newLots
+        pure VestingResult with position = newPosition; vesting_starts; vesting_events; vesting_accelerations

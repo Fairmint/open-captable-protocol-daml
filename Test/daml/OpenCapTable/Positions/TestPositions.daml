@@ -1,0 +1,361 @@
+-- | Migration and its guards, transfers and transfer receipts of the position register.
+module OpenCapTable.Positions.TestPositions where
+
+import DA.Assert
+import DA.Optional (fromOptional)
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import DA.Time (addRelTime, days, time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransfer)
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfSecurityExemption(..), OcfShareNumberRange(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+
+data Env = Env with
+    book : Book
+    alice : Party
+    bob : Party
+    carol : Party
+    registry : ContractId PositionRegistry
+    posA : ContractId StockPosition
+    posB : ContractId StockPosition
+
+-- Root book: class SC; A holds S-A1 60, S-A2 40, S-A3 100 (vesting in 2030), S-A4 100 (received
+-- from C by transfer TR-C); B holds S-B1 10; C's S-C1 was fully transferred.
+setup : Script Env
+setup = do
+  b0 <- newBook
+  alice <- allocateParty "alice"
+  bob <- allocateParty "bob"
+  carol <- allocateParty "carol"
+  let unvested = (mkIssuance "SC" "S-A3" "SH-A" 100.0) with
+        vestings = [OcfVesting with amount = 100.0; date = time (D.date 2030 Jan 01) 0 0 0]
+  b1 <- update b0
+    [ CT.OcfCreateStockClass (mkStockClass "SC")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-A")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-B")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-C")
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A1" "SH-A" 60.0)
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-A2" "SH-A" 40.0)
+    , CT.OcfCreateStockIssuance unvested
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-B1" "SH-B" 10.0)
+    , CT.OcfCreateStockIssuance (mkIssuance "SC" "S-C1" "SH-C" 100.0)
+    , CT.OcfCreateStockIssuance ((mkIssuance "SC" "S-A4" "SH-A" 100.0) with date = dTransfer)
+    , CT.OcfCreateStockTransfer (mkTransfer "TR-C" "S-C1" 100.0 ["S-A4"] None)
+    ] [] []
+  (root2, registry) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
+  (root3, [posA, posB]) <- submit b1.issuer $ exerciseCmd root2 CT.MigrateToPositions with
+    stock_class_id = "SC"
+    migrations =
+      [ CT.PositionMigration with stakeholder_id = "SH-A"; holder = alice; security_ids = ["S-A1", "S-A2", "S-A3", "S-A4"]
+      , CT.PositionMigration with stakeholder_id = "SH-B"; holder = bob; security_ids = ["S-B1"] ]
+  let book = b1 with root = root3
+  pure Env with book; alice; bob; carol; registry; posA; posB
+
+lotQty : StockPosition -> Text -> Decimal
+lotQty p sid = case Map.lookup sid p.lots of
+  Some l -> l.issuance.quantity
+  None -> 0.0
+
+-- | A transfer to SH-B (bob) without a receipt.
+transfer : Env -> Text -> ContractId StockPosition -> Optional (ContractId StockPosition) -> Decimal -> [(Text, Decimal)] -> Registry_Transfer
+transfer env tid fromPos toPos qty draws = Registry_Transfer with
+  transfer_id = tid; date = dTransfer; transferor_position = fromPos
+  transferee = Transferee with stakeholder_id = "SH-B"; party = env.bob; position = toPos
+  quantity = qty; share_price = usd 2.5
+  draws = map (\(s, q) -> LotDraw with security_id = s; quantity = q) draws
+  reference = None; request_receipt = False
+
+-- M1: migration builds one position per holder with lots as data.
+test_M1_migration : Script ()
+test_M1_migration = do
+  env <- setup
+  Some a <- queryContractId env.alice env.posA
+  Map.keys a.lots === ["S-A1", "S-A2", "S-A3", "S-A4"]
+  lotQty a "S-A1" === 60.0
+  lotQty a "S-A4" === 100.0
+  Some b <- queryContractId env.bob env.posB
+  lotQty b "S-B1" === 10.0
+  -- holders see only their own position
+  none <- queryContractId env.bob env.posA
+  none === None
+  root <- queryContractId env.book.issuer env.book.root
+  case root of
+    Some r -> Map.size (fromOptional Map.empty r.position_migrated_security_ids) === 5
+    None -> fail "root missing"
+
+-- M2..M4: migration guards, and root writes into the managed class (TestRootGuard covers the root
+-- guard's other paths).
+test_M2_migrationGuards : Script ()
+test_M2_migrationGuards = do
+  env <- setup
+  let b = env.book
+  expectMigrationFails "M2 migrate a security that was transferred" "was transferred"
+    b [migration "SH-C" env.carol ["S-C1"]]
+  expectMigrationFails "M3 migrate a security twice" "already migrated"
+    b [migration "SH-A" env.alice ["S-A1"]]
+  expectRootWriteFails "M4b root issuance in a position-managed class" "Position-managed holding"
+    b [CT.OcfCreateStockIssuance (mkIssuance "SC" "S-NEW" "SH-B" 5.0)] [] []
+  expectRootWriteFails "M4c root split of a position-managed class" "Position-managed holding"
+    b [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
+        id = "SPLIT-1"; date = dTransfer; stock_class_id = "SC"; comments = []
+        split_ratio = OcfRatio with numerator = 2.0; denominator = 1.0] [] []
+  -- unrelated root writes still work
+  _ <- update b [CT.OcfCreateStakeholder (mkStakeholder "SH-D")] [] []
+  pure ()
+
+-- T1: a multi-lot transfer 60 + 20 -> 80 with a partial remainder, and its history records.
+test_T1_multiLotTransfer : Script ()
+test_T1_multiLotTransfer = do
+  env <- setup
+  r <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T1" env.posA (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)])
+  r.receipt === None
+  Some fromPos <- pure r.transferor_position
+  Some a <- queryContractId env.alice fromPos
+  Map.keys a.lots === ["S-A3", "S-A4", "T1-R-1"]
+  lotQty a "T1-R-1" === 20.0
+  Some b <- queryContractId env.bob r.transferee_position
+  Map.keys b.lots === ["S-B1", "T1-B-0", "T1-B-1"]
+  lotQty b "T1-B-0" === 60.0
+  lotQty b "T1-B-1" === 20.0
+  trs <- transferRecords env.book.issuer (writtenBy "T1")
+  map (\t -> (t.id, t.security_id, t.quantity, t.resulting_security_ids, t.balance_security_id)) trs ===
+    [("T1-TR-0", "S-A1", 60.0, ["T1-B-0"], None), ("T1-TR-1", "S-A2", 20.0, ["T1-B-1"], Some "T1-R-1")]
+  -- the transferee's issuances and the remainder's
+  issued <- issuanceRecords env.book.issuer (writtenBy "T1")
+  map (\s -> (s.id, s.security_id, s.quantity)) issued ===
+    [("T1-ISS-B-0", "T1-B-0", 60.0), ("T1-ISS-B-1", "T1-B-1", 20.0), ("T1-ISS-R-1", "T1-R-1", 20.0)]
+  -- holders cannot see the history records
+  [] <- query @StockTransfer env.bob
+  -- the root was not touched
+  Some _ <- queryContractId env.book.issuer env.book.root
+  pure ()
+
+-- T2: double spend: the second transfer on the consumed transferor position fails.
+test_T2_doubleSpend : Script ()
+test_T2_doubleSpend = do
+  env <- setup
+  _ <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T2a" env.posA None 60.0 [("S-A1", 60.0)])
+  expectFail "T2 reuse of the consumed transferor position" "contract"
+    (actAs env.book.issuer) $ exerciseCmd env.registry (transfer env "T2b" env.posA None 60.0 [("S-A1", 60.0)])
+
+-- T3: per-lot checks.
+test_T3_lotChecks : Script ()
+test_T3_lotChecks = do
+  env <- setup
+  let i = actAs env.book.issuer
+  expectFail "T3a sum != transfer quantity" "sum to the transfer quantity" i $
+    exerciseCmd env.registry (transfer env "T3a" env.posA None 70.0 [("S-A1", 60.0), ("S-A2", 20.0)])
+  expectFail "T3b lot not in the transferor's position" "is not in the transferor's position" i $
+    exerciseCmd env.registry (transfer env "T3b" env.posA None 10.0 [("S-B1", 10.0)])
+  expectFail "T3c same lot twice" "at most once" i $
+    exerciseCmd env.registry (transfer env "T3c" env.posA None 20.0 [("S-A1", 10.0), ("S-A1", 10.0)])
+  expectFail "T3d draw above lot quantity" "draw exceeds the drawable quantity of lot S-A1" i $
+    exerciseCmd env.registry (transfer env "T3d" env.posA None 61.0 [("S-A1", 61.0)])
+  expectFail "T3e unvested lot" "draw exceeds the drawable quantity of lot S-A3" i $
+    exerciseCmd env.registry (transfer env "T3e" env.posA None 10.0 [("S-A3", 10.0)])
+  expectFail "T3f more than 50 lots" "at most 50 lots" i $
+    exerciseCmd env.registry (transfer env "T3f" env.posA None 51.0 [("L" <> show n, 1.0) | n <- [1..51]])
+  expectFail "T3g transferee position of another holder" "transferee position does not match" i $
+    exerciseCmd env.registry (transfer env "T3g" env.posA (Some env.posA) 10.0 [("S-A1", 10.0)])
+  expectFail "T3h self-transfer" "transferor and transferee must differ" i $
+    exerciseCmd env.registry (transfer env "T3h" env.posB None 10.0 [("S-B1", 10.0)])
+  -- only the issuer can run the registry, not a holder
+  expectFail "T3i holder submits a transfer" "requires authorizers" (actAs env.alice <> readAs env.book.issuer) $
+    exerciseCmd env.registry (transfer env "T3i" env.posA None 10.0 [("S-A1", 10.0)])
+  expectFail "T3j lot issued after the transfer date" "was issued after the transfer date" i $
+    exerciseCmd env.registry ((transfer env "T3j" env.posA None 10.0 [("S-A4", 10.0)]) with date = dTransfer `addRelTime` days (-1))
+  -- the draw's StockTransfer record rejects a non-positive quantity
+  expectFail "T3k non-positive draw" "Template precondition violated: StockTransfer" i $
+    exerciseCmd env.registry (transfer env "T3k" env.posA None 5.0 [("S-A1", 10.0), ("S-A2", -5.0)])
+  -- a remainder the transfer creates is not in the submitted position, so it cannot be drawn again
+  expectFail "T3l draw the transfer's own remainder" "lot T3l-R-0 is not in the transferor's position" i $
+    exerciseCmd env.registry (transfer env "T3l" env.posA None 20.0 [("S-A1", 10.0), ("T3l-R-0", 10.0)])
+  pure ()
+
+-- T4: transfers on disjoint holders do not share any consumed contract; a transferee without a
+-- position gets a new one; merge folds positions.
+test_T4_newTransfereePositionAndMerge : Script ()
+test_T4_newTransfereePositionAndMerge = do
+  env <- setup
+  r1 <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T4a" env.posA None 10.0 [("S-A1", 10.0)])
+  Some sp <- pure r1.transferor_position
+  r2 <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T4b" sp None 5.0 [("S-A2", 5.0)])
+  merged <- submit env.book.issuer $ exerciseCmd env.registry Registry_MergePositions with
+    positions = [env.posB, r1.transferee_position, r2.transferee_position]
+  Some m <- queryContractId env.bob merged
+  Map.keys m.lots === ["S-B1", "T4a-B-0", "T4b-B-0"]
+
+-- T5: the transferee and remainder lots of a partial draw keep the source lot's legends,
+-- exemptions, plan, issuance type and approval dates, and so do their StockIssuance records. The
+-- transferee lot resets share numbers, cost basis, consideration and comments and takes the
+-- transfer's price and date; the remainder keeps the lot's price and resets share numbers and
+-- comments.
+test_T5_transfereeAndRemainderKeepIssuanceData : Script ()
+test_T5_transfereeAndRemainderKeepIssuanceData = do
+  env <- setup
+  let regD = OcfSecurityExemption with description = "Reg D 506(b)"; jurisdiction = "US"
+      approved = d0 `addRelTime` days (-10)
+      src = (mkIssuance "SC" "S-L1" "SH-A" 50.0) with
+        stock_legend_ids = ["LEG-1", "LEG-2"]; security_law_exemptions = [regD]
+        stock_plan_id = Some "PLAN-1"; issuance_type = Some OcfStockIssuanceRSA
+        board_approval_date = Some approved; stockholder_approval_date = Some approved
+        share_numbers_issued = [OcfShareNumberRange with starting_share_number = 1.0; ending_share_number = 50.0]
+        cost_basis = Some (usd 0.5); consideration_text = Some "cash"; comments = ["note"]
+      -- nested pairs: there is no Show instance for a 6-tuple
+      kept i = ((i.stock_legend_ids, i.security_law_exemptions, i.stock_plan_id),
+                (i.issuance_type, i.board_approval_date, i.stockholder_approval_date))
+      expected = kept src
+  pos <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
+    holder = env.alice; position = Some env.posA; issuances = [src]
+  r <- submit env.book.issuer $ exerciseCmd env.registry (transfer env "T5" pos None 30.0 [("S-L1", 30.0)])
+  Some b <- queryContractId env.bob r.transferee_position
+  Some toLot <- pure (Map.lookup "T5-B-0" b.lots)
+  kept toLot.issuance === expected
+  ((toLot.issuance.share_numbers_issued, toLot.issuance.cost_basis, toLot.issuance.consideration_text),
+    (toLot.issuance.comments, toLot.issuance.share_price, toLot.issuance.date))
+    === (([], None, None), ([], usd 2.5, dTransfer))
+  Some fromPos <- pure r.transferor_position
+  Some a <- queryContractId env.alice fromPos
+  Some remLot <- pure (Map.lookup "T5-R-0" a.lots)
+  kept remLot.issuance === expected
+  (remLot.issuance.share_numbers_issued, remLot.issuance.comments, remLot.issuance.share_price, remLot.issuance.quantity)
+    === ([], [], usd 1.0, 20.0)
+  -- the StockIssuance history records carry the same data as the lots
+  issued <- issuanceRecords env.book.issuer (writtenBy "T5")
+  issued === [toLot.issuance, remLot.issuance]
+
+-- T6: Registry_Issue adds lots with their OCF issuance records, and it and Registry_MergePositions
+-- reject bad arguments. A security ID can reach two positions of one holder (Registry_Issue checks
+-- duplicates only within the position it is given), so a merge must reject overlapping lots rather
+-- than drop one.
+test_T6_issueAndMergeChecks : Script ()
+test_T6_issueAndMergeChecks = do
+  env <- setup
+  let i = actAs env.book.issuer
+      issue holder position issuances = exerciseCmd env.registry Registry_Issue with holder; position; issuances
+      merge positions = exerciseCmd env.registry Registry_MergePositions with positions
+      new5 = mkIssuance "SC" "S-A5" "SH-A" 5.0
+      new6 = (mkIssuance "SC" "S-A6" "SH-A" 6.0) with date = dTransfer
+  -- an issue into an existing position keeps its lots, adds one lot per issuance, and writes one
+  -- issuance record per lot
+  pos <- submit env.book.issuer $ issue env.alice (Some env.posA) [new5, new6]
+  Some a <- queryContractId env.alice pos
+  Map.keys a.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6"]
+  map (\sid -> fmap (\l -> (l.issuance, l.holds, l.vesting_snapshot)) (Map.lookup sid a.lots)) ["S-A5", "S-A6"]
+    === [Some (new5, [], None), Some (new6, [], None)]
+  records <- issuanceRecords env.book.issuer (`elem` [new5.id, new6.id])
+  records === [new5, new6]
+  -- Registry_Issue argument checks
+  let one = [mkIssuance "SC" "S-A9" "SH-A" 1.0]
+  expectFail "T6a issue nothing" "issue at least one lot" i $ issue env.alice (Some pos) []
+  expectFail "T6b issue into another class" positionPreconditionViolated i $
+    issue env.alice (Some pos) [mkIssuance "OTHER" "S-A9" "SH-A" 1.0]
+  expectFail "T6c issue a lot already in the position" "duplicate lot S-A1" i $
+    issue env.alice (Some pos) [mkIssuance "SC" "S-A1" "SH-A" 1.0]
+  expectFail "T6d issue one lot twice" "duplicate lot S-A9" i $ issue env.alice None (one ++ one)
+  expectFail "T6e issue into another holder's position" "position does not match" i $ issue env.alice (Some env.posB) one
+  expectFail "T6f issue to another party into the position" "position does not match" i $ issue env.bob (Some pos) one
+  -- Registry_MergePositions argument checks
+  dup <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A1" "SH-A" 7.0]
+  expectFail "T6g merge positions that share a lot" "positions share a lot" i $ merge [pos, dup]
+  expectFail "T6h merge one position" "merge at least two positions" i $ merge [pos]
+  expectFail "T6i merge positions of two holders" "positions must share registry and holder" i $ merge [pos, env.posB]
+  -- a position of the same holder in another class (another registry)
+  b1 <- update env.book [CT.OcfCreateStockClass (mkStockClass "SC3")] [] []
+  (_, registry3) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC3"
+  pos3 <- submit b1.issuer $ exerciseCmd registry3 Registry_Issue with
+    holder = env.alice; position = None; issuances = [mkIssuance "SC3" "S-A30" "SH-A" 3.0]
+  expectFail "T6j merge positions of two classes" "positions must share registry and holder" i $ merge [pos, pos3]
+  -- the rejected calls changed nothing: a merge of disjoint positions still works
+  extra <- submit env.book.issuer $ issue env.alice None [mkIssuance "SC" "S-A8" "SH-A" 8.0]
+  merged <- submit env.book.issuer $ merge [pos, extra]
+  Some m <- queryContractId env.alice merged
+  Map.keys m.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-A5", "S-A6", "S-A8"]
+
+-- R1: a transfer that requests a receipt creates exactly one, holding the delivered terms. The
+-- holders cannot see it. The transfer runs under a hold reference, so the holds are placed first,
+-- and it removes them.
+test_R1_receiptOnRequest : Script ()
+test_R1_receiptOnRequest = do
+  env <- setup
+  let b = env.book
+  held <- (.position) <$> submit env.book.issuer
+    (exerciseCmd env.registry (settlementArgs env.posA "REF-R1" [("S-A1", 60.0), ("S-A2", 20.0)]))
+  r <- submit b.issuer $ exerciseCmd env.registry
+    ((transfer env "R1" held (Some env.posB) 80.0 [("S-A1", 60.0), ("S-A2", 20.0)]) with
+      reference = Some "REF-R1"; request_receipt = True)
+  Some fromPos <- pure r.transferor_position
+  Some a <- queryContractId b.issuer fromPos
+  map (\l -> l.holds) (Map.values a.lots) === [[], [], []]
+  [(rc, receipt)] <- query @TransferReceipt b.issuer
+  r.receipt === Some rc
+  receipt === TransferReceipt with
+    context = b.ctx; stock_class_id = "SC"
+    transferor = env.alice; transferor_stakeholder_id = "SH-A"
+    transferee = env.bob; transferee_stakeholder_id = "SH-B"
+    quantity = 80.0; share_price = usd 2.5; reference = Some "REF-R1"; date = dTransfer
+  transfers <- transferRecords b.issuer (writtenBy "R1")
+  map (.id) transfers === ["R1-TR-0", "R1-TR-1"]
+  issued <- issuanceRecords b.issuer (writtenBy "R1")
+  let toIssuances = filter (\s -> s.stakeholder_id == "SH-B") issued
+  map (.id) toIssuances === ["R1-ISS-B-0", "R1-ISS-B-1"]
+  sum (map (.quantity) toIssuances) === receipt.quantity
+  map (.share_price) toIssuances === [receipt.share_price, receipt.share_price]
+  seenByAlice <- query @TransferReceipt env.alice
+  seenByBob <- query @TransferReceipt env.bob
+  (seenByAlice, seenByBob) === ([], [])
+
+-- R2: a transfer that does not request a receipt creates none, even under a hold reference.
+test_R2_noReceiptUnlessRequested : Script ()
+test_R2_noReceiptUnlessRequested = do
+  env <- setup
+  held <- (.position) <$> submit env.book.issuer
+    (exerciseCmd env.registry (settlementArgs env.posA "REF-R2" [("S-A1", 10.0)]))
+  r <- submit env.book.issuer $ exerciseCmd env.registry
+    ((transfer env "R2" held None 10.0 [("S-A1", 10.0)]) with reference = Some "REF-R2")
+  r.receipt === None
+  receipts <- query @TransferReceipt env.book.issuer
+  receipts === []
+
+-- R3: a receipt cannot be created directly without the system operator's authority. In this
+-- package only Registry_Transfer, which holds it, creates one.
+test_R3_receiptNeedsSystemOperator : Script ()
+test_R3_receiptNeedsSystemOperator = do
+  env <- setup
+  other <- allocateParty "other"
+  let b = env.book
+      receipt = TransferReceipt with
+        context = b.ctx; stock_class_id = "SC"
+        transferor = env.alice; transferor_stakeholder_id = "SH-A"
+        transferee = env.bob; transferee_stakeholder_id = "SH-B"
+        quantity = 10.0; share_price = usd 2.5; reference = Some "REF-R3"; date = dTransfer
+  expectFail "R3a issuer alone" "requires authorizers" (actAs b.issuer) $ createCmd receipt
+  expectFail "R3b issuer and another party" "requires authorizers" (actAs [b.issuer, other]) $ createCmd receipt
+  expectFail "R3c issuer and both holders" "requires authorizers" (actAs [b.issuer, env.alice, env.bob]) $
+    createCmd receipt
+  receipts <- query @TransferReceipt b.sysop
+  receipts === []
+
+-- R4: redeeming a receipt archives it and returns what it recorded, so it is redeemed at most once.
+test_R4_redeemOnce : Script ()
+test_R4_redeemOnce = do
+  env <- setup
+  let i = env.book.issuer
+  r <- submit i $ exerciseCmd env.registry
+    ((transfer env "R4" env.posA None 10.0 [("S-A1", 10.0)]) with request_receipt = True)
+  Some rc <- pure r.receipt
+  Some recorded <- queryContractId i rc
+  redeemed <- submit i $ exerciseCmd rc TransferReceipt_Redeem
+  redeemed === recorded
+  gone <- queryContractId i rc
+  gone === None
+  expectFail "R4 redeem a redeemed receipt" "NotActive" (actAs i) $ exerciseCmd rc TransferReceipt_Redeem

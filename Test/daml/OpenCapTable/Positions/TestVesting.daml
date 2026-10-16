@@ -1,0 +1,321 @@
+-- | Partial vesting on positions: only vested shares move. A lot's vested quantity as of a date
+-- comes from its OCF tranches and, for a lot on vesting terms, from the snapshot the issuer records
+-- with `Registry_RecordVesting`; holds count against vested shares first. A partial draw leaves
+-- the unvested shares on the remainder; the transferee's lot carries no vesting. Migrated lots on
+-- vesting terms: MG4 in TestMigration.
+module OpenCapTable.Positions.TestVesting where
+
+import DA.Assert
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import DA.Time (addRelTime, days, time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAcceleration, VestingAccelerationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingEvent (VestingEvent, VestingEventOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStart, VestingStartOcfData(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+import OpenCapTable.Positions.TestPositions (Env(..), setup, transfer)
+import OpenCapTable.Positions.TestHolds (lotOf, placeHold, positionOf, releaseArgs, releaseHold, runTransfer, scripArgs, settle, stopArgs)
+
+-- | The tranche dates of S-T1: dT1 < dT2 < dTransfer < dT3 < dT4.
+dT1, dT2, dT3, dT4 : Time
+dT1 = time (D.date 2024 Jul 01) 0 0 0
+dT2 = time (D.date 2025 Jan 01) 0 0 0
+dT3 = time (D.date 2025 Jul 01) 0 0 0
+dT4 = time (D.date 2026 Jan 01) 0 0 0
+
+-- | When the issuer computes a snapshot, before the transfer date.
+dSnap : Time
+dSnap = time (D.date 2025 Mar 01) 0 0 0
+
+tranche : Decimal -> Time -> OcfVesting
+tranche amount date = OcfVesting with amount; date
+
+-- | `setup`, plus two lots of 100 issued to alice: S-T1 with four tranches of 25, listed out of
+-- date order (50 vested at the transfer date), and S-V1 on vesting terms VT-4Y.
+vsetup : Script (Env, ContractId StockPosition)
+vsetup = do
+  env <- setup
+  pos <- submit env.book.issuer $ exerciseCmd env.registry Registry_Issue with
+    holder = env.alice; position = Some env.posA
+    issuances =
+      [ (mkIssuance "SC" "S-T1" "SH-A" 100.0) with
+          vestings = [tranche 25.0 dT3, tranche 25.0 dT1, tranche 25.0 dT4, tranche 25.0 dT2]
+      , (mkIssuance "SC" "S-V1" "SH-A" 100.0) with vesting_terms_id = Some "VT-4Y" ]
+  pure (env, pos)
+
+recordVesting : Env -> ContractId StockPosition -> Time -> [(Text, Decimal)] -> [PositionVestingRecord] -> Commands VestingResult
+recordVesting env pos asOf lots records = exerciseCmd env.registry Registry_RecordVesting with
+  position = pos; as_of = asOf; records
+  lots = map (\(s, q) -> LotVestingSnapshot with security_id = s; vested_quantity = q) lots
+
+-- | Record snapshots only and return the new position.
+snapshot : Env -> ContractId StockPosition -> Time -> [(Text, Decimal)] -> Script (ContractId StockPosition)
+snapshot env pos asOf lots = (.position) <$> submit env.book.issuer (recordVesting env pos asOf lots [])
+
+lotOn : Env -> ContractId StockPosition -> Text -> Script PositionLot
+lotOn env pos sid = positionOf env pos >>= (`lotOf` sid)
+
+-- | A lot's vesting as (quantity, tranches, vesting terms, snapshot).
+vestingOf : PositionLot -> (Decimal, [OcfVesting], Optional Text, Optional VestingSnapshot)
+vestingOf l = (l.issuance.quantity, l.issuance.vestings, l.issuance.vesting_terms_id, l.vesting_snapshot)
+
+-- V1: a partial draw from a tranche lot takes the earliest tranches; the remainder keeps the rest.
+test_V1_trancheLotPartialDraw : Script ()
+test_V1_trancheLotPartialDraw = do
+  (env, pos) <- vsetup
+  t1 <- lotOn env pos "S-T1"
+  map (`vestedQuantity` t1) [dT1 `addRelTime` days (-1), dT1, dTransfer, dT4] === [0.0, 25.0, 50.0, 100.0]
+  drawableQuantity dTransfer t1 === 50.0
+  r <- runTransfer env (transfer env "V1" pos None 30.0 [("S-T1", 30.0)])
+  Some from <- pure r.transferor_position
+  remainder <- lotOn env from "V1-R-0"
+  -- the 30 drawn shares were dT1's 25 and 5 of dT2's
+  vestingOf remainder === (70.0, [tranche 20.0 dT2, tranche 25.0 dT3, tranche 25.0 dT4], None, None)
+  drawableQuantity dTransfer remainder === 20.0
+  issued <- issuanceRecords env.book.issuer (== "V1-ISS-R-0")
+  map (.vestings) issued === [remainder.issuance.vestings]
+
+-- V2: a partial draw from a lot on vesting terms: the remainder keeps the terms and the snapshot
+-- less the draw, at the same date.
+test_V2_scheduledLotPartialDraw : Script ()
+test_V2_scheduledLotPartialDraw = do
+  (env, pos) <- vsetup
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  v1 <- lotOn env pos2 "S-V1"
+  v1.vesting_snapshot === Some VestingSnapshot with vested_quantity = 40.0; as_of = dSnap
+  (vestedQuantity dTransfer v1, drawableQuantity dTransfer v1) === (40.0, 40.0)
+  r <- runTransfer env (transfer env "V2" pos2 None 30.0 [("S-V1", 30.0)])
+  Some from <- pure r.transferor_position
+  remainder <- lotOn env from "V2-R-0"
+  vestingOf remainder === (70.0, [], Some "VT-4Y", Some VestingSnapshot with vested_quantity = 10.0; as_of = dSnap)
+  issued <- issuanceRecords env.book.issuer (== "V2-ISS-R-0")
+  map (\d -> (d.vesting_terms_id, d.vestings)) issued === [(Some "VT-4Y", [])]
+  -- the rest of the vested part moves too
+  _ <- runTransfer env (transfer env "V2-2" from None 10.0 [("V2-R-0", 10.0)])
+  pure ()
+
+-- V3: a draw without a hold reference takes at most the drawable quantity: the vested part less
+-- the holds.
+test_V3_drawAboveDrawable : Script ()
+test_V3_drawAboveDrawable = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+  expectFail "V3a lot on vesting terms without a snapshot" "draw exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (transfer env "V3a" pos None 1.0 [("S-V1", 1.0)])
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  expectFail "V3b tranche lot above its vested part" "draw exceeds the drawable quantity of lot S-T1" i $
+    exerciseCmd reg (transfer env "V3b" pos2 None 51.0 [("S-T1", 51.0)])
+  expectFail "V3c lot on vesting terms above its snapshot" "draw exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (transfer env "V3c" pos2 None 41.0 [("S-V1", 41.0)])
+  h <- placeHold env (scripArgs pos2 "SCRIP-1" [("S-V1", 30.0)])
+  expectFail "V3d above what the holds leave of the vested part" "draw exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (transfer env "V3d" h.position None 11.0 [("S-V1", 11.0)])
+  _ <- runTransfer env (transfer env "V3" h.position None 10.0 [("S-V1", 10.0)])
+  pure ()
+
+-- V4: a snapshot dated after the transfer date proves nothing about it: the lot counts as
+-- unvested for draws, holds and the holds a transfer under a reference draws.
+test_V4_snapshotAfterTransferDate : Script ()
+test_V4_snapshotAfterTransferDate = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+      later = dTransfer `addRelTime` days 1
+  pos2 <- snapshot env pos later [("S-V1", 100.0)]
+  v1 <- lotOn env pos2 "S-V1"
+  map (`vestedQuantity` v1) [dTransfer, later] === [0.0, 100.0]
+  expectFail "V4a draw before the snapshot date" "draw exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (transfer env "V4a" pos2 None 10.0 [("S-V1", 10.0)])
+  expectFail "V4b hold before the snapshot date" "hold exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (settlementArgs pos2 "SET-1" [("S-V1", 10.0)])
+  h <- placeHold env ((settlementArgs pos2 "SET-1" [("S-V1", 20.0)]) with date = later)
+  expectFail "V4c transfer under the hold, dated before the snapshot"
+    "the holds on lot S-V1 exceed its vested quantity at the transfer date" i $
+    exerciseCmd reg (settle env "V4c" h.position "SET-1" 20.0 [("S-V1", 20.0)])
+  _ <- runTransfer env ((settle env "V4" h.position "SET-1" 20.0 [("S-V1", 20.0)]) with date = later)
+  pure ()
+
+-- V5: vesting never goes backwards: a new snapshot is dated no earlier and vests no less.
+test_V5_snapshotMonotonicity : Script ()
+test_V5_snapshotMonotonicity = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  expectFail "V5a an earlier snapshot" "the vesting of lot S-V1 cannot go backwards" i $
+    recordVesting env pos2 (dSnap `addRelTime` days (-1)) [("S-V1", 50.0)] []
+  expectFail "V5b less vested" "the vesting of lot S-V1 cannot go backwards" i $
+    recordVesting env pos2 dTransfer [("S-V1", 39.0)] []
+  -- the same snapshot again, then a later and larger one
+  pos3 <- snapshot env pos2 dSnap [("S-V1", 40.0)]
+  pos4 <- snapshot env pos3 dTransfer [("S-V1", 60.0)]
+  v1 <- lotOn env pos4 "S-V1"
+  v1.vesting_snapshot === Some VestingSnapshot with vested_quantity = 60.0; as_of = dTransfer
+
+-- V6: snapshots go only on lots of the position on vesting terms, once each, from none to all of
+-- the lot; the position's ensure rejects the rest.
+test_V6_recordChecks : Script ()
+test_V6_recordChecks = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+  expectFail "V6a nothing to record" "record at least one vesting snapshot or record" i $
+    recordVesting env pos dSnap [] []
+  expectFail "V6b lot listed twice" "each lot is recorded at most once" i $
+    recordVesting env pos dSnap [("S-V1", 10.0), ("S-V1", 20.0)] []
+  expectFail "V6c lot not in the position" "lot S-B1 is not in the position" i $
+    recordVesting env pos dSnap [("S-B1", 10.0)] []
+  expectFail "V6d lot without vesting terms" positionPreconditionViolated i $
+    recordVesting env pos dSnap [("S-V1", 10.0), ("S-A1", 60.0)] []
+  expectFail "V6e lot with tranches only" positionPreconditionViolated i $
+    recordVesting env pos dSnap [("S-T1", 50.0)] []
+  expectFail "V6f negative vested quantity" positionPreconditionViolated i $
+    recordVesting env pos dSnap [("S-V1", -1.0)] []
+  expectFail "V6g above the lot quantity" positionPreconditionViolated i $
+    recordVesting env pos dSnap [("S-V1", 100.5)] []
+  -- none and all of the lot are both fine
+  pos2 <- snapshot env pos dSnap [("S-V1", 0.0)]
+  _ <- snapshot env pos2 dSnap [("S-V1", 100.0)]
+  expectFail "V6h a consumed position" "NotActive" i $ recordVesting env pos dSnap [("S-V1", 10.0)] []
+
+-- V7: holds of both purposes take only vested shares, together at most the vested part.
+test_V7_holdsLimitedByVested : Script ()
+test_V7_holdsLimitedByVested = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+  expectFail "V7a scrip-mint hold on a lot whose tranches vest later" "hold exceeds the drawable quantity of lot S-A3" i $
+    exerciseCmd reg (scripArgs pos "SCRIP-1" [("S-A3", 1.0)])
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  expectFail "V7b settlement hold above the snapshot" "hold exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (settlementArgs pos2 "SET-1" [("S-V1", 41.0)])
+  expectFail "V7c scrip-mint hold above the snapshot" "hold exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (scripArgs pos2 "SCRIP-1" [("S-V1", 41.0)])
+  expectFail "V7d settlement hold above the vested tranches" "hold exceeds the drawable quantity of lot S-T1" i $
+    exerciseCmd reg (settlementArgs pos2 "SET-1" [("S-T1", 51.0)])
+  h1 <- placeHold env (settlementArgs pos2 "SET-1" [("S-T1", 50.0), ("S-V1", 25.0)])
+  h2 <- placeHold env (scripArgs h1.position "SCRIP-1" [("S-V1", 15.0)])
+  expectFail "V7e above what the other holds leave" "hold exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (settlementArgs h2.position "SET-2" [("S-V1", 1.0)])
+  -- the transfer under the reference draws its holds; the other hold stays on the remainder
+  r <- runTransfer env (settle env "V7" h2.position "SET-1" 75.0 [("S-T1", 50.0), ("S-V1", 25.0)])
+  Some from <- pure r.transferor_position
+  remainder <- lotOn env from "V7-R-1"
+  (vestingOf remainder, map (.reference) remainder.holds, drawableQuantity dTransfer remainder) ===
+    ((75.0, [], Some "VT-4Y", Some VestingSnapshot with vested_quantity = 15.0; as_of = dSnap), ["SCRIP-1"], 0.0)
+
+-- V8: a stop needs no vesting and locks the lot's vested part until it is lifted.
+test_V8_stopLocksUnvestedLot : Script ()
+test_V8_stopLocksUnvestedLot = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+  s <- placeHold env (stopArgs pos "STOP-1" ["S-V1"])
+  -- vesting recorded on the stopped lot leaves the stop in place
+  pos2 <- snapshot env s.position dSnap [("S-V1", 40.0)]
+  v1 <- lotOn env pos2 "S-V1"
+  (map (.reference) v1.holds, drawableQuantity dTransfer v1) === (["STOP-1"], 0.0)
+  expectFail "V8a draw on the stopped lot" "lot S-V1 is stopped" i $
+    exerciseCmd reg (transfer env "V8a" pos2 None 10.0 [("S-V1", 10.0)])
+  expectFail "V8b settlement hold on the stopped lot" "lot S-V1 is stopped" i $
+    exerciseCmd reg (settlementArgs pos2 "SET-1" [("S-V1", 10.0)])
+  expectFail "V8c scrip-mint hold on the stopped lot" "lot S-V1 is stopped" i $
+    exerciseCmd reg (scripArgs pos2 "SCRIP-1" [("S-V1", 10.0)])
+  lifted <- releaseHold env (releaseArgs pos2 HoldPurposeStopTransfer "STOP-1" ReleaseCodeStopLifted None)
+  _ <- runTransfer env (transfer env "V8" lifted.position None 40.0 [("S-V1", 40.0)])
+  pure ()
+
+-- V9: `Registry_RecordVesting` writes the OCF vesting records it is given as create-only history,
+-- each naming a lot of the position; they stay out of the root, whose guard still rejects root
+-- vesting records on a migrated lot.
+test_V9_vestingRecords : Script ()
+test_V9_vestingRecords = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      start = VestingStartOcfData with
+        id = "VS-1"; date = d0; security_id = "S-V1"; vesting_condition_id = "start"; comments = []
+      event = VestingEventOcfData with
+        id = "VE-1"; date = dSnap; security_id = "S-V1"; vesting_condition_id = "milestone"; comments = []
+      acceleration = VestingAccelerationOcfData with
+        id = "VA-1"; date = dSnap; quantity = 10.0; reason_text = "board approval"; security_id = "S-V1"; comments = []
+  expectFail "V9a record on another holder's lot" "lot S-B1 is not in the position" i $
+    recordVesting env pos dSnap [("S-V1", 40.0)] [PositionVestingEvent event with security_id = "S-B1"]
+  expectFail "V9b record on an unknown lot" "lot S-ZZ is not in the position" i $
+    recordVesting env pos dSnap [] [PositionVestingAcceleration acceleration with security_id = "S-ZZ"]
+  r <- submit env.book.issuer $ recordVesting env pos dSnap [("S-V1", 40.0)]
+    [PositionVestingAcceleration acceleration, PositionVestingStart start, PositionVestingEvent event]
+  starts <- mapA (queryContractId env.book.issuer) r.vesting_starts
+  events <- mapA (queryContractId env.book.issuer) r.vesting_events
+  accelerations <- mapA (queryContractId env.book.issuer) r.vesting_accelerations
+  map (fmap (.vesting_data)) starts === [Some start]
+  map (fmap (.vesting_data)) events === [Some event]
+  map (fmap (.acceleration_data)) accelerations === [Some acceleration]
+  -- records without a snapshot, on any lot of the position
+  r2 <- submit env.book.issuer $ recordVesting env r.position dTransfer []
+    [PositionVestingAcceleration acceleration with id = "VA-2"; security_id = "S-T1"]
+  length r2.vesting_accelerations === 1
+  -- the holder sees none of them, and the root lists none
+  seen <- (,,) <$> query @VestingStart env.alice <*> query @VestingEvent env.alice <*> query @VestingAcceleration env.alice
+  seen === ([], [], [])
+  Some root <- queryContractId env.book.issuer env.book.root
+  (Map.keys root.vesting_starts, Map.keys root.vesting_events, Map.keys root.vesting_accelerations) === ([], [], [])
+  expectRootWriteFails "V9c root vesting event on a migrated lot"
+    "vesting event VE-2 (proposed) references security S-A3 of position-managed class SC"
+    env.book [CT.OcfCreateVestingEvent event with id = "VE-2"; security_id = "S-A3"] [] []
+
+-- V10: the transferee's lots carry no vesting: only vested shares move.
+test_V10_transfereeLotHasNoVesting : Script ()
+test_V10_transfereeLotHasNoVesting = do
+  (env, pos) <- vsetup
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  r <- runTransfer env (transfer env "V10" pos2 None 50.0 [("S-T1", 30.0), ("S-V1", 20.0)])
+  pb <- positionOf env r.transferee_position
+  map vestingOf (Map.values pb.lots) === [(30.0, [], None, None), (20.0, [], None, None)]
+  map (drawableQuantity dTransfer) (Map.values pb.lots) === [30.0, 20.0]
+  issued <- issuanceRecords env.book.issuer (`elem` ["V10-ISS-B-0", "V10-ISS-B-1"])
+  map (\d -> (d.vestings, d.vesting_terms_id)) issued === [([], None), ([], None)]
+
+-- V11: a lot with unvested shares is never drawn or held whole; fully vested, it is.
+test_V11_noFullDrawOfPartiallyVestedLot : Script ()
+test_V11_noFullDrawOfPartiallyVestedLot = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+      reg = env.registry
+  pos2 <- snapshot env pos dSnap [("S-V1", 40.0)]
+  expectFail "V11a whole lot on vesting terms" "draw exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (transfer env "V11a" pos2 None 100.0 [("S-V1", 100.0)])
+  expectFail "V11b whole tranche lot" "draw exceeds the drawable quantity of lot S-T1" i $
+    exerciseCmd reg (transfer env "V11b" pos2 None 100.0 [("S-T1", 100.0)])
+  expectFail "V11c settlement hold on the whole lot" "hold exceeds the drawable quantity of lot S-V1" i $
+    exerciseCmd reg (settlementArgs pos2 "SET-1" [("S-V1", 100.0)])
+  pos3 <- snapshot env pos2 dTransfer [("S-V1", 100.0)]
+  r <- runTransfer env (transfer env "V11" pos3 None 100.0 [("S-V1", 100.0)])
+  Some from <- pure r.transferor_position
+  p <- positionOf env from
+  Map.keys p.lots === ["S-A1", "S-A2", "S-A3", "S-A4", "S-T1"]
+
+-- V12: a lot's tranches cover all of it, so a draw of every vested tranche leaves the later
+-- tranches on the remainder, and the remainder never reads as vested; a lot whose tranches cover
+-- only part of it never enters a position.
+test_V12_tranchesCoverTheLot : Script ()
+test_V12_tranchesCoverTheLot = do
+  (env, pos) <- vsetup
+  let i = actAs env.book.issuer
+  expectFail "V12a tranches below the lot quantity" positionPreconditionViolated i $
+    exerciseCmd env.registry Registry_Issue with
+      holder = env.alice; position = Some pos
+      issuances = [(mkIssuance "SC" "S-T2" "SH-A" 100.0) with vestings = [tranche 25.0 dT1]]
+  r <- runTransfer env (transfer env "V12" pos None 50.0 [("S-T1", 50.0)])
+  Some from <- pure r.transferor_position
+  remainder <- lotOn env from "V12-R-0"
+  vestingOf remainder === (50.0, [tranche 25.0 dT3, tranche 25.0 dT4], None, None)
+  (vestedQuantity dTransfer remainder, drawableQuantity dTransfer remainder) === (0.0, 0.0)
+  expectFail "V12b draw from the unvested remainder" "draw exceeds the drawable quantity of lot V12-R-0" i $
+    exerciseCmd env.registry (transfer env "V12b" from None 1.0 [("V12-R-0", 1.0)])
+

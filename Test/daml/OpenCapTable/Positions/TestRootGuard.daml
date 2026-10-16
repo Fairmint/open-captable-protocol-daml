@@ -1,0 +1,287 @@
+-- | The root guard on books with a position-managed class: no root write may name a stock security
+-- of a managed class, migrated or not, a managed class cannot be deleted, and vesting terms behind
+-- position lots stay as they are. Writes that name only securities of unmanaged classes still pass,
+-- even where a migrated lot's history runs through them, and migration batches still work after
+-- enabling.
+module OpenCapTable.Positions.TestRootGuard where
+
+import DA.Assert
+import DA.Date (Month(..))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import DA.Optional (fromOptional)
+import DA.Time (time)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockPlanReturnToPool (StockPlanReturnToPoolOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (VestingTermsOcfData(..), OcfVestingTrigger(..))
+import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..))
+import qualified Fairmint.OpenCapTable.CapTable as CT
+import Fairmint.OpenCapTable.Positions
+
+import OpenCapTable.Positions.Common
+import OpenCapTable.Positions.TestMigration
+import OpenCapTable.TestHelpers (defaultStockPlan, defaultVestingCondition, defaultVestingTerms, defaultVestingTermsWithConditions)
+
+-- | A date before every other record of the guard book.
+dOld : Time
+dOld = time (D.date 2015 Jan 01) 0 0 0
+
+-- | Classes SC (position-managed) and PREF, stakeholders SH-A to SH-D, and:
+--
+-- * S-A -> TR-AB -> S-B: a transfer inside SC.
+-- * S-D1 and S-D2: plain SC issuances.
+-- * S-E1 and S-Y: plain PREF issuances.
+--
+-- Positions are enabled for SC; nothing is migrated yet.
+guardBook : Script Book
+guardBook = migrationBook
+  [ CT.OcfCreateStakeholder (mkStakeholder "SH-D")
+  , stock "SC" "S-A" "SH-A" dA 100.0
+  , transferOf "TR-AB" dB "S-A" 100.0 ["S-B"] None
+  , stock "SC" "S-B" "SH-B" dB 100.0
+  , stock "SC" "S-D1" "SH-D" dA 30.0
+  , stock "SC" "S-D2" "SH-D" dA 20.0
+  , stock "PREF" "S-E1" "SH-B" dA 50.0
+  , stock "PREF" "S-Y" "SH-A" dA 5.0
+  ]
+
+-- | TR-AB with its comments changed (an edit must change something).
+editedTransferAB : CT.OcfEditData
+editedTransferAB = CT.OcfEditStockTransfer ((mkTransfer "TR-AB" "S-A" 100.0 ["S-B"] None) with
+  date = dB; comments = ["corrected"])
+
+-- G1: an edit cannot move an unmigrated root issuance into a position-managed class: the guard
+-- checks the proposed version, not only the stored one.
+test_G1_editIntoManagedClass : Script ()
+test_G1_editIntoManagedClass = do
+  b <- guardBook
+  expectRootWriteFails "G1 edit moves a root issuance into the managed class"
+    "stock issuance ISS-S-E1 (proposed) is in position-managed class SC"
+    b [] [CT.OcfEditStockIssuance ((mkIssuance "SC" "S-E1" "SH-B" 50.0) with date = dA)] []
+  -- an edit that keeps the issuance in its root-managed class still works
+  _ <- update b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-E1" "SH-B" 60.0) with date = dA)] []
+  pure ()
+
+-- G2: an edit or delete of a stored root issuance in a position-managed class is rejected, even
+-- when the issuance was not migrated and the edit would move it out of the class.
+test_G2_editStoredManagedIssuance : Script ()
+test_G2_editStoredManagedIssuance = do
+  b <- guardBook
+  expectRootWriteFails "G2a edit moves an unmigrated issuance out of the managed class"
+    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
+    b [] [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-D1" "SH-D" 30.0) with date = dA)] []
+  expectRootWriteFails "G2b delete of an unmigrated issuance in the managed class"
+    "stock issuance ISS-S-D1 (stored) is in position-managed class SC"
+    b [] [] [CT.OcfDeleteStockIssuance "ISS-S-D1"]
+
+-- G3: every security a proposed record names is checked: a transfer's balance security, the
+-- resulting security of an equity compensation exercise, a warrant exercise and a convertible
+-- conversion, and a vesting start's security. A migrated security's root issuance stays in the
+-- managed class, so the class rule covers it.
+test_G3_proposedSecurityReferences : Script ()
+test_G3_proposedSecurityReferences = do
+  bob <- allocateParty "bob"
+  b0 <- guardBook
+  (b, _) <- migrate b0 [migration "SH-B" bob ["S-B"]]
+  expectRootWriteFails "G3a root transfer whose balance security is migrated"
+    "stock transfer TR-G3 (proposed) references security S-B of position-managed class SC"
+    b [CT.OcfCreateStockTransfer (mkTransfer "TR-G3" "S-E1" 1.0 [] (Some "S-B"))] [] []
+  expectRootWriteFails "G3b equity compensation exercise resulting in a migrated security"
+    "equity compensation exercise EX-G3 (proposed) references security S-B of position-managed class SC"
+    b [CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
+      id = "EX-G3"; date = dTransfer; quantity = 1.0; security_id = "EC-1"; comments = []
+      resulting_security_ids = ["S-B"]; consideration_text = None] [] []
+  expectRootWriteFails "G3c vesting start on a migrated security"
+    "vesting start VS-G3 (proposed) references security S-B of position-managed class SC"
+    b [CT.OcfCreateVestingStart VestingStartOcfData with
+      id = "VS-G3"; date = dTransfer; security_id = "S-B"; vesting_condition_id = "start"; comments = []] [] []
+  expectRootWriteFails "G3d warrant exercise resulting in a migrated security"
+    "warrant exercise WE-G3 (proposed) references security S-B of position-managed class SC"
+    b [CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
+      id = "WE-G3"; date = dTransfer; security_id = "W-1"; trigger_id = "T-1"; comments = []
+      resulting_security_ids = ["S-B"]; consideration_text = None; quantity = Some 1.0] [] []
+  expectRootWriteFails "G3e convertible conversion resulting in a migrated security"
+    "convertible conversion CC-G3 (proposed) references security S-B of position-managed class SC"
+    b [CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
+      id = "CC-G3"; date = dTransfer; reason_text = "Converted"; security_id = "C-1"; trigger_id = "T-1"
+      comments = []; resulting_security_ids = ["S-B"]; balance_security_id = None
+      capitalization_definition = None; quantity_converted = None] [] []
+
+-- G4: before any migration, a root write that names an unmigrated security of the managed class is
+-- rejected, whichever record it is and whether the security is its source or its result. Writes
+-- that name only PREF securities pass, and migration batches still work after enabling.
+test_G4_unmigratedSecuritiesOfManagedClass : Script ()
+test_G4_unmigratedSecuritiesOfManagedClass = do
+  bob <- allocateParty "bob"
+  dave <- allocateParty "dave"
+  b <- guardBook
+  -- the A -> B transfer, as a delete and as an edit
+  expectRootWriteFails "G4a delete a transfer inside the managed class"
+    "stock transfer TR-AB (stored) references security S-A of position-managed class SC"
+    b [] [] [CT.OcfDeleteStockTransfer "TR-AB"]
+  expectRootWriteFails "G4b edit a transfer inside the managed class"
+    "stock transfer TR-AB (proposed) references security S-A of position-managed class SC"
+    b [] [editedTransferAB] []
+  -- new records on unmigrated securities of the class: a cancellation, a transfer into one that
+  -- would backdate its holding, a transfer out of the class
+  expectRootWriteFails "G4c new cancellation of an unmigrated security"
+    "stock cancellation CN-D2 (proposed) references security S-D2 of position-managed class SC"
+    b [cancellationOf "CN-D2" dB "S-D2" 20.0 None] [] []
+  expectRootWriteFails "G4d new transfer that results in an existing unmigrated security"
+    "stock transfer TR-OLD (proposed) references security S-D1 of position-managed class SC"
+    b [stock "PREF" "S-OLD" "SH-A" dOld 30.0, transferOf "TR-OLD" dB "S-OLD" 30.0 ["S-D1"] None] [] []
+  expectRootWriteFails "G4e new transfer of an unmigrated security out of the class"
+    "stock transfer TR-OUT (proposed) references security S-D1 of position-managed class SC"
+    b [stock "PREF" "S-E9" "SH-B" dC 30.0, transferOf "TR-OUT" dC "S-D1" 30.0 ["S-E9"] None] [] []
+  -- writes that name only securities of an unmanaged class still pass, as creates and as edits
+  b1 <- update b
+    [ stock "PREF" "S-E2" "SH-C" dC 20.0
+    , stock "PREF" "S-E3" "SH-B" dC 30.0
+    , transferOf "TR-E" dC "S-E1" 20.0 ["S-E2"] (Some "S-E3") ] [] []
+  b2 <- update b1 []
+    [ CT.OcfEditStockTransfer ((mkTransfer "TR-E" "S-E1" 20.0 ["S-E2"] (Some "S-E3")) with
+        date = dC; comments = ["corrected"])
+    , CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-Y" "SH-A" 6.0) with date = dA) ] []
+  -- migration batches still work after enabling and after the rejected writes
+  (b3, [posB]) <- migrate b2 [migration "SH-B" bob ["S-B"]]
+  (b4, [posD]) <- migrate b3 [migration "SH-D" dave ["S-D1", "S-D2"]]
+  lotQuantities b4 posB >>= (=== [("S-B", 100.0, 1.0)])
+  lotQuantities b4 posD >>= (=== [("S-D1", 30.0, 1.0), ("S-D2", 20.0, 1.0)])
+  -- migrated securities stay guarded by their class
+  expectRootWriteFails "G4f new cancellation of a migrated security"
+    "stock cancellation CN-D1 (proposed) references security S-D1 of position-managed class SC"
+    b4 [cancellationOf "CN-D1" dB "S-D1" 30.0 None] [] []
+
+-- G5: a position-managed stock class cannot be deleted from the root, even when no root record
+-- references it (its holdings were issued through the registry), and a root with position
+-- registries cannot be archived.
+test_G5_managedClassCannotBeDeleted : Script ()
+test_G5_managedClassCannotBeDeleted = do
+  alice <- allocateParty "alice"
+  b0 <- newBook
+  b1 <- update b0
+    [ CT.OcfCreateStockClass (mkStockClass "SC")
+    , CT.OcfCreateStockClass (mkStockClass "SC2")
+    , CT.OcfCreateStakeholder (mkStakeholder "SH-A") ] [] []
+  (root, registry) <- submit b1.issuer $ exerciseCmd b1.root CT.EnablePositions with stock_class_id = "SC"
+  let b = b1 with root
+  _ <- submit b.issuer $ exerciseCmd registry Registry_Issue with
+    holder = alice; position = None; issuances = [mkIssuance "SC" "S-N1" "SH-A" 10.0]
+  expectRootWriteFails "G5a delete the managed class"
+    "stock class SC is position-managed"
+    b [] [] [CT.OcfDeleteStockClass "SC"]
+  -- an unmanaged class can still be deleted
+  b2 <- update b [] [] [CT.OcfDeleteStockClass "SC2"]
+  Some r <- queryContractId b2.issuer b2.root
+  (Map.keys r.stock_classes, Map.keys (fromOptional Map.empty r.position_registries)) === (["SC"], ["SC"])
+  -- so the root cannot be emptied for ArchiveCapTable, and a root whose entity maps are empty but
+  -- that still has a registry (created directly, like a corrupt legacy root) is not archived
+  emptied <- submit (actAs [b2.issuer, b2.sysop]) $ createCmd r with
+    stock_classes = Map.empty; stakeholders = Map.empty
+  expectFail "G5b archive a root with a position registry" "Cannot archive: position_registries is not empty"
+    (actAs b2.sysop) $ exerciseCmd emptied CT.ArchiveCapTable
+
+-- G6: a return to pool names its security without a validation against the stock issuances (it may
+-- be an equity compensation security), and the guard still checks it: a return to pool naming a
+-- security of the managed class is rejected as a create, an edit and a delete.
+test_G6_returnToPoolNamingManagedSecurity : Script ()
+test_G6_returnToPoolNamingManagedSecurity = do
+  let returnToPool rid sec = StockPlanReturnToPoolOcfData with
+        id = rid; date = dB; quantity = 5.0; reason_text = "Repurchased"; security_id = sec
+        stock_plan_id = "PLAN"; comments = []
+  b <- migrationBook
+    [ CT.OcfCreateStockPlan (defaultStockPlan "PLAN" "SC")
+    , stock "SC" "S-1" "SH-A" dA 100.0
+    , stock "PREF" "S-2" "SH-A" dA 100.0
+    , CT.OcfCreateStockPlanReturnToPool (returnToPool "RTP-1" "S-1")
+    , CT.OcfCreateStockPlanReturnToPool (returnToPool "RTP-2" "S-2") ]
+  expectRootWriteFails "G6a create" "stock plan return to pool RTP-3 (proposed) references security S-1 of position-managed class SC"
+    b [CT.OcfCreateStockPlanReturnToPool (returnToPool "RTP-3" "S-1")] [] []
+  expectRootWriteFails "G6b edit" "stock plan return to pool RTP-1 (proposed) references security S-1 of position-managed class SC"
+    b [] [CT.OcfEditStockPlanReturnToPool ((returnToPool "RTP-1" "S-1") with comments = ["corrected"])] []
+  expectRootWriteFails "G6c edit away from the managed security" "stock plan return to pool RTP-1 (stored) references security S-1 of position-managed class SC"
+    b [] [CT.OcfEditStockPlanReturnToPool (returnToPool "RTP-1" "S-2")] []
+  expectRootWriteFails "G6d delete" "stock plan return to pool RTP-1 (stored) references security S-1 of position-managed class SC"
+    b [] [] [CT.OcfDeleteStockPlanReturnToPool "RTP-1"]
+  -- one naming a security of an unmanaged class is still the root's to change
+  _ <- update b [] [CT.OcfEditStockPlanReturnToPool ((returnToPool "RTP-2" "S-2") with comments = ["corrected"])] []
+  pure ()
+
+-- G7: vesting terms behind position lots stay as they are. Terms that a root issuance of the
+-- managed class names, migrated (VT-1, S-1) or not (VT-4, S-2), can be neither edited nor
+-- deleted, since lots keep them and the registry's snapshots and vesting records follow them. No
+-- edit of other terms may drop a condition ID either, since a registry-written vesting start or
+-- event may name it. Other edits of terms that only an unmanaged class names, edits that add a
+-- condition, and the deletion of unused terms still pass.
+test_G7_vestingTermsBehindPositions : Script ()
+test_G7_vestingTermsBehindPositions = do
+  alice <- allocateParty "alice"
+  let onTerms cls sec sh terms = CT.OcfCreateStockIssuance ((mkIssuance cls sec sh 100.0) with
+        date = dA; vesting_terms_id = Some terms)
+      renamed terms = defaultVestingTermsWithConditions terms [defaultVestingCondition "begin" OcfVestingStartTrigger []]
+  b0 <- migrationBook
+    [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT-1")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-2")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-3")
+    , CT.OcfCreateVestingTerms (defaultVestingTerms "VT-4")
+    , onTerms "SC" "S-1" "SH-A" "VT-1"
+    , onTerms "SC" "S-2" "SH-B" "VT-4"
+    , onTerms "PREF" "S-P" "SH-A" "VT-2" ]
+  (b, _) <- migrate b0 [migration "SH-A" alice ["S-1"]]
+  expectRootWriteFails "G7a edit of a migrated lot's terms"
+    "vesting terms VT-1 are named by security S-1 of position-managed class SC"
+    b [] [CT.OcfEditVestingTerms ((defaultVestingTerms "VT-1") with description = "corrected")] []
+  expectRootWriteFails "G7b delete of a migrated lot's terms"
+    "vesting terms VT-1 are named by security S-1 of position-managed class SC"
+    b [] [] [CT.OcfDeleteVestingTerms "VT-1"]
+  expectRootWriteFails "G7c delete of an unmigrated managed issuance's terms"
+    "vesting terms VT-4 are named by security S-2 of position-managed class SC"
+    b [] [] [CT.OcfDeleteVestingTerms "VT-4"]
+  expectRootWriteFails "G7d edit renaming a condition of terms only an unmanaged class names"
+    "vesting terms VT-2 (proposed) removes vesting condition start"
+    b [] [CT.OcfEditVestingTerms (renamed "VT-2")] []
+  expectRootWriteFails "G7e edit renaming a condition of unused terms"
+    "vesting terms VT-3 (proposed) removes vesting condition start"
+    b [] [CT.OcfEditVestingTerms (renamed "VT-3")] []
+  -- an edit that keeps every condition, adding one, and a delete of unused terms still pass
+  b1 <- update b []
+    [ CT.OcfEditVestingTerms ((defaultVestingTerms "VT-2") with
+        description = "corrected"
+        vesting_conditions = [ defaultVestingCondition "start" OcfVestingStartTrigger []
+                             , defaultVestingCondition "begin" OcfVestingStartTrigger [] ]) ]
+    [CT.OcfDeleteVestingTerms "VT-3"]
+  Some r <- queryContractId b1.issuer b1.root
+  Map.keys r.vesting_terms === ["VT-1", "VT-2", "VT-4"]
+
+-- G8: records that name only securities of an unmanaged class stay the root's, even where a
+-- migrated lot's history runs through them. S-P (PREF) converted by CV-P into S-Q (SC), and S-Q
+-- migrated. CV-P names S-Q, so it stays as it is; but S-P's own issuance can be backdated, and new
+-- PREF transfers can give S-P a parent, and then a further one. The engine computes the holding
+-- period from the OCF log as it stands, and flags a security with several parents.
+test_G8_otherClassHistoryOfMigratedLot : Script ()
+test_G8_otherClassHistoryOfMigratedLot = do
+  alice <- allocateParty "alice"
+  b0 <- migrationBook
+    [ stock "PREF" "S-P" "SH-A" dA 100.0
+    , conversionOf "CV-P" dB "S-P" 100.0 ["S-Q"] None
+    , stock "SC" "S-Q" "SH-A" dB 100.0 ]
+  (b, [pos]) <- migrate b0 [migration "SH-A" alice ["S-Q"]]
+  expectRootWriteFails "G8a edit of the conversion that resulted in the migrated lot"
+    "stock conversion CV-P (proposed) references security S-Q of position-managed class SC"
+    b [] [CT.OcfEditStockConversion StockConversionOcfData with
+      id = "CV-P"; date = dB; quantity_converted = 100.0; security_id = "S-P"; comments = ["corrected"]
+      resulting_security_ids = ["S-Q"]; balance_security_id = None] []
+  b1 <- update b
+    [stock "PREF" "S-Z" "SH-B" dOld 100.0, transferOf "TR-Z" dOld "S-Z" 100.0 ["S-P"] None]
+    [CT.OcfEditStockIssuance ((mkIssuance "PREF" "S-P" "SH-A" 100.0) with date = dOld)] []
+  b2 <- update b1
+    [stock "PREF" "S-Z2" "SH-C" dOld 100.0, transferOf "TR-Z2" dOld "S-Z2" 100.0 ["S-P"] None] [] []
+  transfers <- transferRecords b2.issuer (const True)
+  [t.id | t <- transfers, "S-P" `elem` t.resulting_security_ids] === ["TR-Z", "TR-Z2"]
+  -- the migrated lot is unchanged
+  lotQuantities b2 pos >>= (=== [("S-Q", 100.0, 1.0)])

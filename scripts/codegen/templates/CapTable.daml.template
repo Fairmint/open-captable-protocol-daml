@@ -13,9 +13,9 @@ module Fairmint.OpenCapTable.CapTable where
 import DA.Map (Map)
 import qualified DA.Map as Map
 import DA.List (sortOn, unique)
-import DA.Action (foldlA, when)
-import DA.Foldable (mapA_)
-import DA.Optional (fromOptional, isNone, isSome)
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_, mapA_)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import qualified DA.Date as Date
 
 import Fairmint.OpenCapTable.Types.Core (Context)
@@ -24,6 +24,9 @@ import qualified Fairmint.OpenCapTable.OCF.ConvertibleIssuance as ConvertibleIss
 import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData)
 import Fairmint.OpenCapTable.OCF.Document (Document(..), DocumentOcfData, OcfObjectReference(..), OcfObjectType(..))
 import qualified Fairmint.OpenCapTable.OCF.VestingTerms as VT
+-- Position register (positions and their registry)
+import Fairmint.OpenCapTable.Positions (StockPosition(..), PositionRegistry(..), PositionLot(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..), ocfVestingAmountTotal)
 
 -- OCF Types
 {{#each types_alpha}}
@@ -1624,6 +1627,214 @@ validateActiveSecurityTargets maps = do
 
 
 -- =============================================================================
+-- Position register support
+-- =============================================================================
+
+data PositionMigration = PositionMigration with
+    stakeholder_id : Text
+    holder : Party
+    security_ids : [Text]
+  deriving (Eq, Show)
+
+positionManagedError : Text -> Text
+positionManagedError what = "Position-managed holding: " <> what <> "; use the PositionRegistry choices"
+
+-- | Fetch the stored version of a record (one fetch). An unknown ID has no stored version; the
+-- edit or delete then fails in UpdateCapTable itself.
+storedVersion
+  : (HasFetch t) => Map Text (ContractId t) -> Text -> (t -> (Text, Optional Text, [Text]))
+  -> Update (Optional (Text, Optional Text, [Text]))
+storedVersion objects objectId refs = case Map.lookup objectId objects of
+  None -> pure None
+  Some cid -> Some . refs <$> fetch cid
+
+-- | What one version of a root record says about position-managed holdings, as
+-- `(label, writes_into, security_ids)`: the record's label ("stock transfer TR-1"), the stock
+-- class it writes into and every stock security it names. The tables below are generated from
+-- captable-config.yaml: a type is guarded on the fields its `validations` check against
+-- stock_issuances_by_security_id (a stock issuance on its own security_id), and the types in
+-- `position_class_writes` write into their stock_class_id.
+--
+-- The guard uses tuples, not a serializable data type of its own: a serializable type is upgrade
+-- API, which later versions could only extend.
+{{#each types_alpha}}
+{{#if position_guard}}
+{{position_guard.fn}} : {{data_type}} -> (Text, Optional Text, [Text])
+{{position_guard.fn}} d = ("{{position_guard.label}} " <> d.id, {{position_guard.writes_into}}, {{position_guard.security_ids}})
+
+{{/if}}
+{{/each}}
+-- | The proposed version of a created record (no fetch).
+createdRefs : OcfCreateData -> Optional (Text, Optional Text, [Text])
+createdRefs c = case c of
+{{#each types_alpha}}
+{{#if position_guard}}
+  OcfCreate{{name}} d -> Some ({{position_guard.fn}} d)
+{{/if}}
+{{/each}}
+  _ -> None
+
+-- | The proposed and stored versions of an edited record (one fetch).
+editedRefs
+  : CapTable -> OcfEditData
+  -> Update (Optional ((Text, Optional Text, [Text]), Optional (Text, Optional Text, [Text])))
+editedRefs ct e = case e of
+{{#each types_alpha}}
+{{#if position_guard}}
+  OcfEdit{{name}} d -> (\stored -> Some ({{position_guard.fn}} d, stored)) <$> storedVersion ct.{{map_field}} d.id ({{position_guard.fn}} . (.{{data_param}}))
+{{/if}}
+{{/each}}
+  _ -> pure None
+
+-- | The stored version of a deleted record (one fetch).
+deletedRefs : CapTable -> OcfDeleteData -> Update (Optional (Text, Optional Text, [Text]))
+deletedRefs ct r = case r of
+{{#each types_alpha}}
+{{#if position_guard}}
+  OcfDelete{{name}} i -> storedVersion ct.{{map_field}} i ({{position_guard.fn}} . (.{{data_param}}))
+{{/if}}
+{{/each}}
+  _ -> pure None
+
+-- | Root guard for position-managed holdings. Every record a batch writes is checked in its
+-- proposed version (creates and edits) and in its stored version (edits and deletes). No version
+-- may be a stock issuance, split or conversion-ratio adjustment in a position-managed class, or
+-- name a stock security whose root stock issuance is in one (as a migrated security's is). A
+-- position-managed stock class cannot be deleted either, and vesting terms behind position lots
+-- stay as they are (`validatePositionVestingTerms`). So an edit can move a root record neither
+-- into nor out of a managed class, and no root write can edit, delete or extend the history of a
+-- managed class. Records that name only securities of other classes stay the root's, even where
+-- a migrated lot's history passes through them: an edit of one, or a new record that gives one
+-- of those securities a parent (a first or a further one), changes the OCF log the holding period
+-- is computed from, and the engine computes it from the log as it stands. The generator picks up
+-- any OCF type whose validations name stock securities. A type added in a v34 patch has an
+-- upgrade-appended (Optional) root map, which this guard does not read, so codegen refuses such a
+-- type until the guard handles Optional maps.
+-- Costs nothing on a root without positions. Otherwise O(batch): one fetch per edit or delete of
+-- a guarded record, plus one lookup and at most one fetch (the root stock issuance) per security
+-- a version names; a batch that edits or deletes vesting terms adds one fetch per root stock
+-- issuance and per edited vesting terms.
+validatePositionManagedWrites : CapTable -> [OcfCreateData] -> [OcfEditData] -> [OcfDeleteData] -> Update ()
+validatePositionManagedWrites ct creates edits deletes = do
+  let classes = fromOptional Map.empty ct.position_registries
+      check version (label, writesInto, securityIds) = do
+        let reject what = assertMsg (positionManagedError (label <> " (" <> version <> ") " <> what))
+        forA_ writesInto \c -> reject ("is in position-managed class " <> c) (not (Map.member c classes))
+        -- A record that writes into a class names only the security it issues there, and that
+        -- class was checked above.
+        when (isNone writesInto) $
+          forA_ securityIds \s ->
+            forA_ (Map.lookup s ct.stock_issuances_by_security_id) \issuanceCid -> do
+              issuance <- fetch issuanceCid
+              let c = issuance.issuance_data.stock_class_id
+              reject ("references security " <> s <> " of position-managed class " <> c) (not (Map.member c classes))
+      checkDelete r = do
+        case r of
+          OcfDeleteStockClass c ->
+            assertMsg (positionManagedError ("stock class " <> c <> " is position-managed")) (not (Map.member c classes))
+          _ -> pure ()
+        stored <- deletedRefs ct r
+        forA_ stored (check "stored")
+  unless (Map.null classes) $ do
+    forA_ creates \c -> forA_ (createdRefs c) (check "proposed")
+    forA_ edits \e -> do
+      versions <- editedRefs ct e
+      forA_ versions \(proposed, stored) -> do
+        check "proposed" proposed
+        forA_ stored (check "stored")
+    forA_ deletes checkDelete
+    validatePositionVestingTerms ct classes edits deletes
+
+-- | Vesting terms behind position lots. A lot keeps its issuance's vesting_terms_id, and the
+-- snapshots and OCF vesting records the registry writes are computed from those terms and name
+-- their conditions. So vesting terms that a root stock issuance of a managed class names (every
+-- migrated lot's terms among them) can be neither edited nor deleted, and no edit of other
+-- vesting terms may drop a condition ID, which a registry-written vesting start or event may
+-- name. The root cannot see terms that only registry-issued lots name; root writers
+-- (CapTableBatch, replication) must not edit or delete those.
+validatePositionVestingTerms
+  : CapTable -> Map Text (ContractId PositionRegistry) -> [OcfEditData] -> [OcfDeleteData] -> Update ()
+validatePositionVestingTerms ct classes edits deletes = do
+  let edited = [d | OcfEditVestingTerms d <- edits]
+      touched = map (.id) edited ++ [i | OcfDeleteVestingTerms i <- deletes]
+  unless (null touched) $ do
+    forA_ (Map.values ct.stock_issuances) \issuanceCid -> do
+      d <- (.issuance_data) <$> fetch issuanceCid
+      forA_ d.vesting_terms_id \t ->
+        when (t `elem` touched && Map.member d.stock_class_id classes) $
+          abort (positionManagedError ("vesting terms " <> t <> " are named by security " <> d.security_id
+            <> " of position-managed class " <> d.stock_class_id))
+    forA_ edited \d -> forA_ (Map.lookup d.id ct.vesting_terms) \termsCid -> do
+      stored <- fetch termsCid
+      let kept = map (.id) d.vesting_conditions
+      forA_ stored.vesting_terms_data.vesting_conditions \c ->
+        unless (c.id `elem` kept) $
+          abort (positionManagedError ("vesting terms " <> d.id <> " (proposed) removes vesting condition " <> c.id))
+
+-- | Remaining balance of a root stock issuance after every recorded lifecycle event and split, under
+-- v34's own balance rules: a split dated after the issuance applies; on the issuance's own date a
+-- forward split is taken as already in the recorded quantity and a reverse split as following it.
+-- That is the lowest balance any intra-day order allows, the same balance within which the root
+-- lets later records reduce the security.
+remainingStockBalance : Map Text [SecurityBalanceEvent] -> Map Text [SecurityBalanceEvent] -> StockIssuance -> Update Decimal
+remainingStockBalance stockEvents splitEvents issuance = do
+  let sid = issuance.issuance_data.security_id
+      events = fromOptional [] (Map.lookup sid stockEvents)
+      allEvents = events ++ issuanceSplits splitEvents issuance
+  validateSecurityBalanceEventDates sid issuance.issuance_data.date allEvents
+  foldlA (applySecurityBalanceEvent sid) issuance.issuance_data.quantity (sortOn securityBalanceEventSortKey allEvents)
+
+-- | Whether a balance event consumes its security (a transfer, cancellation, repurchase or
+-- conversion), leaving any remainder in a balance security.
+isBalanceReduction : SecurityBalanceEvent -> Bool
+isBalanceReduction event = case event of
+  SecurityBalanceReduction {} -> True
+  _ -> False
+
+-- | Whether an issuance's tranches, when it has any, cover its quantity (as a position lot's must).
+vestingsCoverQuantity : StockIssuanceOcfData -> Bool
+vestingsCoverQuantity d = null d.vestings || ocfVestingAmountTotal d.vestings == d.quantity
+
+-- | The stock securities that a transfer, cancellation, repurchase or conversion leaves a balance
+-- security. One fetch per such record.
+stockSecuritiesWithBalanceSecurity : CapTableMaps -> Update [Text]
+stockSecuritiesWithBalanceSecurity maps = do
+  let withBalance pairs = [s | (s, Some _) <- pairs]
+  transfers <- forA (Map.values maps.stock_transfers)
+    (fmap (\r -> (r.transfer_data.security_id, r.transfer_data.balance_security_id)) . fetch)
+  cancellations <- forA (Map.values maps.stock_cancellations)
+    (fmap (\r -> (r.cancellation_data.security_id, r.cancellation_data.balance_security_id)) . fetch)
+  repurchases <- forA (Map.values maps.stock_repurchases)
+    (fmap (\r -> (r.repurchase_data.security_id, r.repurchase_data.balance_security_id)) . fetch)
+  conversions <- forA (Map.values maps.stock_conversions)
+    (fmap (\r -> (r.conversion_data.security_id, r.conversion_data.balance_security_id)) . fetch)
+  pure (withBalance (transfers ++ cancellations ++ repurchases ++ conversions))
+
+-- | The splits of its class that apply to a root stock issuance (see `remainingStockBalance`), in
+-- the order the balance rules apply them.
+issuanceSplits : Map Text [SecurityBalanceEvent] -> StockIssuance -> [SecurityBalanceEvent]
+issuanceSplits splitEvents issuance =
+  sortOn securityBalanceEventSortKey (filter
+    (splitMayReducePostIssuanceBalance issuance.issuance_data.date)
+    (fromOptional [] (Map.lookup issuance.issuance_data.stock_class_id splitEvents)))
+
+-- | An issuance's tranches in the units of its quantity after these splits (in this order). The
+-- shares vested by each tranche date scale exactly as the quantity does, with the same arithmetic,
+-- so tranches that covered the recorded quantity cover the split quantity; a tranche that rounds to
+-- nothing is dropped.
+splitVestings : [SecurityBalanceEvent] -> [OcfVesting] -> [OcfVesting]
+splitVestings splits vestings = reverse scaled
+  where
+    scale x = foldl (\acc event -> case event of
+        SecurityBalanceMultiplier with numerator; denominator -> acc * numerator / denominator
+        _ -> acc) x splits
+    (_, scaled) = foldl (\(vestedBefore, acc) v ->
+        let vestedBy = vestedBefore + v.amount
+            amount = scale vestedBy - scale vestedBefore
+        in (vestedBy, if amount > 0.0 then (v with amount = amount) :: acc else acc))
+      (0.0, []) (sortOn (.date) vestings)
+
+-- =============================================================================
 -- CapTable Template
 -- =============================================================================
 
@@ -1649,6 +1860,19 @@ template CapTable
 {{#each types_appended}}
     {{map_field}}: Optional (Map Text (ContractId {{name}}))
 {{/each}}
+
+    -- Position register, appended as Optional fields (None on payloads written before positions).
+    -- Two maps because they answer different questions at different grains.
+    -- stock_class_id -> registry: which classes are position-managed, for the root guard.
+    position_registries: Optional (Map Text (ContractId PositionRegistry))
+    -- security_id -> stakeholder_id: which root stock issuances now live in a position. The class
+    -- map cannot say: `MigrateToPositions` runs in holder batches after `EnablePositions`, so a
+    -- managed class holds migrated and not-yet-migrated issuances at once. A migrated issuance
+    -- stays on the root as OCF history, and the root cannot see positions, so this map is its only
+    -- record of the move. Migration refuses a listed security, so no lot is created twice, and
+    -- readers skip listed issuances so a lot is not also counted on the root. The value names the
+    -- holder whose position took the lot.
+    position_migrated_security_ids: Optional (Map Text Text)
 
   where
     signatory context.issuer, context.system_operator
@@ -1677,6 +1901,9 @@ template CapTable
         -- Empty batches only rotate the CapTable CID; require a create, edit, or delete.
         assertMsg "UpdateCapTable requires at least one create, edit, or delete"
           (creates /= [] || edits /= [] || deletes /= [])
+
+        -- No root writes to position-managed holdings. O(batch).
+        validatePositionManagedWrites this creates edits deletes
 
         -- Start with current maps
         let initialMaps = toMaps this
@@ -1798,7 +2025,124 @@ template CapTable
 {{#each types_appended}}
         assertMsg "Cannot archive: {{map_field}} is not empty" (Map.null (fromOptional Map.empty {{map_field}}))
 {{/each}}
+        -- Positions outlive no root: their teardown is not defined, so a root with position
+        -- registries stays (a managed stock class cannot be deleted either).
+        assertMsg "Cannot archive: position_registries is not empty" (Map.null (fromOptional Map.empty position_registries))
         -- Archive the issuer contract (separate contract referenced by CapTable)
         archive issuer
         -- CapTable self-archives (consuming choice)
         pure ()
+
+    -- ==========================================================================
+    -- Position register
+    -- ==========================================================================
+
+    -- | Make one stock class position-managed: create its registry and record it in the root. The
+    -- registry keeps the date of the class's latest split. Once the class is enabled, the guard
+    -- freezes its root issuances, so this refuses, by name, a root issuance of the class with a
+    -- remaining balance that `MigrateToPositions` would refuse and only a root write could fix:
+    -- one whose tranches do not cover its quantity, and one that a transfer, cancellation,
+    -- repurchase or conversion left with a balance but no balance security to migrate. One scan
+    -- of the root (O(book) fetches).
+    choice EnablePositions : (ContractId CapTable, ContractId PositionRegistry)
+      with
+        stock_class_id : Text
+      controller context.issuer
+      do
+        assertMsg ("Unknown stock class " <> stock_class_id) (Map.member stock_class_id stock_classes)
+        let registries = fromOptional Map.empty position_registries
+        assertMsg ("Positions already enabled for " <> stock_class_id) (not (Map.member stock_class_id registries))
+        let maps = toMaps this
+            refuse sid what = abort ("Cannot enable positions for " <> stock_class_id <> ": security " <> sid <> " " <> what)
+        splitEvents <- splitEventsByStockClassId maps
+        stockEvents <- stockBalanceEventsBySecurityId maps
+        balanced <- stockSecuritiesWithBalanceSecurity maps
+        forA_ (Map.values stock_issuances) \issuanceCid -> do
+          issuance <- fetch issuanceCid
+          let d = issuance.issuance_data
+          when (d.stock_class_id == stock_class_id) $ do
+            remaining <- remainingStockBalance stockEvents splitEvents issuance
+            when (remaining > 0.0) $
+              if any isBalanceReduction (fromOptional [] (Map.lookup d.security_id stockEvents))
+                then unless (d.security_id `elem` balanced) $
+                  refuse d.security_id "keeps a balance after a transfer, cancellation, repurchase or conversion without a balance security"
+                else unless (vestingsCoverQuantity d) $
+                  refuse d.security_id "has vesting tranches that do not cover its quantity"
+        let last_split_date = case fromOptional [] (Map.lookup stock_class_id splitEvents) of
+              [] -> None
+              e :: es -> Some (foldl max (securityBalanceEventDate e) (map securityBalanceEventDate es))
+        registryCid <- create PositionRegistry with context; stock_class_id; last_split_date
+        rootCid <- create this with position_registries = Some (Map.insert stock_class_id registryCid registries)
+        pure (rootCid, registryCid)
+
+    -- | Build positions from the root's active stock issuances, one batch of holders at a time.
+    -- Each security must be a root stock issuance of the holder in this class, not yet migrated,
+    -- with no transfer, cancellation, repurchase or conversion (its resulting or balance security
+    -- migrates instead) and a positive remaining balance. Its lot keeps the issuance data with the
+    -- quantity set to that balance, computed by v34's own balance rules from every recorded
+    -- lifecycle event and split (`remainingStockBalance`); the share price stays the recorded
+    -- issuance price, the vesting terms stay, and the tranches, which cover the recorded quantity
+    -- (`EnablePositions` checked), are scaled by the same splits (`splitVestings`). A lot on
+    -- vesting terms starts without a vesting snapshot, so it counts as unvested until
+    -- `Registry_RecordVesting` records one. The root records each migrated security, which stops a
+    -- second migration. The root cannot see positions, so it cannot tell whether a lot that
+    -- `Registry_Issue` or `Registry_Transfer` wrote already uses a security ID; the caller keeps
+    -- security IDs unique across the book. One scan of the root per batch (O(book) fetches) builds
+    -- the balance events.
+    choice MigrateToPositions : (ContractId CapTable, [ContractId StockPosition])
+      with
+        stock_class_id : Text
+        migrations : [PositionMigration]
+      controller context.issuer
+      do
+        assertMsg "Nothing to migrate" (not (null migrations))
+        let registries = fromOptional Map.empty position_registries
+        assertMsg ("Positions are not enabled for " <> stock_class_id) (Map.member stock_class_id registries)
+        let maps = toMaps this
+        stockEvents <- stockBalanceEventsBySecurityId maps
+        splitEvents <- splitEventsByStockClassId maps
+        (migratedFinal, positionCids) <- foldlA
+          (\(migrated, cids) m -> do
+            assertMsg ("Unknown stakeholder " <> m.stakeholder_id) (Map.member m.stakeholder_id stakeholders)
+            assertMsg ("No securities to migrate for " <> m.stakeholder_id) (not (null m.security_ids))
+            (migrated', lots) <- foldlA
+              (\(mig, acc) sid -> do
+                assertMsg ("Security already migrated " <> sid) (not (Map.member sid mig))
+                issuanceCid <- case Map.lookup sid stock_issuances_by_security_id of
+                  Some c -> pure c
+                  None -> abort ("Unknown stock security " <> sid)
+                issuance <- fetch issuanceCid
+                assertMsg ("Security " <> sid <> " is not held by " <> m.stakeholder_id)
+                  (issuance.issuance_data.stakeholder_id == m.stakeholder_id)
+                assertMsg ("Security " <> sid <> " is not in class " <> stock_class_id)
+                  (issuance.issuance_data.stock_class_id == stock_class_id)
+                -- OCF semantics: a transfer, cancellation, repurchase or conversion consumes the
+                -- source security (any remainder lives in its balance security). Only securities
+                -- without such an event are active lots (`EnablePositions` refused a class with a
+                -- remainder that has no balance security).
+                assertMsg ("Security " <> sid <> " was transferred, cancelled, repurchased or converted; migrate its resulting or balance security")
+                  (not (any isBalanceReduction (fromOptional [] (Map.lookup sid stockEvents))))
+                remaining <- remainingStockBalance stockEvents splitEvents issuance
+                assertMsg ("Security " <> sid <> " has no remaining balance") (remaining > 0.0)
+                -- `EnablePositions` checked that the tranches cover the issuance, and the scaled
+                -- tranches cover the lot (the position's ensure checks it again).
+                let lot = PositionLot with
+                      issuance = issuance.issuance_data with
+                        quantity = remaining
+                        vestings = splitVestings (issuanceSplits splitEvents issuance) issuance.issuance_data.vestings
+                      holds = []
+                      vesting_snapshot = None
+                pure (Map.insert sid m.stakeholder_id mig, Map.insert sid lot acc))
+              (migrated, Map.empty)
+              m.security_ids
+            positionCid <- create StockPosition with
+              context
+              stock_class_id
+              stakeholder_id = m.stakeholder_id
+              holder = m.holder
+              lots
+            pure (migrated', cids ++ [positionCid]))
+          (fromOptional Map.empty position_migrated_security_ids, [])
+          migrations
+        rootCid <- create this with position_migrated_security_ids = Some migratedFinal
+        pure (rootCid, positionCids)
