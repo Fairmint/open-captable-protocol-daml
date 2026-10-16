@@ -1,5 +1,5 @@
 name: Replay OCF Database on LocalNet
-run-name: OCF LocalNet replay (${{ inputs.database }}${{ inputs.target_sha && format(' at {0}', inputs.target_sha) || '' }})
+run-name: OCF LocalNet replay (${{ inputs.database }}${{ inputs.target_sha && format(' at {0}', inputs.target_sha) || '' }}${{ inputs.sdk_ref && format(' with SDK {0}', inputs.sdk_ref) || '' }})
 
 on:
   workflow_dispatch:
@@ -14,6 +14,10 @@ on:
           - production
       target_sha:
         description: Exact contract commit SHA to test
+        required: false
+        type: string
+      sdk_ref:
+        description: Optional exact Fairmint/ocp-canton-sdk commit SHA to build and replay instead of the published SDK
         required: false
         type: string
       portal_id:
@@ -39,8 +43,13 @@ jobs:
       - name: Validate request
         env:
           TARGET_SHA: ${{ inputs.target_sha }}
+          SDK_REF: ${{ inputs.sdk_ref }}
           PORTAL_ID: ${{ inputs.portal_id }}
         run: |
+          if [ -n "$SDK_REF" ] && ! [[ "$SDK_REF" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::sdk_ref must be an exact lowercase 40-character Git commit SHA when provided."
+            exit 1
+          fi
           if [ "${{ inputs.database }}" = "production" ]; then
             echo "Production replay protection is enforced by the production-data environment (required reviewer + deployment branch policy)."
           fi
@@ -69,6 +78,7 @@ jobs:
       DISABLE_FILE_LOGGER: 'true'
       OCP_REPLAY_REPORT_DIR: ${{ inputs.report_prefix != '' && format('artifacts/ocf-localnet-replay/{0}', inputs.report_prefix) || 'artifacts/ocf-localnet-replay' }}
       OCP_REPLAY_PORTAL_ID: ${{ inputs.portal_id }}
+      OCP_REPLAY_SDK_REF: ${{ inputs.sdk_ref }}
 
     steps:
       - name: Checkout contracts
@@ -173,6 +183,31 @@ jobs:
 
       - name: Test replay planner and generated package
         run: npm run verify-package
+
+      # Replays an unpublished SDK commit without publishing it. The SDK is built and packed exactly as
+      # `npm publish` would ship it, then installed over the pinned devDependency. Runs before any database
+      # secret is exposed to a step, and only ever fetches the public SDK repository.
+      - name: Build and install candidate SDK
+        if: env.OCP_REPLAY_SDK_REF != ''
+        run: |
+          set -euo pipefail
+          sdk_dir="$RUNNER_TEMP/ocp-canton-sdk"
+          git init --quiet "$sdk_dir"
+          git -C "$sdk_dir" remote add origin https://github.com/Fairmint/ocp-canton-sdk.git
+          git -C "$sdk_dir" fetch --quiet --depth 1 origin "$OCP_REPLAY_SDK_REF"
+          git -C "$sdk_dir" checkout --quiet --detach FETCH_HEAD
+          actual_sdk_sha=$(git -C "$sdk_dir" rev-parse HEAD)
+          if [ "$actual_sdk_sha" != "$OCP_REPLAY_SDK_REF" ]; then
+            echo "::error::Checked out SDK $actual_sdk_sha instead of requested $OCP_REPLAY_SDK_REF."
+            exit 1
+          fi
+          git -C "$sdk_dir" submodule update --init --depth 1 libs/Open-Cap-Format-OCF
+          (cd "$sdk_dir" && npm install --no-audit --no-fund && npm run build)
+          tarball=$(cd "$sdk_dir" && npm pack --ignore-scripts --silent --pack-destination "$RUNNER_TEMP")
+          npm install --no-save --no-audit --no-fund --ignore-scripts "$RUNNER_TEMP/$tarball"
+          installed=$(node -p "require('@open-captable-protocol/canton/package.json').version")
+          echo "OCP_REPLAY_SDK_SHA=$actual_sdk_sha" >> "$GITHUB_ENV"
+          echo "Replayed candidate SDK: \`Fairmint/ocp-canton-sdk@$actual_sdk_sha\` (package version $installed, not published)" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Validate environment-scoped database secret
         env:
