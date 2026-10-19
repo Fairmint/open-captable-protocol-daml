@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: 'Package-scoped release tag, e.g. OpenCapTable-v34-v0.0.2'
+        description: 'Package-scoped release tag, e.g. OpenCapTable-v35-v0.0.1'
         required: true
         type: string
 
@@ -28,6 +28,10 @@ jobs:
       id-token: write
     env:
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      # ADR-040: OpenCapTable-v35 goes to a fresh DevNet stack and MainNet is out of scope. The MainNet steps below are
+      # kept but gated off by this flag; set it to 'true' only once a MainNet rollout is decided (MainNet secrets are
+      # then required too).
+      MAINNET_RELEASES_ENABLED: 'false'
       CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
       CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
       CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
@@ -74,12 +78,18 @@ jobs:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           missing=()
-          for name in \
-            NODE_AUTH_TOKEN \
-            CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
-            CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET \
-            CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET \
-            CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET
+          required=(
+            NODE_AUTH_TOKEN
+            CANTON_DEVNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET
+            CANTON_DEVNET_5N_LEDGER_JSON_API_CLIENT_SECRET
+          )
+          if [ "$MAINNET_RELEASES_ENABLED" = 'true' ]; then
+            required+=(
+              CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET
+              CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET
+            )
+          fi
+          for name in "${required[@]}"
           do
             if [ -z "${!name}" ]; then
               missing+=("$name")
@@ -103,6 +113,9 @@ jobs:
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `package=${result.package}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `source_dir=${result.source_dir}\n`);
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `version=${result.version}\n`);
+          // Packages the release package data-depends on, in upload order: `<name>@<version> ...`.
+          const dependencies = result.dependencies.map((dep) => `${dep.package}@${dep.version}`).join(' ');
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `dependencies=${dependencies}\n`);
           NODE
 
       - name: Restore Daml SDK cache
@@ -125,13 +138,18 @@ jobs:
           PACKAGE_NAME=$(node -p "require('./package.json').name")
           PACKAGE_VERSION=$(node -p "require('./package.json').version")
           if npm view "${PACKAGE_NAME}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
-            devnet_tag="dar-deploy/devnet/${{ steps.release_tag.outputs.package }}/v${{ steps.release_tag.outputs.version }}"
-            mainnet_tag="dar-deploy/mainnet/${{ steps.release_tag.outputs.package }}/v${{ steps.release_tag.outputs.version }}"
-            if ! git show-ref --verify --quiet "refs/tags/${devnet_tag}" || ! git show-ref --verify --quiet "refs/tags/${mainnet_tag}"; then
-              echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published without both deployment success tags. Refusing a new release over an existing npm version."
-              exit 1
+            networks=devnet
+            if [ "$MAINNET_RELEASES_ENABLED" = 'true' ]; then
+              networks="devnet mainnet"
             fi
-            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} and both deployment tags already exist; resuming post-publish finalization."
+            for network in $networks; do
+              tag="dar-deploy/${network}/${{ steps.release_tag.outputs.package }}/v${{ steps.release_tag.outputs.version }}"
+              if ! git show-ref --verify --quiet "refs/tags/${tag}"; then
+                echo "::error::${PACKAGE_NAME}@${PACKAGE_VERSION} is already published without deployment success tag ${tag}. Refusing a new release over an existing npm version."
+                exit 1
+              fi
+            done
+            echo "${PACKAGE_NAME}@${PACKAGE_VERSION} and its deployment tags (${networks}) already exist; resuming post-publish finalization."
             echo "already_published=true" >> "$GITHUB_OUTPUT"
           else
             echo "already_published=false" >> "$GITHUB_OUTPUT"
@@ -164,48 +182,86 @@ jobs:
           npm run verify-package
           npm run test
 
+      # upload-dar uploads the dependency DARs (OpenCapTableApi-v01, OpenCapTableDeliveryProof-v01) before the package,
+      # so each dependency is checked and gets its own deployment tag too, before the package's.
       - name: Check DevNet deployment
         id: devnet_gate
-        run: npm run check:dar-version-policy -- --deployment devnet --package "${{ steps.release_tag.outputs.package }}"
+        env:
+          DEPENDENCIES: ${{ steps.release_tag.outputs.dependencies }}
+        run: |
+          for dep in $DEPENDENCIES; do
+            GITHUB_OUTPUT=/dev/null npm run check:dar-version-policy -- --deployment devnet --package "${dep%@*}"
+          done
+          npm run check:dar-version-policy -- --deployment devnet --package "${{ steps.release_tag.outputs.package }}"
 
-      - name: Upload DAR to devnet
+      - name: Upload DARs to devnet
         if: steps.devnet_gate.outputs.tag_exists != 'true'
         run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network devnet
 
-      - name: Record DevNet deployment tag
+      - name: Record DevNet deployment tags
         if: steps.devnet_gate.outputs.tag_exists != 'true'
         env:
+          DEPENDENCIES: ${{ steps.release_tag.outputs.dependencies }}
           PACKAGE_NAME: ${{ steps.release_tag.outputs.package }}
           PACKAGE_VERSION: ${{ steps.release_tag.outputs.version }}
         run: |
-          tag="dar-deploy/devnet/${PACKAGE_NAME}/v${PACKAGE_VERSION}"
-          sha=$(node -e 'const fs=require("fs"); const l=JSON.parse(fs.readFileSync("dars/dars.lock", "utf8")); console.log(l.packages[`${process.env.PACKAGE_NAME}/${process.env.PACKAGE_VERSION}/${process.env.PACKAGE_NAME}.dar`].sha256)')
-          git tag -a "$tag" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to DevNet (${sha})"
-          git push --no-verify origin "refs/tags/$tag"
+          for release in $DEPENDENCIES "${PACKAGE_NAME}@${PACKAGE_VERSION}"; do
+            name="${release%@*}"
+            version="${release#*@}"
+            tag="dar-deploy/devnet/${name}/v${version}"
+            if git show-ref --verify --quiet "refs/tags/${tag}"; then
+              echo "${tag} already recorded"
+              continue
+            fi
+            sha=$(NAME="$name" VERSION="$version" node -e 'const fs=require("fs"); const l=JSON.parse(fs.readFileSync("dars/dars.lock", "utf8")); console.log(l.packages[`${process.env.NAME}/${process.env.VERSION}/${process.env.NAME}.dar`].sha256)')
+            git tag -a "$tag" -m "Deployed ${name} v${version} to DevNet (${sha})"
+            git push --no-verify origin "refs/tags/$tag"
+          done
 
+      # MainNet: gated off for OpenCapTable-v35 (MAINNET_RELEASES_ENABLED above).
       - name: Check Mainnet deployment
         id: mainnet_gate
-        run: npm run check:dar-version-policy -- --deployment mainnet --package "${{ steps.release_tag.outputs.package }}"
+        if: env.MAINNET_RELEASES_ENABLED == 'true'
+        env:
+          DEPENDENCIES: ${{ steps.release_tag.outputs.dependencies }}
+        run: |
+          for dep in $DEPENDENCIES; do
+            GITHUB_OUTPUT=/dev/null npm run check:dar-version-policy -- --deployment mainnet --package "${dep%@*}"
+          done
+          npm run check:dar-version-policy -- --deployment mainnet --package "${{ steps.release_tag.outputs.package }}"
 
-      - name: Upload DAR to mainnet
-        if: steps.mainnet_gate.outputs.tag_exists != 'true'
+      - name: Upload DARs to mainnet
+        if: env.MAINNET_RELEASES_ENABLED == 'true' && steps.mainnet_gate.outputs.tag_exists != 'true'
         run: npm run upload-dar -- --package "${{ steps.release_tag.outputs.package_key }}" --network mainnet
 
-      - name: Record Mainnet deployment tag
-        if: steps.mainnet_gate.outputs.tag_exists != 'true'
+      - name: Record Mainnet deployment tags
+        if: env.MAINNET_RELEASES_ENABLED == 'true' && steps.mainnet_gate.outputs.tag_exists != 'true'
         env:
+          DEPENDENCIES: ${{ steps.release_tag.outputs.dependencies }}
           PACKAGE_NAME: ${{ steps.release_tag.outputs.package }}
           PACKAGE_VERSION: ${{ steps.release_tag.outputs.version }}
         run: |
-          tag="dar-deploy/mainnet/${PACKAGE_NAME}/v${PACKAGE_VERSION}"
-          sha=$(node -e 'const fs=require("fs"); const l=JSON.parse(fs.readFileSync("dars/dars.lock", "utf8")); console.log(l.packages[`${process.env.PACKAGE_NAME}/${process.env.PACKAGE_VERSION}/${process.env.PACKAGE_NAME}.dar`].sha256)')
-          git tag -a "$tag" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to Mainnet (${sha})"
-          git push --no-verify origin "refs/tags/$tag"
+          for release in $DEPENDENCIES "${PACKAGE_NAME}@${PACKAGE_VERSION}"; do
+            name="${release%@*}"
+            version="${release#*@}"
+            tag="dar-deploy/mainnet/${name}/v${version}"
+            if git show-ref --verify --quiet "refs/tags/${tag}"; then
+              echo "${tag} already recorded"
+              continue
+            fi
+            sha=$(NAME="$name" VERSION="$version" node -e 'const fs=require("fs"); const l=JSON.parse(fs.readFileSync("dars/dars.lock", "utf8")); console.log(l.packages[`${process.env.NAME}/${process.env.VERSION}/${process.env.NAME}.dar`].sha256)')
+            git tag -a "$tag" -m "Deployed ${name} v${version} to Mainnet (${sha})"
+            git push --no-verify origin "refs/tags/$tag"
+          done
 
       - name: Detect factory state
         id: factory
         run: |
-          npx tsx scripts/detect-factory-need.ts --package "${{ steps.release_tag.outputs.package_key }}" | tee factory-need.json
+          networks=devnet
+          if [ "$MAINNET_RELEASES_ENABLED" = 'true' ]; then
+            networks=devnet,mainnet
+          fi
+          npx tsx scripts/detect-factory-need.ts --package "${{ steps.release_tag.outputs.package_key }}" --networks "$networks" | tee factory-need.json
           node <<'NODE'
           const fs = require('fs');
           const result = JSON.parse(fs.readFileSync('factory-need.json', 'utf8'));
@@ -217,7 +273,9 @@ jobs:
         if: steps.factory.outputs.needs_factory == 'true'
         run: |
           while IFS= read -r network; do
-            if [ -n "$network" ]; then
+            if [ "$network" = mainnet ]; then
+              npx tsx scripts/create-ocp-factory.ts --network mainnet --allow-mainnet
+            elif [ -n "$network" ]; then
               npx tsx scripts/create-ocp-factory.ts --network "$network"
             fi
           done < missing-factory-networks.txt

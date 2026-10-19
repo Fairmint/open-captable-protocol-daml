@@ -2,9 +2,10 @@
 /**
  * Parse and validate package-scoped release tags.
  *
- * Usage: tsx scripts/parse-release-tag.ts OpenCapTable-v34-v0.0.2
+ * Usage: tsx scripts/parse-release-tag.ts OpenCapTable-v35-v0.0.1
  */
 
+import { getUploadOrder } from './packages';
 import {
   getLatestPreviousPackageTag,
   getPreviousPackageTags,
@@ -44,6 +45,10 @@ function main(): void {
   const previousPackageMajor = previousPackageTag ? parsePackageMajor(previousPackageTag.packageName) : null;
   const isMajorUpgrade =
     packageMajor !== null && previousPackageMajor !== null && packageMajor.major > previousPackageMajor.major;
+  // Uploaded (and deployment-tagged) before the package itself, in this order.
+  const dependencies = getUploadOrder(resolvedPackage.key)
+    .filter((pkg) => pkg.name !== resolvedPackage.package.name)
+    .map((pkg) => ({ package: pkg.name, version: pkg.version }));
 
   process.stdout.write(
     `${JSON.stringify(
@@ -53,10 +58,11 @@ function main(): void {
         package_key: resolvedPackage.key,
         source_dir: resolvedPackage.package.sourceDir,
         version: tag.version,
+        dependencies,
         is_major_upgrade: isMajorUpgrade,
         previous_package_tag: previousPackageTag?.tag ?? null,
         needs_factory: isMajorUpgrade,
-        factory_script: 'npx tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>',
+        factory_script: 'npx tsx scripts/create-ocp-factory.ts --network devnet',
       },
       null,
       2

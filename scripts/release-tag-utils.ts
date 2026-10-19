@@ -39,7 +39,7 @@ export function parseReleaseTagName(tag: string): ReleaseTagParts {
   const match = /^(?<packageName>.+)-v(?<version>\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?)$/.exec(trimmed);
   if (!match?.groups) {
     throw new Error(
-      `Invalid release tag "${tag}". Expected <package-name>-v<major>.<minor>.<patch>, for example OpenCapTable-v34-v0.0.2.`
+      `Invalid release tag "${tag}". Expected <package-name>-v<major>.<minor>.<patch>, for example OpenCapTable-v35-v0.0.1.`
     );
   }
 
@@ -61,8 +61,12 @@ export function parsePackageMajor(packageName: string): PackageMajor | null {
   };
 }
 
+/**
+ * Resolve the package a release tag names. Only releasable packages qualify: dependencies (OpenCapTableApi-v01,
+ * OpenCapTableDeliveryProof-v01) are uploaded and tagged with the package that depends on them.
+ */
 export function resolveReleasePackage(packageName: string): ResolvedReleasePackage {
-  const keys = getPackageKeys();
+  const keys = getPackageKeys().filter((key) => getPackage(key)?.releasable);
   for (const key of keys) {
     const pkg = getPackage(key);
     if (pkg?.name === packageName) {
