@@ -1,8 +1,17 @@
 #!/usr/bin/env node
 /**
- * Detect whether the current OCP package version already has recorded factory contracts.
+ * Detect whether the current OCP package version already has recorded factory identities.
  *
- * Usage: tsx scripts/detect-factory-need.ts --package ocp
+ * A network "has" a factory when generated/ocp-factory-contract-id.json records an identity (`templateId`,
+ * `system_operator`, `factory_id`) whose template belongs to this package's DAR. The v35 factory is consumed by each
+ * authorization, so no contract ID is recorded or checked. An identity recorded by an older version of the package
+ * counts as missing: create-ocp-factory.ts then recovers that live factory (it matches across package versions) and
+ * records the current template ID, rather than creating a second factory with the same `factory_id`.
+ *
+ * Networks default to DevNet: MainNet is out of scope for OpenCapTable-v35 (ADR-040). `--networks devnet,mainnet`
+ * restores the MainNet check once a MainNet rollout is decided.
+ *
+ * Usage: tsx scripts/detect-factory-need.ts --package ocp [--networks devnet[,mainnet]]
  */
 
 import { getBackedUpDarPath, getFreshDarPath } from '@fairmint/canton-dev-tools/daml';
@@ -10,15 +19,16 @@ import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import { getPackage, parsePackageArg } from './packages';
-import type { ContractNetwork } from './types';
+import { isContractNetwork, type ContractNetwork } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
 const FACTORY_JSON_PATH = path.join(ROOT_DIR, 'generated', 'ocp-factory-contract-id.json');
-const NETWORKS = ['devnet', 'mainnet'] as const satisfies readonly ContractNetwork[];
+const DEFAULT_NETWORKS: readonly ContractNetwork[] = ['devnet'];
 
 interface FactoryEntry {
-  ocpFactoryContractId: string;
   templateId: string;
+  system_operator: string;
+  factory_id: string;
   packageName?: string;
   packageVersion?: string;
   sourceDir?: string;
@@ -33,10 +43,27 @@ interface FactoryJson {
 interface NetworkResult {
   exists: boolean;
   match_reason: 'metadata_and_template_package_id' | 'template_package_id' | null;
-  ocp_factory_contract_id?: string;
   template_id?: string;
+  system_operator?: string;
+  factory_id?: string;
   package_name?: string;
   package_version?: string;
+}
+
+/** Parse `--networks devnet,mainnet` (default: DevNet only). */
+export function parseNetworksArg(args: string[] = process.argv.slice(2)): ContractNetwork[] {
+  const idx = args.indexOf('--networks');
+  if (idx === -1) {
+    return [...DEFAULT_NETWORKS];
+  }
+  const networks = (args[idx + 1] ?? '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0);
+  if (networks.length === 0 || !networks.every(isContractNetwork)) {
+    throw new Error(`--networks must list devnet and/or mainnet, got ${JSON.stringify(args[idx + 1] ?? '')}`);
+  }
+  return [...new Set(networks)];
 }
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -156,13 +183,14 @@ export function getDarPath(packageName: string, version: string, darName: string
   );
 }
 
-function analyzeNetwork(
-  entry: FactoryEntry | undefined,
+export function analyzeNetwork(
+  entry: Partial<FactoryEntry> | undefined,
   packageName: string,
   version: string,
   packageId: string
 ): NetworkResult {
-  if (!entry) {
+  if (!entry || typeof entry.templateId !== 'string' || !entry.system_operator || !entry.factory_id) {
+    // Absent, or an entry in the old v34 shape (a contract ID, no factory identity).
     return { exists: false, match_reason: null };
   }
 
@@ -177,14 +205,16 @@ function analyzeNetwork(
   return {
     exists: matchReason !== null,
     match_reason: matchReason,
-    ocp_factory_contract_id: entry.ocpFactoryContractId,
     template_id: entry.templateId,
+    system_operator: entry.system_operator,
+    factory_id: entry.factory_id,
     package_name: entry.packageName,
     package_version: entry.packageVersion,
   };
 }
 
 function main(): void {
+  const networks = parseNetworksArg();
   const packageArg = parsePackageArg() ?? 'ocp';
   const pkg = getPackage(packageArg);
   if (!pkg) {
@@ -195,9 +225,9 @@ function main(): void {
   const packageId = inspectDarPackageId(darPath, pkg.name, pkg.version);
   const factoryJson = readJsonFile<FactoryJson>(FACTORY_JSON_PATH) ?? {};
   const factories = Object.fromEntries(
-    NETWORKS.map((network) => [network, analyzeNetwork(factoryJson[network], pkg.name, pkg.version, packageId)])
-  ) as Record<ContractNetwork, NetworkResult>;
-  const missingNetworks = NETWORKS.filter((network) => !factories[network].exists);
+    networks.map((network) => [network, analyzeNetwork(factoryJson[network], pkg.name, pkg.version, packageId)])
+  ) as Partial<Record<ContractNetwork, NetworkResult>>;
+  const missingNetworks = networks.filter((network) => !factories[network]?.exists);
 
   process.stdout.write(
     `${JSON.stringify(
@@ -211,6 +241,7 @@ function main(): void {
         factory_json: path.relative(ROOT_DIR, FACTORY_JSON_PATH),
         needs_factory: missingNetworks.length > 0,
         missing_networks: missingNetworks,
+        networks,
         factory_script: 'npx tsx scripts/create-ocp-factory.ts --network <network>',
         factories,
       },

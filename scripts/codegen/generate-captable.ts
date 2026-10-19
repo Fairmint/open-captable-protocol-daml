@@ -1,12 +1,12 @@
 /**
  * OCF record dispatch generator.
  *
- * Generates `Fairmint/OpenCapTable/OcfRecords.daml`: the `OcfRecordData` and `OcfRecordCid` sums over every
- * OCF record template, and the functions that create, fetch, archive and view any of them. The register's
- * anchor and its writes are hand-written source; only this 51-way dispatch is generated.
+ * Generates `Fairmint/OpenCapTable/OcfRecords.daml`: the `OcfRecordData` and `OcfRecordCid` sums over every OCF record
+ * template, and the functions that create, fetch, archive and view any of them. The register's anchor and its writes
+ * are hand-written source; only this 51-way dispatch is generated.
  *
- * One naming rule, no overrides: each template `X` in `OCF/X.daml` has the fields `context : Context` and
- * `ocf_data : XOcfData`, and its `OcfObject` instance names its object type (`object_type = OcfObjectType...`).
+ * One naming rule, no overrides: each template `X` in `OCF/X.daml` has the fields `context : Context` and `ocf_data :
+ * XOcfData`, and its `OcfObject` instance names its object type (`object_type = OcfObjectType...`).
  *
  * Usage: tsx scripts/codegen/generate-captable.ts
  */
@@ -32,7 +32,10 @@ export interface RecordType {
 /** Reads one OCF module and checks it follows the naming rule. */
 export function parseRecordType(name: string, source: string): RecordType {
   const dataType = `${name}OcfData`;
-  const template = new RegExp(`^template ${name}\\s*\\n\\s*with\\s*\\n\\s*context\\s*:\\s*Context\\s*\\n\\s*ocf_data\\s*:\\s*${dataType}\\s*\\n`, 'm');
+  const template = new RegExp(
+    `^template ${name}\\s*\\n\\s*with\\s*\\n\\s*context\\s*:\\s*Context\\s*\\n\\s*ocf_data\\s*:\\s*${dataType}\\s*\\n`,
+    'm'
+  );
   if (!template.test(source)) {
     throw new Error(`OCF/${name}.daml must declare "template ${name} with context : Context; ocf_data : ${dataType}"`);
   }

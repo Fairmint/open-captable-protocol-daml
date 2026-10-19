@@ -1,8 +1,16 @@
 #!/usr/bin/env node
 /**
- * Create the OcpFactory contract on ledger and record IDs in generated/ocp-factory-contract-id.json.
+ * Create the OpenCapTable OcpFactory on ledger and record its identity in generated/ocp-factory-contract-id.json.
  *
- * Usage: tsx scripts/create-ocp-factory.ts --network <devnet|mainnet>
+ * The v35 factory is consumed by each `OcpFactory_AuthorizeIssuer` (it recreates itself with the next cap table
+ * number), so a contract ID goes stale after the first authorization. The JSON records the factory's identity instead:
+ * its `templateId` and the `system_operator` and `factory_id` it was created with. Consumers find the live contract
+ * with an active-contracts query for that template, filtered on both fields; this script does the same to recover a
+ * factory that already exists instead of creating a second one.
+ *
+ * MainNet is out of scope for OpenCapTable-v35 (ADR-040): `--network mainnet` also needs `--allow-mainnet`.
+ *
+ * Usage: tsx scripts/create-ocp-factory.ts --network devnet [--factory-id <id>]
  */
 
 import { extractEventsFromTransaction } from '@fairmint/canton-node-sdk';
@@ -11,21 +19,24 @@ import * as path from 'path';
 import { getDarPath, inspectDarPackageId } from './detect-factory-need';
 import { buildTemplateId, requireNetwork, requirePackageConfig } from './packages';
 import { OCP_FACTORY_LEDGER_PROVIDERS } from './providers';
+import type { ContractNetwork } from './types';
 import { createLedgerJsonApiClient } from './utils';
 
-interface ContractIdData {
-  mainnet?: ContractIdEntry;
-  devnet?: ContractIdEntry;
-}
+export const OCP_FACTORY_MODULE = 'Fairmint.OpenCapTable.OcpFactory';
+export const OCP_FACTORY_TEMPLATE = 'OcpFactory';
 
-interface ContractIdEntry {
-  ocpFactoryContractId: string;
+/** One network's factory identity. `system_operator` and `factory_id` are the contract's own fields. */
+export interface FactoryIdentity {
   templateId: string;
+  system_operator: string;
+  factory_id: string;
   packageName?: string;
   packageVersion?: string;
   sourceDir?: string;
   updatedAt?: string;
 }
+
+export type FactoryIdentityFile = Partial<Record<ContractNetwork, FactoryIdentity>>;
 
 export interface ActiveFactory {
   contractId: string;
@@ -36,11 +47,50 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
 }
 
-/** Find the one active factory for this exact package and operator, if it already exists. */
+function nonEmptyString(value: unknown): value is string {
+  return typeof value === 'string' && value.trim().length > 0;
+}
+
+/** The factory ID a network gets unless `--factory-id` overrides it: one factory per package major and network. */
+export function defaultFactoryId(packageName: string, network: ContractNetwork): string {
+  return `${packageName}-${network}`;
+}
+
+/** Mirrors the OcpFactory `ensure`: non-empty and no ':' (derived IDs are a cap table ID, a colon and a hash). */
+export function assertValidFactoryId(factoryId: string): void {
+  if (factoryId.length === 0 || factoryId.includes(':')) {
+    throw new Error(`Invalid factory_id ${JSON.stringify(factoryId)}: it must be non-empty and contain no ':'`);
+  }
+}
+
+/** Create arguments for a new factory; its first cap table is `<factory_id>-1`. */
+export function factoryCreateArguments(systemOperator: string, factoryId: string): Record<string, string> {
+  assertValidFactoryId(factoryId);
+  // Daml Int64 travels as a JSON string in the Ledger JSON API.
+  return { system_operator: systemOperator, factory_id: factoryId, next_cap_table_number: '1' };
+}
+
+/** `<module>:<entity>` of a `<package id or #name>:<module>:<entity>` template ID. */
+function qualifiedTemplateName(templateId: string): string {
+  const separator = templateId.indexOf(':');
+  return separator === -1 ? templateId : templateId.slice(separator + 1);
+}
+
+/**
+ * Find the one active factory for this template, operator and factory ID, if it exists. Two live factories with one
+ * `factory_id` would issue the same cap table IDs, so more than one match is an error.
+ *
+ * A factory belongs to its package name, not to one package version: after an upgrade the live factory still carries
+ * the template ID of the version that created it (or last recreated it), so the match is on the template's module and
+ * entity, plus `packageName` when the event carries it, never on the exact package ID. Matching the exact ID would miss
+ * that factory and create a second one with the same `factory_id`.
+ */
 export function findActiveFactory(
   response: unknown,
   expectedTemplateId: string,
-  expectedOperatorPartyId: string
+  expectedOperatorPartyId: string,
+  expectedFactoryId: string,
+  expectedPackageName?: string
 ): ActiveFactory | null {
   if (!Array.isArray(response)) {
     return null;
@@ -55,13 +105,16 @@ export function findActiveFactory(
     if (!isRecord(activeContract)) continue;
     const { createdEvent } = activeContract;
     if (!isRecord(createdEvent)) continue;
-    const { createArgument, contractId, templateId } = createdEvent;
+    const { createArgument, contractId, templateId, packageName } = createdEvent;
     if (!isRecord(createArgument)) continue;
 
     if (
       typeof contractId === 'string' &&
-      templateId === expectedTemplateId &&
-      createArgument.system_operator === expectedOperatorPartyId
+      typeof templateId === 'string' &&
+      qualifiedTemplateName(templateId) === qualifiedTemplateName(expectedTemplateId) &&
+      (expectedPackageName === undefined || packageName === undefined || packageName === expectedPackageName) &&
+      createArgument.system_operator === expectedOperatorPartyId &&
+      createArgument.factory_id === expectedFactoryId
     ) {
       matches.push({ contractId, templateId });
     }
@@ -69,21 +122,43 @@ export function findActiveFactory(
 
   if (matches.length > 1) {
     throw new Error(
-      `Found ${matches.length} active OcpFactory contracts for ${expectedTemplateId} and ${expectedOperatorPartyId}; refusing to choose one.`
+      `Found ${matches.length} active OcpFactory contracts for ${expectedTemplateId}, ${expectedOperatorPartyId} and factory_id ${expectedFactoryId}; refusing to choose one.`
     );
   }
   return matches[0] ?? null;
 }
 
-function loadExistingData(filePath: string): ContractIdData {
+/** Whether a recorded entry has the v35 identity shape (an old v34 entry, which records a contract ID, does not). */
+export function isFactoryIdentity(value: unknown): value is FactoryIdentity {
+  if (!isRecord(value)) {
+    return false;
+  }
+  return nonEmptyString(value.templateId) && nonEmptyString(value.system_operator) && nonEmptyString(value.factory_id);
+}
+
+/** Records `identity` for `network`, keeping other networks' entries only if they are v35 identities. */
+export function withFactoryIdentity(
+  existing: unknown,
+  network: ContractNetwork,
+  identity: FactoryIdentity
+): FactoryIdentityFile {
+  const data: FactoryIdentityFile = {};
+  if (isRecord(existing)) {
+    for (const key of ['devnet', 'mainnet'] as const) {
+      const entry = existing[key];
+      if (key !== network && isFactoryIdentity(entry)) {
+        data[key] = entry;
+      }
+    }
+  }
+  data[network] = identity;
+  return data;
+}
+
+function loadExistingData(filePath: string): unknown {
   try {
     if (fs.existsSync(filePath)) {
-      const data = JSON.parse(fs.readFileSync(filePath, 'utf8')) as Record<string, unknown>;
-      const { mainnet, devnet } = data;
-      return {
-        ...(isNetworkEntry(mainnet) ? { mainnet } : {}),
-        ...(isNetworkEntry(devnet) ? { devnet } : {}),
-      };
+      return JSON.parse(fs.readFileSync(filePath, 'utf8')) as unknown;
     }
   } catch {
     console.warn('⚠️  Could not read existing file, starting fresh');
@@ -91,44 +166,56 @@ function loadExistingData(filePath: string): ContractIdData {
   return {};
 }
 
-function isNetworkEntry(value: unknown): value is ContractIdEntry {
-  if (value === null || typeof value !== 'object') {
-    return false;
-  }
-  const o = value as Record<string, unknown>;
-  const cid = o.ocpFactoryContractId;
-  const tid = o.templateId;
-  if (typeof cid !== 'string' || typeof tid !== 'string') {
-    return false;
-  }
-  return cid.trim().length > 0 && tid.trim().length > 0;
+function parseFactoryIdArg(args: string[] = process.argv.slice(2)): string | undefined {
+  const idx = args.indexOf('--factory-id');
+  return idx === -1 ? undefined : args[idx + 1];
 }
 
 async function main() {
   const network = requireNetwork('create-ocp-factory.ts');
+  if (network === 'mainnet' && !process.argv.includes('--allow-mainnet')) {
+    throw new Error(
+      'OpenCapTable-v35 targets DevNet only (ADR-040: MainNet is out of scope). Pass --allow-mainnet once a MainNet rollout is decided.'
+    );
+  }
   const pkg = requirePackageConfig('ocp');
+  const factoryId = parseFactoryIdArg() ?? defaultFactoryId(pkg.name, network);
+  assertValidFactoryId(factoryId);
 
   console.log(`\n🔨 Creating OcpFactory on ${network}\n`);
 
   const darPath = getDarPath(pkg.name, pkg.version, pkg.darName, pkg.buildDir);
   const packageId = inspectDarPackageId(darPath, pkg.name, pkg.version);
-  const templateId = `${packageId}:Fairmint.OpenCapTable.OcpFactory:OcpFactory`;
-  const templateQuery = buildTemplateId('ocp', 'Fairmint.OpenCapTable.OcpFactory', 'OcpFactory');
-  console.log(`  Template: ${templateId}`);
+  const templateId = `${packageId}:${OCP_FACTORY_MODULE}:${OCP_FACTORY_TEMPLATE}`;
+  const templateQuery = buildTemplateId('ocp', OCP_FACTORY_MODULE, OCP_FACTORY_TEMPLATE);
+  console.log(`  Template:   ${templateId}`);
+  console.log(`  Factory ID: ${factoryId}`);
 
   const [provider] = OCP_FACTORY_LEDGER_PROVIDERS;
   const client = createLedgerJsonApiClient(network, provider);
   const operatorPartyId = client.getPartyId();
-  console.log(`  Provider: ${provider}`);
-  console.log(`  Operator: ${operatorPartyId}`);
+  console.log(`  Provider:   ${provider}`);
+  console.log(`  Operator:   ${operatorPartyId}`);
+
+  const identity: FactoryIdentity = {
+    templateId,
+    system_operator: operatorPartyId,
+    factory_id: factoryId,
+    packageName: pkg.name,
+    packageVersion: pkg.version,
+    sourceDir: pkg.sourceDir,
+    updatedAt: new Date().toISOString(),
+  };
 
   const activeFactory = findActiveFactory(
     await client.getActiveContracts({ parties: [operatorPartyId], templateIds: [templateQuery] }),
     templateId,
-    operatorPartyId
+    operatorPartyId,
+    factoryId,
+    pkg.name
   );
   if (activeFactory) {
-    saveFactory(network, activeFactory, outputPathForJson(), pkg, 'Recovered');
+    saveFactory(network, identity, activeFactory.contractId, 'Recovered');
     return;
   }
 
@@ -137,56 +224,39 @@ async function main() {
       {
         CreateCommand: {
           templateId,
-          createArguments: { system_operator: operatorPartyId },
+          createArguments: factoryCreateArguments(operatorPartyId, factoryId),
         },
       },
     ],
   });
 
-  finishCreate(network, response, outputPathForJson(), pkg);
-}
-
-const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
-
-function finishCreate(
-  network: 'devnet' | 'mainnet',
-  response: unknown,
-  outputPath: string,
-  pkg: { name: string; version: string; sourceDir: string }
-): void {
   const { created } = extractEventsFromTransaction(response);
   if (created.length !== 1) {
     throw new Error(`Expected exactly 1 CreatedEvent, got ${created.length}`);
   }
-
-  const { contractId, templateId: resultTemplateId } = created[0];
-
-  saveFactory(network, { contractId, templateId: resultTemplateId }, outputPath, pkg, 'Created');
+  saveFactory(network, { ...identity, templateId: created[0].templateId }, created[0].contractId, 'Created');
 }
 
+const outputPathForJson = (): string => path.join(__dirname, '..', 'generated', 'ocp-factory-contract-id.json');
+
 function saveFactory(
-  network: 'devnet' | 'mainnet',
-  factory: ActiveFactory,
-  outputPath: string,
-  pkg: { name: string; version: string; sourceDir: string },
+  network: ContractNetwork,
+  identity: FactoryIdentity,
+  contractId: string,
   action: 'Created' | 'Recovered'
 ): void {
-  const data = loadExistingData(outputPath);
-  data[network] = {
-    ocpFactoryContractId: factory.contractId,
-    templateId: factory.templateId,
-    packageName: pkg.name,
-    packageVersion: pkg.version,
-    sourceDir: pkg.sourceDir,
-    updatedAt: new Date().toISOString(),
-  };
-  fs.writeFileSync(outputPath, JSON.stringify(data, null, 2));
+  const outputPath = outputPathForJson();
+  const data = withFactoryIdentity(loadExistingData(outputPath), network, identity);
+  fs.writeFileSync(outputPath, `${JSON.stringify(data, null, 2)}\n`);
 
-  console.log(`\n✅ ${action}: ${factory.contractId}`);
+  console.log(
+    `\n✅ ${action}: ${identity.factory_id} (current contract ${contractId}; it changes with each authorization)`
+  );
   console.log(`   Saved to: ${path.relative(process.cwd(), outputPath)}`);
-
-  if (data.mainnet) console.log(`   Mainnet:  ${data.mainnet.ocpFactoryContractId}`);
-  if (data.devnet) console.log(`   Devnet:   ${data.devnet.ocpFactoryContractId}`);
+  for (const key of ['devnet', 'mainnet'] as const) {
+    const entry = data[key];
+    if (entry) console.log(`   ${key.padEnd(8)} ${entry.factory_id} by ${entry.system_operator}`);
+  }
   console.log('');
 }
 

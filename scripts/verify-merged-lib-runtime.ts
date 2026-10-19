@@ -12,21 +12,40 @@ import { getErrorMessage } from './types';
 const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
-/** Paths that merged lib must include for Splice/Amulet (OpenCapTable-v34). */
+/**
+ * Paths the merged lib must include: the OpenCapTable-v35 entry points, the hold pair, the sibling packages bundled by
+ * scripts/bundle-local-packages.ts, and the stdlib `DA.Set` that `OcfIdShard.claimed` uses.
+ */
 const REQUIRED_RELATIVE_FILES = [
   'Fairmint/OpenCapTable/CapTable/module.js',
   'Fairmint/OpenCapTable/OcpFactory/module.js',
-  'Splice/Api/Token/MetadataV1/module.js',
-  'Splice/Api/Token/HoldingV1/module.js',
+  'Fairmint/OpenCapTable/IssuerAuthorization/module.js',
+  'Fairmint/OpenCapTable/State/module.js',
+  'Fairmint/OpenCapTable/OCF/StockHold/module.js',
+  'Fairmint/OpenCapTable/OCF/StockHoldCancellation/module.js',
+  'Fairmint/OpenCapTableApi/ObjectType/module.js',
+  'Fairmint/OpenCapTableApi/OcfObject/module.js',
+  'Fairmint/OpenCapTableApi/RegisterContract/module.js',
+  'Fairmint/OpenCapTableDeliveryProof/DeliveryProof/module.js',
+  '__bundled__/OpenCapTableApi-v01/index.js',
+  '__bundled__/OpenCapTableDeliveryProof-v01/index.js',
   'DA/Set/Types/module.js',
   'openCapTableDarPath.js',
 ];
+
+/** V35 has no Splice dependency; a `lib/Splice` tree means a stale bundle config. */
+const FORBIDDEN_RELATIVE_DIRS = ['Splice'];
 
 function assertRequiredFiles(): void {
   for (const rel of REQUIRED_RELATIVE_FILES) {
     const abs = path.join(LIB_DIR, rel);
     if (!fs.existsSync(abs)) {
       throw new Error(`Missing required file in merged lib: ${rel}`);
+    }
+  }
+  for (const rel of FORBIDDEN_RELATIVE_DIRS) {
+    if (fs.existsSync(path.join(LIB_DIR, rel))) {
+      throw new Error(`Unexpected lib/${rel} in merged lib (OpenCapTable-v35 has no ${rel} dependency)`);
     }
   }
 }
@@ -57,7 +76,15 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (!idx.OCP_TEMPLATES || !idx.OCP_TEMPLATES.capTable) process.exit(7);
     if (!idx.OCP_TEMPLATES.issuerAuthorization) process.exit(11);
     if (!idx.OCP_TEMPLATES.ocpFactory) process.exit(12);
+    if (!idx.OCP_TEMPLATES.stockSecurity || !idx.OCP_TEMPLATES.stockClassEpoch || !idx.OCP_TEMPLATES.ocfIdShard) process.exit(13);
+    if (!idx.OCP_INTERFACES || !idx.OCP_INTERFACES.ocfObject || !idx.OCP_INTERFACES.registerContract) process.exit(14);
+    if (!idx.OCP_DELIVERY_PROOF_TEMPLATES || !idx.OCP_DELIVERY_PROOF_TEMPLATES.deliveryProof) process.exit(15);
     if (!idx.Fairmint || !idx.Fairmint.OpenCapTable) process.exit(8);
+    if (!idx.Fairmint.OpenCapTableApi || !idx.Fairmint.OpenCapTableDeliveryProof) process.exit(16);
+    // The bundled sibling and the root namespace must be the same module objects, or decoders would diverge.
+    const api = require('./lib/__bundled__/OpenCapTableApi-v01');
+    if (api.Fairmint.OpenCapTableApi !== idx.Fairmint.OpenCapTableApi) process.exit(17);
+    if (!/^[0-9a-f]{64}$/.test(api.packageId)) process.exit(18);
     if (typeof idx.Nft !== 'undefined') process.exit(9);
     if (typeof idx.CantonPayments !== 'undefined') process.exit(10);
   `;

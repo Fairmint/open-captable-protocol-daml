@@ -4,8 +4,10 @@
  *
  * After Canton 3.4, DAML codegen produces imports like: require('daml.js/ghc-stdlib-DA-Internal-Template-1.0.0')
  *
- * These must be replaced with relative paths by `canton-dev-tools bundle-dependencies` before the package is published,
- * otherwise consumers can't use it.
+ * These must be replaced with relative paths before the package is published, otherwise consumers can't use it:
+ * `canton-dev-tools bundle-dependencies` bundles the stdlib packages, `scripts/bundle-local-packages.ts` bundles this
+ * repository's sibling packages (`daml.js/OpenCapTableApi-v01-…`, `daml.js/OpenCapTableDeliveryProof-v01-…`), and
+ * `canton-dev-tools fix-splice-refs --target lib` rewrites the imports onto them.
  *
  * This script catches the issue in CI before publish.
  */
@@ -88,9 +90,9 @@ function main(): void {
         console.error('');
       }
       console.error(
-        'These imports should have been replaced with relative paths by canton-dev-tools bundle-dependencies.'
+        'These imports should have been replaced with relative paths by canton-dev-tools bundle-dependencies (stdlib) or scripts/bundle-local-packages.ts (sibling packages).'
       );
-      console.error('Check daml-js-bundle.json presets/pins and re-run npm run codegen.');
+      console.error('Check daml-js-bundle.json presets and multi-package.yaml, then re-run npm run codegen.');
       process.exit(1);
     }
 
