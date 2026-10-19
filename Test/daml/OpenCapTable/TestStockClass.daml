@@ -1,0 +1,330 @@
+-- Stock classes and their class-level records, ported from v34's TestStockClass, TestStockClassAuthorizedSharesAdjustment, TestStockClassConversionRatioAdjustment and TestStockClassConversionRightReferences: the class and its epoch, the reshaped (ratio-only) conversion right, every validator branch, and the references to classes.
+module OpenCapTable.TestStockClass where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (mapA_)
+import DA.List (sort)
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..), OcfStockClassConversionRight(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfAuthorizedShares(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfStockClassType(..))
+import Fairmint.OpenCapTable.OCF.StockClass
+import Fairmint.OpenCapTable.OCF.StockClassAuthorizedSharesAdjustment
+import Fairmint.OpenCapTable.OCF.StockClassConversionRatioAdjustment
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+ratioMechanism : Decimal -> Decimal -> OcfRoundingType -> OcfRatioConversionMechanism
+ratioMechanism price numerator rounding = OcfRatioConversionMechanism with
+  conversion_price = usd price
+  ratio = OcfRatio with numerator; denominator = 1.0
+  rounding_type = rounding
+
+-- | A 1:1 ratio conversion right into `target` (v35's stock class right carries only a ratio
+-- mechanism and no trigger).
+ratioRightTo : Optional Text -> OcfStockClassConversionRight
+ratioRightTo target = OcfStockClassConversionRight with
+  conversion_mechanism = ratioMechanism 1.0 1.0 OcfRoundingTypeNormal
+  converts_to_future_round = None
+  converts_to_stock_class_id = target
+
+-- | A preferred class converting into `target`.
+preferredInto : Text -> Text -> StockClassOcfData
+preferredInto id target = (stockClass id) with
+  name = "Preferred " <> id
+  class_type = OcfStockClassTypePreferred
+  default_id_prefix = "PS-"
+  seniority = 2.0
+  conversion_rights = [ratioRightTo (Some target)]
+
+-- | v34's Series A preferred with every optional field populated.
+fullPreferred : Text -> Text -> StockClassOcfData
+fullPreferred id target = (preferredInto id target) with
+  initial_shares_authorized = OcfInitialSharesNumeric 2000000.0
+  board_approval_date = Some (D.date 2024 D.Jan 1)
+  stockholder_approval_date = Some (D.date 2024 D.Jan 15)
+  par_value = Some (OcfMonetary with amount = 0.0001; currency = "USD")
+  price_per_share = Some (usd 1.0)
+  liquidation_preference_multiple = Some 1.0
+  participation_cap_multiple = Some 3.0
+  comments = ["Preferred terms"]
+
+classAdjustment : Text -> Text -> Decimal -> StockClassAuthorizedSharesAdjustmentOcfData
+classAdjustment id cls shares = StockClassAuthorizedSharesAdjustmentOcfData with
+  id
+  date = D.date 2024 D.Jan 1
+  new_shares_authorized = shares
+  stock_class_id = cls
+  comments = []
+  board_approval_date = None
+  stockholder_approval_date = None
+
+ratioAdjustment : Text -> Text -> OcfRatioConversionMechanism -> StockClassConversionRatioAdjustmentOcfData
+ratioAdjustment id cls m = StockClassConversionRatioAdjustmentOcfData with
+  id
+  date = D.date 2024 D.Mar 15
+  new_ratio_conversion_mechanism = m
+  stock_class_id = cls
+  comments = []
+
+-- | Common class SC_COMMON, Series A preferred SC_SERIES_A converting into it, and stakeholder SH-1.
+classRecords : [OcfRecordData]
+classRecords =
+  [ OcfRecordDataStockClass (stockClass "SC_COMMON")
+  , OcfRecordDataStockClass (preferredInto "SC_SERIES_A" "SC_COMMON")
+  , OcfRecordDataStakeholder (stakeholderData "SH-1")
+  ]
+
+-- =============================================================================
+-- STOCK CLASS
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStockClass(BuiltIn): the class is written with its epoch.
+test_stock_class_create_edit_delete : Script ()
+test_stock_class_create_edit_delete = do
+  env <- setupEnv
+  let common = stockClass "SC_COMMON"
+  r <- applyRecords env [OcfRecordDataStockClass common]
+  Map.keys r.records === ["SC_COMMON"]
+  Map.keys r.epochs === ["SC_COMMON"]
+  expectRecord env (OcfRecordDataStockClass common)
+  (_, e) <- epochOf env "SC_COMMON"
+  e === StockClassEpoch with context = env.ctx; stock_class_id = "SC_COMMON"; frozen = False; splits = []
+  -- An edit replaces the record and leaves the epoch alone.
+  let renamed = common with name = "Class A Common"; votes_per_share = 10.0
+  e' <- restateOps env [RestateEdit (OcfRecordDataStockClass renamed)]
+  Map.keys e'.epochs === []
+  expectRecord env (OcfRecordDataStockClass renamed)
+  (_, e2) <- epochOf env "SC_COMMON"
+  e2 === e
+  -- A delete archives both and releases the ID.
+  _ <- restateOps env [RestateDelete "SC_COMMON"]
+  expectNoRecord env "SC_COMMON"
+  epochsOf env >>= (=== []) . map snd
+  _ <- applyRecords env [OcfRecordDataStockClass common]
+  expectRecord env (OcfRecordDataStockClass common)
+
+-- A class frozen for a split is never deleted (one with recorded splits neither: TestRestate).
+test_stock_class_frozen_class_is_not_deleted : Script ()
+test_stock_class_frozen_class_is_not_deleted = do
+  env <- bookWith classRecords
+  (cid, _) <- epochOf env "SC_COMMON"
+  frozen <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid
+  restateOpsFails env "stock class SC_COMMON is frozen for a split" [RestateDelete "SC_COMMON"]
+  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = frozen
+  _ <- restateOps env [RestateDelete "SC_COMMON"]
+  expectNoRecord env "SC_COMMON"
+
+-- v34 testCreateStockClass_OptionalsSome, with v35's ratio-only conversion right.
+test_stock_class_all_optional_fields : Script ()
+test_stock_class_all_optional_fields = do
+  env <- setupEnv
+  let common = stockClass "SC_COMMON"
+      preferred = fullPreferred "SC_PREFERRED" "SC_COMMON"
+  assertMsg "the validator refused the preferred class" (validateStockClassOcfData preferred)
+  _ <- applyRecords env [OcfRecordDataStockClass common, OcfRecordDataStockClass preferred]
+  expectRecords env [OcfRecordDataStockClass common, OcfRecordDataStockClass preferred]
+  epochIds <- sort . map ((.stock_class_id) . snd) <$> epochsOf env
+  epochIds === ["SC_COMMON", "SC_PREFERRED"]
+
+test_stock_class_validation : Script ()
+test_stock_class_validation = do
+  env <- bookWith classRecords
+  let no = refuse env validateStockClassOcfData OcfRecordDataStockClass
+      yes = accept env validateStockClassOcfData OcfRecordDataStockClass
+      base = fullPreferred "SC_V" "SC_COMMON"
+      right = ratioRightTo (Some "SC_COMMON")
+  no base with name = ""
+  no base with default_id_prefix = ""
+  no base with initial_shares_authorized = OcfInitialSharesNumeric (-1.0)
+  no base with votes_per_share = -1.0
+  no base with seniority = -0.5
+  no base with par_value = Some (OcfMonetary with amount = 0.0001; currency = "US")
+  no base with par_value = Some (OcfMonetary with amount = -0.0001; currency = "USD")
+  no base with price_per_share = Some (OcfMonetary with amount = 1.0; currency = "")
+  no base with liquidation_preference_multiple = Some (-1.0)
+  no base with participation_cap_multiple = Some (-1.0)
+  no base with comments = [""]
+  -- The conversion right: a valid ratio mechanism and a non-empty target when one is named.
+  no base with conversion_rights = [(right with conversion_mechanism = ratioMechanism 1.0 0.0 OcfRoundingTypeNormal)]
+  no base with conversion_rights = [(right with conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with ratio = (OcfRatio with numerator = 1.0; denominator = 0.0)))]
+  no base with conversion_rights = [(right with conversion_mechanism = ratioMechanism (-1.0) 1.0 OcfRoundingTypeNormal)]
+  no base with conversion_rights = [(right with conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with conversion_price = (OcfMonetary with amount = 1.0; currency = "DOLLARS")))]
+  no base with conversion_rights = [right, (right with converts_to_stock_class_id = Some "")]
+  -- The boundaries that pass.
+  yes base with
+    id = "SC_V1"
+    initial_shares_authorized = OcfInitialSharesNumeric 0.0
+    votes_per_share = 0.0
+    seniority = 0.0
+    liquidation_preference_multiple = Some 0.0
+    participation_cap_multiple = Some 0.0
+    par_value = Some (usd 0.0)
+  yes base with id = "SC_V2"; initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesUnlimited
+  yes base with id = "SC_V3"; initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesNotApplicable
+  -- Several rights, every rounding type, and a right into a future round with no target class.
+  yes base with
+    id = "SC_V4"
+    conversion_rights =
+      [ (right with conversion_mechanism = ratioMechanism 0.0 2.5 OcfRoundingTypeCeiling)
+      , (right with conversion_mechanism = ratioMechanism 2.0 0.5 OcfRoundingTypeFloor)
+      , OcfStockClassConversionRight with
+          conversion_mechanism = ratioMechanism 1.0 1.0 OcfRoundingTypeNormal
+          converts_to_future_round = Some True
+          converts_to_stock_class_id = None
+      ]
+  -- An empty ID is never claimed.
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockClass (base with id = "")]
+
+-- v34 testStockClassConversionRight* (TestStockClassConversionRightReferences).
+test_stock_class_conversion_right_references : Script ()
+test_stock_class_conversion_right_references = do
+  env <- bookWith classRecords
+  -- The target may come later in the same batch.
+  let converts = preferredInto "SC_PREFERRED_CONVERTS" "SC_COMMON_TARGET"
+  _ <- applyRecords env [OcfRecordDataStockClass converts, OcfRecordDataStockClass (stockClass "SC_COMMON_TARGET")]
+  expectRecords env [OcfRecordDataStockClass converts, OcfRecordDataStockClass (stockClass "SC_COMMON_TARGET")]
+  -- A missing target, or a target that is not a stock class, is refused.
+  applyRecordsFails env "Stock class SC_PREFERRED_MISSING conversion target not found: SC_MISSING_TARGET"
+    [OcfRecordDataStockClass (preferredInto "SC_PREFERRED_MISSING" "SC_MISSING_TARGET")]
+  applyRecordsFails env "Stock class SC_PREFERRED_SH conversion target SH-1 is a OcfObjectTypeStakeholder"
+    [OcfRecordDataStockClass (preferredInto "SC_PREFERRED_SH" "SH-1")]
+  -- Every right is checked, not only the first.
+  applyRecordsFails env "conversion target not found: SC_MISSING_SECOND"
+    [OcfRecordDataStockClass ((preferredInto "SC_PREFERRED_TWO" "SC_COMMON") with
+       conversion_rights = [ratioRightTo (Some "SC_COMMON"), ratioRightTo (Some "SC_MISSING_SECOND")])]
+  -- A right with no target class makes no reference.
+  let futureRound = (stockClass "SC_FUTURE") with conversion_rights = [(ratioRightTo None) with converts_to_future_round = Some True]
+  _ <- applyRecords env [OcfRecordDataStockClass futureRound]
+  expectRecord env (OcfRecordDataStockClass futureRound)
+  -- An edit's new target is checked: missing refused, existing accepted.
+  let plain = stockClass "SC_PREFERRED_EDIT_TARGET"
+  _ <- applyRecords env [OcfRecordDataStockClass plain]
+  restateOpsFails env "Stock class SC_PREFERRED_EDIT_TARGET conversion target not found: SC_MISSING_EDIT_TARGET"
+    [RestateEdit (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_MISSING_EDIT_TARGET"))]
+  expectRecord env (OcfRecordDataStockClass plain)
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_COMMON"))]
+  expectRecord env (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_COMMON"))
+
+-- v34 refused deleting a class that another record still references (a conversion target, a ratio
+-- adjustment's class). v35 checks references when they are written, not when the target is later
+-- edited or deleted: the SDK refuses an orphaning delete off the ledger.
+test_stock_class_delete_is_not_rechecked_on_the_ledger : Script ()
+test_stock_class_delete_is_not_rechecked_on_the_ledger = do
+  env <- bookWith classRecords
+  _ <- applyRecords env [OcfRecordDataStockClassConversionRatioAdjustment (ratioAdjustment "TX_RATIO" "SC_SERIES_A" (ratioMechanism 0.75 1.333 OcfRoundingTypeFloor))]
+  _ <- restateOps env [RestateDelete "SC_COMMON", RestateDelete "SC_SERIES_A"]
+  expectNoRecord env "SC_COMMON"
+  expectNoRecord env "SC_SERIES_A"
+  hasRecord env "TX_RATIO" >>= (=== True)
+
+-- =============================================================================
+-- AUTHORIZED SHARES ADJUSTMENT
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStockClassAuthorizedSharesAdjustment(BuiltIn).
+test_stock_class_authorized_shares_adjustment : Script ()
+test_stock_class_authorized_shares_adjustment = do
+  env <- bookWith classRecords
+  let ok = accept env validateStockClassAuthorizedSharesAdjustmentOcfData OcfRecordDataStockClassAuthorizedSharesAdjustment
+      plain = classAdjustment "TX_SC_AUTH_SHARES_ADJ_1" "SC_COMMON" 2000000.0
+      full = (classAdjustment "TX_SC_AUTH_SHARES_ADJ_2" "SC_SERIES_A" 1500000.0) with
+        date = D.date 2024 D.Jan 2
+        board_approval_date = Some (D.date 2024 D.Jan 3)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 5)
+        comments = ["Authorized change"]
+  ok plain
+  ok full
+  ok (classAdjustment "TX_SC_AUTH_SHARES_ADJ_0" "SC_COMMON" 0.0)
+  let edited = full with new_shares_authorized = 1750000.0
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockClassAuthorizedSharesAdjustment edited), RestateDelete "TX_SC_AUTH_SHARES_ADJ_1"]
+  expectRecord env (OcfRecordDataStockClassAuthorizedSharesAdjustment edited)
+  expectNoRecord env "TX_SC_AUTH_SHARES_ADJ_1"
+
+test_stock_class_authorized_shares_adjustment_validation_and_reference : Script ()
+test_stock_class_authorized_shares_adjustment_validation_and_reference = do
+  env <- bookWith classRecords
+  let no = refuse env validateStockClassAuthorizedSharesAdjustmentOcfData OcfRecordDataStockClassAuthorizedSharesAdjustment
+      base = classAdjustment "TX_SC_BAD" "SC_COMMON" 100.0
+      write = OcfRecordDataStockClassAuthorizedSharesAdjustment
+  no base with new_shares_authorized = -1.0
+  no base with stock_class_id = ""
+  no base with comments = [""]
+  applyRecordsFails env "Stock class authorized shares adjustment not found: SC_NONE" [write (base with stock_class_id = "SC_NONE")]
+  applyRecordsFails env "Stock class authorized shares adjustment SH-1 is a OcfObjectTypeStakeholder" [write (base with stock_class_id = "SH-1")]
+  _ <- applyRecords env [write (base with stock_class_id = "SC_LATER"), OcfRecordDataStockClass (stockClass "SC_LATER")]
+  expectRecord env (write (base with stock_class_id = "SC_LATER"))
+  restateOpsFails env "Stock class authorized shares adjustment not found: SC_NONE" [RestateEdit (write (base with stock_class_id = "SC_NONE"))]
+
+-- =============================================================================
+-- CONVERSION RATIO ADJUSTMENT
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStockClassConversionRatioAdjustment(BuiltIn): anti-dilution adjustments.
+test_stock_class_conversion_ratio_adjustment : Script ()
+test_stock_class_conversion_ratio_adjustment = do
+  env <- bookWith classRecords
+  let seriesB = (fullPreferred "SC_SERIES_B" "SC_COMMON") with
+        initial_shares_authorized = OcfInitialSharesNumeric 5000000.0
+        seniority = 3.0
+        price_per_share = Some (usd 2.5)
+      weighted = (ratioAdjustment "TX_CONV_RATIO_ADJ_1" "SC_SERIES_A" (ratioMechanism 0.75 1.333 OcfRoundingTypeFloor)) with
+        comments = ["Down-round triggered broad-based weighted average anti-dilution adjustment"]
+      ratchet = (ratioAdjustment "TX_CONV_RATIO_ADJ_2" "SC_SERIES_B" (ratioMechanism 1.5 1.667 OcfRoundingTypeNormal)) with
+        date = D.date 2024 D.Sep 20
+        comments = ["Full ratchet anti-dilution protection triggered by Series C down-round"]
+  _ <- applyRecords env [OcfRecordDataStockClass seriesB]
+  mapA_ (accept env validateStockClassConversionRatioAdjustmentOcfData OcfRecordDataStockClassConversionRatioAdjustment) [weighted, ratchet]
+  let edited = weighted with new_ratio_conversion_mechanism = ratioMechanism 0.8 1.25 OcfRoundingTypeCeiling
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockClassConversionRatioAdjustment edited), RestateDelete "TX_CONV_RATIO_ADJ_2"]
+  expectRecord env (OcfRecordDataStockClassConversionRatioAdjustment edited)
+  expectNoRecord env "TX_CONV_RATIO_ADJ_2"
+  -- The class itself is unchanged by an adjustment.
+  expectRecord env (OcfRecordDataStockClass (preferredInto "SC_SERIES_A" "SC_COMMON"))
+
+test_stock_class_conversion_ratio_adjustment_validation : Script ()
+test_stock_class_conversion_ratio_adjustment_validation = do
+  env <- bookWith classRecords
+  let no = refuse env validateStockClassConversionRatioAdjustmentOcfData OcfRecordDataStockClassConversionRatioAdjustment
+      base = ratioAdjustment "TX_RATIO_BAD" "SC_SERIES_A" (ratioMechanism 1.0 1.25 OcfRoundingTypeNormal)
+  no base with stock_class_id = ""
+  no base with comments = [""]
+  no base with new_ratio_conversion_mechanism = ratioMechanism 1.0 0.0 OcfRoundingTypeNormal
+  no base with new_ratio_conversion_mechanism = ratioMechanism (-0.01) 1.0 OcfRoundingTypeNormal
+  no base with new_ratio_conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with ratio = (OcfRatio with numerator = 1.0; denominator = -1.0))
+
+-- v34 testStockClassConversionRatioAdjustmentRequiresRatioRight, and the class reference.
+test_stock_class_conversion_ratio_adjustment_needs_a_ratio_right : Script ()
+test_stock_class_conversion_ratio_adjustment_needs_a_ratio_right = do
+  env <- bookWith classRecords
+  let adj cls = OcfRecordDataStockClassConversionRatioAdjustment (ratioAdjustment "TX_RATIO_ADJ" cls (ratioMechanism 1.0 1.25 OcfRoundingTypeNormal))
+  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ targets a stock class without a ratio conversion right: SC_COMMON" [adj "SC_COMMON"]
+  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ target not found: SC_NONE" [adj "SC_NONE"]
+  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ target not found: SH-1" [adj "SH-1"]
+  -- The class and its right may come later in the same batch.
+  _ <- applyRecords env [adj "SC_SERIES_X", OcfRecordDataStockClass (preferredInto "SC_SERIES_X" "SC_COMMON")]
+  expectRecord env (adj "SC_SERIES_X")
+  -- An edit onto a class without a right is refused.
+  restateOpsFails env "without a ratio conversion right: SC_COMMON" [RestateEdit (adj "SC_COMMON")]
+  _ <- restateOps env [RestateEdit (adj "SC_SERIES_A")]
+  expectRecord env (adj "SC_SERIES_A")
+
+-- KNOWN BUG (OCF pattern gap, shared with v34): OCF's CurrencyCode is `^[A-Z]{3}$`, but
+-- validateOcfMonetary checks only the length, so a lowercase currency such as "usd" is accepted
+-- here and in every other monetary field.
+-- test_stock_class_currency_follows_the_ocf_pattern : Script ()
+-- test_stock_class_currency_follows_the_ocf_pattern = do
+--   env <- bookWith classRecords
+--   refuse env validateStockClassOcfData OcfRecordDataStockClass
+--     ((stockClass "SC_LOWER_CCY") with price_per_share = Some (OcfMonetary with amount = 1.0; currency = "usd"))

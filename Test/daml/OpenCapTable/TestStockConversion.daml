@@ -1,0 +1,150 @@
+-- Stock conversions through ApplyStockConversion: a terminal event whose resulting issuances may be in another class (the arithmetic is the writer's), with an optional balance in the source's class, same-class outputs that never vest ahead of the source, and the conversion validator.
+module OpenCapTable.TestStockConversion where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..), validateStockConversionOcfData)
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+issued : Date
+issued = D.date 2023 D.Jan 1
+
+-- | The standard book plus a preferred class CLS-P and SH-A's preferred lot `sec` of `q` shares.
+conversionBook : Text -> Decimal -> Script Env
+conversionBook sec q = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass ((stockClass "CLS-P") with class_type = OcfStockClassTypePreferred; name = "Series A Preferred"; default_id_prefix = "PA-")
+    , OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-P" q issued) with id = "TX_STOCK_ISS_1"; custom_id = "PREF-1"; cost_basis = None)
+    ]
+  pure env
+
+mkConversion : Text -> Text -> Date -> Decimal -> [Text] -> Optional Text -> StockConversionOcfData
+mkConversion id sec d q resulting balance = StockConversionOcfData with
+  id; date = d; security_id = sec; quantity_converted = q; resulting_security_ids = resulting
+  comments = []; balance_security_id = balance
+
+common : Text -> Text -> Date -> Decimal -> StockIssuanceOcfData
+common id sec d q = (issuance sec "SH-A" "CLS-A" q d) with id
+
+preferred : Text -> Text -> Date -> Decimal -> StockIssuanceOcfData
+preferred id sec d q = (issuance sec "SH-A" "CLS-P" q d) with id
+
+convert : StockConversionOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> ApplyOperation
+convert c rs b = ApplyStockConversion with conversion = c; resulting = rs; balance = b
+
+-- Typical scenario: an IPO triggers the automatic conversion of preferred into common.
+test_stock_conversion_preferred_to_common : Script ()
+test_stock_conversion_preferred_to_common = do
+  env <- conversionBook "SSEC-PREF-001" 100000.0
+  let d = D.date 2025 D.Dec 15
+      c = (mkConversion "TX_STOCK_CONVERSION_1" "SSEC-PREF-001" d 100000.0 ["SSEC-COMMON-001"] None) with
+        comments = ["Automatic conversion of Series A Preferred to Common upon IPO"]
+      r = common "TX_STOCK_CONVERSION_1_RESULT" "SSEC-COMMON-001" d 100000.0
+  _ <- applyOps env [convert c [r] None]
+  expectRecord env (OcfRecordDataStockConversion c)
+  expectRecord env (OcfRecordDataStockIssuance r)
+  hasState env "SSEC-PREF-001" >>= (=== False)
+  s <- stateOf env "SSEC-COMMON-001"
+  s.stock_class_id === "CLS-A"
+  s.quantity === 100000.0
+  s.last_event_date === d
+
+-- An elective partial conversion keeps the rest in the source's class.
+test_stock_conversion_partial_with_balance : Script ()
+test_stock_conversion_partial_with_balance = do
+  env <- conversionBook "SSEC-PREF-002" 50000.0
+  let d = D.date 2025 D.Nov 1
+      c = (mkConversion "TX_STOCK_CONVERSION_2" "SSEC-PREF-002" d 30000.0 ["SSEC-COMMON-002"] (Some "SSEC-PREF-002-REMAIN")) with
+        comments = ["Elective partial conversion by investor"]
+      r = common "TX_STOCK_CONVERSION_2_RESULT" "SSEC-COMMON-002" d 30000.0
+      b = preferred "TX_STOCK_CONVERSION_2_BALANCE" "SSEC-PREF-002-REMAIN" d 20000.0
+  -- The balance stays in the source's class.
+  applyOpsFails env "must stay with the source's stakeholder and class" [convert c [r] (Some (b with stock_class_id = "CLS-A"))]
+  applyOpsFails env "needs a balance issuance" [convert c [r] None]
+  _ <- applyOps env [convert c [r] (Some b)]
+  expectRecord env (OcfRecordDataStockConversion c)
+  expectRecord env (OcfRecordDataStockIssuance b)
+  (.quantity) <$> stateOf env "SSEC-COMMON-002" >>= (=== 30000.0)
+  remain <- stateOf env "SSEC-PREF-002-REMAIN"
+  remain.quantity === 20000.0
+  remain.stock_class_id === "CLS-P"
+
+test_stock_conversion_multiple_resulting : Script ()
+test_stock_conversion_multiple_resulting = do
+  env <- conversionBook "SSEC-PREF-003" 200000.0
+  let d = D.date 2025 D.Oct 15
+      c = mkConversion "TX_STOCK_CONVERSION_3" "SSEC-PREF-003" d 200000.0 ["SSEC-COMMON-003A", "SSEC-COMMON-003B"] None
+      ra = common "TX_STOCK_CONVERSION_3_RESULT_A" "SSEC-COMMON-003A" d 100000.0
+      rb = common "TX_STOCK_CONVERSION_3_RESULT_B" "SSEC-COMMON-003B" d 100000.0
+  -- The resulting issuances are the event's resulting securities, in order.
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order" [convert c [rb, ra] None]
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order" [convert c [ra] None]
+  _ <- applyOps env [convert c [ra, rb] None]
+  expectRecord env (OcfRecordDataStockConversion c)
+  (.quantity) <$> stateOf env "SSEC-COMMON-003A" >>= (=== 100000.0)
+  (.quantity) <$> stateOf env "SSEC-COMMON-003B" >>= (=== 100000.0)
+
+test_stock_conversion_overdraw_refused : Script ()
+test_stock_conversion_overdraw_refused = do
+  env <- conversionBook "SSEC-CONVERSION-OVERDRAW" 100.0
+  let d = D.date 2025 D.Oct 15
+  applyOpsFails env "event quantity 101.0 exceeds the 100.0 of security SSEC-CONVERSION-OVERDRAW"
+    [convert (mkConversion "TX_STOCK_CONVERSION_OVERDRAW" "SSEC-CONVERSION-OVERDRAW" d 101.0 ["SSEC-CONVERSION-RESULT"] None) [common "R-1" "SSEC-CONVERSION-RESULT" d 101.0] None]
+  (.quantity) <$> stateOf env "SSEC-CONVERSION-OVERDRAW" >>= (=== 100.0)
+
+-- Same-class outputs never vest ahead of the source; another class's units differ, so outputs
+-- there are the writer's arithmetic.
+test_stock_conversion_vesting_of_outputs : Script ()
+test_stock_conversion_vesting_of_outputs = do
+  env <- standardBook
+  let tranches = [(OcfVesting with amount = 50.0; date = d2024), (OcfVesting with amount = 50.0; date = D.date 2026 D.Jan 1)]
+      d = D.date 2025 D.Jan 1
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockIssuance ((issuance "S-V" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)
+    ]
+  let c = mkConversion "CONV-V" "S-V" d 100.0 ["S-V-C"] None
+  applyOpsFails env "more than the 50.0 their source has vested"
+    [convert c [common "ISS-S-V-C" "S-V-C" d 100.0] None]
+  _ <- applyOps env [convert c [(common "ISS-S-V-C" "S-V-C" d 100.0) with stock_class_id = "CLS-B"] None]
+  s <- stateOf env "S-V-C"
+  s.stock_class_id === "CLS-B"
+  s.vesting === StockVestingNone
+
+test_stock_conversion_validator : Script ()
+test_stock_conversion_validator = do
+  env <- conversionBook "SSEC-PREF" 100.0
+  let d = D.date 2025 D.Oct 15
+      c = mkConversion "CONV-1" "SSEC-PREF" d 100.0 ["SSEC-C"] None
+      r = common "ISS-C" "SSEC-C" d 100.0
+  applyOpsFails env "precondition" [convert (c with comments = [""]) [r] None]
+  -- With no resulting securities the record's ensure refuses the conversion.
+  applyOpsFails env "precondition" [convert (c with resulting_security_ids = []) [] None]
+  applyOpsFails env "precondition" [convert (c with resulting_security_ids = [""]) [r with security_id = ""] None]
+  applyOpsFails env "precondition"
+    [convert (c with quantity_converted = 0.0; balance_security_id = Some "SSEC-B") [r] (Some (preferred "ISS-B" "SSEC-B" d 100.0))]
+  applyOpsFails env "precondition"
+    [convert (c with quantity_converted = 40.0; balance_security_id = Some "") [r] (Some (preferred "ISS-B" "" d 60.0))]
+  applyOpsFails env "an empty ID cannot be claimed" [convert (c with id = "") [r] None]
+  hasState env "SSEC-PREF" >>= (=== True)
+  let ok = validateStockConversionOcfData
+  expectTrue "the fixture" (ok c)
+  expectTrue "a balance" (ok c with balance_security_id = Some "SSEC-B")
+  expectFalse "empty id" (ok c with id = "")
+  expectFalse "empty security_id" (ok c with security_id = "")
+  expectFalse "zero quantity_converted" (ok c with quantity_converted = 0.0)
+  expectFalse "negative quantity_converted" (ok c with quantity_converted = -1.0)
+  expectFalse "an empty balance_security_id" (ok c with balance_security_id = Some "")
+  expectFalse "an empty comment" (ok c with comments = [""])
+  expectFalse "an empty resulting security ID" (ok c with resulting_security_ids = ["SSEC-C", ""])
+  expectFalse "no resulting securities" (ok c with resulting_security_ids = [])

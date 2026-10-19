@@ -1,0 +1,103 @@
+-- Stock repurchases through ApplyStockRepurchase: a terminal event at a price with an optional balance issuance, overdraw refusal, and the repurchase validator.
+module OpenCapTable.TestStockRepurchase where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..), validateStockRepurchaseOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+issued : Date
+issued = D.date 2022 D.Jan 1
+
+repurchaseBook : Text -> Decimal -> Script Env
+repurchaseBook sec q = do
+  env <- standardBook
+  _ <- applyRecords env
+    [OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-A" q issued) with id = "TX_STOCK_ISS_1"; custom_id = "CS-1"; share_price = usd 0.0001; cost_basis = None)]
+  pure env
+
+mkRepurchase : Text -> Text -> Date -> Decimal -> Decimal -> Optional Text -> StockRepurchaseOcfData
+mkRepurchase id sec d price q balance = StockRepurchaseOcfData with
+  id; date = d; security_id = sec; price = usd price; quantity = q; comments = []
+  balance_security_id = balance; consideration_text = None
+
+repurchaseOp : StockRepurchaseOcfData -> Optional StockIssuanceOcfData -> ApplyOperation
+repurchaseOp r b = ApplyStockRepurchase with repurchase = r; balance = b
+
+-- Based on production: a departing employee's unvested shares repurchased at 0.01 USD, with
+-- UUID object and security IDs.
+test_stock_repurchase_whole : Script ()
+test_stock_repurchase_whole = do
+  let sec = "a9d6afeb-fae1-449b-adf2-1b233d05cb35"
+  env <- repurchaseBook sec 61792.0
+  let r = mkRepurchase "3c18efd8-ee72-4ddc-8b88-6859011848c0" sec (D.date 2023 D.Feb 25) 0.01 61792.0 None
+  _ <- applyOps env [repurchaseOp r None]
+  expectRecord env (OcfRecordDataStockRepurchase r)
+  hasState env sec >>= (=== False)
+
+test_stock_repurchase_partial_with_balance : Script ()
+test_stock_repurchase_partial_with_balance = do
+  env <- repurchaseBook "SSEC-002" 100000.0
+  let d = D.date 2023 D.Jun 15
+      r = (mkRepurchase "TX_STOCK_REPURCHASE_2" "SSEC-002" d 0.01 50000.0 (Some "SSEC-002-REMAIN")) with
+        comments = ["Partial repurchase of unvested shares upon voluntary termination."]
+        consideration_text = Some "Repurchase at original issue price per Stock Restriction Agreement Section 3."
+      b = (issuance "SSEC-002-REMAIN" "SH-A" "CLS-A" 50000.0 d) with id = "TX_STOCK_ISS_2_BALANCE"
+  applyOpsFails env "needs a balance issuance" [repurchaseOp r None]
+  applyOpsFails env "balance SSEC-002-REMAIN must hold the remaining 50000.0" [repurchaseOp r (Some (b with quantity = 60000.0))]
+  _ <- applyOps env [repurchaseOp r (Some b)]
+  expectRecord env (OcfRecordDataStockRepurchase r)
+  expectRecord env (OcfRecordDataStockIssuance b)
+  hasState env "SSEC-002" >>= (=== False)
+  (.quantity) <$> stateOf env "SSEC-002-REMAIN" >>= (=== 50000.0)
+
+-- A company buyback at the current 409A fair market value.
+test_stock_repurchase_at_fair_market_value : Script ()
+test_stock_repurchase_at_fair_market_value = do
+  env <- repurchaseBook "SSEC-003" 75000.0
+  let r = (mkRepurchase "TX_STOCK_REPURCHASE_3" "SSEC-003" (D.date 2024 D.Mar 30) 2.50 75000.0 None) with
+        consideration_text = Some "Company buyback at current 409A FMV of $2.50 per share."
+  _ <- applyOps env [repurchaseOp r None]
+  expectRecord env (OcfRecordDataStockRepurchase r)
+  hasState env "SSEC-003" >>= (=== False)
+
+test_stock_repurchase_overdraw_refused : Script ()
+test_stock_repurchase_overdraw_refused = do
+  env <- repurchaseBook "SSEC-REPURCHASE-OVERDRAW" 100.0
+  applyOpsFails env "event quantity 101.0 exceeds the 100.0 of security SSEC-REPURCHASE-OVERDRAW"
+    [repurchaseOp (mkRepurchase "TX_STOCK_REPURCHASE_OVERDRAW" "SSEC-REPURCHASE-OVERDRAW" (D.date 2024 D.Mar 30) 1.0 101.0 None) None]
+  (.quantity) <$> stateOf env "SSEC-REPURCHASE-OVERDRAW" >>= (=== 100.0)
+
+test_stock_repurchase_validator : Script ()
+test_stock_repurchase_validator = do
+  env <- repurchaseBook "SSEC-V" 100.0
+  let d = D.date 2024 D.Mar 30
+      r = mkRepurchase "REP-1" "SSEC-V" d 1.0 100.0 None
+  applyOpsFails env "precondition" [repurchaseOp (r with price = usd (-1.0)) None]
+  applyOpsFails env "precondition" [repurchaseOp (r with price = OcfMonetary with amount = 1.0; currency = "DOLLARS") None]
+  applyOpsFails env "precondition" [repurchaseOp (r with consideration_text = Some "") None]
+  applyOpsFails env "precondition" [repurchaseOp (r with comments = [""]) None]
+  applyOpsFails env "precondition"
+    [repurchaseOp (r with quantity = 0.0; balance_security_id = Some "SSEC-V-R") (Some ((issuance "SSEC-V-R" "SH-A" "CLS-A" 100.0 d) with id = "ISS-V-R"))]
+  applyOpsFails env "precondition"
+    [repurchaseOp (r with quantity = 10.0; balance_security_id = Some "") (Some ((issuance "" "SH-A" "CLS-A" 90.0 d) with id = "ISS-V-R"))]
+  applyOpsFails env "an empty ID cannot be claimed" [repurchaseOp (r with id = "") None]
+  hasState env "SSEC-V" >>= (=== True)
+  let ok = validateStockRepurchaseOcfData
+  expectTrue "the fixture" (ok r)
+  expectTrue "a zero price" (ok r with price = usd 0.0)
+  expectFalse "empty id" (ok r with id = "")
+  expectFalse "empty security_id" (ok r with security_id = "")
+  expectFalse "zero quantity" (ok r with quantity = 0.0)
+  expectFalse "a negative price" (ok r with price = usd (-0.01))
+  expectFalse "a two-letter currency" (ok r with price = OcfMonetary with amount = 1.0; currency = "US")
+  expectFalse "an empty balance_security_id" (ok r with balance_security_id = Some "")
+  expectFalse "an empty consideration_text" (ok r with consideration_text = Some "")
+  expectFalse "an empty comment" (ok r with comments = [""])

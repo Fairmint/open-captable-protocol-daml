@@ -1,0 +1,144 @@
+-- Financings, ported from v34's TestFinancing: issuances of every instrument by object ID, every validator branch, edits and deletes, and the per-transaction and stored reference caps.
+module OpenCapTable.TestFinancing where
+
+import DA.Action (foldlA)
+import DA.Assert ((===))
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.Financing
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+financingData : Text -> [Text] -> FinancingOcfData
+financingData id issuanceIds = FinancingOcfData with
+  id
+  date = d2024
+  name = "Series A"
+  comments = []
+  issuance_ids = issuanceIds
+
+stockFin : Text -> Text -> OcfRecordData
+stockFin id sec = OcfRecordDataStockIssuance ((issuance sec "SH_FIN" "SC_FIN" 100.0 d2024) with id)
+
+-- | Stakeholder SH_FIN, class SC_FIN and a stock issuance STOCK_FIN (security SEC_STOCK_FIN).
+financingRecords : [OcfRecordData]
+financingRecords =
+  [ OcfRecordDataStakeholder (stakeholderData "SH_FIN")
+  , OcfRecordDataStockClass (stockClass "SC_FIN")
+  , stockFin "STOCK_FIN" "SEC_STOCK_FIN"
+  ]
+
+-- =============================================================================
+-- TESTS
+-- =============================================================================
+
+-- v34 testFinancing_AllIssuanceTypesRoundTrip (v34's anchor-side financing map is gone: the anchor
+-- indexes nothing).
+test_financing_all_issuance_types : Script ()
+test_financing_all_issuance_types = do
+  env <- bookWith financingRecords
+  _ <- applyRecords env
+    [ OcfRecordDataConvertibleIssuance (convertibleIssuance "CONVERTIBLE_FIN" "SEC_CONVERTIBLE_FIN" "SH_FIN")
+    , OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "EQUITY_FIN" "SEC_EQUITY_FIN" "SH_FIN")
+    , OcfRecordDataWarrantIssuance (warrantIssuance "WARRANT_FIN" "SEC_WARRANT_FIN" "SH_FIN")
+    ]
+  let financing = (financingData "FIN_ALL_TYPES" ["STOCK_FIN", "CONVERTIBLE_FIN", "EQUITY_FIN", "WARRANT_FIN"]) with
+        comments = ["Seed and bridge"]
+  assertMsg "the validator refused the financing" (validateFinancingOcfData financing)
+  r <- applyRecords env [OcfRecordDataFinancing financing]
+  Map.keys r.records === ["FIN_ALL_TYPES"]
+  expectRecord env (OcfRecordDataFinancing financing)
+
+-- v34 testFinancing_MissingIssuanceFails, and the issuance must be an issuance named by object ID.
+test_financing_issuance_references : Script ()
+test_financing_issuance_references = do
+  env <- bookWith financingRecords
+  let fin id ids = OcfRecordDataFinancing (financingData id ids)
+  applyRecordsFails env "Financing issuance not found: ISSUANCE_MISSING" [fin "FIN_MISSING" ["ISSUANCE_MISSING"]]
+  applyRecordsFails env "Financing issuance SH_FIN is a OcfObjectTypeStakeholder" [fin "FIN_SH" ["SH_FIN"]]
+  applyRecordsFails env "Financing issuance not found: SEC_STOCK_FIN" [fin "FIN_SEC" ["SEC_STOCK_FIN"]]
+  applyRecordsFails env "Financing issuance not found: STOCK_SECOND" [fin "FIN_TWO" ["STOCK_FIN", "STOCK_SECOND"]]
+  -- The issuance may come later in the same batch.
+  _ <- applyRecords env [fin "FIN_LATER" ["STOCK_LATER"], stockFin "STOCK_LATER" "SEC_STOCK_LATER"]
+  expectRecord env (fin "FIN_LATER" ["STOCK_LATER"])
+
+-- v34 testFinancing_EmptyIssuanceIdFailsReferenceValidation and testFinancing_EmptyIssuanceIdsFails.
+test_financing_validation : Script ()
+test_financing_validation = do
+  env <- bookWith financingRecords
+  let no = refuse env validateFinancingOcfData OcfRecordDataFinancing
+      base = financingData "FIN_BAD" ["STOCK_FIN"]
+  no base with issuance_ids = []
+  no base with issuance_ids = [""]
+  no base with issuance_ids = ["STOCK_FIN", ""]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataFinancing (base with id = "")]
+
+-- KNOWN BUG: v34 accepted an empty name and an empty comment string
+-- (testFinancing_EmptyNameAndCommentStringsRemainSchemaValid), and OCF allows both (Financing.name
+-- and Object.comments items are plain strings with no minLength). v35's validateFinancingOcfData
+-- adds `d.name /= ""` and `validateNonEmptyStringsArray d.comments`, so the ledger refuses the
+-- record with a template precondition violation.
+-- test_financing_empty_name_and_comment_are_ocf_valid : Script ()
+-- test_financing_empty_name_and_comment_are_ocf_valid = do
+--   env <- bookWith financingRecords
+--   accept env validateFinancingOcfData OcfRecordDataFinancing ((financingData "FIN_EMPTY_TEXT" ["STOCK_FIN"]) with name = "")
+--   accept env validateFinancingOcfData OcfRecordDataFinancing ((financingData "FIN_EMPTY_COMMENT" ["STOCK_FIN"]) with comments = [""])
+
+-- v34 testFinancing_DuplicateIssuanceIdsRemainSchemaValid.
+test_financing_duplicate_issuance_ids : Script ()
+test_financing_duplicate_issuance_ids = do
+  env <- bookWith financingRecords
+  accept env validateFinancingOcfData OcfRecordDataFinancing (financingData "FIN_DUP" ["STOCK_FIN", "STOCK_FIN"])
+
+-- v34 testFinancing_CrossFamilyIssuanceIdCollisionFails: v35 claims object IDs across all types and
+-- security IDs across all instruments, so the ambiguous financing reference cannot arise.
+test_financing_issuance_ids_are_unique_across_instruments : Script ()
+test_financing_issuance_ids_are_unique_across_instruments = do
+  env <- bookWith financingRecords
+  applyRecordsFails env "ID already used: STOCK_FIN" [OcfRecordDataWarrantIssuance (warrantIssuance "STOCK_FIN" "SEC_WARRANT_FIN_COLLISION" "SH_FIN")]
+  applyRecordsFails env "security ID already used: SEC_STOCK_FIN" [OcfRecordDataWarrantIssuance (warrantIssuance "WARRANT_FIN" "SEC_STOCK_FIN" "SH_FIN")]
+  applyRecordsFails env "ID already used: CONV_TWIN"
+    [ OcfRecordDataConvertibleIssuance (convertibleIssuance "CONV_TWIN" "SEC_CONV_1" "SH_FIN")
+    , OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "CONV_TWIN" "SEC_EQ_1" "SH_FIN")
+    ]
+  expectNoRecord env "CONV_TWIN"
+
+-- v34 testFinancing_EditCanReferenceSameBatchIssuance (v35 writes the issuance first, then restates
+-- the financing) and the delete half of testFinancing_DeleteLastFinancingCollapsesMapToNone.
+test_financing_edit_and_delete : Script ()
+test_financing_edit_and_delete = do
+  env <- bookWith (financingRecords <> [OcfRecordDataFinancing (financingData "FIN_EDIT" ["STOCK_FIN"])])
+  restateOpsFails env "Financing issuance not found: STOCK_FIN_EDIT_2"
+    [RestateEdit (OcfRecordDataFinancing (financingData "FIN_EDIT" ["STOCK_FIN", "STOCK_FIN_EDIT_2"]))]
+  _ <- applyRecords env [stockFin "STOCK_FIN_EDIT_2" "SEC_STOCK_FIN_EDIT_2"]
+  let edited = (financingData "FIN_EDIT" ["STOCK_FIN", "STOCK_FIN_EDIT_2"]) with name = "Series A-1"; date = d2024
+  _ <- restateOps env [RestateEdit (OcfRecordDataFinancing edited)]
+  expectRecord env (OcfRecordDataFinancing edited)
+  restateOpsFails env "precondition" [RestateEdit (OcfRecordDataFinancing (edited with issuance_ids = []))]
+  _ <- restateOps env [RestateDelete "FIN_EDIT"]
+  expectNoRecord env "FIN_EDIT"
+  -- The ID is free again.
+  _ <- applyRecords env [OcfRecordDataFinancing (financingData "FIN_EDIT" ["STOCK_FIN_EDIT_2"])]
+  expectRecord env (OcfRecordDataFinancing (financingData "FIN_EDIT" ["STOCK_FIN_EDIT_2"]))
+
+-- A transaction checks at most 100 polymorphic references; a financing stores at most 1000.
+test_financing_reference_caps : Script ()
+test_financing_reference_caps = do
+  env <- bookWith financingRecords
+  let fin id n = OcfRecordDataFinancing (financingData id (replicate n "STOCK_FIN"))
+  applyRecordsFails env "more than 100 polymorphic references" [fin "FIN_101" 101]
+  _ <- applyRecords env [fin "FIN_BIG" 100]
+  restateOpsFails env "more than 100 polymorphic references" [RestateEdit (fin "FIN_BIG" 201)]
+  _ <- foldlA (\_ n -> do
+      _ <- restateOps env [RestateEdit (fin "FIN_BIG" n)]
+      pure ())
+    () [200, 300 .. 1000]
+  expectRecord env (fin "FIN_BIG" 1000)
+  restateOpsFails env "has 1001 financing issuance IDs; at most 1000" [RestateEdit (fin "FIN_BIG" 1001)]

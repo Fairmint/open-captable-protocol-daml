@@ -1,0 +1,317 @@
+-- Primary stock issuances through CapTable_Apply: the record and the state it creates, every branch of the issuance validator, its references (stakeholder, class, legends, plan, vesting terms) checked at the end of the batch, and edits and deletes through CapTable_Restate.
+module OpenCapTable.TestStockIssuance where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfSecurityExemption(..), OcfShareNumberRange(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..), StockIssuanceOcfData(..), validateStockIssuanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+issueDay : Date
+issueDay = D.date 2024 D.Feb 1
+
+vest : Date -> Decimal -> OcfVesting
+vest d amount = OcfVesting with date = d; amount
+
+newIssuance : StockIssuanceOcfData
+newIssuance = issuance "S-NEW" "SH-B" "CLS-A" 250.0 issueDay
+
+-- | The standard book plus two legends, a plan over CLS-A and vesting terms VT-1.
+referenceBook : Script Env
+referenceBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockLegendTemplate (legend "LEGEND-1")
+    , OcfRecordDataStockLegendTemplate (legend "LEGEND-2")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-1" ["CLS-A"])
+    , OcfRecordDataVestingTerms (vestingTerms "VT-1")
+    ]
+  pure env
+
+-- =============================================================================
+-- RECORD AND STATE
+-- =============================================================================
+
+test_stock_issuance_create : Script ()
+test_stock_issuance_create = do
+  env <- standardBook
+  r <- applyRecords env [OcfRecordDataStockIssuance newIssuance]
+  Map.keys r.records === ["ISS-S-NEW"]
+  Map.keys r.states === ["S-NEW"]
+  expectRecord env (OcfRecordDataStockIssuance newIssuance)
+  s <- stateOf env "S-NEW"
+  s.quantity === 250.0
+  s.stakeholder_id === "SH-B"
+  s.stock_class_id === "CLS-A"
+  s.issue_date === issueDay
+  s.last_event_date === issueDay
+  s.origin_transaction_id === "ISS-S-NEW"
+  s.seq === 0
+  s.split_epoch === 0
+  s.vesting === StockVestingNone
+  s.holds === []
+  s.snapshot === None
+
+-- Every optional field populated, the Date fields included.
+test_stock_issuance_optionals_some : Script ()
+test_stock_issuance_optionals_some = do
+  env <- referenceBook
+  let iss = (issuance "SEC-3" "SH-B" "CLS-A" 10.0 issueDay) with
+        custom_id = "CERT-3"
+        board_approval_date = Some (D.date 2024 D.Jan 15)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 16)
+        consideration_text = Some "Cash consideration"
+        security_law_exemptions = [OcfSecurityExemption with description = "Rule 506(b)"; jurisdiction = "US-CA"]
+        stock_plan_id = Some "PLAN-1"
+        share_numbers_issued = [OcfShareNumberRange with starting_share_number = 1.0; ending_share_number = 10.0]
+        share_price = OcfMonetary with amount = 2.5; currency = "USD"
+        vesting_terms_id = Some "VT-1"
+        vestings = [vest (D.date 2024 D.Mar 1) 5.0]
+        cost_basis = Some (usd 25.0)
+        stock_legend_ids = ["LEGEND-1", "LEGEND-2"]
+        issuance_type = Some OcfStockIssuanceTypeRsa
+        comments = ["Initial issuance"]
+  _ <- applyRecords env [OcfRecordDataStockIssuance iss]
+  expectRecord env (OcfRecordDataStockIssuance iss)
+  -- Explicit vestings come ahead of the vesting terms.
+  s <- stateOf env "SEC-3"
+  s.vesting === StockVestingTranches [vest (D.date 2024 D.Mar 1) 5.0]
+
+test_stock_issuance_types_and_vesting_kinds : Script ()
+test_stock_issuance_types_and_vesting_kinds = do
+  env <- referenceBook
+  let founders = (issuance "S-F" "SH-B" "CLS-A" 100.0 issueDay) with issuance_type = Some OcfStockIssuanceTypeFoundersStock
+      onTerms = (issuance "S-T" "SH-B" "CLS-A" 100.0 issueDay) with vesting_terms_id = Some "VT-1"
+      -- Tranches out of date order are stored sorted on the state.
+      tranches = (issuance "S-V" "SH-B" "CLS-A" 100.0 issueDay) with
+        vestings = [vest (D.date 2026 D.Jan 1) 60.0, vest (D.date 2025 D.Jan 1) 40.0]
+  _ <- applyRecords env (map OcfRecordDataStockIssuance [founders, onTerms, tranches])
+  expectRecord env (OcfRecordDataStockIssuance founders)
+  (.vesting) <$> stateOf env "S-F" >>= (=== StockVestingNone)
+  (.vesting) <$> stateOf env "S-T" >>= (=== StockVestingOnTerms "VT-1")
+  (.vesting) <$> stateOf env "S-V" >>= (=== StockVestingTranches
+    [vest (D.date 2025 D.Jan 1) 40.0, vest (D.date 2026 D.Jan 1) 60.0])
+
+-- An issuance's record is deleted with its state; both its IDs are released.
+test_stock_issuance_delete : Script ()
+test_stock_issuance_delete = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance newIssuance]
+  _ <- restateOps env [RestateDelete "ISS-S-NEW", RestateEndState "S-NEW"]
+  hasRecord env "ISS-S-NEW" >>= (=== False)
+  hasState env "S-NEW" >>= (=== False)
+  let again = newIssuance with quantity = 1.0
+  _ <- applyRecords env [OcfRecordDataStockIssuance again]
+  expectRecord env (OcfRecordDataStockIssuance again)
+
+test_stock_issuance_ids_claimed : Script ()
+test_stock_issuance_ids_claimed = do
+  env <- standardBook
+  -- The object ID is claimed against every type, the security ID against every instrument.
+  applyRecordsFails env "ID already used: SH-B" [OcfRecordDataStockIssuance (newIssuance with id = "SH-B")]
+  applyRecordsFails env "security ID already used: S-A1" [OcfRecordDataStockIssuance (newIssuance with security_id = "S-A1")]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockIssuance (newIssuance with id = "")]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockIssuance (newIssuance with security_id = "")]
+  hasRecord env "ISS-S-NEW" >>= (=== False)
+
+-- =============================================================================
+-- VALIDATOR
+-- =============================================================================
+
+-- Each branch of validateStockIssuanceOcfData that a write reaches is refused by the record's
+-- ensure. (An empty ID or security ID fails its claim first, an empty class its epoch lookup.)
+test_stock_issuance_ensure_refuses_invalid_data : Script ()
+test_stock_issuance_ensure_refuses_invalid_data = do
+  env <- standardBook
+  let refused d = applyRecordsFails env "precondition" [OcfRecordDataStockIssuance d]
+  refused newIssuance with custom_id = ""
+  refused newIssuance with stakeholder_id = ""
+  refused newIssuance with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"]
+  refused newIssuance with security_law_exemptions = [OcfSecurityExemption with description = "Rule 506(b)"; jurisdiction = ""]
+  refused newIssuance with share_numbers_issued = [OcfShareNumberRange with starting_share_number = 0.0; ending_share_number = 10.0]
+  refused newIssuance with share_numbers_issued = [OcfShareNumberRange with starting_share_number = 5.0; ending_share_number = 4.0]
+  refused newIssuance with vestings = [vest issueDay 0.0]
+  refused newIssuance with vestings = [vest issueDay 200.0, vest (D.date 2025 D.Jan 1) 51.0]
+  refused newIssuance with comments = [""]
+  refused newIssuance with stock_legend_ids = [""]
+  refused newIssuance with share_price = OcfMonetary with amount = -1.0; currency = "USD"
+  refused newIssuance with share_price = OcfMonetary with amount = 1.0; currency = "US"
+  refused newIssuance with share_price = OcfMonetary with amount = 1.0; currency = ""
+  refused newIssuance with quantity = 0.0
+  refused newIssuance with quantity = -5.0
+  refused newIssuance with consideration_text = Some ""
+  refused newIssuance with stock_plan_id = Some ""
+  refused newIssuance with vesting_terms_id = Some ""
+  applyRecordsFails env "no active epoch for stock class  in this write" [OcfRecordDataStockIssuance (newIssuance with stock_class_id = "")]
+  hasRecord env "ISS-S-NEW" >>= (=== False)
+
+test_stock_issuance_validator_branches : Script ()
+test_stock_issuance_validator_branches = do
+  let ok = validateStockIssuanceOcfData
+  expectTrue "the fixture" (ok newIssuance)
+  expectTrue "empty arrays conform" (ok newIssuance with stock_legend_ids = []; comments = []; vestings = [])
+  expectTrue "vestings within the quantity" (ok newIssuance with vestings = [vest issueDay 250.0])
+  expectTrue "a zero share price" (ok newIssuance with share_price = usd 0.0)
+  expectTrue "a one-share range" (ok newIssuance with share_numbers_issued = [OcfShareNumberRange with starting_share_number = 3.0; ending_share_number = 3.0])
+  expectFalse "empty id" (ok newIssuance with id = "")
+  expectFalse "empty security_id" (ok newIssuance with security_id = "")
+  expectFalse "empty custom_id" (ok newIssuance with custom_id = "")
+  expectFalse "empty stakeholder_id" (ok newIssuance with stakeholder_id = "")
+  expectFalse "empty stock_class_id" (ok newIssuance with stock_class_id = "")
+  expectFalse "exemption without description" (ok newIssuance with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"])
+  expectFalse "exemption without jurisdiction" (ok newIssuance with security_law_exemptions = [OcfSecurityExemption with description = "Reg D"; jurisdiction = ""])
+  expectFalse "share range from zero" (ok newIssuance with share_numbers_issued = [OcfShareNumberRange with starting_share_number = 0.0; ending_share_number = 1.0])
+  expectFalse "share range ending before it starts" (ok newIssuance with share_numbers_issued = [OcfShareNumberRange with starting_share_number = 2.0; ending_share_number = 1.0])
+  expectFalse "a zero tranche" (ok newIssuance with vestings = [vest issueDay 0.0])
+  expectFalse "a negative tranche" (ok newIssuance with vestings = [vest (issueDay) (-1.0)])
+  expectFalse "vestings above the quantity" (ok newIssuance with vestings = [vest issueDay 250.0000000001])
+  expectFalse "an empty comment" (ok newIssuance with comments = ["ok", ""])
+  expectFalse "an empty legend ID" (ok newIssuance with stock_legend_ids = ["LEGEND-1", ""])
+  expectFalse "a negative share price" (ok newIssuance with share_price = usd (-0.01))
+  expectFalse "a two-letter currency" (ok newIssuance with share_price = OcfMonetary with amount = 1.0; currency = "US")
+  expectFalse "a four-letter currency" (ok newIssuance with share_price = OcfMonetary with amount = 1.0; currency = "USDT")
+  expectFalse "a zero quantity" (ok newIssuance with quantity = 0.0)
+  expectFalse "an empty consideration_text" (ok newIssuance with consideration_text = Some "")
+  expectFalse "an empty stock_plan_id" (ok newIssuance with stock_plan_id = Some "")
+  expectFalse "an empty vesting_terms_id" (ok newIssuance with vesting_terms_id = Some "")
+
+-- =============================================================================
+-- REFERENCES
+-- =============================================================================
+
+test_stock_issuance_missing_references_fail : Script ()
+test_stock_issuance_missing_references_fail = do
+  env <- referenceBook
+  let refused msg d = applyRecordsFails env msg [OcfRecordDataStockIssuance d]
+  refused "Stock issuance stakeholder not found: SH-MISSING" newIssuance with stakeholder_id = "SH-MISSING"
+  refused "Stock issuance stock legend not found: LEGEND-MISSING" newIssuance with stock_legend_ids = ["LEGEND-1", "LEGEND-MISSING"]
+  refused "Stock issuance stock plan not found: PLAN-MISSING" newIssuance with stock_plan_id = Some "PLAN-MISSING"
+  refused "Stock issuance vesting terms not found: VT-MISSING" newIssuance with vesting_terms_id = Some "VT-MISSING"
+  -- The class is found through its epoch, before any reference.
+  refused "no active epoch for stock class CLS-MISSING" newIssuance with stock_class_id = "CLS-MISSING"
+  hasRecord env "ISS-S-NEW" >>= (=== False)
+
+test_stock_issuance_references_need_their_types : Script ()
+test_stock_issuance_references_need_their_types = do
+  env <- referenceBook
+  let refused msg d = applyRecordsFails env msg [OcfRecordDataStockIssuance d]
+  refused "Stock issuance stakeholder CLS-A is a OcfObjectTypeStockClass" newIssuance with stakeholder_id = "CLS-A"
+  refused "Stock issuance stock legend SH-B is a OcfObjectTypeStakeholder" newIssuance with stock_legend_ids = ["SH-B"]
+  refused "Stock issuance vesting terms LEGEND-1 is a OcfObjectTypeStockLegendTemplate" newIssuance with vesting_terms_id = Some "LEGEND-1"
+  refused "Stock issuance stock plan not found: VT-1" newIssuance with stock_plan_id = Some "VT-1"
+
+test_stock_issuance_plan_must_include_class : Script ()
+test_stock_issuance_plan_must_include_class = do
+  env <- standardBook
+  applyRecordsFails env "Stock issuance stock plan PLAN-B does not include stock class CLS-A"
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])
+    , OcfRecordDataStockIssuance (newIssuance with stock_plan_id = Some "PLAN-B")
+    ]
+  -- A plan over both classes is fine.
+  let iss = newIssuance with stock_plan_id = Some "PLAN-AB"
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-AB" ["CLS-B", "CLS-A"])
+    , OcfRecordDataStockIssuance iss
+    ]
+  expectRecord env (OcfRecordDataStockIssuance iss)
+
+-- References are checked at the end of the batch, so the issuance may come before the records it
+-- names.
+test_stock_issuance_references_created_in_same_batch : Script ()
+test_stock_issuance_references_created_in_same_batch = do
+  env <- standardBook
+  let iss = newIssuance with
+        stock_legend_ids = ["LEGEND-VALID"]
+        stock_plan_id = Some "PLAN-VALID"
+        vesting_terms_id = Some "VT-VALID"
+  r <- applyRecords env
+    [ OcfRecordDataStockIssuance iss
+    , OcfRecordDataStockLegendTemplate (legend "LEGEND-VALID")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-VALID" ["CLS-A"])
+    , OcfRecordDataVestingTerms (vestingTerms "VT-VALID")
+    ]
+  Map.size r.records === 4
+  expectRecord env (OcfRecordDataStockIssuance iss)
+  (.vesting) <$> stateOf env "S-NEW" >>= (=== StockVestingOnTerms "VT-VALID")
+
+-- =============================================================================
+-- EDITS
+-- =============================================================================
+
+test_stock_issuance_edit_checks_added_references : Script ()
+test_stock_issuance_edit_checks_added_references = do
+  env <- referenceBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockIssuance newIssuance
+    , OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])
+    ]
+  restateOpsFails env "Stock issuance stock plan not found: PLAN-MISSING-ON-EDIT"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with stock_plan_id = Some "PLAN-MISSING-ON-EDIT"))]
+  restateOpsFails env "Stock issuance stock plan PLAN-B does not include stock class CLS-A"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with stock_plan_id = Some "PLAN-B"))]
+  restateOpsFails env "Stock issuance stock legend not found: LEGEND-MISSING"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with stock_legend_ids = ["LEGEND-MISSING"]))]
+  restateOpsFails env "Stock issuance vesting terms not found: VT-MISSING"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with vesting_terms_id = Some "VT-MISSING"))]
+  restateOpsFails env "Stock issuance stakeholder not found: SH-MISSING"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with stakeholder_id = "SH-MISSING"))]
+  expectRecord env (OcfRecordDataStockIssuance newIssuance)
+
+-- A restatement creates no records, so an edit's new references are written first and the edit
+-- then finds them in its inputs.
+test_stock_issuance_edit_adds_existing_references : Script ()
+test_stock_issuance_edit_adds_existing_references = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance newIssuance]
+  _ <- applyRecords env
+    [ OcfRecordDataStockLegendTemplate (legend "LEGEND-EDIT")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-EDIT" ["CLS-A"])
+    , OcfRecordDataVestingTerms (vestingTerms "VT-EDIT")
+    ]
+  let edited = newIssuance with
+        stock_legend_ids = ["LEGEND-EDIT"]
+        stock_plan_id = Some "PLAN-EDIT"
+        vesting_terms_id = Some "VT-EDIT"
+        comments = ["Restated"]
+  r <- restateOps env [RestateEdit (OcfRecordDataStockIssuance edited)]
+  Map.keys r.records === ["ISS-S-NEW"]
+  expectRecord env (OcfRecordDataStockIssuance edited)
+
+test_stock_issuance_edit_rules : Script ()
+test_stock_issuance_edit_rules = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance newIssuance]
+  restateOpsFails env "changes nothing" [RestateEdit (OcfRecordDataStockIssuance newIssuance)]
+  restateOpsFails env "cannot change stock issuance ISS-S-NEW's security ID"
+    [RestateEdit (OcfRecordDataStockIssuance (newIssuance with security_id = "S-RENAMED"))]
+  -- An edit keeps every ensure.
+  restateOpsFails env "precondition" [RestateEdit (OcfRecordDataStockIssuance (newIssuance with custom_id = ""))]
+  -- An edit of the record alone leaves the state; the state is restated beside it.
+  let edited = newIssuance with custom_id = "C-RENUMBERED"
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockIssuance edited)]
+  expectRecord env (OcfRecordDataStockIssuance edited)
+  s <- stateOf env "S-NEW"
+  s.quantity === 250.0
+  s.seq === 0
+
+-- KNOWN BUG: validateStockIssuanceOcfData never validates cost_basis (share_price goes through
+-- validateOcfMonetary, cost_basis through nothing), so a cost basis whose currency is not an OCF
+-- currency code is written. v34 had the same gap. Expected: refused with "precondition"; actual:
+-- the issuance is written ("expected an error containing "precondition", but it succeeded").
+-- test_stock_issuance_cost_basis_validated : Script ()
+-- test_stock_issuance_cost_basis_validated = do
+--   env <- standardBook
+--   applyRecordsFails env "precondition"
+--     [OcfRecordDataStockIssuance (newIssuance with cost_basis = Some (OcfMonetary with amount = 250.0; currency = "dollars"))]

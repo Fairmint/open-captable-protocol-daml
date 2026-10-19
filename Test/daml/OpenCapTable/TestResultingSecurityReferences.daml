@@ -1,0 +1,190 @@
+-- Resulting securities: a stock event writes its resulting issuances in its own operation, in the order it names them; warrant, convertible and equity-compensation events reference resulting issuances of the right instrument, checked at the end of the batch and when a restatement adds them.
+module OpenCapTable.TestResultingSecurityReferences where
+
+import DA.Assert ((===))
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+stockTransfer : Text -> [Text] -> StockTransferOcfData
+stockTransfer id resulting = StockTransferOcfData with
+  id; date = eventDate; quantity = 400.0; security_id = "S-A2"; resulting_security_ids = resulting
+  balance_security_id = None; consideration_text = None; comments = []
+
+stockOut : Text -> Decimal -> StockIssuanceOcfData
+stockOut sec q = (issuance sec "SH-B" "CLS-A" q eventDate) with id = "ISS-" <> sec
+
+-- =============================================================================
+-- STOCK EVENTS: OUTPUTS WRITTEN IN THE OPERATION
+-- =============================================================================
+
+test_resulting_refs_missing_stock_transfer_result_fails : Script ()
+test_resulting_refs_missing_stock_transfer_result_fails = do
+  env <- standardBook
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-MISSING-RESULT" ["SEC-STOCK-MISSING-RESULT"]; resulting = []; balance = None]
+  hasState env "S-A2" >>= (=== True)
+
+-- A stock transfer's results are new stock issuances: no other instrument's security can stand in.
+test_resulting_refs_stock_transfer_result_must_be_new_stock : Script ()
+test_resulting_refs_stock_transfer_result_must_be_new_stock = do
+  env <- instrumentBook
+  applyOpsFails env "security ID already used: W-1"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-WRONG-RESULT-TYPE" ["W-1"]; resulting = [(stockOut "W-1" 400.0) with id = "ISS-STOCK-RESULT"]; balance = None]
+  applyOpsFails env "security ID already used: S-A1"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-WRONG-RESULT-TYPE" ["S-A1"]; resulting = [(stockOut "S-A1" 400.0) with id = "ISS-STOCK-RESULT"]; balance = None]
+
+test_resulting_refs_missing_consolidation_result_fails : Script ()
+test_resulting_refs_missing_consolidation_result_fails = do
+  env <- standardBook
+  let c = StockConsolidationOcfData with
+        id = "TX-STOCK-MISSING-CONSOLIDATION-RESULT"; date = eventDate; security_ids = ["S-A1", "S-A2"]
+        resulting_security_id = "SEC-STOCK-MISSING-CONSOLIDATION-RESULT"; reason_text = None; comments = []
+  applyOpsFails env "must write its resulting security SEC-STOCK-MISSING-CONSOLIDATION-RESULT"
+    [ApplyStockConsolidation with consolidation = c; resulting_issuance = (stockOut "SEC-OTHER" 1000.0) with stakeholder_id = "SH-A"]
+
+test_resulting_refs_missing_stock_reissuance_result_fails : Script ()
+test_resulting_refs_missing_stock_reissuance_result_fails = do
+  env <- standardBook
+  let r = StockReissuanceOcfData with
+        id = "TX-STOCK-MISSING-REISSUANCE-RESULT"; date = eventDate; security_id = "S-A2"
+        resulting_security_ids = ["SEC-STOCK-MISSING-REISSUANCE-RESULT"]; comments = []; reason_text = None; split_transaction_id = None
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order"
+    [ApplyStockReissuance with reissuance = r; resulting = []]
+
+test_resulting_refs_stock_result_in_same_operation : Script ()
+test_resulting_refs_stock_result_in_same_operation = do
+  env <- standardBook
+  let t = stockTransfer "TX-STOCK-SAME-BATCH-TRANSFER" ["SEC-STOCK-SAME-BATCH-RESULT"]
+      r = stockOut "SEC-STOCK-SAME-BATCH-RESULT" 400.0
+  _ <- applyOps env [ApplyStockTransfer with transfer = t; resulting = [r]; balance = None]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  expectRecord env (OcfRecordDataStockIssuance r)
+  (.stakeholder_id) <$> stateOf env "SEC-STOCK-SAME-BATCH-RESULT" >>= (=== "SH-B")
+
+-- =============================================================================
+-- WARRANT, CONVERTIBLE AND EQUITY-COMPENSATION EVENTS: REFERENCES
+-- =============================================================================
+
+test_resulting_refs_missing_instrument_transfer_results_fail : Script ()
+test_resulting_refs_missing_instrument_transfer_results_fail = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant transfer resulting security security not found: SEC-WARRANT-MISSING-RESULT"
+    [OcfRecordDataWarrantTransfer (warrantTransfer "TX-WARRANT-MISSING-RESULT" "W-1" ["SEC-WARRANT-MISSING-RESULT"] None)]
+  applyRecordsFails env "Convertible transfer resulting security security not found: SEC-CONVERTIBLE-MISSING-RESULT"
+    [OcfRecordDataConvertibleTransfer (convertibleTransfer "TX-CONVERTIBLE-MISSING-RESULT" "CV-1" ["SEC-CONVERTIBLE-MISSING-RESULT"] None)]
+  applyRecordsFails env "Equity compensation transfer resulting security security not found: SEC-EC-MISSING-RESULT"
+    [OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX-EC-MISSING-RESULT" "EC-1" ["SEC-EC-MISSING-RESULT"] None)]
+  -- The balance of a transfer is checked the same way.
+  applyRecordsFails env "Warrant transfer balance security not found: W-1-BAL"
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "W-2" "SH-B")
+    , OcfRecordDataWarrantTransfer (warrantTransfer "TX-WARRANT-BALANCE" "W-1" ["W-2"] (Some "W-1-BAL"))
+    ]
+
+test_resulting_refs_instrument_transfer_results_keep_their_instrument : Script ()
+test_resulting_refs_instrument_transfer_results_keep_their_instrument = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant transfer resulting security security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [OcfRecordDataWarrantTransfer (warrantTransfer "TX-W" "W-1" ["S-A1"] None)]
+  applyRecordsFails env "Convertible transfer resulting security security EC-1 is carried by a OcfObjectTypeTxEquityCompensationIssuance"
+    [OcfRecordDataConvertibleTransfer (convertibleTransfer "TX-CV" "CV-1" ["EC-1"] None)]
+  applyRecordsFails env "Equity compensation transfer resulting security security W-1 is carried by a OcfObjectTypeTxWarrantIssuance"
+    [OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX-EC" "EC-1" ["W-1"] None)]
+
+-- Exercises, conversions and releases result in stock.
+test_resulting_refs_missing_stock_results_of_instruments_fail : Script ()
+test_resulting_refs_missing_stock_results_of_instruments_fail = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant exercise resulting security security not found: SEC-STOCK-MISSING-WARRANT-EXERCISE-RESULT"
+    [OcfRecordDataWarrantExercise (warrantExercise "TX-WARRANT-MISSING-EXERCISE-RESULT" "W-1" ["SEC-STOCK-MISSING-WARRANT-EXERCISE-RESULT"])]
+  applyRecordsFails env "Convertible conversion resulting security security not found: SEC-STOCK-MISSING-CONVERTIBLE-CONVERSION-RESULT"
+    [OcfRecordDataConvertibleConversion (convertibleConversion "TX-CONVERTIBLE-MISSING-CONVERSION-RESULT" "CV-1" ["SEC-STOCK-MISSING-CONVERTIBLE-CONVERSION-RESULT"])]
+  applyRecordsFails env "Equity compensation exercise resulting security security not found: SEC-STOCK-MISSING-EC-EXERCISE-RESULT"
+    [OcfRecordDataEquityCompensationExercise (equityCompensationExercise "TX-EC-MISSING-EXERCISE-RESULT" "EC-1" ["SEC-STOCK-MISSING-EC-EXERCISE-RESULT"])]
+  applyRecordsFails env "Equity compensation release resulting security security not found: SEC-STOCK-MISSING-EC-RELEASE-RESULT"
+    [OcfRecordDataEquityCompensationRelease (equityCompensationRelease "TX-EC-MISSING-RELEASE-RESULT" "EC-1" ["SEC-STOCK-MISSING-EC-RELEASE-RESULT"])]
+  -- A warrant cannot be what an exercise results in.
+  applyRecordsFails env "Warrant exercise resulting security security CV-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [OcfRecordDataWarrantExercise (warrantExercise "TX-W-EX" "W-1" ["CV-1"])]
+  -- The exercise names a trigger of its warrant.
+  applyRecordsFails env "Warrant exercise trigger not found: NO-TRIGGER"
+    [OcfRecordDataWarrantExercise ((warrantExercise "TX-W-EX" "W-1" ["S-A1"]) with trigger_id = "NO-TRIGGER")]
+
+-- Each stock result may be written later in the same batch. The v35 warrant exercise carries no
+-- quantity: the resulting issuance holds it.
+test_resulting_refs_stock_results_created_in_same_batch : Script ()
+test_resulting_refs_stock_results_created_in_same_batch = do
+  env <- instrumentBook
+  let we = warrantExercise "TX-W-EX" "W-1" ["S-W-EX"]
+      cc = convertibleConversion "TX-CV-CONV" "CV-1" ["S-CV-CONV"]
+      ex = equityCompensationExercise "TX-EC-EX" "EC-1" ["S-EC-EX"]
+      rel = equityCompensationRelease "TX-EC-REL" "EC-1" ["S-EC-REL"]
+      out sec = (issuance sec "SH-A" "CLS-A" 100.0 eventDate) with id = "ISS-" <> sec
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantExercise we
+    , OcfRecordDataConvertibleConversion cc
+    , OcfRecordDataEquityCompensationExercise ex
+    , OcfRecordDataEquityCompensationRelease rel
+    , OcfRecordDataStockIssuance (out "S-W-EX")
+    , OcfRecordDataStockIssuance (out "S-CV-CONV")
+    , OcfRecordDataStockIssuance (out "S-EC-EX")
+    , OcfRecordDataStockIssuance (out "S-EC-REL")
+    ]
+  expectRecord env (OcfRecordDataWarrantExercise we)
+  expectRecord env (OcfRecordDataConvertibleConversion cc)
+  expectRecord env (OcfRecordDataEquityCompensationExercise ex)
+  expectRecord env (OcfRecordDataEquityCompensationRelease rel)
+  -- Each result is a primary stock issuance with its own state.
+  (.quantity) <$> stateOf env "S-W-EX" >>= (=== 100.0)
+  (.quantity) <$> stateOf env "S-EC-REL" >>= (=== 100.0)
+
+test_resulting_refs_instrument_transfer_result_created_in_same_batch : Script ()
+test_resulting_refs_instrument_transfer_result_created_in_same_batch = do
+  env <- instrumentBook
+  let wt = warrantTransfer "TX-W-TR" "W-1" ["W-2"] None
+      ct = convertibleTransfer "TX-CV-TR" "CV-1" ["CV-2"] None
+      et = equityCompensationTransfer "TX-EC-TR" "EC-1" ["EC-2"] None
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantTransfer wt
+    , OcfRecordDataConvertibleTransfer ct
+    , OcfRecordDataEquityCompensationTransfer et
+    , OcfRecordDataWarrantIssuance (warrantIssuance "W-2" "SH-B")
+    , OcfRecordDataConvertibleIssuance (convertibleIssuance "CV-2" "SH-B")
+    , OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "EC-2" "SH-B")
+    ]
+  expectRecord env (OcfRecordDataWarrantTransfer wt)
+  expectRecord env (OcfRecordDataConvertibleTransfer ct)
+  expectRecord env (OcfRecordDataEquityCompensationTransfer et)
+
+-- =============================================================================
+-- RESTATEMENTS
+-- =============================================================================
+
+-- An edit may point a transfer at a new result and delete the old one in the same restatement; the
+-- result it adds is checked, the one it drops is not re-checked.
+test_resulting_refs_edit_can_replace_result : Script ()
+test_resulting_refs_edit_can_replace_result = do
+  env <- instrumentBook
+  let original = warrantTransfer "TX-W-EDIT-RESULT" "W-1" ["W-EDIT-RESULT-OLD"] None
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "W-EDIT-RESULT-OLD" "SH-B")
+    , OcfRecordDataWarrantTransfer original
+    ]
+  restateOpsFails env "Warrant transfer resulting security security not found: W-EDIT-RESULT-NEW"
+    [RestateEdit (OcfRecordDataWarrantTransfer (original with resulting_security_ids = ["W-EDIT-RESULT-NEW"]))]
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance (warrantIssuance "W-EDIT-RESULT-NEW" "SH-B")]
+  let edited = original with resulting_security_ids = ["W-EDIT-RESULT-NEW"]
+  _ <- restateOps env
+    [ RestateEdit (OcfRecordDataWarrantTransfer edited)
+    , RestateDelete "ISS-W-EDIT-RESULT-OLD"
+    ]
+  expectRecord env (OcfRecordDataWarrantTransfer edited)
+  hasRecord env "ISS-W-EDIT-RESULT-OLD" >>= (=== False)
