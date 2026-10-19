@@ -46,15 +46,16 @@ module Fairmint.OpenCapTable.Book
 
 import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_)
-import DA.List (dedup)
+import DA.List (dedup, sortOn)
 import qualified DA.Map as Map
 import DA.Map (Map)
 import DA.Optional (isNone, isSome)
+import DA.Record (HasField)
 import qualified DA.Set as Set
 import qualified DA.Text as T
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
-import Fairmint.OpenCapTable.References (Requirement)
+import Fairmint.OpenCapTable.References (Requirement, checkRecordCaps, issuanceSecurityId, recordTranches)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Core (Context(..))
 
@@ -198,16 +199,19 @@ loadBook ctx inputs = do
         contracts_touched = 0
   b1 <- foldlA loadState empty (dedup inputs.states)
   b2 <- foldlA loadEpoch b1 (dedup inputs.epochs)
-  b3 <- foldlA loadShard b2 (dedup inputs.shards)
+  shards <- mapA (fetchChecked ctx "an ID shard") (dedup inputs.shards)
+  -- Shorter prefixes first, so each shard needs to check only its own proper prefixes for overlap.
+  b3 <- foldlA loadShard b2 (sortOn (T.length . fst) (zip (map (.prefix) shards) (zip (dedup inputs.shards) shards)))
   foldlA loadRecord b3 (dedup inputs.records)
   where
     loadState b cid = do
       s <- fetchChecked ctx "a stock state" cid
       when (Map.member s.security_id b.states)
         (abort ("two active states for security " <> s.security_id))
-      countTranches (stateTranches s) b with
-        states = Map.insert s.security_id
-          (StateSlot with original = Some cid; archived = False; current = Some s; dirty = False) b.states
+      let b' = b with
+            states = Map.insert s.security_id
+              (StateSlot with original = Some cid; archived = False; current = Some s; dirty = False) b.states
+      countTranches (stateTranches s) b'
     loadEpoch b cid = do
       e <- fetchChecked ctx "a stock class epoch" cid
       when (Map.member e.stock_class_id b.epochs)
@@ -215,9 +219,8 @@ loadBook ctx inputs = do
       pure b with
         epochs = Map.insert e.stock_class_id
           (EpochSlot with original = Some cid; archived = False; current = Some e; dirty = False) b.epochs
-    loadShard b cid = do
-      sh <- fetchChecked ctx "an ID shard" cid
-      when (any (\p -> T.isPrefixOf p sh.prefix || T.isPrefixOf sh.prefix p) (Map.keys b.shards))
+    loadShard b (_, (cid, sh)) = do
+      when (any (\n -> Map.member (T.take n sh.prefix) b.shards) [8 .. T.length sh.prefix])
         (abort ("overlapping ID shards for prefix " <> sh.prefix))
       pure b with
         shards = Map.insert sh.prefix (ShardSlot with original = Some cid; claimed = sh.claimed) b.shards
@@ -269,7 +272,9 @@ consumeSlot sec b = case Map.lookup sec b.states of
         archive cid
         pure slot with archived = True
       _ -> pure slot
-    pure (b with contracts_touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0), slot')
+    let touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0)
+        b' = b with contracts_touched = touched
+    pure (b', slot')
   _ -> abort ("no active state for security " <> sec <> " in this write")
 
 -- | Consumes the security's state and records its successor.
@@ -314,7 +319,9 @@ consumeEpochSlot cls b = case Map.lookup cls b.epochs of
         archive cid
         pure slot with archived = True
       _ -> pure slot
-    pure (b with contracts_touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0), slot')
+    let touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0)
+        b' = b with contracts_touched = touched
+    pure (b', slot')
   _ -> abort ("no active epoch for stock class " <> cls <> " in this write")
 
 replaceEpoch : StockClassEpoch -> Book -> Update Book
@@ -356,6 +363,7 @@ requireRecord objectId b = case lookupRecord objectId b of
 -- | Creates an OCF record now and adds it to the working set.
 addRecord : OcfRecordData -> Book -> Update (Book, OcfRecordCid)
 addRecord d b = do
+  either abort pure (checkRecordCaps d)
   let objectId = recordIdOf b.context d
   when (Map.member objectId b.records)
     (abort ("ID already used: " <> objectId))
@@ -364,9 +372,10 @@ addRecord d b = do
   rcid <- createRecord b.context d
   b' <- countTranches (recordTranches d) b
   let b'' = indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b'
-  pure (b'' with
-    created_records = Map.insert objectId rcid b''.created_records
-    contracts_touched = b''.contracts_touched + 1, rcid)
+  let b''' = b'' with
+        created_records = Map.insert objectId rcid b''.created_records
+        contracts_touched = b''.contracts_touched + 1
+  pure (b''', rcid)
 
 -- | Archives a record the working set holds and drops it (a restatement's edit or delete).
 removeRecord : Text -> Book -> Update Book
@@ -430,12 +439,16 @@ preSplitShard prefix b = case Map.lookup prefix b.shards of
       shards = Map.insert (prefix <> "0") (ShardSlot with original = None; claimed = zeros)
         (Map.insert (prefix <> "1") (ShardSlot with original = None; claimed = ones) (Map.delete prefix b.shards))
 
+-- The shard whose prefix starts the hash's bit string. Active shards partition the hash space, so
+-- the shortest matching prefix is the only one.
 coveringShard : Text -> Text -> Book -> Update (Text, ShardSlot)
-coveringShard bits id b =
-  case filter (\(p, _) -> T.isPrefixOf p bits) (Map.toList b.shards) of
-    [found] -> pure found
-    [] -> abort ("no shard in this write covers the ID " <> id)
-    _ -> abort ("overlapping shards cover the ID " <> id)
+coveringShard bits id b = go 8
+  where
+    go n
+      | n > T.length bits = abort ("no shard in this write covers the ID " <> id)
+      | otherwise = case Map.lookup (T.take n bits) b.shards of
+          Some slot -> pure (T.take n bits, slot)
+          None -> go (n + 1)
 
 archiveShardOriginal : ShardSlot -> Update ()
 archiveShardOriginal slot = forA_ slot.original archive
@@ -497,8 +510,10 @@ flushBook b = do
   newTranches <- pure (sum (map (\(_, slot) -> if slot.dirty then optional 0 stateTranches slot.current else 0) (Map.toList b.states)))
   b' <- countTranches newTranches b
   let touched = b'.contracts_touched + Map.size states + Map.size epochs + length shards
-  pure (b' with contracts_touched = touched, BookResult with
-    states
-    epochs
-    shards
-    records = b'.created_records)
+  let result = BookResult with
+        states
+        epochs
+        shards
+        records = b'.created_records
+  let b'' = b' with contracts_touched = touched
+  pure (b'', result)

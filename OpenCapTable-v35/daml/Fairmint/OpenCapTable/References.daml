@@ -8,6 +8,9 @@ module Fairmint.OpenCapTable.References
   , issuanceSecurityId
   , recordTranches
   , issuanceObjectTypes
+  , checkRecordCaps
+  , maxStoredPolymorphicReferences
+  , maxClassesPerStockPlan
   ) where
 
 import DA.List (dedup)
@@ -23,7 +26,7 @@ import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockPlan (StockPlanOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingCondition(..), OcfVestingTrigger(..), VestingTermsOcfData(..))
 import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
-import Fairmint.OpenCapTable.State (RecordedSplit(..))
+import Fairmint.OpenCapTable.State (RecordedSplit(..), maxTranchesPerSecurity)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition(..), OcfConversionTrigger(..), OcfConvertibleConversionRight(..), OcfStockClassConversionRight(..), OcfWarrantConversionRight(..))
 
 -- | A reference a record makes, checked after the write's last operation against the final
@@ -80,17 +83,42 @@ recordTranches d = case d of
   OcfRecordDataStockIssuance x -> length x.vestings
   _ -> 0
 
+-- | Polymorphic references one record stores. A larger financing or document is created and then
+-- extended by restatements that check only the references they add.
+maxStoredPolymorphicReferences : Int
+maxStoredPolymorphicReferences = 1000
+
+maxClassesPerStockPlan : Int
+maxClassesPerStockPlan = 16
+
+-- | The register's size caps on one record, checked on every write (they bound a transaction's
+-- view; they are not OCF validity, so they are not in the records' `ensure`).
+checkRecordCaps : OcfRecordData -> Either Text ()
+checkRecordCaps d = case d of
+  OcfRecordDataDocument x -> cap "document related objects" (length x.related_objects) maxStoredPolymorphicReferences
+  OcfRecordDataFinancing x -> cap "financing issuance IDs" (length x.issuance_ids) maxStoredPolymorphicReferences
+  OcfRecordDataConvertibleConversion x ->
+    cap "capitalization definition references" (optional 0 capitalizationReferenceCount x.capitalization_definition) maxStoredPolymorphicReferences
+  OcfRecordDataStockPlan x -> cap "stock plan classes" (length x.stock_class_ids) maxClassesPerStockPlan
+  OcfRecordDataStockIssuance x -> cap "stock issuance vesting tranches" (length x.vestings) maxTranchesPerSecurity
+  _ -> pure ()
+  where
+    cap what n limit =
+      if n <= limit then pure ()
+      else Left (show (recordObjectType d) <> " has " <> show n <> " " <> what <> "; at most " <> show limit)
+
+capitalizationReferenceCount : OcfCapitalizationDefinition -> Int
+capitalizationReferenceCount c =
+  length c.include_security_ids + length c.exclude_security_ids
+    + length c.include_stock_class_ids + length c.include_stock_plans_ids
+
 -- | Polymorphic references a record makes; a transaction checks at most 100.
 polymorphicReferenceCount : OcfRecordData -> Int
 polymorphicReferenceCount d = case d of
   OcfRecordDataDocument x -> length x.related_objects
   OcfRecordDataFinancing x -> length x.issuance_ids
-  OcfRecordDataConvertibleConversion x -> optional 0 capitalizationCount x.capitalization_definition
+  OcfRecordDataConvertibleConversion x -> optional 0 capitalizationReferenceCount x.capitalization_definition
   _ -> 0
-  where
-    capitalizationCount c =
-      length c.include_security_ids + length c.exclude_security_ids
-        + length c.include_stock_class_ids + length c.include_stock_plans_ids
 
 stakeholderRef : Text -> Text -> Requirement
 stakeholderRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeStakeholder]

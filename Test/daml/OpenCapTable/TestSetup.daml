@@ -1,0 +1,186 @@
+-- Setup, authority, context isolation and teardown of a v35 cap table: the factory counter, the three-step authorization, who may write, and the anchor's status.
+module OpenCapTable.TestSetup where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Optional (isNone, isSome)
+import qualified DA.Set as Set
+import Daml.Script
+
+import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..), RegisterKind(..))
+import Fairmint.OpenCapTable.Apply
+import Fairmint.OpenCapTable.Book (BookInputs(..), emptyInputs)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.IssuerAuthorization
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OcpFactory
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import OpenCapTable.Harness
+
+test_setup_factory_counter_and_ids : Script ()
+test_setup_factory_counter_and_ids = do
+  env <- setupEnv
+  env.ctx.cap_table_id === "test-1"
+  env2 <- secondCapTable env
+  env2.ctx.cap_table_id === "test-2"
+  Some f <- queryContractId env.system_operator env2.factory
+  f.next_cap_table_number === 3
+
+test_setup_factory_requires_distinct_parties : Script ()
+test_setup_factory_requires_distinct_parties = do
+  env <- setupEnv
+  expectSubmitFailure "three distinct parties" env.system_operator
+    (exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.issuer)
+  expectSubmitFailure "three distinct parties" env.system_operator
+    (exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.system_operator)
+  expectSubmitFailure "three distinct parties" env.system_operator
+    (exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.system_operator; transfer_agent = env.transfer_agent)
+
+test_setup_factory_id_rules : Script ()
+test_setup_factory_id_rules = do
+  sysOp <- allocateParty "SystemOperator"
+  submitMustFail sysOp do createCmd OcpFactory with system_operator = sysOp; factory_id = ""; next_cap_table_number = 1
+  submitMustFail sysOp do createCmd OcpFactory with system_operator = sysOp; factory_id = "a:b"; next_cap_table_number = 1
+  submitMustFail sysOp do createCmd OcpFactory with system_operator = sysOp; factory_id = "a"; next_cap_table_number = 0
+
+test_setup_issuer_needs_ta_acceptance_and_pinned_ta : Script ()
+test_setup_issuer_needs_ta_acceptance_and_pinned_ta = do
+  env <- setupEnv
+  other <- allocateParty "OtherTA"
+  auth <- submit env.system_operator do
+    exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.transfer_agent
+  -- Before the TA accepts, the issuer cannot create the cap table.
+  expectSubmitFailure "has not accepted" env.issuer
+    (exerciseCmd auth.authorization IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData)
+  -- Only the pinned TA accepts.
+  submitMustFail other do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  submitMustFail env.issuer do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  accepted <- submit env.transfer_agent do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  -- The issuer must name the pinned TA.
+  expectSubmitFailure "pins" env.issuer
+    (exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = other; issuer_data = issuerData)
+  -- Only the issuer creates it, and only once.
+  submitMustFail env.transfer_agent do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData
+  created <- submit env.issuer do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData
+  submitMustFail env.issuer do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData
+  Some anchor <- queryContractId env.transfer_agent created.cap_table
+  anchor.context.transfer_agent === env.transfer_agent
+  anchor.status === CapTableStatusActive
+  length created.shards === 256
+
+test_setup_withdraw_authorization : Script ()
+test_setup_withdraw_authorization = do
+  env <- setupEnv
+  auth <- submit env.system_operator do
+    exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.transfer_agent
+  submitMustFail env.issuer do exerciseCmd auth.authorization IssuerAuthorization_Withdraw
+  submit env.system_operator do exerciseCmd auth.authorization IssuerAuthorization_Withdraw
+  submitMustFail env.transfer_agent do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+
+test_setup_issuer_id_cannot_be_derived_form : Script ()
+test_setup_issuer_id_cannot_be_derived_form = do
+  env <- setupEnv
+  auth <- submit env.system_operator do
+    exerciseCmd env.factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.transfer_agent
+  accepted <- submit env.transfer_agent do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  expectSubmitFailure "derived form" env.issuer
+    (exerciseCmd accepted IssuerAuthorization_CreateCapTable with
+      transfer_agent = env.transfer_agent
+      issuer_data = issuerData with id = auth.cap_table_id <> ":abc")
+
+test_setup_initial_shards_partition_and_issuer_claim : Script ()
+test_setup_initial_shards_partition_and_issuer_claim = do
+  env <- setupEnv
+  shards <- map snd <$> shardsOf env
+  length shards === 256
+  Set.size (Set.fromList (map (.prefix) shards)) === 256
+  let hash = claimHash IdNamespaceObject issuerId
+      holders = filter (\s -> Set.member hash s.claimed) shards
+  length holders === 1
+  -- The issuer's ID is claimed: no record may reuse it.
+  applyRecordsFails env "ID already used" [OcfRecordDataStakeholder (stakeholder issuerId)]
+
+test_setup_only_the_ta_writes : Script ()
+test_setup_only_the_ta_writes = do
+  env <- standardBook
+  inputs <- allInputs env
+  let ops = [ApplyRecord (OcfRecordDataStakeholder (stakeholder "SH-X"))]
+  submitMustFail env.issuer do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+  submitMustFail env.system_operator do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+  submitMustFail env.outsider do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+  pure ()
+
+test_setup_empty_and_oversized_batches_refused : Script ()
+test_setup_empty_and_oversized_batches_refused = do
+  env <- setupEnv
+  applyOpsFails env "at least one operation" []
+  applyOpsFails env "at most 500"
+    (map (\i -> ApplyRecord (OcfRecordDataStakeholder (stakeholder ("SH-" <> show i)))) [1 .. 501])
+
+-- One issuer can hold several cap tables with the same three parties: a write on one book refuses
+-- every contract of another.
+test_setup_context_isolation : Script ()
+test_setup_context_isolation = do
+  env1 <- standardBook
+  env2 <- secondCapTable env1
+  states1 <- map fst <$> statesOf env1
+  records1 <- map fst <$> recordsOf env1
+  epochs1 <- map fst <$> epochsOf env1
+  shards1 <- map fst <$> shardsOf env1
+  inputs2 <- allInputs env2
+  let op = ApplyRecord (OcfRecordDataStakeholder (stakeholder "SH-Z"))
+  expectSubmitFailure "another cap table" env2.transfer_agent
+    (exerciseCmd env2.cap_table CapTable_Apply with inputs = inputs2 with states = states1; operations = [op])
+  expectSubmitFailure "another cap table" env2.transfer_agent
+    (exerciseCmd env2.cap_table CapTable_Apply with inputs = inputs2 with records = records1; operations = [op])
+  expectSubmitFailure "another cap table" env2.transfer_agent
+    (exerciseCmd env2.cap_table CapTable_Apply with inputs = inputs2 with epochs = epochs1; operations = [op])
+  expectSubmitFailure "another cap table" env2.transfer_agent
+    (exerciseCmd env2.cap_table CapTable_Apply with inputs = inputs2 with shards = shards1; operations = [op])
+  -- The same IDs are free in the other book.
+  _ <- applyRecords env2 [OcfRecordDataStakeholder (stakeholder "SH-A")]
+  pure ()
+
+test_setup_register_views : Script ()
+test_setup_register_views = do
+  env <- standardBook
+  views <- queryInterface @RegisterContract env.transfer_agent
+  let mine = [v | (_, Some v) <- views, v.cap_table_id == env.ctx.cap_table_id]
+  length (filter (\v -> v.kind == RegisterKindCapTable) mine) === 1
+  length (filter (\v -> v.kind == RegisterKindOcfIdShard) mine) === 256
+  map (.key) (filter (\v -> v.kind == RegisterKindStockClassEpoch) mine) === ["CLS-A"]
+  length (filter (\v -> v.kind == RegisterKindStockSecurity) mine) === 2
+
+test_setup_teardown_purge_close : Script ()
+test_setup_teardown_purge_close = do
+  env <- standardBook
+  -- Only the TA begins teardown; the system operator cannot purge an active book.
+  submitMustFail env.system_operator do exerciseCmd env.cap_table CapTable_BeginTeardown
+  expectSubmitFailure "not CapTableStatusTearingDown" env.system_operator
+    (exerciseCmd env.cap_table CapTable_Purge with targets = [])
+  tearing <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_BeginTeardown
+  -- Writes on the old anchor fail; the new one refuses writes.
+  inputs <- allInputs env
+  let op = ApplyRecord (OcfRecordDataStakeholder (stakeholder "SH-X"))
+  submitMustFail env.transfer_agent do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = [op]
+  expectSubmitFailure "not CapTableStatusActive" env.transfer_agent
+    (exerciseCmd tearing CapTable_Apply with inputs; operations = [op])
+  -- Purge in batches, as the system operator only.
+  states <- map (PurgeState . fst) <$> statesOf env
+  records <- map (PurgeRecord . fst) <$> recordsOf env
+  epochs <- map (PurgeEpoch . fst) <$> epochsOf env
+  shards <- map (PurgeShard . fst) <$> shardsOf env
+  submitMustFail env.transfer_agent do exerciseCmd tearing CapTable_Purge with targets = states
+  submit env.system_operator do exerciseCmd tearing CapTable_Purge with targets = states <> records <> epochs
+  submit env.system_operator do exerciseCmd tearing CapTable_Purge with targets = shards
+  statesOf env >>= (=== []) . map snd
+  closed <- submit env.system_operator do exerciseCmd tearing CapTable_Close
+  Some tomb <- queryContractId env.transfer_agent closed
+  tomb.status === CapTableStatusClosed
+  submitMustFail env.transfer_agent do exerciseCmd closed CapTable_BeginTeardown
