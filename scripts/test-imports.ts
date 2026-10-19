@@ -8,6 +8,20 @@ const rootPackagePath = path.join(ROOT_DIR, 'package.json');
 const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
 const ocpPackage = requirePackageConfig('ocp');
 
+/** Template and interface ID constants on the root entry point (`rootIndex.templateConstants` in daml-js-bundle.json). */
+const ENTRY_POINTS: Record<string, string[]> = {
+  OCP_TEMPLATES: ['ocpFactory', 'issuerAuthorization', 'capTable', 'stockSecurity', 'stockClassEpoch', 'ocfIdShard'],
+  OCP_INTERFACES: ['ocfObject', 'registerContract'],
+  OCP_DELIVERY_PROOF_TEMPLATES: ['deliveryProof'],
+};
+
+/** DAR exports: `[package.json export subpath, helper exported by openCapTableDarPath]`. */
+const DAR_EXPORTS: Array<[string, string]> = [
+  ['./opencaptable.dar', 'getOpenCapTableDarPath'],
+  ['./opencaptable-api.dar', 'getOpenCapTableApiDarPath'],
+  ['./opencaptable-delivery-proof.dar', 'getOpenCapTableDeliveryProofDarPath'],
+];
+
 try {
   const rootPkg = require(ROOT_DIR);
   const hasOcp = Boolean(rootPkg?.Fairmint?.OpenCapTable);
@@ -21,12 +35,14 @@ try {
   if (typeof rootPkg.CantonPayments !== 'undefined') {
     throw new Error('This package must not export CantonPayments (use @fairmint/daml-js)');
   }
-  if (
-    !rootPkg.OCP_TEMPLATES?.capTable ||
-    !rootPkg.OCP_TEMPLATES?.issuerAuthorization ||
-    !rootPkg.OCP_TEMPLATES?.ocpFactory
-  ) {
-    throw new Error('Root package missing OCP_TEMPLATES (capTable, issuerAuthorization, ocpFactory)');
+  for (const ns of ['OpenCapTableApi', 'OpenCapTableDeliveryProof']) {
+    if (!rootPkg?.Fairmint?.[ns]) throw new Error(`Root export missing Fairmint.${ns}`);
+  }
+  for (const [constant, keys] of Object.entries(ENTRY_POINTS)) {
+    const missing = keys.filter((key) => typeof rootPkg[constant]?.[key] !== 'string');
+    if (missing.length > 0) {
+      throw new Error(`Root package ${constant} missing ${missing.join(', ')}`);
+    }
   }
 
   // The v35 factory is consumed per authorization, so the JSON records identities, never a contract ID. A network is
@@ -90,6 +106,29 @@ try {
     );
   }
 
+  // Every DAR export resolves to a staged file, and getOpenCapTableDarPaths lists them in upload order.
+  const exportsMap = rootPackage.exports as Record<string, unknown>;
+  const darPaths: string[] = [];
+  for (const [subpath, helper] of DAR_EXPORTS) {
+    if (typeof exportsMap[subpath] !== 'string') throw new Error(`package.json exports missing ${subpath}`);
+    const resolved = require.resolve(`${rootPackage.name}/${subpath.slice(2)}`);
+    if (typeof openCapTableDarPathMod[helper] !== 'function') {
+      throw new Error(`openCapTableDarPath export missing ${helper}`);
+    }
+    const helperPath = openCapTableDarPathMod[helper]() as string;
+    if (fs.realpathSync(resolved) !== fs.realpathSync(helperPath)) {
+      throw new Error(`${subpath} resolves to ${resolved}, but ${helper}() returns ${helperPath}`);
+    }
+    darPaths.push(helperPath);
+  }
+  const uploadOrder = openCapTableDarPathMod.getOpenCapTableDarPaths() as string[];
+  const expectedOrder = [darPaths[1], darPaths[2], darPaths[0]];
+  if (JSON.stringify(uploadOrder) !== JSON.stringify(expectedOrder)) {
+    throw new Error(
+      `getOpenCapTableDarPaths() must list Api, DeliveryProof, then OpenCapTable; got ${JSON.stringify(uploadOrder)}`
+    );
+  }
+
   if (typeof rootPkg.resolveOpenCapTableDarPath !== 'undefined') {
     throw new Error('Root package must not export resolveOpenCapTableDarPath (use openCapTableDarPath subpath)');
   }
@@ -118,7 +157,9 @@ try {
     delete process.env.OPEN_CAP_TABLE_DAR_PATH;
   }
 
-  console.log('OK: Root package exports OpenCapTable + OCP_TEMPLATES; OCP factory JSON + DAR path subpath work');
+  console.log(
+    'OK: Root package exports Fairmint (OpenCapTable, OpenCapTableApi, OpenCapTableDeliveryProof) and the entry-point constants; OCP factory JSON, DAR exports and the DAR path subpath work'
+  );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));
   process.exit(1);
