@@ -1,0 +1,232 @@
+-- The hold pair: settlement holds and stops placed, carried and canceled under the hold rules.
+module OpenCapTable.TestHolds where
+
+import DA.Assert ((===))
+import DA.Foldable (mapA_)
+import qualified DA.Date as D
+import DA.Optional (isSome)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockHold (StockHoldOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import OpenCapTable.Harness
+
+holdDay : Date
+holdDay = D.date 2025 D.Jun 2
+
+-- The standard book on the hold day.
+heldBook : Script Env
+heldBook = do
+  env <- standardBook
+  onDate holdDay
+  pure env
+
+test_holds_settlement_hold_placed : Script ()
+test_holds_settlement_hold_placed = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  [r] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  r.hold_id === derived env "S-A1" 0 DerivedRoleHold 0
+  r.stakeholder_id === "SH-A"
+  r.stock_class_id === "CLS-A"
+  r.split_epoch === 0
+  isSome r.canceled_settlement_hold === False
+  s <- stateOf env "S-A1"
+  s.seq === 1
+  s.last_event_date === holdDay
+  s.holds === [OpenHold with hold_id = r.hold_id; hold_type = OcfHoldTypeRegisterSettlement; reference = "T-1"; split_epoch = 0; quantity = Some 100.0]
+  -- The TX_STOCK_HOLD record exists under its derived ID.
+  hasRecord env r.hold_id >>= (=== True)
+
+test_holds_must_be_on_the_ledger_date : Script ()
+test_holds_must_be_on_the_ledger_date = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  placeHoldsFails env "is not the ledger date" OcfHoldTypeRegisterSettlement "T-1" (D.addDays holdDay 1) [lot]
+  placeHoldsFails env "is not the ledger date" OcfHoldTypeRegisterSettlement "T-1" (D.addDays holdDay (-1)) [lot]
+
+test_holds_argument_checks : Script ()
+test_holds_argument_checks = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  placeHoldsFails env "at least one lot" OcfHoldTypeRegisterSettlement "T-1" holdDay []
+  placeHoldsFails env "each lot appears once" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot, lot]
+  placeHoldsFails env "needs a reference" OcfHoldTypeRegisterSettlement "" holdDay [lot]
+  placeHoldsFails env "needs a quantity" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with quantity = None]
+  placeHoldsFails env "must be positive" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with quantity = Some 0.0]
+  placeHoldsFails env "at most its vested" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with quantity = Some 601.0]
+  placeHoldsFails env "origin issuance" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with origin_issuance = None]
+  other <- issuanceCidOf env "ISS-S-A2"
+  placeHoldsFails env "is not the origin" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with origin_issuance = Some other]
+  placeHoldsFails env "takes no quantity" OcfHoldTypeStopTransfer "STOP-1" holdDay [lot]
+  placeHoldsFails env "no active state for security S-NONE" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with security_id = "S-NONE"]
+
+test_holds_one_settlement_hold_per_lot : Script ()
+test_holds_one_settlement_hold_per_lot = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  lot' <- settlementLot env "S-A1" 100.0
+  placeHoldsFails env "already carries a settlement hold" OcfHoldTypeRegisterSettlement "T-2" holdDay [lot']
+  -- The same reference twice on one lot is refused too.
+  placeHoldsFails env "already open" OcfHoldTypeStopTransfer "T-1" holdDay [stopLot "S-A1"]
+
+test_holds_settlement_lots_one_stakeholder_one_class : Script ()
+test_holds_settlement_lots_one_stakeholder_one_class = do
+  env <- heldBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-B1" "SH-B" "CLS-A" 10.0 d2024)]
+  a <- settlementLot env "S-A1" 10.0
+  b <- settlementLot env "S-B1" 10.0
+  placeHoldsFails env "one stakeholder in one class" OcfHoldTypeRegisterSettlement "T-1" holdDay [a, b]
+  -- Two lots of one stakeholder work, atomically.
+  a2 <- settlementLot env "S-A2" 10.0
+  rs <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [a, a2]
+  length rs === 2
+
+test_holds_at_most_fifty_lots : Script ()
+test_holds_at_most_fifty_lots = do
+  env <- standardBook
+  _ <- applyRecords env (map (\i -> OcfRecordDataStockIssuance (issuance ("S-M" <> show i) "SH-A" "CLS-A" 1.0 d2024)) [1 .. 51])
+  onDate holdDay
+  lots <- mapA (\i -> settlementLot env ("S-M" <> show i) 1.0) [1 .. 51]
+  placeHoldsFails env "at most 50 lots" OcfHoldTypeRegisterSettlement "T-1" holdDay lots
+  rs <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay (take 50 lots)
+  length rs === 50
+
+test_holds_vested_shares_only : Script ()
+test_holds_vested_shares_only = do
+  env <- standardBook
+  -- 100 shares, 25 vesting each quarter of 2025: 50 vested on the hold day.
+  let tranches = [OcfVesting with amount = 25.0; date = d | d <- [D.date 2025 D.Jan 1, D.date 2025 D.Apr 1, D.date 2025 D.Jul 1, D.date 2025 D.Oct 1]]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-T1" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)]
+  onDate holdDay
+  lot <- settlementLot env "S-T1" 51.0
+  placeHoldsFails env "at most its vested" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot with quantity = Some 50.0]
+  pure ()
+
+test_holds_partial_tranche_cover_refused : Script ()
+test_holds_partial_tranche_cover_refused = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-P1" "SH-A" "CLS-A" 100.0 d2024) with vestings = [(OcfVesting with amount = 50.0; date = d2024)])]
+  onDate holdDay
+  lot <- settlementLot env "S-P1" 10.0
+  placeHoldsFails env "covering less than its quantity" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  -- A stop still goes on it.
+  _ <- placeHolds env OcfHoldTypeStopTransfer "STOP-1" holdDay [stopLot "S-P1"]
+  pure ()
+
+test_holds_stop_cancels_settlement_hold : Script ()
+test_holds_stop_cancels_settlement_hold = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  [stop] <- placeHolds env OcfHoldTypeStopTransfer "CASE-9" holdDay [stopLot "S-A1"]
+  case stop.canceled_settlement_hold of
+    Some c -> do
+      c.hold_id === h.hold_id
+      c.reference === "T-1"
+      c.hold_cancellation_id === derived env "S-A1" 1 DerivedRoleHoldCancellation 0
+      hasRecord env c.hold_cancellation_id >>= (=== True)
+    None -> fail "the stop should have canceled the settlement hold"
+  s <- stateOf env "S-A1"
+  map (.reference) s.holds === ["CASE-9"]
+  -- While stopped: no settlement hold, no terminal event; non-terminal events apply.
+  lot' <- settlementLot env "S-A1" 10.0
+  placeHoldsFails env "is stopped" OcfHoldTypeRegisterSettlement "T-2" holdDay [lot']
+  applyRecordsFails env "carries an open hold"
+    [OcfRecordDataStockRetraction (retraction env "S-A1" holdDay)]
+  _ <- applyRecords env [OcfRecordDataStockAcceptance (acceptance env "S-A1" holdDay)]
+  s' <- stateOf env "S-A1"
+  map (.reference) s'.holds === ["CASE-9"]
+
+test_holds_stops_stack_and_lift : Script ()
+test_holds_stops_stack_and_lift = do
+  env <- heldBook
+  [s1] <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" holdDay [stopLot "S-A1"]
+  [s2] <- placeHolds env OcfHoldTypeStopTransfer "CASE-2" holdDay [stopLot "S-A1"]
+  _ <- cancelHolds env holdDay [CancelHold with security_id = "S-A1"; hold_id = s1.hold_id; reason_text = "lifted"]
+  lot <- settlementLot env "S-A1" 10.0
+  placeHoldsFails env "is stopped" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  _ <- cancelHolds env holdDay [CancelHold with security_id = "S-A1"; hold_id = s2.hold_id; reason_text = "lifted"]
+  lot' <- settlementLot env "S-A1" 10.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot']
+  pure ()
+
+test_holds_cap_of_32 : Script ()
+test_holds_cap_of_32 = do
+  env <- heldBook
+  mapA_ (\i -> placeHolds env OcfHoldTypeStopTransfer ("CASE-" <> show i) holdDay [stopLot "S-A2"]) [1 .. 32]
+  placeHoldsFails env "already carries 32 holds" OcfHoldTypeStopTransfer "CASE-33" holdDay [stopLot "S-A2"]
+
+test_holds_cancel_checks : Script ()
+test_holds_cancel_checks = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  cancelHoldsFails env "at least one hold" holdDay []
+  cancelHoldsFails env "needs a reason" holdDay [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = ""]
+  cancelHoldsFails env "is not open" holdDay [CancelHold with security_id = "S-A1"; hold_id = "nope"; reason_text = "x"]
+  cancelHoldsFails env "is not open" holdDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "x"]
+  r <- cancelHolds env holdDay [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "trade not executed"]
+  [c] <- pure r.canceled
+  c.hold_cancellation_id === derived env "S-A1" 1 DerivedRoleHoldCancellation 0
+  s <- stateOf env "S-A1"
+  s.holds === []
+  s.seq === 2
+  -- A canceled hold cannot be canceled again.
+  cancelHoldsFails env "is not open" holdDay [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "again"]
+
+test_holds_block_terminal_events : Script ()
+test_holds_block_terminal_events = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  let c = StockCancellationOcfData with
+        id = "CXL-1"; date = holdDay; quantity = 600.0; reason_text = "x"; security_id = "S-A1"
+        comments = []; balance_security_id = None
+  applyOpsFails env "carries an open hold" [ApplyStockCancellation with cancellation = c; balance = None]
+
+test_holds_only_ta_places : Script ()
+test_holds_only_ta_places = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  inputs <- allInputs env
+  submitMustFail env.issuer do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = OcfHoldTypeRegisterSettlement; reference = "T-1"; date = holdDay; reason_text = "x"; lots = [lot]
+  submitMustFail env.system_operator do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = OcfHoldTypeRegisterSettlement; reference = "T-1"; date = holdDay; reason_text = "x"; lots = [lot]
+
+test_holds_conflicting_placements : Script ()
+test_holds_conflicting_placements = do
+  env <- heldBook
+  lot <- settlementLot env "S-A1" 100.0
+  -- Two placements prepared against the same state: the second fails because the first consumed it.
+  inputs <- allInputs env
+  _ <- submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = OcfHoldTypeRegisterSettlement; reference = "T-1"; date = holdDay; reason_text = "x"; lots = [lot]
+  submitMustFail env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = OcfHoldTypeStopTransfer; reference = "CASE-1"; date = holdDay; reason_text = "x"; lots = [stopLot "S-A1"]
+
+-- Helpers
+
+acceptance : Env -> Text -> Date -> StockAcceptanceOcfData
+acceptance env sec d = StockAcceptanceOcfData with id = "ACC-" <> sec <> "-" <> show d; date = d; security_id = sec; comments = []
+
+retraction : Env -> Text -> Date -> StockRetractionOcfData
+retraction env sec d = StockRetractionOcfData with id = "RET-" <> sec; date = d; reason_text = "x"; security_id = sec; comments = []

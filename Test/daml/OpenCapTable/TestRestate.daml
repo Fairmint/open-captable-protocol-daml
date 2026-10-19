@@ -1,0 +1,176 @@
+-- CapTable_Restate: mirrored edits and deletes, and the stock states they affect, within the restatement limits.
+module OpenCapTable.TestRestate where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..), StakeholderOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import OpenCapTable.Harness
+
+restatementOf : StockSecurity -> StateRestatement
+restatementOf s = StateRestatement with
+  security_id = s.security_id
+  issue_date = s.issue_date
+  last_event_date = s.last_event_date
+  origin_transaction_id = s.origin_transaction_id
+  quantity = s.quantity
+  stakeholder_id = s.stakeholder_id
+  stock_class_id = s.stock_class_id
+  vesting = s.vesting
+  snapshot = s.snapshot
+  seq = None
+
+test_restate_edit_record : Script ()
+test_restate_edit_record = do
+  env <- standardBook
+  let edited = (stakeholderData "SH-B") with name = OcfName with legal_name = "Renamed"; first_name = None; last_name = None
+  r <- restateOps env [RestateEdit (OcfRecordDataStakeholder edited)]
+  rcid <- recordCidOf env "SH-B"
+  case rcid of
+    OcfRecordCidStakeholder cid -> do
+      Some sh <- queryContractId env.transfer_agent cid
+      sh.ocf_data.name.legal_name === "Renamed"
+    _ -> fail "SH-B is not a stakeholder"
+
+test_restate_edit_rules : Script ()
+test_restate_edit_rules = do
+  env <- standardBook
+  restateOpsFails env "at least one operation" []
+  restateOpsFails env "changes nothing" [RestateEdit (OcfRecordDataStakeholder (stakeholderData "SH-B"))]
+  restateOpsFails env "is not in this write" [RestateEdit (OcfRecordDataStakeholder (stakeholderData "SH-NONE"))]
+  -- An edit keeps the record's type (the ID is SH-B's, the type a stock class).
+  restateOpsFails env "keeps record SH-B's type" [RestateEdit (OcfRecordDataStockClass (stockClass "SH-B"))]
+  -- Each record at most once per restatement.
+  let e1 = (stakeholderData "SH-B") with issuer_assigned_id = Some "1"
+      e2 = (stakeholderData "SH-B") with issuer_assigned_id = Some "2"
+  restateOpsFails env "more than once" [RestateEdit (OcfRecordDataStakeholder e1), RestateEdit (OcfRecordDataStakeholder e2)]
+  -- A stock issuance keeps its security ID.
+  restateOpsFails env "cannot change stock issuance"
+    [RestateEdit (OcfRecordDataStockIssuance ((issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024) with security_id = "S-OTHER"))]
+
+test_restate_issuer_edit_but_no_delete : Script ()
+test_restate_issuer_edit_but_no_delete = do
+  env <- standardBook
+  _ <- restateOps env [RestateEdit (OcfRecordDataIssuer issuerData with dba = Some "Trade name")]
+  restateOpsFails env "never deleted" [RestateDelete issuerId]
+
+test_restate_refuses_derived_records : Script ()
+test_restate_refuses_derived_records = do
+  env <- standardBook
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  lot <- settlementLot env "S-A1" 10.0
+  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" d [lot]
+  restateOpsFails env "never restated" [RestateDelete h.hold_id]
+
+test_restate_refuses_splits : Script ()
+test_restate_refuses_splits = do
+  env <- standardBook
+  (cid, _) <- epochOf env "CLS-A"
+  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid
+  _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 (D.date 2025 D.Jan 10))]
+  (cid', _) <- epochOf env "CLS-A"
+  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = cid'
+  restateOpsFails env "never restated" [RestateDelete "SPLIT-1"]
+  restateOpsFails env "never restated" [RestateEdit (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 3.0 1.0 (D.date 2025 D.Jan 10)))]
+  -- The class with recorded splits is never deleted either.
+  restateOpsFails env "has recorded splits" [RestateDelete "CLS-A"]
+
+test_restate_delete_class_archives_epoch : Script ()
+test_restate_delete_class_archives_epoch = do
+  env <- setupEnv
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-X")]
+  _ <- restateOps env [RestateDelete "CLS-X"]
+  epochsOf env >>= (=== 0) . length
+  -- The class ID is free again.
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-X")]
+  pure ()
+
+test_restate_replace_state : Script ()
+test_restate_replace_state = do
+  env <- standardBook
+  s <- stateOf env "S-A1"
+  _ <- restateOps env
+    [ RestateEdit (OcfRecordDataStockIssuance (issuance "S-A1" "SH-A" "CLS-A" 650.0 d2024))
+    , RestateSetState (restatementOf s) with quantity = 650.0
+    ]
+  s' <- stateOf env "S-A1"
+  s'.quantity === 650.0
+  s'.seq === s.seq + 1
+
+test_restate_state_with_hold_keeps_its_key_fields : Script ()
+test_restate_state_with_hold_keeps_its_key_fields = do
+  env <- standardBook
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  lot <- settlementLot env "S-A1" 100.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" d [lot]
+  s <- stateOf env "S-A1"
+  restateOpsFails env "keeps its stakeholder" [RestateSetState (restatementOf s) with stakeholder_id = "SH-B"]
+  r <- restateOps env [RestateSetState (restatementOf s) with quantity = 700.0]
+  s' <- stateOf env "S-A1"
+  s'.holds === s.holds
+  s'.quantity === 700.0
+  -- A correction that leaves the hold above the vested quantity is refused (the state's ensure).
+  restateOpsFails env "precondition" [RestateSetState (restatementOf s') with quantity = 50.0]
+
+test_restate_end_state_needs_origin_delete : Script ()
+test_restate_end_state_needs_origin_delete = do
+  env <- standardBook
+  restateOpsFails env "only with the deletion of its origin issuance" [RestateEndState "S-A2"]
+  _ <- restateOps env [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
+  hasState env "S-A2" >>= (=== False)
+  hasRecord env "ISS-S-A2" >>= (=== False)
+  -- Its security ID is released with the issuance.
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 1.0 d2024)]
+  pure ()
+
+test_restate_end_state_refused_on_hold : Script ()
+test_restate_end_state_refused_on_hold = do
+  env <- standardBook
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "S-A2"]
+  restateOpsFails env "never ends a lot on hold" [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
+
+test_restate_recreate_needs_consuming_record_delete : Script ()
+test_restate_recreate_needs_consuming_record_delete = do
+  env <- standardBook
+  let ret = StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Mar 1; reason_text = "x"; security_id = "S-A2"; comments = []
+  _ <- applyRecords env [OcfRecordDataStockRetraction ret]
+  hasState env "S-A2" >>= (=== False)
+  let restored = StateRestatement with
+        security_id = "S-A2"
+        issue_date = d2024
+        last_event_date = d2024
+        origin_transaction_id = "ISS-S-A2"
+        quantity = 400.0
+        stakeholder_id = "SH-A"
+        stock_class_id = "CLS-A"
+        vesting = StockVestingNone
+        snapshot = None
+        seq = Some 5
+  restateOpsFails env "only with the deletion of the record that consumed it" [RestateSetState restored]
+  restateOpsFails env "give a seq" [RestateSetState restored with seq = None]
+  _ <- restateOps env [RestateDelete "RET-1", RestateSetState restored]
+  s <- stateOf env "S-A2"
+  s.seq === 5
+  s.quantity === 400.0
+
+test_restate_never_moves_last_event_back : Script ()
+test_restate_never_moves_last_event_back = do
+  env <- standardBook
+  s <- stateOf env "S-A1"
+  restateOpsFails env "last event date back" [RestateSetState (restatementOf s) with last_event_date = D.addDays s.last_event_date (-1)]
