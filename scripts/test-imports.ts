@@ -1,10 +1,12 @@
 import fs from 'fs';
 import path from 'path';
+import { requirePackageConfig } from './packages';
 import { getErrorMessage, type PackageJson } from './types';
 
 const ROOT_DIR = path.join(__dirname, '..');
 const rootPackagePath = path.join(ROOT_DIR, 'package.json');
 const rootPackage = JSON.parse(fs.readFileSync(rootPackagePath, 'utf8')) as PackageJson;
+const ocpPackage = requirePackageConfig('ocp');
 
 try {
   const rootPkg = require(ROOT_DIR);
@@ -27,8 +29,27 @@ try {
     throw new Error('Root package missing OCP_TEMPLATES (capTable, issuerAuthorization, ocpFactory)');
   }
 
+  // The v35 factory is consumed per authorization, so the JSON records identities, never a contract ID. A network is
+  // absent until its factory exists; any entry present must belong to the current package (no v34 leftovers).
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
-  if (!ocp?.mainnet?.ocpFactoryContractId) throw new Error('OCP Factory JSON missing expected fields');
+  if (ocp === null || typeof ocp !== 'object' || Array.isArray(ocp)) {
+    throw new Error('OCP Factory JSON must be an object keyed by network');
+  }
+  for (const [network, entry] of Object.entries(ocp as Record<string, Record<string, unknown> | undefined>)) {
+    if (network !== 'devnet' && network !== 'mainnet')
+      throw new Error(`OCP Factory JSON has unknown network ${network}`);
+    for (const field of ['templateId', 'system_operator', 'factory_id']) {
+      if (typeof entry?.[field] !== 'string' || entry[field] === '') {
+        throw new Error(`OCP Factory JSON ${network} entry missing ${field}`);
+      }
+    }
+    if ('ocpFactoryContractId' in (entry ?? {})) {
+      throw new Error(`OCP Factory JSON ${network} entry records a contract ID; the v35 factory is consumed per use`);
+    }
+    if (entry?.packageName !== ocpPackage.name) {
+      throw new Error(`OCP Factory JSON ${network} entry is for ${String(entry?.packageName)}, not ${ocpPackage.name}`);
+    }
+  }
 
   const openCapTableDarPathMod = require(`${rootPackage.name}/openCapTableDarPath`);
   if (typeof openCapTableDarPathMod.getOpenCapTableDarPath !== 'function') {
