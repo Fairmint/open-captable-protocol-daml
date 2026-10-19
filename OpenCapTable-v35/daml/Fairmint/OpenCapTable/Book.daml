@@ -1,0 +1,504 @@
+-- The working set of one register write: the contracts it was given, what it changes in memory, and the counters behind the per-transaction caps.
+module Fairmint.OpenCapTable.Book
+  ( BookInputs(..)
+  , emptyInputs
+  , Book(..)
+  , StateSlot(..)
+  , EpochSlot(..)
+  , ShardSlot(..)
+  , RecordEntry(..)
+  , BookResult(..)
+  , maxClaimsPerTransaction
+  , maxShardsCreatedPerTransaction
+  , maxTranchesPerTransaction
+  , maxPolymorphicReferencesPerTransaction
+  , loadBook
+  , fetchChecked
+  -- states
+  , lookupState
+  , requireState
+  , replaceState
+  , endState
+  , addState
+  -- epochs
+  , requireEpoch
+  , lookupEpoch
+  , replaceEpoch
+  , addEpoch
+  , removeEpoch
+  -- records
+  , lookupRecord
+  , lookupRecordData
+  , lookupSecurity
+  , addRecord
+  , removeRecord
+  , requireRecord
+  -- ids
+  , claimId
+  , releaseId
+  , preSplitShard
+  -- counters and deferred checks
+  , countTranches
+  , countPolymorphicReferences
+  , addRequirements
+  , flushBook
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.List (dedup)
+import qualified DA.Map as Map
+import DA.Map (Map)
+import DA.Optional (isNone, isSome)
+import qualified DA.Set as Set
+import qualified DA.Text as T
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.References (Requirement)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+
+-- =============================================================================
+-- INPUTS AND CAPS
+-- =============================================================================
+
+-- | The existing contracts a write reads or changes. Operations name everything else by OCF ID:
+-- states by security ID, epochs by stock class ID, records by object ID, shards by the hash an ID
+-- claims. Every contract is fetched by its template-typed ID and checked to belong to this cap
+-- table.
+data BookInputs = BookInputs
+  with
+    -- Stock states the write consumes or reads
+    states : [ContractId StockSecurity]
+    -- Epochs of the classes whose stock states the write creates or changes, or whose splits it records
+    epochs : [ContractId StockClassEpoch]
+    -- The shards that cover the IDs the write claims or releases
+    shards : [ContractId OcfIdShard]
+    -- OCF records the write's references point at, and the records a restatement edits or deletes
+    records : [OcfRecordCid]
+  deriving (Eq, Show)
+
+emptyInputs : BookInputs
+emptyInputs = BookInputs with states = []; epochs = []; shards = []; records = []
+
+maxClaimsPerTransaction : Int
+maxClaimsPerTransaction = 500
+
+maxShardsCreatedPerTransaction : Int
+maxShardsCreatedPerTransaction = 4096
+
+-- | Vesting tranches summed over the states and stock issuances a transaction reads or writes.
+maxTranchesPerTransaction : Int
+maxTranchesPerTransaction = 20000
+
+-- | Polymorphic references (a document's related objects, a financing's issuances and
+-- capitalization-definition targets) checked per transaction.
+maxPolymorphicReferencesPerTransaction : Int
+maxPolymorphicReferencesPerTransaction = 100
+
+-- =============================================================================
+-- WORKING SET
+-- =============================================================================
+
+-- | A stock security in the working set. `original` is the active contract the write was given;
+-- it is archived when an operation first consumes the state. `current` is the state after the
+-- operations so far (None once a terminal event or a restatement ended it); if `dirty`, it is
+-- created when the write flushes.
+data StateSlot = StateSlot
+  with
+    original : Optional (ContractId StockSecurity)
+    archived : Bool
+    current : Optional StockSecurity
+    dirty : Bool
+  deriving (Eq, Show)
+
+data EpochSlot = EpochSlot
+  with
+    original : Optional (ContractId StockClassEpoch)
+    archived : Bool
+    current : Optional StockClassEpoch
+    dirty : Bool
+  deriving (Eq, Show)
+
+-- | A shard in the working set, by prefix. `original` is the active shard while unchanged; a
+-- changed shard has been archived and is created at flush.
+data ShardSlot = ShardSlot
+  with
+    original : Optional (ContractId OcfIdShard)
+    claimed : Set.Set Text
+  deriving (Eq, Show)
+
+-- | An OCF record in the working set, by object ID: one the write was given or created.
+data RecordEntry = RecordEntry
+  with
+    cid : OcfRecordCid
+    ocf_data : OcfRecordData
+  deriving (Eq, Show)
+
+data Book = Book
+  with
+    context : Context
+    states : Map Text StateSlot
+    epochs : Map Text EpochSlot
+    shards : Map Text ShardSlot
+    records : Map Text RecordEntry
+    -- security ID -> object ID of the issuance that carries it
+    securities : Map Text Text
+    -- object IDs of records created by this write, with their contract IDs
+    created_records : Map Text OcfRecordCid
+    -- deferred reference requirements, checked after the last operation
+    requirements : [Requirement]
+    claims : Int
+    tranches : Int
+    polymorphic_references : Int
+    -- register contracts archived or created so far (restatements cap it)
+    contracts_touched : Int
+  deriving (Eq, Show)
+
+-- | What a write created, for its result.
+data BookResult = BookResult
+  with
+    -- The states created, by security ID
+    states : Map Text (ContractId StockSecurity)
+    -- The epochs created, by stock class ID
+    epochs : Map Text (ContractId StockClassEpoch)
+    -- The shards created
+    shards : [ContractId OcfIdShard]
+    -- The OCF records created, by object ID
+    records : Map Text OcfRecordCid
+  deriving (Eq, Show)
+
+-- =============================================================================
+-- LOADING
+-- =============================================================================
+
+-- | Fetches a register contract by its template-typed ID and checks that it belongs to this cap
+-- table: one issuer can hold several cap tables with the same parties, and authority depends only
+-- on the parties.
+fetchChecked : (HasFetch t, HasField "context" t Context) => Context -> Text -> ContractId t -> Update t
+fetchChecked ctx what cid = do
+  c <- fetch cid
+  unless (c.context == ctx) (abort (what <> " belongs to another cap table"))
+  pure c
+
+loadBook : Context -> BookInputs -> Update Book
+loadBook ctx inputs = do
+  let empty = Book with
+        context = ctx
+        states = Map.empty
+        epochs = Map.empty
+        shards = Map.empty
+        records = Map.empty
+        securities = Map.empty
+        created_records = Map.empty
+        requirements = []
+        claims = 0
+        tranches = 0
+        polymorphic_references = 0
+        contracts_touched = 0
+  b1 <- foldlA loadState empty (dedup inputs.states)
+  b2 <- foldlA loadEpoch b1 (dedup inputs.epochs)
+  b3 <- foldlA loadShard b2 (dedup inputs.shards)
+  foldlA loadRecord b3 (dedup inputs.records)
+  where
+    loadState b cid = do
+      s <- fetchChecked ctx "a stock state" cid
+      when (Map.member s.security_id b.states)
+        (abort ("two active states for security " <> s.security_id))
+      countTranches (stateTranches s) b with
+        states = Map.insert s.security_id
+          (StateSlot with original = Some cid; archived = False; current = Some s; dirty = False) b.states
+    loadEpoch b cid = do
+      e <- fetchChecked ctx "a stock class epoch" cid
+      when (Map.member e.stock_class_id b.epochs)
+        (abort ("two active epochs for stock class " <> e.stock_class_id))
+      pure b with
+        epochs = Map.insert e.stock_class_id
+          (EpochSlot with original = Some cid; archived = False; current = Some e; dirty = False) b.epochs
+    loadShard b cid = do
+      sh <- fetchChecked ctx "an ID shard" cid
+      when (any (\p -> T.isPrefixOf p sh.prefix || T.isPrefixOf sh.prefix p) (Map.keys b.shards))
+        (abort ("overlapping ID shards for prefix " <> sh.prefix))
+      pure b with
+        shards = Map.insert sh.prefix (ShardSlot with original = Some cid; claimed = sh.claimed) b.shards
+    loadRecord b rcid = do
+      (rctx, d) <- fetchRecord rcid
+      unless (rctx == ctx) (abort ("record " <> recordIdOf ctx d <> " belongs to another cap table"))
+      let objectId = recordIdOf ctx d
+      when (Map.member objectId b.records)
+        (abort ("two active records with object ID " <> objectId))
+      b' <- countTranches (recordTranches d) b
+      pure (indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b')
+
+recordIdOf : Context -> OcfRecordData -> Text
+recordIdOf ctx d = (recordView ctx d).object_id
+
+indexRecord : Text -> RecordEntry -> Book -> Book
+indexRecord objectId entry b =
+  b with
+    records = Map.insert objectId entry b.records
+    securities = case issuanceSecurityId entry.ocf_data of
+      Some sec -> Map.insert sec objectId b.securities
+      None -> b.securities
+
+stateTranches : StockSecurity -> Int
+stateTranches s = case s.vesting of
+  StockVestingTranches ts -> length ts
+  _ -> 0
+
+-- =============================================================================
+-- STATES
+-- =============================================================================
+
+lookupState : Text -> Book -> Optional StockSecurity
+lookupState sec b = Map.lookup sec b.states >>= (.current)
+
+-- | The current state of a security, or abort: an event on a security that has no state in the
+-- working set (never supplied, or already consumed) fails.
+requireState : Text -> Book -> Update StockSecurity
+requireState sec b = case lookupState sec b of
+  Some s -> pure s
+  None -> abort ("no active state for security " <> sec <> " in this write")
+
+-- Archives the slot's original contract the first time an operation consumes it.
+consumeSlot : Text -> Book -> Update (Book, StateSlot)
+consumeSlot sec b = case Map.lookup sec b.states of
+  Some slot | isSome slot.current -> do
+    slot' <- case (slot.original, slot.archived) of
+      (Some cid, False) -> do
+        archive cid
+        pure slot with archived = True
+      _ -> pure slot
+    pure (b with contracts_touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0), slot')
+  _ -> abort ("no active state for security " <> sec <> " in this write")
+
+-- | Consumes the security's state and records its successor.
+replaceState : StockSecurity -> Book -> Update Book
+replaceState s b = do
+  unless (s.context == b.context) (abort "a successor state must belong to this cap table")
+  (b', slot) <- consumeSlot s.security_id b
+  pure b' with states = Map.insert s.security_id (slot with current = Some s; dirty = True) b'.states
+
+-- | Consumes the security's state without a successor.
+endState : Text -> Book -> Update Book
+endState sec b = do
+  (b', slot) <- consumeSlot sec b
+  pure b' with states = Map.insert sec (slot with current = None; dirty = False) b'.states
+
+-- | Adds the state of a new security. A security ID that this write has already seen is refused.
+addState : StockSecurity -> Book -> Update Book
+addState s b = do
+  unless (s.context == b.context) (abort "a new state must belong to this cap table")
+  when (Map.member s.security_id b.states)
+    (abort ("security " <> s.security_id <> " already has a state in this write"))
+  pure b with
+    states = Map.insert s.security_id (StateSlot with original = None; archived = False; current = Some s; dirty = True) b.states
+
+-- =============================================================================
+-- EPOCHS
+-- =============================================================================
+
+lookupEpoch : Text -> Book -> Optional StockClassEpoch
+lookupEpoch cls b = Map.lookup cls b.epochs >>= (.current)
+
+requireEpoch : Text -> Book -> Update StockClassEpoch
+requireEpoch cls b = case lookupEpoch cls b of
+  Some e -> pure e
+  None -> abort ("no active epoch for stock class " <> cls <> " in this write")
+
+consumeEpochSlot : Text -> Book -> Update (Book, EpochSlot)
+consumeEpochSlot cls b = case Map.lookup cls b.epochs of
+  Some slot | isSome slot.current -> do
+    slot' <- case (slot.original, slot.archived) of
+      (Some cid, False) -> do
+        archive cid
+        pure slot with archived = True
+      _ -> pure slot
+    pure (b with contracts_touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0), slot')
+  _ -> abort ("no active epoch for stock class " <> cls <> " in this write")
+
+replaceEpoch : StockClassEpoch -> Book -> Update Book
+replaceEpoch e b = do
+  (b', slot) <- consumeEpochSlot e.stock_class_id b
+  pure b' with epochs = Map.insert e.stock_class_id (slot with current = Some e; dirty = True) b'.epochs
+
+addEpoch : StockClassEpoch -> Book -> Update Book
+addEpoch e b = do
+  when (Map.member e.stock_class_id b.epochs)
+    (abort ("stock class " <> e.stock_class_id <> " already has an epoch in this write"))
+  pure b with
+    epochs = Map.insert e.stock_class_id (EpochSlot with original = None; archived = False; current = Some e; dirty = True) b.epochs
+
+removeEpoch : Text -> Book -> Update Book
+removeEpoch cls b = do
+  (b', slot) <- consumeEpochSlot cls b
+  pure b' with epochs = Map.insert cls (slot with current = None; dirty = False) b'.epochs
+
+-- =============================================================================
+-- RECORDS
+-- =============================================================================
+
+lookupRecord : Text -> Book -> Optional RecordEntry
+lookupRecord objectId b = Map.lookup objectId b.records
+
+lookupRecordData : Text -> Book -> Optional OcfRecordData
+lookupRecordData objectId b = (.ocf_data) <$> lookupRecord objectId b
+
+-- | The issuance that carries a security ID, if the working set has it.
+lookupSecurity : Text -> Book -> Optional OcfRecordData
+lookupSecurity sec b = Map.lookup sec b.securities >>= (`lookupRecordData` b)
+
+requireRecord : Text -> Book -> Update RecordEntry
+requireRecord objectId b = case lookupRecord objectId b of
+  Some e -> pure e
+  None -> abort ("record " <> objectId <> " is not in this write")
+
+-- | Creates an OCF record now and adds it to the working set.
+addRecord : OcfRecordData -> Book -> Update (Book, OcfRecordCid)
+addRecord d b = do
+  let objectId = recordIdOf b.context d
+  when (Map.member objectId b.records)
+    (abort ("ID already used: " <> objectId))
+  forA_ (issuanceSecurityId d) \sec ->
+    when (Map.member sec b.securities) (abort ("security ID already used: " <> sec))
+  rcid <- createRecord b.context d
+  b' <- countTranches (recordTranches d) b
+  let b'' = indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b'
+  pure (b'' with
+    created_records = Map.insert objectId rcid b''.created_records
+    contracts_touched = b''.contracts_touched + 1, rcid)
+
+-- | Archives a record the working set holds and drops it (a restatement's edit or delete).
+removeRecord : Text -> Book -> Update Book
+removeRecord objectId b = do
+  entry <- requireRecord objectId b
+  archiveRecord entry.cid
+  pure b with
+    records = Map.delete objectId b.records
+    securities = case issuanceSecurityId entry.ocf_data of
+      Some sec -> Map.delete sec b.securities
+      None -> b.securities
+    created_records = Map.delete objectId b.created_records
+    contracts_touched = b.contracts_touched + 1
+
+-- =============================================================================
+-- CLAIMED IDS AND SHARDS
+-- =============================================================================
+
+-- | Claims a writer-chosen ID in the shard that covers its hash: refused in this book's derived
+-- form, refused if already claimed ("ID already used"). A shard that would hold a 65th hash splits
+-- by the next bit, again until no child holds more than 64.
+claimId : IdNamespace -> Text -> Book -> Update Book
+claimId ns id b = do
+  when (id == "") (abort "an empty ID cannot be claimed")
+  when (isDerivedForm b.context id)
+    (abort ("ID " <> id <> " has this cap table's derived form and cannot be claimed"))
+  when (b.claims >= maxClaimsPerTransaction)
+    (abort ("more than " <> show maxClaimsPerTransaction <> " claimed IDs in one transaction"))
+  let hash = claimHash ns id
+      bits = hashBits hash
+  (prefix, slot) <- coveringShard bits id b
+  when (Set.member hash slot.claimed)
+    (abort ((if ns == IdNamespaceSecurity then "security ID" else "ID") <> " already used: " <> id))
+  archiveShardOriginal slot
+  let claimed' = Set.insert hash slot.claimed
+      parts = if Set.size claimed' <= maxHashesPerShard then [(prefix, claimed')] else splitShard prefix claimed'
+  pure b with
+    shards = foldl (\m (p, c) -> Map.insert p (ShardSlot with original = None; claimed = c) m)
+      (Map.delete prefix b.shards) parts
+    claims = b.claims + 1
+
+-- | Releases the ID of a record a restatement deletes. Shards never merge.
+releaseId : IdNamespace -> Text -> Book -> Update Book
+releaseId ns id b = do
+  let hash = claimHash ns id
+  (prefix, slot) <- coveringShard (hashBits hash) id b
+  unless (Set.member hash slot.claimed) (abort ("ID " <> id <> " is not claimed"))
+  archiveShardOriginal slot
+  pure b with
+    shards = Map.insert prefix (ShardSlot with original = None; claimed = Set.delete hash slot.claimed) b.shards
+
+-- | Splits a shard by its next bit regardless of fill, for a large book's replication.
+preSplitShard : Text -> Book -> Update Book
+preSplitShard prefix b = case Map.lookup prefix b.shards of
+  None -> abort ("no shard with prefix " <> prefix <> " in this write")
+  Some slot -> do
+    when (T.length prefix >= 256) (abort ("shard " <> prefix <> " cannot split further"))
+    archiveShardOriginal slot
+    let (zeros, ones) = partitionByBit (T.length prefix) slot.claimed
+    pure b with
+      shards = Map.insert (prefix <> "0") (ShardSlot with original = None; claimed = zeros)
+        (Map.insert (prefix <> "1") (ShardSlot with original = None; claimed = ones) (Map.delete prefix b.shards))
+
+coveringShard : Text -> Text -> Book -> Update (Text, ShardSlot)
+coveringShard bits id b =
+  case filter (\(p, _) -> T.isPrefixOf p bits) (Map.toList b.shards) of
+    [found] -> pure found
+    [] -> abort ("no shard in this write covers the ID " <> id)
+    _ -> abort ("overlapping shards cover the ID " <> id)
+
+archiveShardOriginal : ShardSlot -> Update ()
+archiveShardOriginal slot = forA_ slot.original archive
+
+splitShard : Text -> Set.Set Text -> [(Text, Set.Set Text)]
+splitShard prefix claimed =
+  let (zeros, ones) = partitionByBit (T.length prefix) claimed
+      child p c = if Set.size c <= maxHashesPerShard then [(p, c)] else splitShard p c
+  in child (prefix <> "0") zeros <> child (prefix <> "1") ones
+
+partitionByBit : Int -> Set.Set Text -> (Set.Set Text, Set.Set Text)
+partitionByBit i claimed =
+  let bitOf h = T.substring i 1 (hashBits h)
+      hashes = Set.toList claimed
+  in (Set.fromList (filter (\h -> bitOf h == "0") hashes), Set.fromList (filter (\h -> bitOf h == "1") hashes))
+
+-- =============================================================================
+-- COUNTERS AND DEFERRED CHECKS
+-- =============================================================================
+
+countTranches : Int -> Book -> Update Book
+countTranches n b = do
+  let total = b.tranches + n
+  when (total > maxTranchesPerTransaction)
+    (abort ("more than " <> show maxTranchesPerTransaction <> " vesting tranches read or written in one transaction"))
+  pure b with tranches = total
+
+countPolymorphicReferences : Int -> Book -> Update Book
+countPolymorphicReferences n b = do
+  let total = b.polymorphic_references + n
+  when (total > maxPolymorphicReferencesPerTransaction)
+    (abort ("more than " <> show maxPolymorphicReferencesPerTransaction <> " polymorphic references checked in one transaction"))
+  pure b with polymorphic_references = total
+
+addRequirements : [Requirement] -> Book -> Book
+addRequirements rs b = b with requirements = b.requirements <> rs
+
+-- =============================================================================
+-- FLUSH
+-- =============================================================================
+
+-- | Creates the final version of every changed state, epoch and shard, once.
+flushBook : Book -> Update (Book, BookResult)
+flushBook b = do
+  states <- foldlA (\acc (sec, slot) -> case (slot.dirty, slot.current) of
+      (True, Some s) -> do
+        cid <- create s
+        pure (Map.insert sec cid acc)
+      _ -> pure acc) Map.empty (Map.toList b.states)
+  epochs <- foldlA (\acc (cls, slot) -> case (slot.dirty, slot.current) of
+      (True, Some e) -> do
+        cid <- create e
+        pure (Map.insert cls cid acc)
+      _ -> pure acc) Map.empty (Map.toList b.epochs)
+  let newShards = filter (\(_, slot) -> isNone slot.original) (Map.toList b.shards)
+  when (length newShards > maxShardsCreatedPerTransaction)
+    (abort ("more than " <> show maxShardsCreatedPerTransaction <> " ID shards created in one transaction"))
+  shards <- mapA (\(p, slot) -> create OcfIdShard with context = b.context; prefix = p; claimed = slot.claimed) newShards
+  newTranches <- pure (sum (map (\(_, slot) -> if slot.dirty then optional 0 stateTranches slot.current else 0) (Map.toList b.states)))
+  b' <- countTranches newTranches b
+  let touched = b'.contracts_touched + Map.size states + Map.size epochs + length shards
+  pure (b' with contracts_touched = touched, BookResult with
+    states
+    epochs
+    shards
+    records = b'.created_records)

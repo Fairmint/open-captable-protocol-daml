@@ -1,0 +1,62 @@
+-- Lazy application of a class's recorded splits to one stock state at its next event.
+module Fairmint.OpenCapTable.Splits
+  ( applySplits
+  , scaleTranches
+  , splitsDatedIn
+  ) where
+
+import Fairmint.OpenCapTable.Numeric (scaleByRatio)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio)
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+
+-- | Brings a state to an event dated `d`. A split touches no stock state when it is recorded;
+-- each state applies it at its next event instead. The state's `split_epoch` must equal the number
+-- of the class's splits dated on or before its `last_event_date` (a stale one fails closed); then
+-- every split dated after its last event and on or before `d` is applied in date order, scaling
+-- the quantity, the tranches (cumulatively) and the snapshot with the shared floor function. Hold
+-- quantities are never scaled: a split voids a settlement hold instead (its split epoch falls
+-- behind). The result is dated max(d, last_event_date): vesting starts and events may be backdated.
+applySplits : [RecordedSplit] -> Date -> StockSecurity -> Either Text StockSecurity
+applySplits splits d s = do
+  let expected = splitsOnOrBefore splits s.last_event_date
+  if s.split_epoch /= expected
+    then Left ("stale split epoch on security " <> s.security_id <> ": " <> show s.split_epoch
+      <> ", the class has " <> show expected <> " splits dated on or before " <> show s.last_event_date)
+    else pure ()
+  let newLast = max d s.last_event_date
+  scaled <- foldl (\acc sp -> acc >>= applyOne sp) (Right s) (splitsDatedIn s.last_event_date newLast splits)
+  pure scaled with
+    last_event_date = newLast
+    split_epoch = splitsOnOrBefore splits newLast
+
+-- | The splits dated after `from` and on or before `to`, in date order.
+splitsDatedIn : Date -> Date -> [RecordedSplit] -> [RecordedSplit]
+splitsDatedIn from to = filter (\sp -> sp.date > from && sp.date <= to)
+
+applyOne : RecordedSplit -> StockSecurity -> Either Text StockSecurity
+applyOne sp s = do
+  let quantity' = scaleByRatio sp.ratio s.quantity
+  if quantity' <= 0.0
+    then Left ("split " <> sp.split_id <> " floors security " <> s.security_id
+      <> " to zero; retire the fraction with a record dated before the split")
+    else pure ()
+  vesting' <- case s.vesting of
+    StockVestingTranches ts -> case scaleTranches sp.ratio ts of
+      [] -> Left ("split " <> sp.split_id <> " floors every vesting tranche of security " <> s.security_id <> " to zero")
+      ts' -> Right (StockVestingTranches ts')
+    other -> Right other
+  pure s with
+    quantity = quantity'
+    vesting = vesting'
+    snapshot = fmap (\snap -> snap with vested = scaleByRatio sp.ratio snap.vested) s.snapshot
+
+-- | Scales tranches cumulatively: the running totals are scaled and floored, then differenced, and
+-- tranches that floor to zero are dropped. So the scaled schedule never vests more by any date
+-- than the floor of the scaled original.
+scaleTranches : OcfRatio -> [OcfVesting] -> [OcfVesting]
+scaleTranches r ts =
+  let cumulative = drop 1 (scanl (+) 0.0 (map (.amount) ts))
+      scaled = map (scaleByRatio r) cumulative
+      amounts = zipWith (-) scaled (0.0 :: scaled)
+  in filter (\t -> t.amount > 0.0) (zipWith (\t a -> t with amount = a) ts amounts)

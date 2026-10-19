@@ -65,7 +65,7 @@ interface PackageDef {
 /** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
 const PACKAGE_DEFS = {
   ocp: {
-    sourceDir: 'OpenCapTable-v34',
+    sourceDir: 'OpenCapTable-v35',
     generated: { createIndex: true, publishNameSuffix: null },
   },
 } as const satisfies Record<string, PackageDef>;

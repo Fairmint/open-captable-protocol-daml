@@ -1,0 +1,75 @@
+-- The system operator's and the pinned transfer agent's consent to exactly one cap table; the issuer's acceptance creates it.
+module Fairmint.OpenCapTable.IssuerAuthorization where
+
+import DA.Action (unless, when)
+import qualified DA.Set as Set
+import Fairmint.OpenCapTable.CapTable (CapTable(..), CapTableStatus(..))
+import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
+import Fairmint.OpenCapTable.OCF.Issuer (Issuer(..), IssuerOcfData(..))
+import Fairmint.OpenCapTable.State (OcfIdShard(..))
+import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
+import qualified DA.Text as T
+
+-- | Created by `OcpFactory_AuthorizeIssuer`, signed by the system operator. The pinned TA's
+-- `IssuerAuthorization_TaAccept` recreates it signed by the TA too; only then can the issuer's
+-- `IssuerAuthorization_CreateCapTable` use it, once.
+template IssuerAuthorization
+  with
+    context : Context
+    ta_accepted : Bool
+  where
+    signatory context.system_operator, (if ta_accepted then [context.transfer_agent] else [])
+    observer context.issuer, context.transfer_agent
+
+    ensure validateContext context
+
+    choice IssuerAuthorization_TaAccept : ContractId IssuerAuthorization
+      controller context.transfer_agent
+      do
+        when ta_accepted (abort "the transfer agent has already accepted this authorization")
+        create this with ta_accepted = True
+
+    -- | Creates the `Issuer` record (its ID claimed), the anchor in Active status and the first 256
+    -- ID shards, each signed by the issuer, the system operator and the TA: the body holds all three
+    -- parties' authority.
+    choice IssuerAuthorization_CreateCapTable : IssuerAuthorization_CreateCapTableResult
+      with
+        -- Must be the pinned TA
+        transfer_agent : Party
+        issuer_data : IssuerOcfData
+      controller context.issuer
+      do
+        unless ta_accepted (abort "the transfer agent has not accepted this authorization")
+        unless (transfer_agent == context.transfer_agent)
+          (abort "the cap table must name the transfer agent this authorization pins")
+        issuer <- create Issuer with context; ocf_data = issuer_data
+        let issuerHash = claimHash IdNamespaceObject issuer_data.id
+            issuerPrefix = T.take 8 (hashBits issuerHash)
+        shards <- mapA (\p -> create OcfIdShard with
+            context
+            prefix = p
+            claimed = if p == issuerPrefix then Set.singleton issuerHash else Set.empty)
+          initialShardPrefixes
+        capTable <- create CapTable with context; status = CapTableStatusActive
+        pure IssuerAuthorization_CreateCapTableResult with
+          cap_table = capTable
+          issuer
+          shards
+
+    choice IssuerAuthorization_Withdraw : ()
+      controller context.system_operator
+      do
+        pure ()
+
+data IssuerAuthorization_CreateCapTableResult = IssuerAuthorization_CreateCapTableResult
+  with
+    cap_table : ContractId CapTable
+    issuer : ContractId Issuer
+    shards : [ContractId OcfIdShard]
+  deriving (Eq, Show)
+
+-- | The 256 8-bit prefixes "00000000" … "11111111", in order.
+initialShardPrefixes : [Text]
+initialShardPrefixes = map toBits [0 .. 255]
+  where
+    toBits n = T.implode (map (\i -> if (n / (2 ^ (7 - i))) % 2 == 1 then "1" else "0") [0 .. 7])

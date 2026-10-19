@@ -1,0 +1,120 @@
+-- Derived OCF IDs and the hashes that claimed IDs are kept unique by; shared test vectors pin both encodings.
+module Fairmint.OpenCapTable.Ids
+  ( IdNamespace(..)
+  , DerivedRole(..)
+  , namespaceTag
+  , roleTag
+  , roleNamespace
+  , utf8Length
+  , encodeFields
+  , deriveId
+  , isDerivedForm
+  , claimHash
+  , hashBits
+  ) where
+
+import qualified DA.Text as T
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+
+-- | The two ID namespaces: OCF object IDs, unique across every object type, and security IDs,
+-- unique across every instrument.
+data IdNamespace = IdNamespaceObject | IdNamespaceSecurity
+  deriving (Eq, Ord, Show)
+
+-- | The fixed vocabulary of derived-ID roles. An event on a stock security's state derives each
+-- ID it writes from the state's security ID and `seq`, the role and an index.
+data DerivedRole
+  = DerivedRoleEvent              -- the event's own OCF record
+  | DerivedRoleHold               -- a TX_STOCK_HOLD
+  | DerivedRoleHoldCancellation   -- a TX_STOCK_HOLD_CANCELLATION
+  | DerivedRoleResultingIssuance  -- a resulting TX_STOCK_ISSUANCE (index = its position)
+  | DerivedRoleResultingSecurity  -- a resulting security ID (index = its position)
+  | DerivedRoleBalanceIssuance    -- the balance TX_STOCK_ISSUANCE
+  | DerivedRoleBalanceSecurity    -- the balance security ID
+  deriving (Eq, Ord, Show)
+
+namespaceTag : IdNamespace -> Text
+namespaceTag IdNamespaceObject = "object"
+namespaceTag IdNamespaceSecurity = "security"
+
+roleTag : DerivedRole -> Text
+roleTag r = case r of
+  DerivedRoleEvent -> "event"
+  DerivedRoleHold -> "hold"
+  DerivedRoleHoldCancellation -> "hold_cancellation"
+  DerivedRoleResultingIssuance -> "resulting_issuance"
+  DerivedRoleResultingSecurity -> "resulting_security"
+  DerivedRoleBalanceIssuance -> "balance_issuance"
+  DerivedRoleBalanceSecurity -> "balance_security"
+
+-- | Security roles derive security IDs; every other role derives an object ID.
+roleNamespace : DerivedRole -> IdNamespace
+roleNamespace r = case r of
+  DerivedRoleResultingSecurity -> IdNamespaceSecurity
+  DerivedRoleBalanceSecurity -> IdNamespaceSecurity
+  _ -> IdNamespaceObject
+
+-- | The number of bytes of the text's UTF-8 encoding.
+utf8Length : Text -> Int
+utf8Length t = sum (map codePointBytes (T.toCodePoints t))
+  where
+    codePointBytes cp
+      | cp < 0x80 = 1
+      | cp < 0x800 = 2
+      | cp < 0x10000 = 3
+      | otherwise = 4
+
+-- | An injective encoding of a list of fields: each field is its UTF-8 byte length in decimal, a
+-- colon and the field itself.
+encodeFields : [Text] -> Text
+encodeFields = T.concat . map (\f -> show (utf8Length f) <> ":" <> f)
+
+-- | The ID an event on a stock state derives: the cap table ID, a colon and the lowercase hex
+-- SHA-256 of the encoding of (namespace tag, cap table ID, security ID, seq, role, index), where
+-- `seq` is the state's `seq` before the event. Each (security ID, seq) is consumed once, so derived
+-- IDs are unique with no state, a retry derives the same IDs, and the TA can compute them first.
+deriveId : Context -> Text -> Int -> DerivedRole -> Int -> Text
+deriveId ctx securityId seq role index =
+  ctx.cap_table_id <> ":" <>
+    T.sha256 (encodeFields
+      [ namespaceTag (roleNamespace role)
+      , ctx.cap_table_id
+      , securityId
+      , show seq
+      , roleTag role
+      , show index
+      ])
+
+-- | Whether an ID has this book's derived form (its cap table ID and a colon). No claim accepts
+-- one, so claimed and derived IDs never meet.
+isDerivedForm : Context -> Text -> Bool
+isDerivedForm ctx id = T.isPrefixOf (ctx.cap_table_id <> ":") id
+
+-- | The hash a claimed ID is recorded under in its `OcfIdShard`: the lowercase hex SHA-256 of the
+-- encoding of (namespace tag, ID), so equal text in the two namespaces never collides.
+claimHash : IdNamespace -> Text -> Text
+claimHash ns id = T.sha256 (encodeFields [namespaceTag ns, id])
+
+-- | The bit string of a lowercase hex hash, 4 bits per hex digit, most significant first, as
+-- "0" and "1" characters. Shard prefixes are prefixes of it.
+hashBits : Text -> Text
+hashBits = T.concat . map hexBits . T.explode
+  where
+    hexBits c = case c of
+      "0" -> "0000"
+      "1" -> "0001"
+      "2" -> "0010"
+      "3" -> "0011"
+      "4" -> "0100"
+      "5" -> "0101"
+      "6" -> "0110"
+      "7" -> "0111"
+      "8" -> "1000"
+      "9" -> "1001"
+      "a" -> "1010"
+      "b" -> "1011"
+      "c" -> "1100"
+      "d" -> "1101"
+      "e" -> "1110"
+      "f" -> "1111"
+      _ -> error ("hashBits: not a lowercase hex digit: " <> c)

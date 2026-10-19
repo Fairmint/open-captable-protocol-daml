@@ -1,0 +1,311 @@
+-- The register's state contracts: one StockSecurity per outstanding stock security, one StockClassEpoch per class and the OcfIdShard partition of claimed IDs.
+module Fairmint.OpenCapTable.State where
+
+import DA.List (dedup, sort)
+import qualified DA.Set as Set
+import qualified DA.Text as T
+import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..), RegisterKind(..))
+import Fairmint.OpenCapTable.Ids (hashBits)
+import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+
+-- =============================================================================
+-- CAPS
+-- =============================================================================
+
+-- | Open holds per security, voided settlement holds included.
+maxHoldsPerSecurity : Int
+maxHoldsPerSecurity = 32
+
+-- | Explicit vesting tranches per security; a longer schedule stays on vesting terms plus a snapshot.
+maxTranchesPerSecurity : Int
+maxTranchesPerSecurity = 1500
+
+-- | Recorded splits per stock class.
+maxSplitsPerClass : Int
+maxSplitsPerClass = 64
+
+-- | Claimed hashes per shard; the 65th splits it.
+maxHashesPerShard : Int
+maxHashesPerShard = 64
+
+-- =============================================================================
+-- STOCK SECURITY STATE
+-- =============================================================================
+
+-- | A hold open on a stock security. A settlement hold puts some of its vested shares on hold for
+-- one trade; a stop holds the whole security for a case or order.
+data OpenHold = OpenHold
+  with
+    -- The TX_STOCK_HOLD that placed it
+    hold_id : Text
+    -- REGISTER_SETTLEMENT or STOP_TRANSFER
+    hold_type : OcfHoldType
+    -- The settlement ID, or the stop's case or order reference
+    reference : Text
+    -- The class's splits dated on or before the hold's date
+    split_epoch : Int
+    -- Some (> 0) iff REGISTER_SETTLEMENT
+    quantity : Optional Decimal
+  deriving (Eq, Show)
+
+-- | Set only on the buyer's state that `CapTable_Settle` creates; every successor clears it.
+data Delivery = Delivery
+  with
+    -- The settlement ID
+    reference : Text
+    -- The stakeholder that delivered the shares
+    seller_stakeholder_id : Text
+    -- The TX_STOCK_TRANSFER that delivered them
+    transfer_id : Text
+  deriving (Eq, Show)
+
+-- | How a security vests.
+data StockVesting
+  = StockVestingNone                    -- fully vested
+  | StockVestingTranches [OcfVesting]   -- explicit OCF tranches, sorted by date
+  | StockVestingOnTerms Text            -- vesting_terms_id; the vested quantity is the snapshot's
+  deriving (Eq, Show)
+
+-- | The TA's record of how much of a security on vesting terms has vested. Monotone, at most the
+-- quantity, in the security's current units.
+data VestedSnapshot = VestedSnapshot
+  with
+    as_of : Date
+    vested : Decimal
+  deriving (Eq, Show)
+
+-- | The one consumable state of an outstanding stock security. Every event on the security
+-- consumes it and creates at most one successor; a terminal event creates none. It names a
+-- stakeholder, never a holder party.
+template StockSecurity
+  with
+    context : Context
+    security_id : Text
+    issue_date : Date
+    last_event_date : Date
+    -- The OCF record that created this security
+    origin_transaction_id : Text
+    -- > 0, in the units of the splits it has applied
+    quantity : Decimal
+    -- Security-level events so far
+    seq : Int
+    -- The class's splits dated on or before last_event_date
+    split_epoch : Int
+    stakeholder_id : Text
+    stock_class_id : Text
+    vesting : StockVesting
+    -- At most 32, voided ones included, with distinct references; at most one REGISTER_SETTLEMENT
+    holds : [OpenHold]
+    delivery : Optional Delivery
+    snapshot : Optional VestedSnapshot
+  where
+    signatory context.issuer, context.system_operator, context.transfer_agent
+
+    ensure validateContext context && validateStockSecurity this
+
+    interface instance RegisterContract for StockSecurity where
+      view = RegisterContractView with
+        cap_table_id = context.cap_table_id
+        kind = RegisterKindStockSecurity
+        key = security_id
+
+-- | The state's own invariants (design: per-contract invariants).
+validateStockSecurity : StockSecurity -> Bool
+validateStockSecurity s =
+  s.security_id /= "" &&
+  s.origin_transaction_id /= "" &&
+  s.stakeholder_id /= "" &&
+  s.stock_class_id /= "" &&
+  s.quantity > 0.0 &&
+  s.seq >= 0 &&
+  s.split_epoch >= 0 &&
+  s.issue_date <= s.last_event_date &&
+  validateHolds s &&
+  validateStockVesting s.quantity s.vesting &&
+  validateSnapshot s &&
+  optional True validateDelivery s.delivery
+
+validateHolds : StockSecurity -> Bool
+validateHolds s =
+  length s.holds <= maxHoldsPerSecurity &&
+  unique (map (.hold_id) s.holds) &&
+  unique (map (.reference) s.holds) &&
+  all validHold s.holds &&
+  length settlement <= 1 &&
+  not (isStopped s && not (null settlement)) &&
+  all (\h -> not (isCurrentHold s h) || optional False (<= vestedAt s s.last_event_date) h.quantity) settlement
+  where
+    settlement = settlementHolds s
+    validHold h =
+      h.hold_id /= "" &&
+      h.reference /= "" &&
+      h.split_epoch >= 0 &&
+      h.split_epoch <= s.split_epoch &&
+      case (h.hold_type, h.quantity) of
+        (OcfHoldTypeRegisterSettlement, Some q) -> q > 0.0
+        (OcfHoldTypeStopTransfer, None) -> True
+        _ -> False
+
+validateStockVesting : Decimal -> StockVesting -> Bool
+validateStockVesting quantity v = case v of
+  StockVestingNone -> True
+  StockVestingTranches ts ->
+    not (null ts) &&
+    length ts <= maxTranchesPerSecurity &&
+    all (\t -> t.amount > 0.0) ts &&
+    trancheTotal ts <= quantity &&
+    map (.date) ts == sort (map (.date) ts)
+  StockVestingOnTerms termsId -> termsId /= ""
+
+validateSnapshot : StockSecurity -> Bool
+validateSnapshot s = case s.snapshot of
+  None -> True
+  Some snap ->
+    isOnTerms s.vesting &&
+    snap.vested >= 0.0 &&
+    snap.vested <= s.quantity &&
+    snap.as_of <= s.last_event_date
+
+validateDelivery : Delivery -> Bool
+validateDelivery d = d.reference /= "" && d.seller_stakeholder_id /= "" && d.transfer_id /= ""
+
+unique : Eq a => [a] -> Bool
+unique xs = length (dedup xs) == length xs
+
+-- =============================================================================
+-- STATE QUERIES
+-- =============================================================================
+
+trancheTotal : [OcfVesting] -> Decimal
+trancheTotal = sum . map (.amount)
+
+isOnTerms : StockVesting -> Bool
+isOnTerms (StockVestingOnTerms _) = True
+isOnTerms _ = False
+
+-- | Vested shares at a date: all of them with no vesting, the tranches dated on or before it, or the
+-- snapshot's vested quantity on vesting terms (none without a snapshot).
+vestedAt : StockSecurity -> Date -> Decimal
+vestedAt s d = case s.vesting of
+  StockVestingNone -> s.quantity
+  StockVestingTranches ts -> trancheTotal (filter (\t -> t.date <= d) ts)
+  StockVestingOnTerms _ -> optional 0.0 (.vested) s.snapshot
+
+-- | Whether explicit tranches, if any, cover the whole quantity. A security whose tranches cover
+-- less takes no settlement hold, draw or partial terminal event.
+fullyCovered : StockSecurity -> Bool
+fullyCovered s = case s.vesting of
+  StockVestingTranches ts -> trancheTotal ts == s.quantity
+  _ -> True
+
+settlementHolds : StockSecurity -> [OpenHold]
+settlementHolds s = filter (\h -> h.hold_type == OcfHoldTypeRegisterSettlement) s.holds
+
+stopHolds : StockSecurity -> [OpenHold]
+stopHolds s = filter (\h -> h.hold_type == OcfHoldTypeStopTransfer) s.holds
+
+-- | A security is stopped while it carries an open STOP_TRANSFER hold.
+isStopped : StockSecurity -> Bool
+isStopped s = not (null (stopHolds s))
+
+-- | A settlement hold is current unless a split the state has applied voided it.
+isCurrentHold : StockSecurity -> OpenHold -> Bool
+isCurrentHold s h = h.split_epoch == s.split_epoch
+
+findHold : Text -> StockSecurity -> Optional OpenHold
+findHold holdId s = case filter (\h -> h.hold_id == holdId) s.holds of
+  [h] -> Some h
+  _ -> None
+
+-- =============================================================================
+-- STOCK CLASS EPOCH
+-- =============================================================================
+
+-- | A split recorded on a class's epoch.
+data RecordedSplit = RecordedSplit
+  with
+    -- The TX_STOCK_CLASS_SPLIT
+    split_id : Text
+    date : Date
+    -- New shares per old share; numerator and denominator > 0
+    ratio : OcfRatio
+  deriving (Eq, Show)
+
+-- | The class's split list and freeze flag, kept apart from its `StockClass` so that a class edit
+-- does not fail trades in flight. Every write that creates or changes a stock state in the class
+-- fetches it; a freeze, a split, an unfreeze and the class's deletion consume it, so exactly one
+-- is active per class.
+template StockClassEpoch
+  with
+    context : Context
+    stock_class_id : Text
+    frozen : Bool
+    -- Dates strictly increase; at most 64
+    splits : [RecordedSplit]
+  where
+    signatory context.issuer, context.system_operator, context.transfer_agent
+
+    ensure validateContext context && validateStockClassEpoch this
+
+    interface instance RegisterContract for StockClassEpoch where
+      view = RegisterContractView with
+        cap_table_id = context.cap_table_id
+        kind = RegisterKindStockClassEpoch
+        key = stock_class_id
+
+validateStockClassEpoch : StockClassEpoch -> Bool
+validateStockClassEpoch e =
+  e.stock_class_id /= "" &&
+  length e.splits <= maxSplitsPerClass &&
+  unique (map (.split_id) e.splits) &&
+  all (\s -> s.split_id /= "" && s.ratio.numerator > 0.0 && s.ratio.denominator > 0.0) e.splits &&
+  strictlyIncreasing (map (.date) e.splits)
+
+strictlyIncreasing : Ord a => [a] -> Bool
+strictlyIncreasing xs = and (zipWith (<) xs (drop 1 xs))
+
+-- | The number of the class's splits dated on or before a date.
+splitsOnOrBefore : [RecordedSplit] -> Date -> Int
+splitsOnOrBefore splits d = length (takeWhile (\s -> s.date <= d) splits)
+
+-- =============================================================================
+-- ID SHARDS
+-- =============================================================================
+
+-- | One cell of the partition of the claim-hash space by bit prefix. A claim of a writer-chosen ID
+-- consumes the shard that covers its hash, so two claims of one ID conflict. The first 256 shards
+-- have 8-bit prefixes; a full shard splits by the next bit.
+template OcfIdShard
+  with
+    context : Context
+    -- Leading bits of the hashes it covers, as "0" and "1"
+    prefix : Text
+    -- At most 64 claim hashes, each 64 lowercase hex characters
+    claimed : Set.Set Text
+  where
+    signatory context.issuer, context.system_operator, context.transfer_agent
+
+    ensure validateContext context && validateOcfIdShard this
+
+    interface instance RegisterContract for OcfIdShard where
+      view = RegisterContractView with
+        cap_table_id = context.cap_table_id
+        kind = RegisterKindOcfIdShard
+        key = prefix
+
+-- | Shard prefixes start at 8 bits and can deepen to the full 256-bit hash.
+validateOcfIdShard : OcfIdShard -> Bool
+validateOcfIdShard sh =
+  T.length sh.prefix >= 8 &&
+  T.length sh.prefix <= 256 &&
+  all (\c -> c == "0" || c == "1") (T.explode sh.prefix) &&
+  Set.size sh.claimed <= maxHashesPerShard &&
+  all validHash (Set.toList sh.claimed)
+  where
+    validHash h =
+      T.length h == 64 &&
+      all isLowerHex (T.explode h) &&
+      T.isPrefixOf sh.prefix (hashBits (T.take ((T.length sh.prefix + 3) / 4) h))
+    isLowerHex c = T.isInfixOf c "0123456789abcdef"
