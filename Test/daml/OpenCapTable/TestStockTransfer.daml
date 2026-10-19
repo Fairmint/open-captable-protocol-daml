@@ -1,0 +1,135 @@
+-- Free stock transfers through ApplyStockTransfer: a terminal event whose resulting issuances hold exactly its quantity in the source's class, with an optional balance kept by the source's stakeholder, the resulting issuances' own references, and the transfer validator.
+module OpenCapTable.TestStockTransfer where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..), validateStockTransferOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+issued : Date
+issued = D.date 2023 D.Jan 1
+
+transferBook : Text -> Decimal -> Script Env
+transferBook sec q = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SH-C")
+    , OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-A" q issued) with
+        id = "TX_STOCK_ISS_1"; custom_id = "CS-1"; share_price = usd 0.0001; cost_basis = Some (usd 0.0))
+    ]
+  pure env
+
+mkTransfer : Text -> Text -> Date -> Decimal -> [Text] -> Optional Text -> StockTransferOcfData
+mkTransfer id sec d q resulting balance = StockTransferOcfData with
+  id; date = d; security_id = sec; quantity = q; resulting_security_ids = resulting
+  balance_security_id = balance; comments = []; consideration_text = None
+
+to : Text -> Text -> Text -> Date -> Decimal -> StockIssuanceOcfData
+to id sec sh d q = (issuance sec sh "CLS-A" q d) with id
+
+transferOp : StockTransferOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> ApplyOperation
+transferOp t rs b = ApplyStockTransfer with transfer = t; resulting = rs; balance = b
+
+-- Based on production: 400,000 shares transferred in full, split between two recipients.
+test_stock_transfer_split_between_recipients : Script ()
+test_stock_transfer_split_between_recipients = do
+  env <- transferBook "SSEC-ORIGINAL-001" 400000.0
+  let d = D.date 2025 D.Aug 5
+      t = mkTransfer "TX_STOCK_TRANSFER_1" "SSEC-ORIGINAL-001" d 400000.0 ["SSEC-NEW-001", "SSEC-NEW-002"] None
+      ra = to "TX_STOCK_TRANSFER_1_RESULT_A" "SSEC-NEW-001" "SH-B" d 200000.0
+      rb = to "TX_STOCK_TRANSFER_1_RESULT_B" "SSEC-NEW-002" "SH-C" d 200000.0
+  _ <- applyOps env [transferOp t [ra, rb] None]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  expectRecord env (OcfRecordDataStockIssuance ra)
+  expectRecord env (OcfRecordDataStockIssuance rb)
+  hasState env "SSEC-ORIGINAL-001" >>= (=== False)
+  a <- stateOf env "SSEC-NEW-001"
+  a.quantity === 200000.0
+  a.stakeholder_id === "SH-B"
+  b <- stateOf env "SSEC-NEW-002"
+  b.stakeholder_id === "SH-C"
+  b.last_event_date === d
+
+-- Based on production: an early founder transfer with detailed consideration and a balance.
+test_stock_transfer_founder_transfer_with_consideration : Script ()
+test_stock_transfer_founder_transfer_with_consideration = do
+  env <- transferBook "SSEC-FOUNDER-001" 1000.0
+  let d = D.date 2024 D.Apr 18
+      t = (mkTransfer "TX_STOCK_TRANSFER_2" "SSEC-FOUNDER-001" d 75.0 ["SSEC-TRANSFEREE-001"] (Some "SSEC-FOUNDER-REMAIN")) with
+        comments = ["Stock transfer from Founder A to Founder B per Stock Transfer Agreement. Transferee assumes all obligations including vesting schedule and repurchase option."]
+        consideration_text = Some "Transfer of 75 shares at $0.0001 per share for aggregate consideration of $0.01."
+      r = to "TX_STOCK_TRANSFER_2_RESULT" "SSEC-TRANSFEREE-001" "SH-B" d 75.0
+      b = to "TX_STOCK_TRANSFER_2_BALANCE" "SSEC-FOUNDER-REMAIN" "SH-A" d 925.0
+  _ <- applyOps env [transferOp t [r] (Some b)]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  expectRecord env (OcfRecordDataStockIssuance b)
+  (.quantity) <$> stateOf env "SSEC-TRANSFEREE-001" >>= (=== 75.0)
+  remain <- stateOf env "SSEC-FOUNDER-REMAIN"
+  remain.quantity === 925.0
+  remain.stakeholder_id === "SH-A"
+
+test_stock_transfer_whole : Script ()
+test_stock_transfer_whole = do
+  env <- transferBook "SSEC-FULL-001" 10000.0
+  let d = D.date 2025 D.Jan 15
+      t = (mkTransfer "TX_STOCK_TRANSFER_FULL" "SSEC-FULL-001" d 10000.0 ["SSEC-NEWOWNER-001"] None) with
+        consideration_text = Some "Secondary sale at $1.50 per share."
+      r = to "TX_STOCK_TRANSFER_FULL_RESULT" "SSEC-NEWOWNER-001" "SH-B" d 10000.0
+  _ <- applyOps env [transferOp t [r] None]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  hasState env "SSEC-FULL-001" >>= (=== False)
+  (.stakeholder_id) <$> stateOf env "SSEC-NEWOWNER-001" >>= (=== "SH-B")
+
+test_stock_transfer_overdraw_refused : Script ()
+test_stock_transfer_overdraw_refused = do
+  env <- transferBook "SSEC-TRANSFER-OVERDRAW" 100.0
+  let d = D.date 2025 D.Jan 15
+  applyOpsFails env "event quantity 101.0 exceeds the 100.0 of security SSEC-TRANSFER-OVERDRAW"
+    [transferOp (mkTransfer "TX_STOCK_TRANSFER_OVERDRAW" "SSEC-TRANSFER-OVERDRAW" d 101.0 ["SSEC-TRANSFER-RESULT"] None) [to "R-1" "SSEC-TRANSFER-RESULT" "SH-B" d 101.0] None]
+  (.quantity) <$> stateOf env "SSEC-TRANSFER-OVERDRAW" >>= (=== 100.0)
+
+-- The resulting and balance issuances are written with the transfer and carry their own
+-- references, checked at the end of the batch.
+test_stock_transfer_outputs_references : Script ()
+test_stock_transfer_outputs_references = do
+  env <- transferBook "SSEC-REF" 100.0
+  let d = D.date 2025 D.Jan 15
+      t = mkTransfer "TR-REF" "SSEC-REF" d 100.0 ["SSEC-REF-B"] None
+      r = to "ISS-REF-B" "SSEC-REF-B" "SH-NEW" d 100.0
+  applyOpsFails env "Stock issuance stakeholder not found: SH-NEW" [transferOp t [r] None]
+  applyOpsFails env "Stock issuance stock legend not found: LEGEND-NONE" [transferOp t [r with stakeholder_id = "SH-B"; stock_legend_ids = ["LEGEND-NONE"]] None]
+  -- A stakeholder created later in the same batch satisfies it.
+  _ <- applyOps env [transferOp t [r] None, ApplyRecord (OcfRecordDataStakeholder (stakeholderData "SH-NEW"))]
+  (.stakeholder_id) <$> stateOf env "SSEC-REF-B" >>= (=== "SH-NEW")
+
+test_stock_transfer_validator : Script ()
+test_stock_transfer_validator = do
+  env <- transferBook "SSEC-V" 100.0
+  let d = D.date 2025 D.Jan 15
+      t = mkTransfer "TR-V" "SSEC-V" d 100.0 ["SSEC-V-B"] None
+      r = to "ISS-V-B" "SSEC-V-B" "SH-B" d 100.0
+  applyOpsFails env "precondition" [transferOp (t with comments = [""]) [r] None]
+  applyOpsFails env "precondition" [transferOp (t with consideration_text = Some "") [r] None]
+  applyOpsFails env "precondition" [transferOp (t with resulting_security_ids = [""]) [r with security_id = ""] None]
+  applyOpsFails env "precondition"
+    [transferOp (t with quantity = 10.0; balance_security_id = Some "") [r with quantity = 10.0] (Some (to "ISS-V-R" "" "SH-A" d 90.0))]
+  applyOpsFails env "an empty ID cannot be claimed" [transferOp (t with id = "") [r] None]
+  applyOpsFails env "must hold exactly its quantity 100.0" [transferOp (t with resulting_security_ids = []) [] None]
+  hasState env "SSEC-V" >>= (=== True)
+  let ok = validateStockTransferOcfData
+  expectTrue "the fixture" (ok t)
+  expectTrue "a balance and consideration" (ok t with balance_security_id = Some "SSEC-V-R"; consideration_text = Some "Gift")
+  expectFalse "empty id" (ok t with id = "")
+  expectFalse "empty security_id" (ok t with security_id = "")
+  expectFalse "zero quantity" (ok t with quantity = 0.0)
+  expectFalse "no resulting securities" (ok t with resulting_security_ids = [])
+  expectFalse "an empty resulting security ID" (ok t with resulting_security_ids = ["SSEC-V-B", ""])
+  expectFalse "an empty comment" (ok t with comments = [""])
+  expectFalse "an empty balance_security_id" (ok t with balance_security_id = Some "")
+  expectFalse "an empty consideration_text" (ok t with consideration_text = Some "")

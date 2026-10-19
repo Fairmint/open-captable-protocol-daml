@@ -1,0 +1,87 @@
+-- Stock retractions through CapTable_Apply: a terminal record on the security's state with no outputs, refused while a hold is open, and the retraction validator.
+module OpenCapTable.TestStockRetraction where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..), validateStockRetractionOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+retractionBook : Script Env
+retractionBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [OcfRecordDataStockIssuance ((issuance "SEC-STOCK-1" "SH-A" "CLS-A" 100.0 d2024) with id = "TX_STOCK_ISS_1"; custom_id = "CERT-1")]
+  pure env
+
+mkRetraction : Text -> Date -> Text -> StockRetractionOcfData
+mkRetraction id d reason = StockRetractionOcfData with
+  id; date = d; security_id = "SEC-STOCK-1"; reason_text = reason; comments = []
+
+test_stock_retraction_create : Script ()
+test_stock_retraction_create = do
+  env <- retractionBook
+  let r = mkRetraction "TX_STOCK_RETRACT_1" (D.date 2024 D.Jan 2) "Administrative error - incorrect share count recorded"
+  _ <- applyRecords env [OcfRecordDataStockRetraction r]
+  expectRecord env (OcfRecordDataStockRetraction r)
+  hasState env "SEC-STOCK-1" >>= (=== False)
+  -- The retracted issuance's record stays.
+  hasRecord env "TX_STOCK_ISS_1" >>= (=== True)
+
+test_stock_retraction_with_comments : Script ()
+test_stock_retraction_with_comments = do
+  env <- retractionBook
+  let r = (mkRetraction "TX_STOCK_RETRACT_2" (D.date 2024 D.Jan 3) "Issuance void ab initio due to failed consideration") with
+        comments = ["Board resolution 2024-003", "Legal counsel reviewed"]
+  _ <- applyRecords env [OcfRecordDataStockRetraction r]
+  expectRecord env (OcfRecordDataStockRetraction r)
+  hasState env "SEC-STOCK-1" >>= (=== False)
+
+test_stock_retraction_retires_source : Script ()
+test_stock_retraction_retires_source = do
+  env <- retractionBook
+  let d = D.date 2024 D.Jan 2
+      cxl = StockCancellationOcfData with
+        id = "TX_STOCK_CANCEL_AFTER_RETRACTION"; date = d; security_id = "SEC-STOCK-1"; quantity = 1.0
+        balance_security_id = None; reason_text = "Cannot reduce a retracted security"; comments = []
+  applyOpsFails env "no active state for security SEC-STOCK-1 in this write"
+    [ ApplyRecord (OcfRecordDataStockRetraction (mkRetraction "TX_STOCK_RETRACT_BALANCE" d "Void the issuance"))
+    , ApplyStockCancellation with cancellation = cxl; balance = None
+    ]
+  hasState env "SEC-STOCK-1" >>= (=== True)
+
+test_stock_retraction_rules : Script ()
+test_stock_retraction_rules = do
+  env <- retractionBook
+  applyRecordsFails env "precedes the last event on security SEC-STOCK-1"
+    [OcfRecordDataStockRetraction (mkRetraction "RET-1" (D.date 2023 D.Dec 31) "Void")]
+  applyRecordsFails env "no active state for security SEC-NONE"
+    [OcfRecordDataStockRetraction ((mkRetraction "RET-1" (D.date 2024 D.Jan 2) "Void") with security_id = "SEC-NONE")]
+  -- Refused while any hold is open on the security.
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "SEC-STOCK-1"]
+  applyRecordsFails env "security SEC-STOCK-1 carries an open hold"
+    [OcfRecordDataStockRetraction (mkRetraction "RET-1" d "Void")]
+  hasState env "SEC-STOCK-1" >>= (=== True)
+
+test_stock_retraction_validator : Script ()
+test_stock_retraction_validator = do
+  env <- retractionBook
+  let r = mkRetraction "RET-1" (D.date 2024 D.Jan 2) "Void"
+  applyRecordsFails env "precondition" [OcfRecordDataStockRetraction (r with reason_text = "")]
+  applyRecordsFails env "precondition" [OcfRecordDataStockRetraction (r with comments = [""])]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockRetraction (r with id = "")]
+  hasState env "SEC-STOCK-1" >>= (=== True)
+  let ok = validateStockRetractionOcfData
+  expectTrue "the fixture" (ok r)
+  expectFalse "empty id" (ok r with id = "")
+  expectFalse "empty security_id" (ok r with security_id = "")
+  expectFalse "empty reason_text" (ok r with reason_text = "")
+  expectFalse "an empty comment" (ok r with comments = ["Board", ""])
