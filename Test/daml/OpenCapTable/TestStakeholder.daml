@@ -1,0 +1,278 @@
+-- Stakeholder records and their change events (relationship and status), ported from v34's TestStakeholder, TestStakeholderRelationshipChangeEvent and TestStakeholderStatusChangeEvent: writes, edits and deletes, every validator branch, and the stakeholder reference.
+module OpenCapTable.TestStakeholder where
+
+import DA.Assert ((===))
+import DA.Foldable (mapA_)
+import qualified DA.Date as D
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Contact
+import Fairmint.OpenCapTable.Types.Stakeholder (OcfStakeholderRelationshipType(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder
+import Fairmint.OpenCapTable.OCF.StakeholderRelationshipChangeEvent
+import Fairmint.OpenCapTable.OCF.StakeholderStatusChangeEvent
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+bobName : OcfName
+bobName = OcfName with legal_name = "Bob Builder"; first_name = Some "Robert"; last_name = Some "Builder"
+
+businessEmail : OcfEmail
+businessEmail = OcfEmail with email_type = OcfEmailTypeBusiness; email_address = "bob@example.com"
+
+legalAddress : OcfAddress
+legalAddress = OcfAddress with
+  address_type = OcfAddressTypeLegal
+  country = "US"
+  city = Some "San Francisco"
+  country_subdivision = Some "CA"
+  postal_code = Some "94105"
+  street_suite = Some "2 Main St"
+
+-- | A stakeholder with every optional field and array populated.
+fullStakeholder : Text -> StakeholderOcfData
+fullStakeholder id = (stakeholderData id) with
+  name = bobName
+  stakeholder_type = OcfStakeholderTypeInstitution
+  addresses = [legalAddress, (legalAddress with address_type = OcfAddressTypeContact; city = None; postal_code = None)]
+  comments = ["VIP"]
+  current_relationships = [OcfStakeholderRelationshipTypeEmployee, OcfStakeholderRelationshipTypeInvestor]
+  tax_ids = [OcfTaxID with tax_id = "999-99-9999"; country = "US"]
+  contact_info = Some OcfContactInfoWithoutName with
+    emails = [OcfEmail with email_type = OcfEmailTypePersonal; email_address = "bob.personal@example.com"]
+    phone_numbers = [OcfPhone with phone_type = OcfPhoneTypeMobile; phone_number = "+1 555 0101"]
+  current_status = Some OcfStakeholderStatusTypeActive
+  issuer_assigned_id = Some "EMP-001"
+  primary_contact = Some OcfContactInfo with
+    name = bobName
+    emails = [businessEmail]
+    phone_numbers = []
+
+relationshipChange : Text -> Text -> Optional OcfStakeholderRelationshipType -> Optional OcfStakeholderRelationshipType -> StakeholderRelationshipChangeEventOcfData
+relationshipChange id sh started ended = StakeholderRelationshipChangeEventOcfData with
+  id
+  date = D.date 2024 D.Mar 1
+  stakeholder_id = sh
+  comments = []
+  relationship_ended = ended
+  relationship_started = started
+
+statusChange : Text -> Text -> OcfStakeholderStatusType -> StakeholderStatusChangeEventOcfData
+statusChange id sh status = StakeholderStatusChangeEventOcfData with
+  id
+  date = D.date 2024 D.Jun 30
+  new_status = status
+  stakeholder_id = sh
+  comments = []
+
+stakeholderRecords : [OcfRecordData]
+stakeholderRecords = [OcfRecordDataStakeholder (stakeholderData "SH-1"), OcfRecordDataStockClass (stockClass "CLS-A")]
+
+-- =============================================================================
+-- STAKEHOLDER
+-- =============================================================================
+
+-- v34 testCreateAndDeleteStakeholder and testEditStakeholder.
+test_stakeholder_create_edit_delete : Script ()
+test_stakeholder_create_edit_delete = do
+  env <- setupEnv
+  let original = stakeholderData "STKH_Alice"
+  r <- applyRecords env [OcfRecordDataStakeholder original]
+  Map.keys r.records === ["STKH_Alice"]
+  expectRecord env (OcfRecordDataStakeholder original)
+  let edited = original with
+        name = OcfName with legal_name = "Updated Name"; first_name = None; last_name = None
+        issuer_assigned_id = Some "EMP-002"
+        current_relationships = [OcfStakeholderRelationshipTypeEmployee]
+        current_status = Some OcfStakeholderStatusTypeActive
+        comments = ["Updated"]
+  e <- restateOps env [RestateEdit (OcfRecordDataStakeholder edited)]
+  Map.keys e.records === ["STKH_Alice"]
+  expectRecord env (OcfRecordDataStakeholder edited)
+  _ <- restateOps env [RestateDelete "STKH_Alice"]
+  expectNoRecord env "STKH_Alice"
+  -- The delete released the ID.
+  _ <- applyRecords env [OcfRecordDataStakeholder original]
+  expectRecord env (OcfRecordDataStakeholder original)
+
+-- v34 testStakeholder_OptionalsSome.
+test_stakeholder_all_optional_fields : Script ()
+test_stakeholder_all_optional_fields = do
+  env <- setupEnv
+  accept env validateStakeholderOcfData OcfRecordDataStakeholder (fullStakeholder "STKH_Bob")
+
+-- v34 testBatchCreateMultipleStakeholders.
+test_stakeholder_batch_of_three : Script ()
+test_stakeholder_batch_of_three = do
+  env <- setupEnv
+  let ds =
+        [ OcfRecordDataStakeholder (stakeholderData "STKH_1")
+        , OcfRecordDataStakeholder (stakeholderData "STKH_2")
+        , OcfRecordDataStakeholder ((stakeholderData "STKH_3") with stakeholder_type = OcfStakeholderTypeInstitution)
+        ]
+  r <- applyRecords env ds
+  Map.keys r.records === ["STKH_1", "STKH_2", "STKH_3"]
+  expectRecords env ds
+
+test_stakeholder_validation : Script ()
+test_stakeholder_validation = do
+  env <- setupEnv
+  let base = fullStakeholder "SH-V"
+      no = refuse env validateStakeholderOcfData OcfRecordDataStakeholder
+      yes = accept env validateStakeholderOcfData OcfRecordDataStakeholder
+      blankName = OcfName with legal_name = ""; first_name = None; last_name = None
+  -- Name
+  no base with name = blankName
+  no base with name = (bobName with first_name = Some "")
+  no base with name = (bobName with last_name = Some "")
+  -- Optional text
+  no base with issuer_assigned_id = Some ""
+  -- Addresses: an ISO 3166-1 alpha-2 country, non-empty optional parts
+  no base with addresses = [legalAddress with country = "USA"]
+  no base with addresses = [legalAddress with country = "XX"]
+  no base with addresses = [legalAddress with country = ""]
+  no base with addresses = [legalAddress with city = Some ""]
+  no base with addresses = [legalAddress with country_subdivision = Some ""]
+  no base with addresses = [legalAddress with postal_code = Some ""]
+  no base with addresses = [legalAddress with street_suite = Some ""]
+  -- Comments and tax IDs
+  no base with comments = ["ok", ""]
+  no base with tax_ids = [OcfTaxID with tax_id = ""; country = "US"]
+  no base with tax_ids = [OcfTaxID with tax_id = "123"; country = "ZZ"]
+  -- Contact info needs a phone or an email, each valid
+  no base with contact_info = Some (OcfContactInfoWithoutName with emails = []; phone_numbers = [])
+  no base with contact_info = Some (OcfContactInfoWithoutName with emails = [OcfEmail with email_type = OcfEmailTypeOther; email_address = "no-at-sign"]; phone_numbers = [])
+  no base with contact_info = Some (OcfContactInfoWithoutName with emails = [OcfEmail with email_type = OcfEmailTypeOther; email_address = "a@"]; phone_numbers = [])
+  no base with contact_info = Some (OcfContactInfoWithoutName with emails = []; phone_numbers = [OcfPhone with phone_type = OcfPhoneTypeHome; phone_number = ""])
+  no base with primary_contact = Some (OcfContactInfo with name = bobName; emails = []; phone_numbers = [])
+  no base with primary_contact = Some (OcfContactInfo with name = blankName; emails = [businessEmail]; phone_numbers = [])
+  no base with primary_contact = Some (OcfContactInfo with name = bobName; emails = [businessEmail with email_address = ""]; phone_numbers = [])
+  -- The boundaries that pass: a phone-only contact, a three-character email, empty arrays.
+  yes base with
+    id = "SH-V1"
+    contact_info = Some (OcfContactInfoWithoutName with emails = []; phone_numbers = [OcfPhone with phone_type = OcfPhoneTypeOther; phone_number = "1"])
+    primary_contact = Some (OcfContactInfo with name = bobName; emails = [OcfEmail with email_type = OcfEmailTypeOther; email_address = "a@b"]; phone_numbers = [])
+  yes (stakeholderData "SH-V2") with addresses = [(OcfAddress with address_type = OcfAddressTypeOther; country = "FR"; city = None; country_subdivision = None; postal_code = None; street_suite = None)]
+  -- An empty ID is never claimed.
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStakeholder (stakeholderData "")]
+
+test_stakeholder_ids_are_unique : Script ()
+test_stakeholder_ids_are_unique = do
+  env <- bookWith stakeholderRecords
+  -- In one batch, against the book, and across types.
+  applyRecordsFails env "ID already used: SH-2" [OcfRecordDataStakeholder (stakeholderData "SH-2"), OcfRecordDataStakeholder (stakeholderData "SH-2")]
+  applyRecordsFails env "ID already used: SH-1" [OcfRecordDataStakeholder (stakeholderData "SH-1")]
+  applyRecordsFails env "ID already used: CLS-A" [OcfRecordDataStakeholder (stakeholderData "CLS-A")]
+  applyRecordsFails env "ID already used: SH-1" [OcfRecordDataStockLegendTemplate (legend "SH-1")]
+  -- A failed batch writes nothing.
+  expectNoRecord env "SH-2"
+
+test_stakeholder_edit_rules : Script ()
+test_stakeholder_edit_rules = do
+  env <- bookWith stakeholderRecords
+  restateOpsFails env "changes nothing" [RestateEdit (OcfRecordDataStakeholder (stakeholderData "SH-1"))]
+  restateOpsFails env "precondition" [RestateEdit (OcfRecordDataStakeholder ((stakeholderData "SH-1") with comments = [""]))]
+  -- An edit is by object ID: another ID is another record.
+  restateOpsFails env "record SH-NONE is not in this write" [RestateEdit (OcfRecordDataStakeholder (stakeholderData "SH-NONE"))]
+  restateOpsFails env "record SH-NONE is not in this write" [RestateDelete "SH-NONE"]
+  expectRecord env (OcfRecordDataStakeholder (stakeholderData "SH-1"))
+
+-- =============================================================================
+-- RELATIONSHIP CHANGE EVENTS
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStakeholderRelationshipChangeEvent{Start,End,BoardMember}.
+test_stakeholder_relationship_change_events : Script ()
+test_stakeholder_relationship_change_events = do
+  env <- bookWith stakeholderRecords
+  let hire = (relationshipChange "CE_REL_1" "SH-1" (Some OcfStakeholderRelationshipTypeEmployee) None) with
+        comments = ["New hire - Software Engineer starting March 1, 2024"]
+      leave = (relationshipChange "CE_REL_2" "SH-1" (Some OcfStakeholderRelationshipTypeExEmployee) (Some OcfStakeholderRelationshipTypeEmployee)) with
+        date = D.date 2024 D.Jun 30
+        comments = ["Voluntary resignation effective June 30, 2024"]
+      board = (relationshipChange "CE_REL_3" "SH-1" (Some OcfStakeholderRelationshipTypeBoardMember) None) with
+        date = D.date 2024 D.Jan 15
+      ended = relationshipChange "CE_REL_4" "SH-1" None (Some OcfStakeholderRelationshipTypeAdvisor)
+  mapA_ (accept env validateStakeholderRelationshipChangeEventOcfData OcfRecordDataStakeholderRelationshipChangeEvent) [hire, leave, board, ended]
+  -- Edit and delete.
+  let moved = hire with date = D.date 2024 D.Mar 4
+  _ <- restateOps env [RestateEdit (OcfRecordDataStakeholderRelationshipChangeEvent moved)]
+  expectRecord env (OcfRecordDataStakeholderRelationshipChangeEvent moved)
+  _ <- restateOps env [RestateDelete "CE_REL_4"]
+  expectNoRecord env "CE_REL_4"
+
+test_stakeholder_relationship_change_validation : Script ()
+test_stakeholder_relationship_change_validation = do
+  env <- bookWith stakeholderRecords
+  let no = refuse env validateStakeholderRelationshipChangeEventOcfData OcfRecordDataStakeholderRelationshipChangeEvent
+      base = relationshipChange "CE_REL_X" "SH-1" (Some OcfStakeholderRelationshipTypeFounder) None
+  -- OCF anyOf: a started or an ended relationship.
+  no base with relationship_started = None
+  no base with stakeholder_id = ""
+  no base with comments = [""]
+
+test_stakeholder_relationship_change_references : Script ()
+test_stakeholder_relationship_change_references = do
+  env <- bookWith stakeholderRecords
+  let ev id sh = OcfRecordDataStakeholderRelationshipChangeEvent (relationshipChange id sh (Some OcfStakeholderRelationshipTypeOfficer) None)
+  applyRecordsFails env "Stakeholder relationship change event stakeholder not found: SH-NONE" [ev "CE_REL_X" "SH-NONE"]
+  applyRecordsFails env "Stakeholder relationship change event stakeholder CLS-A is a OcfObjectTypeStockClass" [ev "CE_REL_X" "CLS-A"]
+  -- The stakeholder may come later in the same batch.
+  _ <- applyRecords env [ev "CE_REL_Y" "SH-2", OcfRecordDataStakeholder (stakeholderData "SH-2")]
+  expectRecord env (ev "CE_REL_Y" "SH-2")
+  -- An edit's new stakeholder is checked too.
+  restateOpsFails env "Stakeholder relationship change event stakeholder not found: SH-NONE" [RestateEdit (ev "CE_REL_Y" "SH-NONE")]
+  _ <- restateOps env [RestateEdit (ev "CE_REL_Y" "SH-1")]
+  expectRecord env (ev "CE_REL_Y" "SH-1")
+
+-- =============================================================================
+-- STATUS CHANGE EVENTS
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStakeholderStatusChangeEvent{Termination,Leave,Active}, with every status.
+test_stakeholder_status_change_events : Script ()
+test_stakeholder_status_change_events = do
+  env <- bookWith stakeholderRecords
+  let statuses =
+        [ OcfStakeholderStatusTypeActive
+        , OcfStakeholderStatusTypeLeaveOfAbsence
+        , OcfStakeholderStatusTypeTerminationVoluntaryOther
+        , OcfStakeholderStatusTypeTerminationVoluntaryGoodCause
+        , OcfStakeholderStatusTypeTerminationVoluntaryRetirement
+        , OcfStakeholderStatusTypeTerminationInvoluntaryOther
+        , OcfStakeholderStatusTypeTerminationInvoluntaryDeath
+        , OcfStakeholderStatusTypeTerminationInvoluntaryDisability
+        , OcfStakeholderStatusTypeTerminationInvoluntaryWithCause
+        ]
+      ds = zipWith (\i s -> OcfRecordDataStakeholderStatusChangeEvent ((statusChange ("CE_STATUS_" <> show i) "SH-1" s) with comments = ["status " <> show i]))
+        [1 .. length statuses] statuses
+  r <- applyRecords env ds
+  Map.size r.records === 9
+  expectRecords env ds
+  let leave = (statusChange "CE_STATUS_2" "SH-1" OcfStakeholderStatusTypeLeaveOfAbsence) with
+        date = D.date 2024 D.Sep 1
+        comments = ["Medical leave of absence starting September 1, 2024"]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStakeholderStatusChangeEvent leave), RestateDelete "CE_STATUS_9"]
+  expectRecord env (OcfRecordDataStakeholderStatusChangeEvent leave)
+  expectNoRecord env "CE_STATUS_9"
+
+test_stakeholder_status_change_validation_and_references : Script ()
+test_stakeholder_status_change_validation_and_references = do
+  env <- bookWith stakeholderRecords
+  let no = refuse env validateStakeholderStatusChangeEventOcfData OcfRecordDataStakeholderStatusChangeEvent
+      base = statusChange "CE_STATUS_X" "SH-1" OcfStakeholderStatusTypeActive
+  no base with stakeholder_id = ""
+  no base with comments = [""]
+  applyRecordsFails env "Stakeholder status change event stakeholder not found: SH-NONE"
+    [OcfRecordDataStakeholderStatusChangeEvent base with stakeholder_id = "SH-NONE"]
+  applyRecordsFails env "Stakeholder status change event stakeholder CLS-A is a OcfObjectTypeStockClass"
+    [OcfRecordDataStakeholderStatusChangeEvent base with stakeholder_id = "CLS-A"]
+  _ <- applyRecords env [OcfRecordDataStakeholderStatusChangeEvent (base with stakeholder_id = "SH-3"), OcfRecordDataStakeholder (stakeholderData "SH-3")]
+  expectRecord env (OcfRecordDataStakeholderStatusChangeEvent (base with stakeholder_id = "SH-3"))

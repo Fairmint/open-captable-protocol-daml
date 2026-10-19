@@ -1,0 +1,267 @@
+-- Vesting terms, ported from v34's TestVestingTerms: writes, edits and deletes, every condition, trigger and period validator branch, and the condition-graph rules (known IDs, no self or duplicate edges, no cycles through next or relative edges).
+module OpenCapTable.TestVestingTerms where
+
+import qualified DA.Date as D
+import DA.Foldable (mapA_)
+import qualified DA.Map as Map
+import DA.Assert ((===))
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.VestingTerms
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+condition : Text -> OcfVestingTrigger -> [Text] -> OcfVestingCondition
+condition id trigger next = OcfVestingCondition with
+  id
+  trigger
+  next_condition_ids = next
+  description = Some id
+  portion = None
+  quantity = Some 1.0
+
+termsOf : Text -> [OcfVestingCondition] -> VestingTermsOcfData
+termsOf id conditions = VestingTermsOcfData with
+  id
+  name = id
+  description = id
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  comments = []
+  vesting_conditions = conditions
+
+startCondition : Text -> [Text] -> OcfVestingCondition
+startCondition id = condition id OcfVestingStartTrigger
+
+eventCondition : Text -> [Text] -> OcfVestingCondition
+eventCondition id = condition id OcfVestingEventTrigger
+
+days : Int -> Int -> OcfVestingPeriod
+days n k = daysWithCliff n k None
+
+daysWithCliff : Int -> Int -> Optional Int -> OcfVestingPeriod
+daysWithCliff n k cliff = OcfVestingPeriodDays with length_ = n; occurrences = k; cliff_installment = cliff
+
+relativeTo : Text -> OcfVestingPeriod -> OcfVestingTrigger
+relativeTo anchor period = OcfVestingScheduleRelativeTrigger with period; relative_to_condition_id = anchor
+
+-- | Relative to `anchor`, 30 days once.
+relativeCondition : Text -> Text -> [Text] -> OcfVestingCondition
+relativeCondition id anchor = condition id (relativeTo anchor (days 30 1))
+
+-- | v34's standard terms: everything at the start.
+allAtStart : VestingTermsOcfData
+allAtStart = VestingTermsOcfData with
+  id = "VT_1"
+  name = "Standard 1k at start"
+  description = "All at start"
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  comments = []
+  vesting_conditions = [(startCondition "start" []) with description = Some "All at start"; quantity = Some 1000.0]
+
+-- | v34's relative schedule: a start, then 1/4 monthly on the 15th for four months, cliff at 1.
+monthlyQuarters : VestingTermsOcfData
+monthlyQuarters = VestingTermsOcfData with
+  id = "VT_SOME"
+  name = "Monthly 4x"
+  description = "1/4 monthly"
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  comments = ["Scheduled"]
+  vesting_conditions =
+    [ (startCondition "start" ["c1"]) with description = Some "Start"
+    , OcfVestingCondition with
+        id = "c1"
+        description = Some "Relative schedule"
+        portion = Some OcfVestingConditionPortion with numerator = 1.0; denominator = 4.0; remainder = Some False
+        quantity = None
+        trigger = relativeTo "start" OcfVestingPeriodMonths with
+          length_ = 1; occurrences = 4; day_of_month = OcfVestingDayOfMonth15; cliff_installment = Some 1
+        next_condition_ids = []
+    ]
+
+-- | Accepted by the validator and written unchanged.
+ok : Env -> VestingTermsOcfData -> Script ()
+ok env = accept env validateVestingTermsOcfData OcfRecordDataVestingTerms
+
+-- | Refused by the validator and by the template's `ensure`.
+no : Env -> VestingTermsOcfData -> Script ()
+no env = refuse env validateVestingTermsOcfData OcfRecordDataVestingTerms
+
+-- =============================================================================
+-- WRITES
+-- =============================================================================
+
+-- v34 testCreateAndArchiveVestingTerms and testCreateAndArchiveVestingTermsBuiltIn.
+test_vesting_terms_create_edit_delete : Script ()
+test_vesting_terms_create_edit_delete = do
+  env <- setupEnv
+  r <- applyRecords env [OcfRecordDataVestingTerms allAtStart]
+  Map.keys r.records === ["VT_1"]
+  expectRecord env (OcfRecordDataVestingTerms allAtStart)
+  let edited = allAtStart with
+        allocation_type = OcfAllocationTypeFrontLoaded
+        vesting_conditions = map (\c -> c with quantity = Some 2000.0) allAtStart.vesting_conditions
+  _ <- restateOps env [RestateEdit (OcfRecordDataVestingTerms edited)]
+  expectRecord env (OcfRecordDataVestingTerms edited)
+  _ <- restateOps env [RestateDelete "VT_1"]
+  expectNoRecord env "VT_1"
+
+-- v34 testVestingTerms_OptionalsSome, with v35's optional `remainder` and Date-typed absolute trigger.
+test_vesting_terms_all_optional_fields : Script ()
+test_vesting_terms_all_optional_fields = do
+  env <- setupEnv
+  ok env monthlyQuarters
+  ok env VestingTermsOcfData with
+    id = "VT_V35_SHAPES"
+    name = "Cliff then remainder"
+    description = "Absolute cliff, then the remainder monthly"
+    allocation_type = OcfAllocationTypeFractional
+    comments = ["v35 shapes"]
+    vesting_conditions =
+      [ OcfVestingCondition with
+          id = "cliff"
+          description = None
+          portion = Some OcfVestingConditionPortion with numerator = 1.0; denominator = 4.0; remainder = None
+          quantity = None
+          trigger = OcfVestingScheduleAbsoluteTrigger with date = D.date 2025 D.Jan 1
+          next_condition_ids = ["rest"]
+      , OcfVestingCondition with
+          id = "rest"
+          description = Some "The rest"
+          portion = Some OcfVestingConditionPortion with numerator = 1.0; denominator = 1.0; remainder = Some True
+          quantity = None
+          trigger = relativeTo "cliff" OcfVestingPeriodMonths with
+            length_ = 1; occurrences = 36; day_of_month = OcfVestingDayOfMonthVestingStartDayOrLastDayOfMonth; cliff_installment = None
+          next_condition_ids = []
+      ]
+  -- Every allocation type, and the day-of-month variants that handle short months.
+  mapA_ (\(i, a) -> ok env (termsOf ("VT_ALLOC_" <> show i) [startCondition "start" []]) with allocation_type = a)
+    (zip [1 .. 7 : Int]
+      [ OcfAllocationTypeCumulativeRounding, OcfAllocationTypeCumulativeRoundDown, OcfAllocationTypeFrontLoaded
+      , OcfAllocationTypeBackLoaded, OcfAllocationTypeFrontLoadedToSingleTranche
+      , OcfAllocationTypeBackLoadedToSingleTranche, OcfAllocationTypeFractional ])
+  mapA_ (\(i, d) -> ok env (termsOf ("VT_DAY_" <> show i)
+      [ startCondition "start" ["m"]
+      , condition "m" (relativeTo "start" OcfVestingPeriodMonths with length_ = 3; occurrences = 4; day_of_month = d; cliff_installment = Some 0) []
+      ]))
+    (zip [1 .. 4 : Int] [OcfVestingDayOfMonth01, OcfVestingDayOfMonth29OrLastDayOfMonth, OcfVestingDayOfMonth30OrLastDayOfMonth, OcfVestingDayOfMonth31OrLastDayOfMonth])
+
+-- v34 testVestingTerms_EditCannotCreateInvalidGraph.
+test_vesting_terms_edit_is_validated : Script ()
+test_vesting_terms_edit_is_validated = do
+  env <- setupEnv
+  let valid = termsOf "VT_EDIT_GRAPH" [startCondition "start" ["next"], eventCondition "next" []]
+  _ <- applyRecords env [OcfRecordDataVestingTerms valid]
+  let invalid = termsOf "VT_EDIT_GRAPH" [startCondition "start" ["missing"], eventCondition "next" []]
+  assertMsg "the validator accepted the invalid edit" (not (validateVestingTermsOcfData invalid))
+  restateOpsFails env "precondition" [RestateEdit (OcfRecordDataVestingTerms invalid)]
+  restateOpsFails env "changes nothing" [RestateEdit (OcfRecordDataVestingTerms valid)]
+  expectRecord env (OcfRecordDataVestingTerms valid)
+
+-- =============================================================================
+-- RECORD, CONDITION, TRIGGER AND PERIOD VALIDATORS
+-- =============================================================================
+
+test_vesting_terms_record_validation : Script ()
+test_vesting_terms_record_validation = do
+  env <- setupEnv
+  no env allAtStart with name = ""
+  no env allAtStart with description = ""
+  no env allAtStart with comments = [""]
+  -- OCF minItems 1
+  no env allAtStart with vesting_conditions = []
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataVestingTerms (allAtStart with id = "")]
+
+test_vesting_terms_condition_validation : Script ()
+test_vesting_terms_condition_validation = do
+  env <- setupEnv
+  let terms c = termsOf "VT_COND" [c]
+      start = startCondition "start" []
+      portion n d = Some OcfVestingConditionPortion with numerator = n; denominator = d; remainder = None
+  no env (terms (start with id = ""))
+  no env (terms (start with description = Some ""))
+  -- Exactly one of portion and quantity
+  no env (terms (start with portion = portion 1.0 4.0; quantity = Some 1.0))
+  no env (terms (start with portion = None; quantity = None))
+  no env (terms (start with quantity = Some (-1.0)))
+  -- A portion with a non-negative numerator over a positive denominator (v34 testVestingTerms_ZeroDenominatorFails)
+  no env (terms (start with quantity = None; portion = portion 1.0 0.0))
+  no env (terms (start with quantity = None; portion = portion 1.0 (-4.0)))
+  no env (terms (start with quantity = None; portion = portion (-1.0) 4.0))
+  no env (terms (start with next_condition_ids = [""]))
+  -- The boundaries that pass: v34 testVestingTerms_ZeroPortionNumerator, a zero quantity, no description.
+  ok env (termsOf "VT_ZERO_NUM" [start with quantity = None; portion = portion 0.0 1.0])
+  ok env (termsOf "VT_ZERO_QTY" [start with quantity = Some 0.0])
+  ok env (termsOf "VT_NO_DESC" [start with description = None])
+
+test_vesting_terms_trigger_and_period_validation : Script ()
+test_vesting_terms_trigger_and_period_validation = do
+  env <- setupEnv
+  let terms period = termsOf "VT_PERIOD" [startCondition "start" ["rel"], condition "rel" (relativeTo "start" period) []]
+      months n k cliff = OcfVestingPeriodMonths with length_ = n; occurrences = k; day_of_month = OcfVestingDayOfMonth01; cliff_installment = cliff
+  -- A relative trigger names an anchor.
+  no env (termsOf "VT_PERIOD" [startCondition "start" ["rel"], condition "rel" (relativeTo "" (days 30 1)) []])
+  -- A period of positive length, at least one occurrence and a non-negative cliff.
+  no env (terms (days 0 1))
+  no env (terms (days 30 0))
+  no env (terms (days (-30) 1))
+  no env (terms (daysWithCliff 30 4 (Some (-1))))
+  no env (terms (months 0 4 None))
+  no env (terms (months 1 0 None))
+  no env (terms (months 1 4 (Some (-1))))
+  -- The boundaries that pass.
+  ok env ((terms (daysWithCliff 1 1 (Some 0))) with id = "VT_DAYS_MIN")
+  ok env ((terms (months 1 1 (Some 1))) with id = "VT_MONTHS_MIN")
+  ok env (termsOf "VT_ABSOLUTE" [condition "on" (OcfVestingScheduleAbsoluteTrigger with date = D.date 2026 D.Jun 30) []])
+
+-- =============================================================================
+-- CONDITION GRAPH
+-- =============================================================================
+
+-- v34 testVestingTerms_DuplicateConditionIdsFail, _DuplicateNextConditionIdsFail,
+-- _MissingNextConditionIdFails, _MissingRelativeConditionIdFails, _RelativeConditionCannotReferenceSelf
+-- and _NextConditionCannotReferenceSelf.
+test_vesting_terms_graph_ids_and_edges : Script ()
+test_vesting_terms_graph_ids_and_edges = do
+  env <- setupEnv
+  no env (termsOf "VT_DUP_COND" [startCondition "dup" [], eventCondition "dup" []])
+  no env (termsOf "VT_DUP_NEXT" [startCondition "start" ["next", "next"], eventCondition "next" []])
+  no env (termsOf "VT_MISSING_NEXT" [startCondition "start" ["missing"]])
+  no env (termsOf "VT_MISSING_RELATIVE" [startCondition "start" ["relative"], relativeCondition "relative" "missing" []])
+  no env (termsOf "VT_SELF_RELATIVE" [relativeCondition "self" "self" []])
+  no env (termsOf "VT_SELF_NEXT" [eventCondition "self" ["self"]])
+
+-- v34 testVestingTerms_CyclicNextConditionsFail and _MutualRelativeConditionsWithoutRootFail, and
+-- longer and mixed cycles (a relative condition depends on its anchor, as a next edge does).
+test_vesting_terms_graph_cycles : Script ()
+test_vesting_terms_graph_cycles = do
+  env <- setupEnv
+  no env (termsOf "VT_CYCLE" [startCondition "first" ["second"], eventCondition "second" ["first"]])
+  no env (termsOf "VT_CYCLE_RELATIVE" [relativeCondition "first" "second" [], relativeCondition "second" "first" []])
+  no env (termsOf "VT_CYCLE_3" [startCondition "a" ["b"], eventCondition "b" ["c"], eventCondition "c" ["a"]])
+  -- a -> b by next, b -> a because a is relative to b.
+  no env (termsOf "VT_CYCLE_MIXED" [relativeCondition "a" "b" ["b"], eventCondition "b" []])
+  -- A cycle away from the start is still a cycle.
+  no env (termsOf "VT_CYCLE_TAIL" [startCondition "start" ["x"], eventCondition "x" ["y"], eventCondition "y" ["x"]])
+
+-- v34 testVestingTerms_RelativeAnchorNeedNotBeDirectPredecessor, _RelativeAnchorNeedNotDominateAllPaths,
+-- _EventOnlyRootIsValid, _IndependentConditionBranchesAreValid, _ArrayOrderDoesNotDefineGraphRoot and
+-- _MultipleStartConditionsAreNotSchemaProhibited: OCF-valid graphs the register must not refuse.
+test_vesting_terms_graph_shapes_ocf_allows : Script ()
+test_vesting_terms_graph_shapes_ocf_allows = do
+  env <- setupEnv
+  ok env (termsOf "VT_RELATIVE_NON_PREDECESSOR"
+    [startCondition "start" ["other", "relative"], eventCondition "other" [], relativeCondition "relative" "other" []])
+  ok env (termsOf "VT_RELATIVE_NON_DOMINATOR"
+    [startCondition "start" ["anchor", "bypass"], eventCondition "anchor" ["relative"], eventCondition "bypass" ["relative"], relativeCondition "relative" "anchor" []])
+  ok env (termsOf "VT_EVENT_ONLY_ROOT" [eventCondition "qualifying-sale" []])
+  ok env (termsOf "VT_INDEPENDENT_BRANCHES" [startCondition "start" [], eventCondition "milestone" []])
+  ok env (termsOf "VT_UNORDERED_START" [eventCondition "next" [], startCondition "start" ["next"]])
+  ok env (termsOf "VT_MULTIPLE_STARTS" [startCondition "start_one" ["start_two"], startCondition "start_two" ["next"], eventCondition "next" []])
+  -- A diamond: two paths converge without forming a cycle.
+  ok env (termsOf "VT_DIAMOND" [startCondition "s" ["l", "r"], eventCondition "l" ["join"], eventCondition "r" ["join"], eventCondition "join" []])
