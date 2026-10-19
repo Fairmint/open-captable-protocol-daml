@@ -4,7 +4,9 @@
  *
  * A network "has" a factory when generated/ocp-factory-contract-id.json records an identity (`templateId`,
  * `system_operator`, `factory_id`) whose template belongs to this package's DAR. The v35 factory is consumed by each
- * authorization, so no contract ID is recorded or checked.
+ * authorization, so no contract ID is recorded or checked. An identity recorded by an older version of the package
+ * counts as missing: create-ocp-factory.ts then recovers that live factory (it matches across package versions) and
+ * records the current template ID, rather than creating a second factory with the same `factory_id`.
  *
  * Networks default to DevNet: MainNet is out of scope for OpenCapTable-v35 (ADR-040). `--networks devnet,mainnet`
  * restores the MainNet check once a MainNet rollout is decided.

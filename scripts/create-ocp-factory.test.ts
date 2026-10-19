@@ -18,7 +18,8 @@ function activeFactory(
   contractId: string,
   template = templateId,
   systemOperator = operator,
-  id: string = factoryId
+  id: string = factoryId,
+  packageName?: string
 ): unknown {
   return {
     contractEntry: {
@@ -26,6 +27,7 @@ function activeFactory(
         createdEvent: {
           contractId,
           templateId: template,
+          ...(packageName === undefined ? {} : { packageName }),
           createArgument: { system_operator: systemOperator, factory_id: id, next_cap_table_number: '3' },
         },
       },
@@ -37,10 +39,10 @@ function identity(network: string, id = `OpenCapTable-v35-${network}`): FactoryI
   return { templateId, system_operator: operator, factory_id: id, packageName: 'OpenCapTable-v35' };
 }
 
-void test('recovers the active factory for the exact template, operator and factory ID', () => {
+void test('recovers the active factory for the template, operator and factory ID', () => {
   const recovered = findActiveFactory(
     [
-      activeFactory('wrong-package', 'other-package:Fairmint.OpenCapTable.OcpFactory:OcpFactory'),
+      activeFactory('wrong-template', 'package-id:Fairmint.OpenCapTable.IssuerAuthorization:IssuerAuthorization'),
       activeFactory('wrong-operator', templateId, 'other::party'),
       activeFactory('wrong-factory-id', templateId, operator, 'another-factory'),
       activeFactory('expected-contract'),
@@ -51,6 +53,25 @@ void test('recovers the active factory for the exact template, operator and fact
   );
 
   assert.deepEqual(recovered, { contractId: 'expected-contract', templateId });
+});
+
+void test('recovers a factory created by an older version of the package instead of creating a second one', () => {
+  const olderTemplateId = 'older-package-id:Fairmint.OpenCapTable.OcpFactory:OcpFactory';
+  const older = activeFactory('older-version', olderTemplateId, operator, factoryId, 'OpenCapTable-v35');
+  assert.deepEqual(findActiveFactory([older], templateId, operator, factoryId, 'OpenCapTable-v35'), {
+    contractId: 'older-version',
+    templateId: olderTemplateId,
+  });
+
+  // One factory per version with the same factory_id would issue duplicate cap table IDs: fail closed.
+  assert.throws(
+    () => findActiveFactory([older, activeFactory('current-version')], templateId, operator, factoryId),
+    /Found 2 active OcpFactory contracts/
+  );
+
+  // An event that names another package is not this package's factory.
+  const otherPackage = activeFactory('other-package', templateId, operator, factoryId, 'OpenCapTable-v36');
+  assert.equal(findActiveFactory([otherPackage], templateId, operator, factoryId, 'OpenCapTable-v35'), null);
 });
 
 void test('returns null when no matching active factory exists', () => {

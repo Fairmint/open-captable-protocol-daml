@@ -24,7 +24,7 @@ scripts):
 
 ```bash
 npm run build   # generate-captable (OcfRecords.daml) -> prepare-build -> (cd generated/build && dpm build --all)
-npm test        # prepare-build -> dpm build --all -> (cd Test && dpm test)
+npm test        # generate-captable -> prepare-build -> dpm build --all -> (cd Test && dpm test)
 ```
 
 `npm run build` compiles into `generated/build/<pkg>/.daml/dist/*.dar`. Nothing in v35 depends on
@@ -43,9 +43,12 @@ npm run backup-dar -- --package OpenCapTableDeliveryProof-v01 --version <version
 npm run backup-dar -- --package OpenCapTable-v35 --version <version-from-daml.yaml>
 ```
 
-Deployment preflight (writes `GITHUB_OUTPUT` when set). v35 deploys to DevNet only:
+Deployment preflight (writes `GITHUB_OUTPUT` when set). v35 deploys to DevNet only, and its two
+dependencies are uploaded and tagged first, so the release workflows check them first too:
 
 ```bash
+npm run check:dar-version-policy -- --deployment devnet --package OpenCapTableApi-v01
+npm run check:dar-version-policy -- --deployment devnet --package OpenCapTableDeliveryProof-v01
 npm run check:dar-version-policy -- --deployment devnet --package OpenCapTable-v35
 ```
 

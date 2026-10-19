@@ -70,15 +70,27 @@ export function factoryCreateArguments(systemOperator: string, factoryId: string
   return { system_operator: systemOperator, factory_id: factoryId, next_cap_table_number: '1' };
 }
 
+/** `<module>:<entity>` of a `<package id or #name>:<module>:<entity>` template ID. */
+function qualifiedTemplateName(templateId: string): string {
+  const separator = templateId.indexOf(':');
+  return separator === -1 ? templateId : templateId.slice(separator + 1);
+}
+
 /**
- * Find the one active factory for this exact template, operator and factory ID, if it exists. Two live factories with
- * one `factory_id` would issue the same cap table IDs, so more than one match is an error.
+ * Find the one active factory for this template, operator and factory ID, if it exists. Two live factories with one
+ * `factory_id` would issue the same cap table IDs, so more than one match is an error.
+ *
+ * A factory belongs to its package name, not to one package version: after an upgrade the live factory still carries
+ * the template ID of the version that created it (or last recreated it), so the match is on the template's module and
+ * entity, plus `packageName` when the event carries it, never on the exact package ID. Matching the exact ID would miss
+ * that factory and create a second one with the same `factory_id`.
  */
 export function findActiveFactory(
   response: unknown,
   expectedTemplateId: string,
   expectedOperatorPartyId: string,
-  expectedFactoryId: string
+  expectedFactoryId: string,
+  expectedPackageName?: string
 ): ActiveFactory | null {
   if (!Array.isArray(response)) {
     return null;
@@ -93,12 +105,14 @@ export function findActiveFactory(
     if (!isRecord(activeContract)) continue;
     const { createdEvent } = activeContract;
     if (!isRecord(createdEvent)) continue;
-    const { createArgument, contractId, templateId } = createdEvent;
+    const { createArgument, contractId, templateId, packageName } = createdEvent;
     if (!isRecord(createArgument)) continue;
 
     if (
       typeof contractId === 'string' &&
-      templateId === expectedTemplateId &&
+      typeof templateId === 'string' &&
+      qualifiedTemplateName(templateId) === qualifiedTemplateName(expectedTemplateId) &&
+      (expectedPackageName === undefined || packageName === undefined || packageName === expectedPackageName) &&
       createArgument.system_operator === expectedOperatorPartyId &&
       createArgument.factory_id === expectedFactoryId
     ) {
@@ -197,7 +211,8 @@ async function main() {
     await client.getActiveContracts({ parties: [operatorPartyId], templateIds: [templateQuery] }),
     templateId,
     operatorPartyId,
-    factoryId
+    factoryId,
+    pkg.name
   );
   if (activeFactory) {
     saveFactory(network, identity, activeFactory.contractId, 'Recovered');
