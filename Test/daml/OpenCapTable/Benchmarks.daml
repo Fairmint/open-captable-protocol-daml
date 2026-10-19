@@ -1,0 +1,94 @@
+-- Benchmarks for a Canton sandbox (`dpm sandbox`): the 1-lot and 50-lot settlements, 250-issuance batches into filling shards, and a split over many states. Each takes an argument, so `dpm test` does not run them.
+module OpenCapTable.Benchmarks where
+
+import DA.Action (foldlA, replicateA_)
+import DA.Date (addDays, toDateUTC)
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import qualified DA.Text as T
+import DA.Time (RelTime, convertRelTimeToMicroseconds, subTime)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Book (BookInputs(..))
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import OpenCapTable.Harness
+
+data SettleBench = SettleBench
+  with
+    lots : Int
+    tranches_per_lot : Int
+  deriving (Eq, Show)
+
+data BenchStep = BenchStep
+  with
+    step : Text
+    micros : Int
+  deriving (Eq, Show)
+
+timed : Text -> Script a -> Script (a, BenchStep)
+timed name act = do
+  t0 <- getTime
+  r <- act
+  t1 <- getTime
+  pure (r, BenchStep with step = name; micros = convertRelTimeToMicroseconds (subTime t1 t0))
+
+-- | Issues `lots` lots of 1,000 shares to SH-S, each with `tranches_per_lot` vested tranches, places
+-- one settlement hold on each and settles them all in one `CapTable_Settle`. The ledger date is the
+-- sandbox's wall-clock date.
+bench_settle : SettleBench -> Script [BenchStep]
+bench_settle cfg = do
+  env <- setupEnv
+  today <- toDateUTC <$> getTime
+  let issued = addDays today (-400)
+      perTranche = 1000.0 / intToDecimal cfg.tranches_per_lot
+      lastTranche = 1000.0 - perTranche * intToDecimal (cfg.tranches_per_lot - 1)
+      tranches = map (\i -> OcfVesting with amount = (if i == cfg.tranches_per_lot then lastTranche else perTranche); date = addDays issued i) [1 .. cfg.tranches_per_lot]
+      lot i = (issuance ("S-" <> show i) "SH-S" "CLS" 1000.0 issued) with
+        vestings = if cfg.tranches_per_lot > 0 then tranches else []
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-S"), OcfRecordDataStakeholder (stakeholderData "SH-B"), OcfRecordDataStockClass (stockClass "CLS")]
+  (_, s1) <- timed "issue" (forA_ (chunks 50 [1 .. cfg.lots]) \is -> applyRecords env (map (OcfRecordDataStockIssuance . lot) is))
+  holdLots <- mapA (\i -> settlementLot env ("S-" <> show i) 500.0) [1 .. cfg.lots]
+  (_, s2) <- timed "place holds" (placeHolds env OcfHoldTypeRegisterSettlement "BENCH-1" today holdLots)
+  draws <- mapA (\i -> drawLot env ("S-" <> show i) 500.0 2.0 []) [1 .. cfg.lots]
+  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+  (_, s3) <- timed "settle" (settle env "BENCH-1" today buyer (map SettleDraw draws))
+  pure [s1, s2, s3]
+
+-- | Fills the book with `batches` batches of 250 fresh issuances (500 claimed IDs each), timing each.
+bench_issuances : Int -> Script [BenchStep]
+bench_issuances batches = do
+  env <- setupEnv
+  today <- toDateUTC <$> getTime
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-S"), OcfRecordDataStockClass (stockClass "CLS")]
+  mapA (\b -> snd <$> timed ("batch " <> show b) (applyRecords env
+      (map (\i -> OcfRecordDataStockIssuance (issuance ("S-" <> show b <> "-" <> show i) "SH-S" "CLS" 10.0 (addDays today (-1)))) [1 .. 250])))
+    [1 .. batches]
+
+-- | A split over a class with `states` states: recorded under a short freeze, touching no state.
+bench_split : Int -> Script [BenchStep]
+bench_split states = do
+  env <- setupEnv
+  today <- toDateUTC <$> getTime
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-S"), OcfRecordDataStockClass (stockClass "CLS")]
+  forA_ (chunks 250 [1 .. states]) \is ->
+    applyRecords env (map (\i -> OcfRecordDataStockIssuance (issuance ("S-" <> show i) "SH-S" "CLS" 10.0 (addDays today (-2)))) is)
+  (cid, _) <- epochOf env "CLS"
+  (frozen, s1) <- timed "freeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid)
+  -- The split reads only its epoch and the shards for its own ID: no stock state.
+  shards <- map fst <$> shardsOf env
+  (_, s2) <- timed "split" (applyWith env (BookInputs with states = []; epochs = [frozen]; shards; records = [])
+    [ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS" 2.0 1.0 today))])
+  (cid', _) <- epochOf env "CLS"
+  (_, s3) <- timed "unfreeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = cid')
+  pure [s1, s2, s3]
+
+chunks : Int -> [a] -> [[a]]
+chunks _ [] = []
+chunks n xs = take n xs :: chunks n (drop n xs)
