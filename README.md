@@ -28,6 +28,7 @@ Two more directories belong to v35:
   hold pair `TX_STOCK_HOLD` / `TX_STOCK_HOLD_CANCELLATION`.
 - [`test-vectors/v35.json`](test-vectors/v35.json) holds the derived-ID, claim-hash and
   floor-function vectors that the Daml tests, the SDK and apiv2 must all reproduce.
+  `npm run test:vectors` recomputes them and checks the generated `TestVectors.daml`.
 
 ## Install and use the package
 

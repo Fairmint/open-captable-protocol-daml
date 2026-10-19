@@ -37,5 +37,6 @@ Keep repository guidance synchronized with the code:
   `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity. The one
   Fairmint OCF extension, the hold pair, lives in `ocf-extension/` and the checker's registry.
 - `test-vectors/v35.json` (derived IDs, claim hashes, floor function) is shared with the SDK and
-  apiv2. `Test/daml/OpenCapTable/TestVectors.daml` asserts the same values, copied by hand, so
-  change the two together.
+  apiv2. `Test/daml/OpenCapTable/TestVectors.daml` is generated from it: edit the JSON, then run
+  `npm run generate:test-vectors`. `npm run test:vectors` recomputes every vector in TypeScript and
+  fails if the Daml file is out of step.
