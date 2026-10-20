@@ -1,11 +1,11 @@
 -- The register's state contracts: one StockSecurity per outstanding stock security, one StockClassEpoch per class and the OcfIdShard partition of claimed IDs.
 module Fairmint.OpenCapTable.State where
 
-import DA.List (sort, unique)
+import DA.List (isPrefixOf, sort, unique)
 import qualified DA.Set as Set
 import qualified DA.Text as T
 import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..))
-import Fairmint.OpenCapTable.Ids (hashBits)
+import Fairmint.OpenCapTable.Ids (hexDigitBits)
 import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfRatio(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
@@ -294,17 +294,27 @@ template OcfIdShard
         kind = "OCF_ID_SHARD"
         key = prefix
 
--- | Shard prefixes start at 8 bits and can deepen to the full 256-bit hash.
+-- | Shard prefixes start at 8 bits and can deepen to the full 256-bit hash, and every hash a shard
+-- holds is 64 characters whose leading bits are its prefix. The ensure runs whenever a shard is
+-- created or fetched, and a claim reads and rewrites a whole shard, so each hash costs one
+-- explode: every writer inserts sha256 output, so its characters are not checked one by one.
 validateOcfIdShard : OcfIdShard -> Bool
 validateOcfIdShard sh =
-  T.length sh.prefix >= 8 &&
-  T.length sh.prefix <= 256 &&
-  all (\c -> c == "0" || c == "1") (T.explode sh.prefix) &&
-  Set.size sh.claimed <= maxHashesPerShard &&
-  all validHash (Set.toList sh.claimed)
+  let prefixBits = T.explode sh.prefix
+      prefixLength = length prefixBits
+      digits = (prefixLength + 3) / 4
+  in prefixLength >= 8 &&
+     prefixLength <= 256 &&
+     all (\c -> c == "0" || c == "1") prefixBits &&
+     Set.size sh.claimed <= maxHashesPerShard &&
+     all (hashInShard prefixBits digits) (Set.toList sh.claimed)
+
+hashInShard : [Text] -> Int -> Text -> Bool
+hashInShard prefixBits digits h =
+  let cs = T.explode h
+  in length cs == 64 && all isHexDigit (take digits cs) && isPrefixOf prefixBits (concatMap hexDigitBits (take digits cs))
   where
-    validHash h =
-      T.length h == 64 &&
-      all isLowerHex (T.explode h) &&
-      T.isPrefixOf sh.prefix (hashBits (T.take ((T.length sh.prefix + 3) / 4) h))
-    isLowerHex c = T.isInfixOf c "0123456789abcdef"
+    isHexDigit c = c `elem` hexDigits
+
+hexDigits : [Text]
+hexDigits = T.explode "0123456789abcdef"

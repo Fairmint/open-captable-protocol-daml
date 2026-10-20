@@ -12,6 +12,7 @@ import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State (OcfIdShard(..), validateOcfIdShard)
 import OpenCapTable.Harness
 
 -- 65 stakeholder IDs whose object-namespace claim hashes all start with the bits 11101011
@@ -195,3 +196,35 @@ test_ids_claims_per_transaction_capped = do
     ]
   applyOpsFails env "claimed IDs in one transaction"
     (map (\i -> ApplyRecord (OcfRecordDataStockIssuance (issuance ("S-" <> show i) "SH-A" "CLS-A" 1.0 d2024))) [1 .. 251])
+
+-- A shard's precondition, which runs on every create and fetch: a bit prefix of 8 to 256 bits, at
+-- most 64 hashes, each 64 characters whose leading bits are the prefix.
+test_ids_shard_precondition : Script ()
+test_ids_shard_precondition = do
+  env <- setupEnv
+  let hashOf i = claimHash IdNamespaceObject ("X-" <> show i)
+      hashes = map hashOf [1 .. 2000]
+      under p = filter (\h -> T.isPrefixOf p (hashBits h)) hashes
+      shard p hs = OcfIdShard with context = env.ctx; prefix = p; claimed = Set.fromList hs
+      p8 = T.take 8 (hashBits (hashOf 1))
+      p10 = T.take 10 (hashBits (hashOf 1))
+      mine = under p8
+      other = head (filter (\h -> not (T.isPrefixOf p8 (hashBits h))) hashes)
+  assertMsg "some hashes share the prefix" (length mine >= 2)
+  validateOcfIdShard (shard p8 mine) === True
+  validateOcfIdShard (shard p10 (under p10)) === True
+  validateOcfIdShard (shard p8 []) === True
+  -- The prefix: 8 to 256 bits, only "0" and "1".
+  validateOcfIdShard (shard (T.take 7 p8) []) === False
+  validateOcfIdShard (shard (p8 <> "2") []) === False
+  validateOcfIdShard (shard (T.implode (replicate 257 "0")) []) === False
+  -- A hash outside the prefix, of the wrong length, or not hex in its leading digits.
+  validateOcfIdShard (shard p8 (other :: mine)) === False
+  validateOcfIdShard (shard p8 [T.take 63 (head mine)]) === False
+  validateOcfIdShard (shard p8 [head mine <> "0"]) === False
+  validateOcfIdShard (shard p8 ["zz" <> T.drop 2 (head mine)]) === False
+  -- At most 64 hashes: 65 distinct ones under the prefix are refused.
+  let many = map (\i -> T.take 2 (head mine) <> T.drop 2 (hashOf i)) [1 .. 65]
+  Set.size (Set.fromList many) === 65
+  validateOcfIdShard (shard p8 (take 64 many)) === True
+  validateOcfIdShard (shard p8 many) === False

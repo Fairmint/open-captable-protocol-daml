@@ -404,7 +404,7 @@ claimId ns id b = do
   when (b.claims >= maxClaimsPerTransaction)
     (abort ("more than " <> show maxClaimsPerTransaction <> " claimed IDs in one transaction"))
   let hash = claimHash ns id
-      bits = hashBits hash
+      bits = hashBitList hash
   (prefix, slot) <- coveringShard bits id b
   when (Set.member hash slot.claimed)
     (abort ((if ns == IdNamespaceSecurity then "security ID" else "ID") <> " already used: " <> id))
@@ -420,7 +420,7 @@ claimId ns id b = do
 releaseId : IdNamespace -> Text -> Book -> Update Book
 releaseId ns id b = do
   let hash = claimHash ns id
-  (prefix, slot) <- coveringShard (hashBits hash) id b
+  (prefix, slot) <- coveringShard (hashBitList hash) id b
   unless (Set.member hash slot.claimed) (abort ("ID " <> id <> " is not claimed"))
   b1 <- archiveShardOriginal slot b
   pure b1 with
@@ -440,17 +440,18 @@ preSplitShard prefix b = case Map.lookup prefix b.shards of
 
 -- The shard whose prefix starts the hash's bit string. Active shards partition the hash space, so
 -- the shortest matching prefix is the only one.
-coveringShard : Text -> Text -> Book -> Update (Text, ShardSlot)
-coveringShard bits id b = case coveringPrefix bits b.shards 8 of
+coveringShard : [Text] -> Text -> Book -> Update (Text, ShardSlot)
+coveringShard bits id b = case coveringFrom (T.implode (take 8 bits)) (drop 8 bits) b.shards of
   Some found -> pure found
   None -> abort ("no shard in this write covers the ID " <> id)
 
-coveringPrefix : Text -> Map Text ShardSlot -> Int -> Optional (Text, ShardSlot)
-coveringPrefix bits shards n
-  | n > T.length bits = None
-  | otherwise = case Map.lookup (T.take n bits) shards of
-      Some slot -> Some (T.take n bits, slot)
-      None -> coveringPrefix bits shards (n + 1)
+-- Lengthens the prefix one bit at a time until a shard in the working set has it.
+coveringFrom : Text -> [Text] -> Map Text ShardSlot -> Optional (Text, ShardSlot)
+coveringFrom prefix rest shards = case Map.lookup prefix shards of
+  Some slot -> Some (prefix, slot)
+  None -> case rest of
+    [] -> None
+    bit :: more -> coveringFrom (prefix <> bit) more shards
 
 -- Archives a loaded shard the first time a write changes it, and counts it among the contracts the
 -- write touches.
@@ -471,7 +472,9 @@ splitChild p c = if Set.size c <= maxHashesPerShard then [(p, c)] else splitShar
 
 partitionByBit : Int -> Set.Set Text -> (Set.Set Text, Set.Set Text)
 partitionByBit i claimed =
-  let bitOf h = T.substring i 1 (hashBits h)
+  let bitOf h = case drop (i % 4) (hexDigitBits (T.substring (i / 4) 1 h)) of
+        bit :: _ -> bit
+        [] -> error "partitionByBit: bit index out of range"
       hashes = Set.toList claimed
   in (Set.fromList (filter (\h -> bitOf h == "0") hashes), Set.fromList (filter (\h -> bitOf h == "1") hashes))
 
