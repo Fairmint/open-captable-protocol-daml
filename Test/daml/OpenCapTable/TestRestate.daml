@@ -7,11 +7,13 @@ import Daml.Script
 
 import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Holds (CancelHold(..))
+import Fairmint.OpenCapTable.Ids (DerivedRole(..))
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate hiding (restate)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
 import OpenCapTable.Harness
 
@@ -273,4 +275,35 @@ test_restate_successor_keeps_its_origin = do
   -- Deleting another stock issuance does not end this lot.
   restateOpsFails env "only with the deletion of its origin issuance"
     [RestateDelete "ISS-S-A1", RestateEndState "S-A1", RestateEndState "S-A2"]
+
+-- A mistaken issuance and the record that consumed it can be deleted together: the consumer shows
+-- the lot is gone, and nothing recreates it.
+test_restate_issuance_deleted_with_its_consumer : Script ()
+test_restate_issuance_deleted_with_its_consumer = do
+  env <- standardBook
+  let ret = StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Mar 1; reason_text = "x"; security_id = "S-A2"; comments = []
+  _ <- applyRecords env [OcfRecordDataStockRetraction ret]
+  _ <- restateOps env [RestateDelete "RET-1", RestateDelete "ISS-S-A2"]
+  hasRecord env "RET-1" >>= (=== False)
+  hasRecord env "ISS-S-A2" >>= (=== False)
+  hasState env "S-A2" >>= (=== False)
+  applyRecordsFails env "security ID already used: S-A2" [OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024)]
+
+-- Replication names its own IDs, so an issuance whose lot took only claimed-ID events can be deleted
+-- and written again under the same security ID; an event under the derived form keeps it claimed.
+test_restate_security_id_released_without_derived_ids : Script ()
+test_restate_security_id_released_without_derived_ids = do
+  env <- standardBook
+  let accept id sec = OcfRecordDataStockAcceptance StockAcceptanceOcfData with id; date = D.date 2024 D.Mar 1; security_id = sec; comments = []
+  _ <- applyRecords env [accept "ACC-1" "S-A2"]
+  s <- stateOf env "S-A2"
+  (s.seq, s.derived_ids) === (1, False)
+  _ <- restateOps env [RestateDelete "ACC-1", RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-A2" "SH-A" "CLS-A" 450.0 d2024) with id = "ISS-S-A2-B")]
+  (.quantity) <$> stateOf env "S-A2" >>= (=== 450.0)
+  -- An acceptance under the derived form marks the lot.
+  _ <- applyRecords env [accept (derived env "S-A1" 0 DerivedRoleEvent 0) "S-A1"]
+  (.derived_ids) <$> stateOf env "S-A1" >>= (=== True)
+  _ <- restateOps env [RestateDelete "ISS-S-A1", RestateEndState "S-A1"]
+  applyRecordsFails env "security ID already used: S-A1" [OcfRecordDataStockIssuance (issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024)]
 

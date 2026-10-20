@@ -25,7 +25,7 @@ export const OPEN_CAP_TABLE_DAR_PATH_ENV = 'OPEN_CAP_TABLE_DAR_PATH' as const;
  */
 export const OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH = './opencaptable.dar' as const;
 
-/** Npm `exports` subpath for the OpenCapTableApi-v01 DAR (reader interfaces and `OcfObjectType`). */
+/** Npm `exports` subpath for the OpenCapTableApi-v01 DAR (the reader interfaces `OcfObject` and `RegisterContract`). */
 export const OPEN_CAP_TABLE_API_DAR_EXPORT_SUBPATH = './opencaptable-api.dar' as const;
 
 /** Npm `exports` subpath for the OpenCapTableDeliveryProof-v01 DAR. */

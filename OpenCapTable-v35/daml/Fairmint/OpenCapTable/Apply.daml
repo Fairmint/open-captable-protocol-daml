@@ -11,7 +11,7 @@ import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_)
 import DA.List (dedup, head, last)
 import DA.Map (Map)
-import DA.Optional (isNone, isSome, optionalToList)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.Book
 import Fairmint.OpenCapTable.Events
@@ -166,7 +166,7 @@ applyRecord b d = case d of
   OcfRecordDataStockAcceptance x -> do
     (s, _) <- beginEvent b x.security_id x.date False
     b' <- writeEventRecord s x.id d b
-    replaceState (successor s) b'
+    replaceState (successorAfter b.context s x.id) b'
   OcfRecordDataStockRetraction x -> do
     (s, _) <- beginEvent b x.security_id x.date False
     requireNoHolds s
@@ -177,22 +177,23 @@ applyRecord b d = case d of
   OcfRecordDataVestingAcceleration x -> case lookupState x.security_id b of
     Some _ -> do
       (s, _) <- beginEvent b x.security_id x.date False
-      (vesting', snapshot') <- case s.vesting of
+      (vesting', accelerated') <- case s.vesting of
         StockVestingNone -> abort ("security " <> s.security_id <> " is fully vested and cannot be accelerated")
         StockVestingTranches ts -> do
           ts' <- liftEither (accelerateTranches x.date x.quantity s ts)
-          pure (StockVestingTranches ts', s.snapshot)
+          pure (StockVestingTranches ts', s.accelerated_since_snapshot)
         StockVestingOnTerms _ -> do
-          let vested = vestedAt s x.date
-              unvested = s.quantity - vested
+          -- The TA's snapshot stays the vested quantity: whether a snapshot dated on the
+          -- acceleration's day counts it is the TA's. The shares accelerated since the snapshot
+          -- bound later accelerations, so together they never exceed the unvested quantity.
+          let accelerated = fromOptional 0.0 s.accelerated_since_snapshot
+              unvested = s.quantity - vestedAt s x.date - accelerated
           when (x.quantity > unvested)
             (abort ("acceleration of " <> show x.quantity <> " on security " <> s.security_id
               <> " exceeds its unvested quantity " <> show unvested))
-          -- The accelerated shares are vested from its date, so a later acceleration or draw
-          -- sees them until the TA's next snapshot, which never goes below this one.
-          pure (s.vesting, Some VestedSnapshot with as_of = x.date; vested = vested + x.quantity)
+          pure (s.vesting, Some (accelerated + x.quantity))
       b' <- writeEventRecord s x.id d b
-      replaceState ((successor s) with vesting = vesting'; snapshot = snapshot') b'
+      replaceState ((successorAfter b.context s x.id) with vesting = vesting'; accelerated_since_snapshot = accelerated') b'
     None -> writeStatelessRecord d [nonStockVestingTarget x.security_id] b
   _ -> writeStatelessRecord d [] b
 
@@ -209,7 +210,7 @@ applyVestingRecord b d id sec date = case lookupState sec b of
   Some _ -> do
     (s, _) <- beginEvent b sec date True
     b' <- writeEventRecord s id d b
-    replaceState (successor s) b'
+    replaceState (successorAfter b.context s id) b'
   None -> writeStatelessRecord d [nonStockVestingTarget sec] b
 
 applyPrimaryIssuance : Book -> StockIssuanceOcfData -> Update Book
@@ -244,7 +245,7 @@ applySnapshot b sec asOf vested = do
     (abort ("vesting snapshot for security " <> sec <> " goes backwards: " <> show vested <> " < " <> show previous))
   when (vested > s.quantity)
     (abort ("vesting snapshot for security " <> sec <> " exceeds its quantity"))
-  replaceState ((successor s) with snapshot = Some VestedSnapshot with as_of = asOf; vested) b
+  replaceState ((successor s) with snapshot = Some (VestedSnapshot with as_of = asOf; vested); accelerated_since_snapshot = None) b
 
 -- =============================================================================
 -- BUNDLED STOCK EVENTS

@@ -9,6 +9,7 @@ import Fairmint.OpenCapTable.Apply hiding (apply)
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate hiding (restate)
 import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
@@ -201,8 +202,9 @@ test_vesting_acceleration_on_stock_on_terms = do
   expectRecord env (accelerationRecord a)
   s <- stateOf env "S-V"
   s.vesting === StockVestingOnTerms "VT-S"
-  -- The accelerated 60 are vested from its date: 40 + 60.
-  s.snapshot === Some (VestedSnapshot with as_of = day; vested = 100.0)
+  -- The TA's snapshot stays the vested quantity; the accelerated 60 bound later accelerations.
+  s.snapshot === Some (VestedSnapshot with as_of = D.date 2025 D.Mar 1; vested = 40.0)
+  s.accelerated_since_snapshot === Some 60.0
   s.last_event_date === day
   -- Without a snapshot nothing has vested, so the whole lot may accelerate.
   applyRecordsFails env "exceeds its unvested quantity 100.0" [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.5) with date = day)]
@@ -264,14 +266,22 @@ test_vesting_acceleration_ids_unique = do
 -- EDITS AND CUMULATIVE ACCELERATIONS
 -- =============================================================================
 
--- An edit keeps the security an acceleration is on: the security is checked only when the record
--- is written, so moving it is a delete and a new record.
+-- An edit may move an acceleration between two grants or warrants, which have no state, and the
+-- new security is checked; a vesting record on a stock lot changed that lot's state and stays on it.
 test_vesting_acceleration_restate_checks_security : Script ()
 test_vesting_acceleration_restate_checks_security = do
-  env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0)]
+  env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0), ecRecord (option "EC-2" "SH-A" 100.0)]
   let a = acceleration "ACC-1" "EC-1" 10.0
   _ <- applyRecords env [accelerationRecord a]
-  restateOpsFails env "cannot change the security record ACC-1 is on" [RestateEdit (accelerationRecord (a with security_id = "EC-MISSING"))]
+  restateOpsFails env "security not found: EC-MISSING" [RestateEdit (accelerationRecord (a with security_id = "EC-MISSING"))]
+  _ <- restateOps env [RestateEdit (accelerationRecord (a with security_id = "EC-2"))]
+  expectRecord env (accelerationRecord (a with security_id = "EC-2"))
+  -- On a stock lot the record stays where it is, and none moves onto one.
+  let onStock = (acceleration "ACC-S" "S-T" 10.0) with date = D.date 2025 D.Jan 1
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-T" "SH-A" "CLS-A" 100.0 d2024) with vestings = [OcfVesting with amount = 100.0; date = D.date 2026 D.Jan 1])]
+  restateOpsFails env "security S-T is carried by a OcfObjectTypeTxStockIssuance" [RestateEdit (accelerationRecord (a with security_id = "S-T"))]
+  _ <- applyRecords env [accelerationRecord onStock]
+  restateOpsFails env "Moved vesting record ACC-S (from) security S-T is carried by a OcfObjectTypeTxStockIssuance" [RestateEdit (accelerationRecord (onStock with security_id = "EC-2"))]
 
 -- On a lot on vesting terms an acceleration vests its shares at once, raising the snapshot, so
 -- accelerations before the next snapshot together stay within the unvested quantity.
@@ -286,3 +296,40 @@ test_vesting_acceleration_on_terms_cumulative = do
   let day = D.date 2025 D.Jun 1
   _ <- applyRecords env [accelerationRecord ((acceleration "ACC-1" "S-V" 60.0) with date = day)]
   applyRecordsFails env "exceeds its unvested quantity" [accelerationRecord ((acceleration "ACC-2" "S-V" 60.0) with date = day)]
+
+-- A snapshot dated on an acceleration's day may already count it, so an acceleration never raises
+-- the vested quantity: in either order the TA's 70 stands, a hold above it is refused, and the
+-- TA's next snapshot clears the shares accelerated since the last one.
+test_vesting_acceleration_on_terms_never_double_counts : Script ()
+test_vesting_acceleration_on_terms_never_double_counts = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    , OcfRecordDataStockIssuance (stockOnTerms "S-W" "VT-S")
+    ]
+  _ <- applyOps env
+    [ ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Mar 1; vested = 40.0
+    , ApplyVestingSnapshot with security_id = "S-W"; as_of = D.date 2025 D.Mar 1; vested = 40.0
+    ]
+  let day = D.date 2025 D.Jun 1
+  _ <- applyOps env
+    [ ApplyVestingSnapshot with security_id = "S-V"; as_of = day; vested = 70.0
+    , ApplyRecord (accelerationRecord ((acceleration "ACC-V" "S-V" 20.0) with date = day))
+    ]
+  _ <- applyOps env
+    [ ApplyRecord (accelerationRecord ((acceleration "ACC-W" "S-W" 20.0) with date = day))
+    , ApplyVestingSnapshot with security_id = "S-W"; as_of = day; vested = 70.0
+    ]
+  v <- stateOf env "S-V"
+  (vestedAt v day, v.accelerated_since_snapshot) === (70.0, Some 20.0)
+  w <- stateOf env "S-W"
+  (vestedAt w day, w.accelerated_since_snapshot) === (70.0, None)
+  let holdDay = D.date 2025 D.Jun 2
+  onDate holdDay
+  lot <- settlementLot env "S-V" 90.0
+  placeHoldsFails env "at most its vested" OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Jul 1; vested = 75.0]
+  v' <- stateOf env "S-V"
+  (vestedAt v' day, v'.accelerated_since_snapshot) === (75.0, None)
+
