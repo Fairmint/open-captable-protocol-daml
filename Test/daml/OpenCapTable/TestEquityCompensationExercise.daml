@@ -1,0 +1,117 @@
+-- Equity compensation exercises, ported from v34's TestEquityCompensationExercise: exercises into resulting stock issuances written in the same batch, the validator, and the security (a grant) and resulting-security (stock issuance) references.
+module OpenCapTable.TestEquityCompensationExercise where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.EquityCompensationExercise
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : EquityCompensationExerciseOcfData -> Bool
+valid = validateEquityCompensationExerciseOcfData
+
+wrap : EquityCompensationExerciseOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationExercise
+
+exerciseOf : Text -> Text -> Decimal -> [Text] -> EquityCompensationExerciseOcfData
+exerciseOf id sec q resulting = EquityCompensationExerciseOcfData with
+  id
+  date = d2024
+  quantity = q
+  security_id = sec
+  comments = []
+  resulting_security_ids = resulting
+  consideration_text = None
+
+-- | Stock that an exercise results in: Alice's common shares, issued on `d`.
+resultingStock : Text -> Decimal -> Date -> OcfRecordData
+resultingStock sec q d = OcfRecordDataStockIssuance (issuance sec "SH-A" "CLS-A" q d)
+
+-- | A book with Alice's NSO grant EC-1 over 100 shares of class CLS-A.
+grantBook : Script Env
+grantBook = ecBookWith [ecRecord ((option "EC-1" "SH-A" 100.0) with stock_class_id = Some "CLS-A")]
+
+test_ec_exercise_into_stock : Script ()
+test_ec_exercise_into_stock = do
+  env <- grantBook
+  let x = exerciseOf "TX_EC_EX_1" "EC-1" 10.0 ["SEC-RES-1"]
+  _ <- applyRecords env [resultingStock "SEC-RES-1" 10.0 d2024, wrap x]
+  expectRecord env (wrap x)
+  -- The resulting stock is an outstanding security with its own state.
+  s <- stateOf env "SEC-RES-1"
+  s.quantity === 10.0
+  s.stakeholder_id === "SH-A"
+
+test_ec_exercise_optionals_some : Script ()
+test_ec_exercise_optionals_some = do
+  env <- grantBook
+  let x = (exerciseOf "TX_EC_EX_2" "EC-1" 5.0 ["SEC-RES-2", "SEC-RES-3"]) with
+        date = D.date 2024 D.Feb 1
+        consideration_text = Some "Cashless"
+        comments = ["Partial exercise"]
+  -- The exercise comes before its resulting issuances: references are checked at the batch's end.
+  _ <- applyRecords env
+    [ wrap x
+    , resultingStock "SEC-RES-2" 2.0 (D.date 2024 D.Feb 1)
+    , resultingStock "SEC-RES-3" 3.0 (D.date 2024 D.Feb 1)
+    ]
+  expectRecord env (wrap x)
+  (.quantity) <$> stateOf env "SEC-RES-3" >>= (=== 3.0)
+
+-- OCF requires the resulting securities array but sets no minimum: an exercise may name none.
+test_ec_exercise_without_resulting_securities : Script ()
+test_ec_exercise_without_resulting_securities = do
+  env <- grantBook
+  accept env valid wrap (exerciseOf "TX_EC_EX_0" "EC-1" 10.0 [])
+
+test_ec_exercise_security_reference : Script ()
+test_ec_exercise_security_reference = do
+  env <- grantBook
+  _ <- applyRecords env [resultingStock "S-1" 10.0 d2024, OcfRecordDataWarrantIssuance (warrant "W-1" "SH-A")]
+  applyRecordsFails env "Equity compensation exercise security not found: EC-MISSING" [wrap (exerciseOf "EX-1" "EC-MISSING" 1.0 [])]
+  -- A warrant is exercised by a warrant exercise.
+  applyRecordsFails env "Equity compensation exercise security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [wrap (exerciseOf "EX-1" "W-1" 1.0 [])]
+  applyRecordsFails env "Equity compensation exercise security S-1 is carried by a OcfObjectTypeTxStockIssuance" [wrap (exerciseOf "EX-1" "S-1" 1.0 [])]
+  expectNoRecord env "EX-1"
+
+test_ec_exercise_resulting_securities_are_stock : Script ()
+test_ec_exercise_resulting_securities_are_stock = do
+  env <- grantBook
+  _ <- applyRecords env [ecRecord (option "EC-2" "SH-A" 100.0)]
+  applyRecordsFails env "Equity compensation exercise resulting security security not found: SEC-RES-X"
+    [wrap (exerciseOf "EX-1" "EC-1" 10.0 ["SEC-RES-X"])]
+  -- Exercising one grant into another is refused.
+  applyRecordsFails env "Equity compensation exercise resulting security security EC-2 is carried by a OcfObjectTypeTxEquityCompensationIssuance"
+    [wrap (exerciseOf "EX-1" "EC-1" 10.0 ["EC-2"])]
+  -- Every resulting security is checked, not just the first.
+  applyRecordsFails env "Equity compensation exercise resulting security security not found: SEC-RES-Y"
+    [resultingStock "SEC-RES-1" 5.0 d2024, wrap (exerciseOf "EX-1" "EC-1" 10.0 ["SEC-RES-1", "SEC-RES-Y"])]
+  expectNoRecord env "EX-1"
+
+test_ec_exercise_validation : Script ()
+test_ec_exercise_validation = do
+  env <- grantBook
+  let x = exerciseOf "EX-V" "EC-1" 10.0 []
+  refuseWith env "an empty ID cannot be claimed" valid wrap (x with id = "")
+  refuse env valid wrap (x with security_id = "")
+  refuse env valid wrap (x with quantity = 0.0)
+  refuse env valid wrap (x with quantity = -1.0)
+  refuse env valid wrap (x with consideration_text = Some "")
+  refuse env valid wrap (x with resulting_security_ids = [""])
+  refuse env valid wrap (x with comments = [""])
+
+test_ec_exercise_restate : Script ()
+test_ec_exercise_restate = do
+  env <- grantBook
+  let x = exerciseOf "EX-1" "EC-1" 10.0 ["SEC-RES-1"]
+  _ <- applyRecords env [resultingStock "SEC-RES-1" 10.0 d2024, wrap x]
+  -- An edit that adds a resulting security checks it.
+  restateOpsFails env "Equity compensation exercise resulting security security not found: SEC-RES-2"
+    [RestateEdit (wrap (x with resulting_security_ids = ["SEC-RES-1", "SEC-RES-2"]))]
+  let x' = x with consideration_text = Some "Cash"
+  _ <- restateOps env [RestateEdit (wrap x')]
+  expectRecord env (wrap x')

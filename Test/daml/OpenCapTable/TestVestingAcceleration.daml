@@ -1,0 +1,293 @@
+-- Vesting accelerations, ported from v34's TestVestingAcceleration: accelerations of option grants and warrants, the validator, the security reference, and accelerations on stock (explicit tranches moved forward, vesting terms bounded by the TA's snapshot, fully vested lots refused, no backdating), restatement and IDs.
+module OpenCapTable.TestVestingAcceleration where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingAcceleration
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : VestingAccelerationOcfData -> Bool
+valid = validateVestingAccelerationOcfData
+
+-- | An ISO grant `sec` for SH-A over `q` shares at 1.25 USD, granted on 2024-01-01 and expiring on
+-- 2034-01-01, with no vesting terms.
+isoGrant : Text -> Decimal -> OcfRecordData
+isoGrant sec q = ecRecord ((option sec "SH-A" q) with
+  id = "TX_EC_ISS_1"
+  compensation_type = OcfCompensationTypeOptionIso
+  custom_id = "OPT-001"
+  exercise_price = Some (usd 1.25)
+  expiration_date = Some (D.date 2034 D.Jan 1))
+
+tranche : Decimal -> Date -> OcfVesting
+tranche amount date = OcfVesting with amount; date
+
+-- | Alice's `q` shares `sec` of CLS-A issued on 2024-01-01 with these tranches.
+stockWithTranches : Text -> Decimal -> [OcfVesting] -> OcfRecordData
+stockWithTranches sec q ts = OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-A" q d2024) with vestings = ts)
+
+trancheState : Env -> Text -> Script [OcfVesting]
+trancheState env sec = do
+  s <- stateOf env sec
+  case s.vesting of
+    StockVestingTranches ts -> pure ts
+    other -> fail ("expected tranches on " <> sec <> ", got " <> show other)
+
+d2025 : Date
+d2025 = D.date 2025 D.Jan 1
+
+d2026 : Date
+d2026 = D.date 2026 D.Jan 1
+
+d2027 : Date
+d2027 = D.date 2027 D.Jan 1
+
+-- =============================================================================
+-- GRANTS AND WARRANTS
+-- =============================================================================
+
+-- 50% of the unvested shares accelerate on an acquisition.
+test_vesting_acceleration_single_trigger : Script ()
+test_vesting_acceleration_single_trigger = do
+  env <- ecBookWith [isoGrant "ECSEC-001" 100000.0]
+  accept env valid accelerationRecord VestingAccelerationOcfData with
+    id = "TX_VESTING_ACCEL_1"
+    date = D.date 2025 D.Nov 15
+    security_id = "ECSEC-001"
+    quantity = 25000.0
+    reason_text = "Single-trigger acceleration upon change of control per equity agreement Section 5.2"
+    comments = []
+  -- An acceleration on a grant touches no stock state.
+  statesOf env >>= assertMsg "no stock state" . null
+
+-- All unvested shares accelerate on a termination after an acquisition.
+test_vesting_acceleration_double_trigger : Script ()
+test_vesting_acceleration_double_trigger = do
+  env <- ecBookWith [isoGrant "ECSEC-002" 200000.0]
+  accept env valid accelerationRecord VestingAccelerationOcfData with
+    id = "TX_VESTING_ACCEL_2"
+    date = D.date 2026 D.Feb 28
+    security_id = "ECSEC-002"
+    quantity = 100000.0
+    reason_text = "Double-trigger acceleration: involuntary termination within 12 months of change of control"
+    comments = ["All unvested shares accelerated per employment agreement.", "Employee terminated without cause on 2026-02-28."]
+
+test_vesting_acceleration_board_discretion : Script ()
+test_vesting_acceleration_board_discretion = do
+  env <- ecBookWith [isoGrant "ECSEC-003" 50000.0]
+  accept env valid accelerationRecord VestingAccelerationOcfData with
+    id = "TX_VESTING_ACCEL_3"
+    date = D.date 2025 D.Dec 1
+    security_id = "ECSEC-003"
+    quantity = 12500.0
+    reason_text = "Board-approved discretionary acceleration for exceptional performance"
+    comments = []
+
+-- v35: an acceleration names no vesting condition, so a warrant or grant needs no vesting terms.
+test_vesting_acceleration_warrant : Script ()
+test_vesting_acceleration_warrant = do
+  env <- ecBookWith [OcfRecordDataWarrantIssuance (warrant "W-1" "SH-A")]
+  accept env valid accelerationRecord (acceleration "ACC-W" "W-1" 10.0)
+
+test_vesting_acceleration_security_reference : Script ()
+test_vesting_acceleration_security_reference = do
+  env <- ecBookWith [OcfRecordDataConvertibleIssuance (convertible "C-1" "SH-A"), ecRecord (option "EC-1" "SH-A" 100.0)]
+  applyRecordsFails env "Vesting record (no stock state in this write) security not found: EC-MISSING"
+    [accelerationRecord (acceleration "ACC-1" "EC-MISSING" 1.0)]
+  -- A convertible does not vest.
+  applyRecordsFails env "Vesting record (no stock state in this write) security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [accelerationRecord (acceleration "ACC-1" "C-1" 1.0)]
+  -- An object ID is not a security ID.
+  applyRecordsFails env "security not found: ECI-EC-1" [accelerationRecord (acceleration "ACC-1" "ECI-EC-1" 1.0)]
+  expectNoRecord env "ACC-1"
+
+-- The security reference is checked at the batch's end, so a grant may follow its acceleration; a
+-- stock lot must already have its state in the write when its acceleration is applied.
+test_vesting_acceleration_same_batch : Script ()
+test_vesting_acceleration_same_batch = do
+  env <- ecBook
+  let a = acceleration "ACC-1" "EC-NEW" 10.0
+  _ <- applyRecords env [accelerationRecord a, ecRecord (option "EC-NEW" "SH-A" 100.0)]
+  expectRecord env (accelerationRecord a)
+  let lot = stockWithTranches "S-NEW" 100.0 [tranche 50.0 d2024, tranche 50.0 d2026]
+      b = acceleration "ACC-2" "S-NEW" 10.0
+  applyRecordsFails env "Vesting record (no stock state in this write) security S-NEW is carried by a OcfObjectTypeTxStockIssuance"
+    [accelerationRecord b, lot]
+  _ <- applyRecords env [lot, accelerationRecord b]
+  expectRecord env (accelerationRecord b)
+  trancheState env "S-NEW" >>= (=== [tranche 50.0 d2024, tranche 10.0 d2025, tranche 40.0 d2026])
+
+-- =============================================================================
+-- VALIDATION
+-- =============================================================================
+
+test_vesting_acceleration_validation : Script ()
+test_vesting_acceleration_validation = do
+  env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0)]
+  let a = acceleration "ACC-V" "EC-1" 10.0
+  -- An empty object ID is stopped by its claim, before the record's ensure.
+  refuseWith env "an empty ID cannot be claimed" valid accelerationRecord (a with id = "")
+  refuse env valid accelerationRecord (a with security_id = "")
+  refuse env valid accelerationRecord (a with quantity = 0.0)
+  refuse env valid accelerationRecord (a with quantity = -1.0)
+  refuse env valid accelerationRecord (a with reason_text = "")
+  refuse env valid accelerationRecord (a with comments = [""])
+  refuse env valid accelerationRecord (a with comments = ["ok", ""])
+
+-- =============================================================================
+-- STOCK
+-- =============================================================================
+
+-- On explicit tranches the register moves the accelerated shares to the acceleration date, from
+-- the earliest tranches after it and then from the shares no tranche covers.
+test_vesting_acceleration_on_stock_tranches : Script ()
+test_vesting_acceleration_on_stock_tranches = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ stockWithTranches "S-T1" 100.0 [tranche 50.0 d2024, tranche 50.0 d2026]
+    , stockWithTranches "S-T2" 100.0 [tranche 50.0 d2024, tranche 20.0 d2026]
+    , stockWithTranches "S-T3" 100.0 [tranche 25.0 d2024, tranche 25.0 d2025, tranche 25.0 d2026, tranche 25.0 d2027]
+    ]
+  -- On a tranche's own date, the accelerated shares join it.
+  let a1 = (acceleration "ACC-1" "S-T1" 10.0) with date = d2024
+  _ <- applyRecords env [accelerationRecord a1]
+  expectRecord env (accelerationRecord a1)
+  trancheState env "S-T1" >>= (=== [tranche 60.0 d2024, tranche 40.0 d2026])
+  (.seq) <$> stateOf env "S-T1" >>= (=== 1)
+  -- Beyond the later tranches, the shares no tranche covers.
+  _ <- applyRecords env [accelerationRecord (acceleration "ACC-2" "S-T2" 40.0)]
+  trancheState env "S-T2" >>= (=== [tranche 50.0 d2024, tranche 40.0 d2025])
+  -- Part of a tranche.
+  let mid = D.date 2024 D.Jun 1
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-3" "S-T3" 30.0) with date = mid)]
+  trancheState env "S-T3" >>= (=== [tranche 25.0 d2024, tranche 30.0 mid, tranche 20.0 d2026, tranche 25.0 d2027])
+  -- At most the unvested quantity at the acceleration date: 100 - 55 on 2024-06-01.
+  applyRecordsFails env "acceleration of 46.0 on security S-T3 must be positive and at most its unvested quantity 45.0"
+    [accelerationRecord ((acceleration "ACC-4" "S-T3" 46.0) with date = mid)]
+  -- Exactly the unvested quantity vests everything.
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-4" "S-T3" 45.0) with date = mid)]
+  trancheState env "S-T3" >>= (=== [tranche 25.0 d2024, tranche 75.0 mid])
+  -- A zero quantity is refused by the tranche arithmetic, before the record's ensure.
+  applyRecordsFails env "must be positive and at most its unvested quantity" [accelerationRecord ((acceleration "ACC-5" "S-T1" 0.0) with date = d2025)]
+
+-- On vesting terms the TA's snapshot says what has vested; the acceleration is bounded by the rest
+-- and leaves the state's vesting to the TA's next snapshot.
+test_vesting_acceleration_on_stock_on_terms : Script ()
+test_vesting_acceleration_on_stock_on_terms = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V2" "VT-S")
+    ]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
+  let day = D.date 2025 D.Jun 1
+      a = (acceleration "ACC-1" "S-V" 60.0) with date = day
+  applyRecordsFails env "acceleration of 61.0 on security S-V exceeds its unvested quantity 60.0" [accelerationRecord (a with quantity = 61.0)]
+  -- A zero quantity passes the bound and is refused by the record's ensure.
+  applyRecordsFails env "precondition" [accelerationRecord (a with quantity = 0.0)]
+  _ <- applyRecords env [accelerationRecord a]
+  expectRecord env (accelerationRecord a)
+  s <- stateOf env "S-V"
+  s.vesting === StockVestingOnTerms "VT-S"
+  s.snapshot === Some (VestedSnapshot with as_of = D.date 2025 D.Mar 1; vested = 40.0)
+  s.last_event_date === day
+  -- Without a snapshot nothing has vested, so the whole lot may accelerate.
+  applyRecordsFails env "exceeds its unvested quantity 100.0" [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.5) with date = day)]
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.0) with date = day)]
+  (.vesting) <$> stateOf env "S-V2" >>= (=== StockVestingOnTerms "VT-S")
+
+test_vesting_acceleration_fully_vested_stock : Script ()
+test_vesting_acceleration_fully_vested_stock = do
+  env <- standardBook
+  applyRecordsFails env "security S-A1 is fully vested and cannot be accelerated" [accelerationRecord (acceleration "ACC-1" "S-A1" 1.0)]
+  expectNoRecord env "ACC-1"
+
+-- Unlike vesting starts and events, an acceleration keeps per-security date order.
+test_vesting_acceleration_on_stock_not_backdated : Script ()
+test_vesting_acceleration_on_stock_not_backdated = do
+  env <- standardBook
+  _ <- applyRecords env [stockWithTranches "S-T" 100.0 [tranche 50.0 d2024, tranche 50.0 d2026]]
+  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-S"; date = d2025; security_id = "S-T"; comments = []]
+  applyRecordsFails env "precedes the last event on security S-T" [accelerationRecord ((acceleration "ACC-1" "S-T" 10.0) with date = D.date 2024 D.Jun 1)]
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-1" "S-T" 10.0) with date = d2025)]
+  trancheState env "S-T" >>= (=== [tranche 50.0 d2024, tranche 10.0 d2025, tranche 40.0 d2026])
+
+test_vesting_acceleration_on_retired_stock : Script ()
+test_vesting_acceleration_on_retired_stock = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Feb 1; reason_text = "Issued in error"; security_id = "S-A2"; comments = []]
+  applyRecordsFails env "Vesting record (no stock state in this write) security S-A2 is carried by a OcfObjectTypeTxStockIssuance"
+    [accelerationRecord (acceleration "ACC-1" "S-A2" 1.0)]
+
+-- =============================================================================
+-- RESTATEMENT AND IDS
+-- =============================================================================
+
+test_vesting_acceleration_restate : Script ()
+test_vesting_acceleration_restate = do
+  env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0)]
+  let a = acceleration "ACC-1" "EC-1" 10.0
+  _ <- applyRecords env [accelerationRecord a]
+  restateOpsFails env "changes nothing" [RestateEdit (accelerationRecord a)]
+  restateOpsFails env "precondition" [RestateEdit (accelerationRecord (a with quantity = 0.0))]
+  let a' = a with quantity = 12.0; reason_text = "Corrected per board minutes"
+  _ <- restateOps env [RestateEdit (accelerationRecord a')]
+  expectRecord env (accelerationRecord a')
+  _ <- restateOps env [RestateDelete "ACC-1"]
+  expectNoRecord env "ACC-1"
+  accept env valid accelerationRecord a
+
+test_vesting_acceleration_ids_unique : Script ()
+test_vesting_acceleration_ids_unique = do
+  env <- standardBook
+  _ <- applyRecords env [ecRecord (option "EC-1" "SH-A" 100.0), accelerationRecord (acceleration "ACC-1" "EC-1" 10.0)]
+  applyRecordsFails env "ID already used: ACC-1" [accelerationRecord (acceleration "ACC-1" "EC-1" 5.0)]
+  applyRecordsFails env "ID already used: ISS-S-A1" [accelerationRecord (acceleration "ISS-S-A1" "EC-1" 5.0)]
+  applyRecordsFails env "ID already used: ACC-2"
+    [accelerationRecord (acceleration "ACC-2" "EC-1" 5.0), accelerationRecord (acceleration "ACC-2" "EC-1" 6.0)]
+  applyRecordsFails env "derived form" [accelerationRecord (acceleration (env.ctx.cap_table_id <> ":x") "EC-1" 5.0)]
+
+-- =============================================================================
+-- SUSPECTED PACKAGE BUGS (kept out of the suite)
+-- =============================================================================
+
+-- KNOWN BUG: CapTable_Restate does not check the security an edited acceleration names. CapTable_Apply
+-- checks an acceleration on a grant or warrant against its security through the extra "Vesting
+-- record (no stock state in this write)" requirement, but `requirementsOf` returns [] for
+-- TX_VESTING_ACCELERATION, so an edit can move the record to a missing security (or a convertible).
+-- Expected: the edit is refused ("security not found: EC-MISSING"). Actual: it succeeds.
+-- test_vesting_acceleration_restate_checks_security : Script ()
+-- test_vesting_acceleration_restate_checks_security = do
+--   env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0)]
+--   let a = acceleration "ACC-1" "EC-1" 10.0
+--   _ <- applyRecords env [accelerationRecord a]
+--   restateOpsFails env "security not found: EC-MISSING" [RestateEdit (accelerationRecord (a with security_id = "EC-MISSING"))]
+
+-- KNOWN BUG (suspected; may be intended, the TA's snapshot being the source of truth on vesting
+-- terms): on a lot on vesting terms each acceleration is bounded by quantity - snapshot, but an
+-- acceleration does not lower that bound, so accelerations written before the next snapshot can
+-- together exceed the unvested quantity. Expected: ACC-2 is refused ("exceeds its unvested
+-- quantity"). Actual: both 60-share accelerations against 60 unvested shares are accepted.
+-- test_vesting_acceleration_on_terms_cumulative : Script ()
+-- test_vesting_acceleration_on_terms_cumulative = do
+--   env <- standardBook
+--   _ <- applyRecords env
+--     [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+--     , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+--     ]
+--   _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
+--   let day = D.date 2025 D.Jun 1
+--   _ <- applyRecords env [accelerationRecord ((acceleration "ACC-1" "S-V" 60.0) with date = day)]
+--   applyRecordsFails env "exceeds its unvested quantity" [accelerationRecord ((acceleration "ACC-2" "S-V" 60.0) with date = day)]

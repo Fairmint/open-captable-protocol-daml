@@ -1,0 +1,78 @@
+-- Equity compensation repricings, ported from v34's TestEquityCompensationRepricing: repricing an option grant, the validator (the new exercise price) and the security reference.
+module OpenCapTable.TestEquityCompensationRepricing where
+
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationRepricing
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : EquityCompensationRepricingOcfData -> Bool
+valid = validateEquityCompensationRepricingOcfData
+
+wrap : EquityCompensationRepricingOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationRepricing
+
+repricing : Text -> Text -> Decimal -> EquityCompensationRepricingOcfData
+repricing id sec price = EquityCompensationRepricingOcfData with
+  id
+  date = D.date 2024 D.Feb 15
+  new_exercise_price = usd price
+  security_id = sec
+  comments = []
+
+-- | A book with Alice's option `sec` over 10,000 shares at 35.00 USD.
+optionBook : Text -> Script Env
+optionBook sec = ecBookWith [ecRecord ((option sec "SH-A" 10000.0) with compensation_type = OcfCompensationTypeOption; exercise_price = Some (usd 35.0))]
+
+test_ec_repricing_underwater_options : Script ()
+test_ec_repricing_underwater_options = do
+  env <- optionBook "SEC_OPT_001"
+  accept env valid wrap ((repricing "TX_EC_REPRICE_1" "SEC_OPT_001" 15.0) with
+    comments = ["Board-approved repricing program for underwater options", "Original exercise price was $35.00, current FMV is $18.00"])
+
+test_ec_repricing_retention : Script ()
+test_ec_repricing_retention = do
+  env <- optionBook "SEC_OPT_002"
+  accept env valid wrap ((repricing "TX_EC_REPRICE_2" "SEC_OPT_002" 8.5) with
+    date = D.date 2024 D.Aug 1
+    comments = ["Retention repricing for key employee per Board resolution dated July 25, 2024"])
+  -- A repricing to zero is a price.
+  accept env valid wrap (repricing "TX_EC_REPRICE_3" "SEC_OPT_002" 0.0)
+
+test_ec_repricing_security_reference : Script ()
+test_ec_repricing_security_reference = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance (warrant "W-1" "SH-A")]
+  applyRecordsFails env "Equity compensation repricing security not found: OPT-MISSING" [wrap (repricing "REP-1" "OPT-MISSING" 1.0)]
+  applyRecordsFails env "Equity compensation repricing security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [wrap (repricing "REP-1" "W-1" 1.0)]
+  applyRecordsFails env "Equity compensation repricing security S-A2 is carried by a OcfObjectTypeTxStockIssuance" [wrap (repricing "REP-1" "S-A2" 1.0)]
+  expectNoRecord env "REP-1"
+
+test_ec_repricing_validation : Script ()
+test_ec_repricing_validation = do
+  env <- optionBook "OPT-1"
+  let r = repricing "REP-V" "OPT-1" 10.0
+  refuseWith env "an empty ID cannot be claimed" valid wrap (r with id = "")
+  refuse env valid wrap (r with security_id = "")
+  refuse env valid wrap (r with new_exercise_price = usd (-0.5))
+  refuse env valid wrap (r with new_exercise_price = OcfMonetary with amount = 10.0; currency = "DOLLARS")
+  refuse env valid wrap (r with new_exercise_price = OcfMonetary with amount = 10.0; currency = "")
+  refuse env valid wrap (r with comments = [""])
+
+test_ec_repricing_restate : Script ()
+test_ec_repricing_restate = do
+  env <- optionBook "OPT-1"
+  let r = repricing "REP-1" "OPT-1" 10.0
+  _ <- applyRecords env [wrap r]
+  restateOpsFails env "changes nothing" [RestateEdit (wrap r)]
+  let r' = r with new_exercise_price = usd 12.0
+  _ <- restateOps env [RestateEdit (wrap r')]
+  expectRecord env (wrap r')
+  _ <- restateOps env [RestateDelete "REP-1"]
+  expectNoRecord env "REP-1"

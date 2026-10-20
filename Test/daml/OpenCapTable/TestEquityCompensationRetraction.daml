@@ -1,0 +1,73 @@
+-- Equity compensation retractions, ported from v34's TestEquityCompensationRetraction: the record as written and restated, its validator and its security reference.
+module OpenCapTable.TestEquityCompensationRetraction where
+
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationRetraction
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : EquityCompensationRetractionOcfData -> Bool
+valid = validateEquityCompensationRetractionOcfData
+
+wrap : EquityCompensationRetractionOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationRetraction
+
+retraction : Text -> Text -> EquityCompensationRetractionOcfData
+retraction id sec = EquityCompensationRetractionOcfData with
+  id
+  date = D.date 2024 D.Feb 2
+  reason_text = "Administrative error - incorrect vesting schedule recorded"
+  security_id = sec
+  comments = []
+
+-- | Alice's ISO grant SEC-OPTION-1 over 10,000 shares.
+grantRecord : OcfRecordData
+grantRecord = ecRecord ((option "SEC-OPTION-1" "SH-A" 10000.0) with compensation_type = OcfCompensationTypeOptionIso; exercise_price = Some (usd 0.5))
+
+grantBook : Script Env
+grantBook = ecBookWith [grantRecord]
+
+test_ec_retraction_writes_record : Script ()
+test_ec_retraction_writes_record = do
+  env <- grantBook
+  accept env valid wrap (retraction "TX_EC_RETRACT_1" "SEC-OPTION-1")
+  accept env valid wrap ((retraction "TX_EC_RETRACT_2" "SEC-OPTION-1") with
+    date = D.date 2024 D.Feb 3
+    reason_text = "Grant void ab initio - employee never started"
+    comments = ["HR confirmed no start date", "Board resolution 2024-006"])
+  -- The grant record stays, unchanged: a retraction is a record, not a state change.
+  expectRecord env grantRecord
+
+test_ec_retraction_security_reference : Script ()
+test_ec_retraction_security_reference = do
+  env <- standardBook
+  applyRecordsFails env "Equity compensation retraction security not found: EC-MISSING" [wrap (retraction "RET-1" "EC-MISSING")]
+  -- A stock retraction is a TX_STOCK_RETRACTION; this record names a grant.
+  applyRecordsFails env "Equity compensation retraction security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [wrap (retraction "RET-1" "S-A1")]
+  expectNoRecord env "RET-1"
+
+test_ec_retraction_validation : Script ()
+test_ec_retraction_validation = do
+  env <- grantBook
+  let r = retraction "RET-V" "SEC-OPTION-1"
+  refuseWith env "an empty ID cannot be claimed" valid wrap (r with id = "")
+  refuse env valid wrap (r with security_id = "")
+  refuse env valid wrap (r with reason_text = "")
+  refuse env valid wrap (r with comments = ["ok", ""])
+
+test_ec_retraction_restate : Script ()
+test_ec_retraction_restate = do
+  env <- grantBook
+  let r = retraction "RET-1" "SEC-OPTION-1"
+  _ <- applyRecords env [wrap r]
+  restateOpsFails env "changes nothing" [RestateEdit (wrap r)]
+  let r' = r with reason_text = "Grant recorded twice"
+  _ <- restateOps env [RestateEdit (wrap r')]
+  expectRecord env (wrap r')
+  _ <- restateOps env [RestateDelete "RET-1"]
+  expectNoRecord env "RET-1"
