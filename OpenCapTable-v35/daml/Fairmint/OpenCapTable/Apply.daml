@@ -177,17 +177,22 @@ applyRecord b d = case d of
   OcfRecordDataVestingAcceleration x -> case lookupState x.security_id b of
     Some _ -> do
       (s, _) <- beginEvent b x.security_id x.date False
-      vesting' <- case s.vesting of
+      (vesting', snapshot') <- case s.vesting of
         StockVestingNone -> abort ("security " <> s.security_id <> " is fully vested and cannot be accelerated")
-        StockVestingTranches ts -> StockVestingTranches <$> liftEither (accelerateTranches x.date x.quantity s ts)
+        StockVestingTranches ts -> do
+          ts' <- liftEither (accelerateTranches x.date x.quantity s ts)
+          pure (StockVestingTranches ts', s.snapshot)
         StockVestingOnTerms _ -> do
-          let unvested = s.quantity - vestedAt s x.date
+          let vested = vestedAt s x.date
+              unvested = s.quantity - vested
           when (x.quantity > unvested)
             (abort ("acceleration of " <> show x.quantity <> " on security " <> s.security_id
               <> " exceeds its unvested quantity " <> show unvested))
-          pure s.vesting
+          -- The accelerated shares are vested from its date, so a later acceleration or draw
+          -- sees them until the TA's next snapshot, which never goes below this one.
+          pure (s.vesting, Some VestedSnapshot with as_of = x.date; vested = vested + x.quantity)
       b' <- writeEventRecord s x.id d b
-      replaceState ((successor s) with vesting = vesting') b'
+      replaceState ((successor s) with vesting = vesting'; snapshot = snapshot') b'
     None -> writeStatelessRecord d [nonStockVestingTarget x.security_id] b
   _ -> writeStatelessRecord d [] b
 
