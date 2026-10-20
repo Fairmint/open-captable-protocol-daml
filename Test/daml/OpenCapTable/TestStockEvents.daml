@@ -26,6 +26,7 @@ import Fairmint.OpenCapTable.Restate (RestateOperation(..))
 import OpenCapTable.DefinitionFixtures (equityCompensationIssuance, warrantIssuance)
 import Fairmint.OpenCapTable.References (recordTranches)
 import OpenCapTable.Harness
+import OpenCapTable.StockHelpers (recordSplit)
 import OpenCapTable.TestSettlement (vestingTerms4y)
 
 eventDay : Date
@@ -76,6 +77,67 @@ test_events_transfer_conservation = do
     [go (mkTransfer "TR-1" "S-A1" 100.0 ["S-B1"] (Some "S-A1-R")) [out "S-B1" "SH-B" 100.0] (Some (out "S-A1-R" "SH-B" 500.0))]
   applyOpsFails env "exceeds"
     [go (mkTransfer "TR-1" "S-A1" 700.0 ["S-B1"] None) [out "S-B1" "SH-B" 700.0] None]
+
+-- An output issuance is dated on its event: its state starts at the event's date and split epoch,
+-- in the event's units, so an earlier date would put its origin record before a split the state
+-- already applied, and before the source was consumed.
+test_events_outputs_dated_on_their_event : Script ()
+test_events_outputs_dated_on_their_event = do
+  env <- standardBook
+  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 (D.date 2024 D.Feb 1)
+  let before = D.date 2024 D.Jan 15
+      after = D.addDays eventDay 1
+      transfer = mkTransfer "TR-1" "S-A1" 200.0 ["S-B1"] (Some "S-A1-R")
+      cancellation = StockCancellationOcfData with
+        id = "CX-1"; date = eventDay; quantity = 200.0; security_id = "S-A1"; reason_text = "Forfeited"
+        comments = []; balance_security_id = Some "S-A1-R"
+      consolidation = StockConsolidationOcfData with
+        id = "CO-1"; date = eventDay; security_ids = ["S-A1", "S-A2"]; resulting_security_id = "S-A-C"
+        comments = []; reason_text = None
+  -- S-A1 holds 1,200 post-split shares on the event date.
+  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
+    transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = before]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
+  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
+    transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = after]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
+  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
+    transfer; resulting = [out "S-B1" "SH-B" 200.0]; balance = Some ((out "S-A1-R" "SH-A" 1000.0) with date = before)]
+  applyOpsFails env "not on its event's date" [ApplyStockCancellation with
+    cancellation; balance = Some ((out "S-A1-R" "SH-A" 1000.0) with date = before)]
+  applyOpsFails env "not on its event's date" [ApplyStockConsolidation with
+    consolidation; resulting_issuance = (out "S-A-C" "SH-A" 2000.0) with date = before]
+  -- A later-dated output stays refused when a later event in the same write moves its state on.
+  applyOpsFails env "not on its event's date"
+    [ ApplyStockTransfer with
+        transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = after]; balance = Some (out "S-A1-R" "SH-A" 1000.0)
+    , ApplyRecord (OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = after; security_id = "S-B1"; comments = []) ]
+  -- Dated on the event, the transfer commits.
+  _ <- applyOps env [ApplyStockTransfer with
+    transfer; resulting = [out "S-B1" "SH-B" 200.0]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
+  b <- stateOf env "S-B1"
+  (b.issue_date, b.last_event_date, b.split_epoch, b.quantity) === (eventDay, eventDay, 1, 200.0)
+
+-- A whole transfer of a lot on vesting terms may keep the terms on its resulting issuance. The new
+-- security has no snapshot, so it counts as unvested until the TA records one, in the same batch
+-- here; its outputs still never vest ahead of the source.
+test_events_whole_transfer_from_terms_lot : Script ()
+test_events_whole_transfer_from_terms_lot = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataVestingTerms vestingTerms4y]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-V1" "SH-A" "CLS-A" 100.0 d2024) with vesting_terms_id = Some "VT-4Y")]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V1"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
+  let day = D.date 2025 D.Mar 3
+      t = (mkTransfer "TR-W" "S-V1" 100.0 ["S-V1-B"] None) with date = day
+  applyOpsFails env "more than the 40.0"
+    [ApplyStockTransfer with transfer = t; resulting = [issuance "S-V1-B" "SH-B" "CLS-A" 100.0 day]; balance = None]
+  _ <- applyOps env
+    [ ApplyStockTransfer with
+        transfer = t
+        resulting = [(issuance "S-V1-B" "SH-B" "CLS-A" 100.0 day) with vesting_terms_id = Some "VT-4Y"]
+        balance = None
+    , ApplyVestingSnapshot with security_id = "S-V1-B"; as_of = day; vested = 40.0 ]
+  b <- stateOf env "S-V1-B"
+  b.vesting === StockVestingOnTerms "VT-4Y"
+  vestedAt b day === 40.0
 
 test_events_transfer_needs_resulting_class : Script ()
 test_events_transfer_needs_resulting_class = do
