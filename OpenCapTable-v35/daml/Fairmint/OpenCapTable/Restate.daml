@@ -8,7 +8,7 @@ module Fairmint.OpenCapTable.Restate
   ) where
 
 import DA.Action (foldlA, unless, when)
-import DA.List ((\\))
+import DA.Foldable (forA_)
 import DA.Map (Map)
 import qualified DA.Map as Map
 import qualified DA.Set as Set
@@ -140,8 +140,14 @@ restateOne p op = case op of
           Some s -> claimId IdNamespaceSecurity s b'
           None -> pure b'
       else pure b1
-    let added = requirementsOf d \\ requirementsOf old.ocf_data
-    b3 <- countPolymorphicReferences (max 0 (polymorphicReferenceCount d - polymorphicReferenceCount old.ocf_data)) b2
+    -- An edit checks only the references the old record did not make. It is charged for the
+    -- distinct polymorphic ones among them, or for the references its lists grow by, if more.
+    let oldRequirements = Set.fromList (requirementsOf old.ocf_data)
+        added = filter (\r -> not (Set.member r oldRequirements)) (requirementsOf d)
+        oldPolymorphic = Set.fromList (polymorphicRequirementsOf old.ocf_data)
+        addedPolymorphic = filter (\r -> not (Set.member r oldPolymorphic)) (polymorphicRequirementsOf d)
+        grown = polymorphicReferenceCount d - polymorphicReferenceCount old.ocf_data
+    b3 <- countPolymorphicReferences (max grown (length addedPolymorphic)) b2
     (b4, _) <- addRecord d b3
     pure p1 with book = addRequirements added b4
   RestateDelete objectId -> do
@@ -195,6 +201,12 @@ restateOne p op = case op of
       (Some old, None) -> do
         when (r.last_event_date < old.last_event_date)
           (abort ("a restatement never moves security " <> r.security_id <> "'s last event date back"))
+        unless (r.origin_transaction_id == old.origin_transaction_id)
+          (abort ("a successor of security " <> r.security_id <> " keeps its origin transaction " <> old.origin_transaction_id))
+        -- Moving a state out of a class changes a state in that class too.
+        when (old.stock_class_id /= r.stock_class_id) do
+          from <- requireEpoch old.stock_class_id b
+          when from.frozen (abort ("stock class " <> old.stock_class_id <> " is frozen for a split"))
         -- A successor under the same security ID carries every hold forward under its hold ID.
         unless (null old.holds) do
           unless (r.stakeholder_id == old.stakeholder_id && r.stock_class_id == old.stock_class_id
@@ -209,11 +221,17 @@ restateOne p op = case op of
         when (Map.member r.security_id b.states)
           (abort ("security " <> r.security_id <> " already has a state in this write"))
         when (n < 0) (abort "a state's seq is not negative")
+        -- A recreated state names the issuance that carries its security, when the write has it.
+        forA_ (Map.lookup r.security_id b.securities) \issuanceId ->
+          unless (issuanceId == r.origin_transaction_id)
+            (abort ("security " <> r.security_id <> "'s origin is issuance " <> issuanceId <> ", not " <> r.origin_transaction_id))
         b' <- addState (base with seq = n) b
         pure p with book = b'; pending = (PendingRecreate with security_id = r.security_id) :: p.pending
       (None, None) -> abort ("no active state for security " <> r.security_id <> "; give a seq to recreate one")
   RestateEndState sec -> do
     s <- requireState sec p.book
+    e <- requireEpoch s.stock_class_id p.book
+    when e.frozen (abort ("stock class " <> s.stock_class_id <> " is frozen for a split"))
     unless (null s.holds)
       (abort ("security " <> sec <> " carries an open hold; a restatement never ends a lot on hold"))
     b' <- endState sec p.book
@@ -223,8 +241,9 @@ restateOne p op = case op of
 resolvePending : Progress -> Book -> Pending -> Update Book
 resolvePending p book pending = case pending of
   PendingEnd with security_id; origin_transaction_id ->
-    if Map.member origin_transaction_id p.deleted then pure book
-    else abort ("a restatement ends security " <> security_id <> "'s state only with the deletion of its origin issuance " <> origin_transaction_id)
+    case Map.lookup origin_transaction_id p.deleted of
+      Some (OcfRecordDataStockIssuance iss) | iss.security_id == security_id -> pure book
+      _ -> abort ("a restatement ends security " <> security_id <> "'s state only with the deletion of its origin issuance " <> origin_transaction_id)
   PendingRecreate with security_id ->
     if any (consumes security_id) (Map.values p.deleted) then pure book
     else abort ("a restatement recreates security " <> security_id <> "'s state only with the deletion of the record that consumed it")

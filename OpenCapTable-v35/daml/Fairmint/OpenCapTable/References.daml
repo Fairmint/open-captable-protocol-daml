@@ -4,6 +4,7 @@ module Fairmint.OpenCapTable.References
   , Lookups(..)
   , requirementsOf
   , polymorphicReferenceCount
+  , polymorphicRequirementsOf
   , checkRequirement
   , issuanceSecurityId
   , recordTranches
@@ -17,6 +18,7 @@ import DA.List (dedup)
 import DA.Optional (optionalToList)
 import Fairmint.OpenCapTableApi.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.Document (OcfObjectReference(..))
 import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
 import Fairmint.OpenCapTable.State (RecordedSplit(..), maxTranchesPerSecurity)
 import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition(..))
@@ -68,11 +70,12 @@ issuanceSecurityId d = case d of
   OcfRecordDataEquityCompensationIssuance x -> Some x.security_id
   _ -> None
 
--- | Vesting tranches a record carries, for the per-transaction tranche cap (stock issuances only:
--- the cap bounds stock states and their issuances).
+-- | Vesting tranches a record carries, for the per-transaction tranche cap: every issuance's.
 recordTranches : OcfRecordData -> Int
 recordTranches d = case d of
   OcfRecordDataStockIssuance x -> length x.vestings
+  OcfRecordDataWarrantIssuance x -> length x.vestings
+  OcfRecordDataEquityCompensationIssuance x -> length x.vestings
   _ -> 0
 
 -- | Polymorphic references one record stores. A larger financing or document is created and then
@@ -113,6 +116,24 @@ polymorphicReferenceCount d = case d of
   OcfRecordDataFinancing x -> length x.issuance_ids
   OcfRecordDataConvertibleConversion x -> optional 0 capitalizationReferenceCount x.capitalization_definition
   _ -> 0
+
+-- | The requirements of a record's polymorphic references, the ones the per-transaction cap counts:
+-- an edit is charged for those the old record did not make.
+polymorphicRequirementsOf : OcfRecordData -> [Requirement]
+polymorphicRequirementsOf d = dedup $ case d of
+  OcfRecordDataDocument x -> documentRefs x.related_objects
+  OcfRecordDataFinancing x -> financingRefs x.issuance_ids
+  OcfRecordDataConvertibleConversion x -> conversionCapitalizationRefs x.capitalization_definition
+  _ -> []
+
+documentRefs : [OcfObjectReference] -> [Requirement]
+documentRefs = map (\r -> RequireObject with label = "Document related object"; object_id = r.object_id; object_types = [r.object_type])
+
+financingRefs : [Text] -> [Requirement]
+financingRefs = map (\i -> RequireObject with label = "Financing issuance"; object_id = i; object_types = issuanceObjectTypes)
+
+conversionCapitalizationRefs : Optional OcfCapitalizationDefinition -> [Requirement]
+conversionCapitalizationRefs = optional [] (capitalizationRefs "Convertible conversion capitalization definition")
 
 stakeholderRef : Text -> Text -> Requirement
 stakeholderRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeStakeholder]
@@ -157,7 +178,7 @@ requirementsOf d = dedup $ case d of
     ]
       <> map (securityRef "Convertible conversion resulting security" OcfObjectTypeTxStockIssuance) x.resulting_security_ids
       <> map (securityRef "Convertible conversion balance" OcfObjectTypeTxConvertibleIssuance) (optionalToList x.balance_security_id)
-      <> optional [] (capitalizationRefs "Convertible conversion capitalization definition") x.capitalization_definition
+      <> conversionCapitalizationRefs x.capitalization_definition
   OcfRecordDataConvertibleIssuance x ->
     stakeholderRef "Convertible issuance stakeholder" x.stakeholder_id
       :: concatMap (\t -> conversionRightTargets "Convertible conversion trigger" (OcfRightConvertible t.conversion_right)) x.conversion_triggers
@@ -166,8 +187,7 @@ requirementsOf d = dedup $ case d of
     securityRef "Convertible transfer" OcfObjectTypeTxConvertibleIssuance x.security_id
       :: map (securityRef "Convertible transfer resulting security" OcfObjectTypeTxConvertibleIssuance) x.resulting_security_ids
       <> map (securityRef "Convertible transfer balance" OcfObjectTypeTxConvertibleIssuance) (optionalToList x.balance_security_id)
-  OcfRecordDataDocument x ->
-    map (\r -> RequireObject with label = "Document related object"; object_id = r.object_id; object_types = [r.object_type]) x.related_objects
+  OcfRecordDataDocument x -> documentRefs x.related_objects
   OcfRecordDataEquityCompensationAcceptance x -> [securityRef "Equity compensation acceptance" OcfObjectTypeTxEquityCompensationIssuance x.security_id]
   OcfRecordDataEquityCompensationCancellation x ->
     securityRef "Equity compensation cancellation" OcfObjectTypeTxEquityCompensationIssuance x.security_id
@@ -192,8 +212,7 @@ requirementsOf d = dedup $ case d of
     securityRef "Equity compensation transfer" OcfObjectTypeTxEquityCompensationIssuance x.security_id
       :: map (securityRef "Equity compensation transfer resulting security" OcfObjectTypeTxEquityCompensationIssuance) x.resulting_security_ids
       <> map (securityRef "Equity compensation transfer balance" OcfObjectTypeTxEquityCompensationIssuance) (optionalToList x.balance_security_id)
-  OcfRecordDataFinancing x ->
-    map (\i -> RequireObject with label = "Financing issuance"; object_id = i; object_types = issuanceObjectTypes) x.issuance_ids
+  OcfRecordDataFinancing x -> financingRefs x.issuance_ids
   OcfRecordDataIssuer _ -> []
   OcfRecordDataIssuerAuthorizedSharesAdjustment x ->
     [RequireObject with label = "Issuer authorized shares adjustment issuer"; object_id = x.issuer_id; object_types = [OcfObjectTypeIssuer]]
