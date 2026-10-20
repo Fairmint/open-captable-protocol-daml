@@ -1,0 +1,490 @@
+-- A demo-style end-to-end book, ported from v34's Demo and Setup: Acme Inc. is authorized through the factory with its pinned TA, and the TA builds its cap table step by step the way it replays a real one (v34's definitions, founder stock, a SAFE, a Series A that converts it, an option grant under the plan, a secondary transfer, a valuation and corrections), reading the book back after each step and as a whole; the same export replayed in one batch yields the same book.
+module OpenCapTable.TestDemo where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import DA.List (head, sort)
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTableApi.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.IssuerAuthorization
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OcpFactory
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..), OcfStockClassConversionRight(..))
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfInitialSharesAuthorized(..), OcfRatio(..), OcfStockClassType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.Document (DocumentOcfData(..), OcfObjectReference(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.Financing (FinancingOcfData(..))
+import Fairmint.OpenCapTable.OCF.Issuer (IssuerOcfData(..))
+import Fairmint.OpenCapTable.OCF.IssuerAuthorizedSharesAdjustment (IssuerAuthorizedSharesAdjustmentOcfData(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..), StakeholderOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (OcfStockIssuanceType(..), StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockLegendTemplate (StockLegendTemplateOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockPlan (StockPlanOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockPlanPoolAdjustment (StockPlanPoolAdjustmentOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.Valuation (OcfValuationType(..), ValuationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- THE ISSUER AND ITS CAP TABLE
+-- =============================================================================
+
+-- | v34's demo issuer: Acme Inc, formed 2010-06-01, 15M shares authorized.
+acmeIssuer : IssuerOcfData
+acmeIssuer = issuerData with
+  id = "ISSUER_DEMO"
+  legal_name = "Acme Inc"
+  formation_date = D.date 2010 D.Jun 1
+  initial_shares_authorized = Some (OcfInitialSharesNumeric 15000000.0)
+
+-- | v34 Demo's step 1 (and Setup's setupTestOcp), the production way: the system operator's factory
+-- authorizes Acme with its pinned TA, the TA accepts, and Acme creates its cap table.
+acmeBook : Party -> Party -> Party -> Party -> ContractId OcpFactory -> Script Env
+acmeBook sysOp acme ta outsider factory = do
+  auth <- submit sysOp do
+    exerciseCmd factory OcpFactory_AuthorizeIssuer with issuer = acme; transfer_agent = ta
+  accepted <- submit ta do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  created <- submit acme do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = ta; issuer_data = acmeIssuer
+  Map.size created.shards === 256
+  pure Env with
+    system_operator = sysOp
+    issuer = acme
+    transfer_agent = ta
+    outsider
+    ctx = Context with cap_table_id = auth.cap_table_id; issuer = acme; system_operator = sysOp; transfer_agent = ta
+    cap_table = created.cap_table
+    issuer_record = created.issuer
+    factory = auth.factory
+
+acmeEnv : Script Env
+acmeEnv = do
+  sysOp <- allocateParty "SystemOperator"
+  acme <- allocateParty "Acme"
+  ta <- allocateParty "TransferAgent"
+  outsider <- allocateParty "Rando"
+  factory <- submit sysOp do
+    createCmd OcpFactory with system_operator = sysOp; factory_id = "demo"; next_cap_table_number = 1
+  acmeBook sysOp acme ta outsider factory
+
+-- =============================================================================
+-- THE BOOK'S RECORDS
+-- =============================================================================
+
+person : Text -> Text -> StakeholderOcfData
+person id name = (stakeholderData id) with name = OcfName with legal_name = name; first_name = Some name; last_name = None
+
+-- | v34's "Common" class with 12M authorized shares.
+common : StockClassOcfData
+common = (stockClass "SC_COMMON") with name = "Common"; initial_shares_authorized = OcfInitialSharesNumeric 12000000.0
+
+seriesA : StockClassOcfData
+seriesA = (stockClass "SC_SERIES_A") with
+  name = "Series A Preferred"
+  class_type = OcfStockClassTypePreferred
+  default_id_prefix = "PA-"
+  initial_shares_authorized = OcfInitialSharesNumeric 2000000.0
+  seniority = 2.0
+  price_per_share = Some (usd 1.0)
+  liquidation_preference_multiple = Some 1.0
+  conversion_rights =
+    [ OcfStockClassConversionRight with
+        conversion_mechanism = OcfRatioConversionMechanism with
+          conversion_price = usd 1.0
+          ratio = OcfRatio with numerator = 1.0; denominator = 1.0
+          rounding_type = OcfRoundingTypeNormal
+        converts_to_future_round = None
+        converts_to_stock_class_id = Some "SC_COMMON"
+    ]
+
+legendStd : StockLegendTemplateOcfData
+legendStd = StockLegendTemplateOcfData with
+  id = "LEG_STD"; name = "Standard Legend"; text = "THIS SECURITY HAS NOT BEEN REGISTERED..."; comments = []
+
+-- | v34's vesting terms: a single start condition.
+vtDemo : VestingTermsOcfData
+vtDemo = VestingTermsOcfData with
+  id = "VT_DEMO"
+  name = "Standard 1k at start"
+  description = "All at start"
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  comments = []
+  vesting_conditions =
+    [ OcfVestingCondition with
+        id = "start"; description = Some "All at start"; portion = None; quantity = Some 1000.0
+        trigger = OcfVestingStartTrigger; next_condition_ids = []
+    ]
+
+-- | Four years monthly from the start, with a one-year cliff.
+vt4y1c : VestingTermsOcfData
+vt4y1c = VestingTermsOcfData with
+  id = "VT_4Y1C"
+  name = "4 years, 1 year cliff"
+  description = "48 monthly installments, the first 12 at the cliff"
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  comments = []
+  vesting_conditions =
+    [ OcfVestingCondition with
+        id = "start"; description = Some "Vesting commencement"; portion = None; quantity = Some 0.0
+        trigger = OcfVestingStartTrigger; next_condition_ids = ["monthly"]
+    , OcfVestingCondition with
+        id = "monthly"; description = Some "Monthly after a one-year cliff"; quantity = None
+        portion = Some OcfVestingConditionPortion with numerator = 1.0; denominator = 1.0; remainder = None
+        trigger = OcfVestingScheduleRelativeTrigger with
+          relative_to_condition_id = "start"
+          period = OcfVestingPeriodMonths with
+            length_ = 1; occurrences = 48; day_of_month = OcfVestingDayOfMonthVestingStartDayOrLastDayOfMonth; cliff_installment = Some 12
+        next_condition_ids = []
+    ]
+
+-- | v34's 2025 Equity Incentive Plan over the common class.
+plan2025 : StockPlanOcfData
+plan2025 = (stockPlan "PLAN_2025" ["SC_COMMON"]) with
+  plan_name = "2025 Equity Incentive Plan"
+  initial_shares_reserved = 1000000.0
+
+-- | v34 Demo's steps 2 to 5 (the common class, Alice and Bob, the legend, vesting terms and the
+-- plan), the plan ahead of its class.
+definitions : [OcfRecordData]
+definitions =
+  [ OcfRecordDataStockPlan plan2025
+  , OcfRecordDataStockClass common
+  , OcfRecordDataStakeholder (person "STKH_Alice" "Alice")
+  , OcfRecordDataStakeholder (person "STKH_Bob" "Bob")
+  , OcfRecordDataStockLegendTemplate legendStd
+  , OcfRecordDataVestingTerms vtDemo
+  , OcfRecordDataVestingTerms vt4y1c
+  ]
+
+founderDate : Date
+founderDate = D.date 2010 D.Jun 15
+
+founderStock : Text -> Text -> Decimal -> StockIssuanceOcfData
+founderStock sec holder qty = (issuance sec holder "SC_COMMON" qty founderDate) with
+  share_price = usd 0.0001
+  cost_basis = Some (usd (qty * 0.0001))
+  stock_legend_ids = ["LEG_STD"]
+  issuance_type = Some OcfStockIssuanceTypeRsa
+
+aliceFounder : StockIssuanceOcfData
+aliceFounder = founderStock "S_ALICE_1" "STKH_Alice" 4000000.0
+
+bobFounder : StockIssuanceOcfData
+bobFounder = (founderStock "S_BOB_1" "STKH_Bob" 3000000.0) with vesting_terms_id = Some "VT_4Y1C"
+
+-- | Founder stock: Alice's 4M fully vested, Bob's 3M on the four-year terms.
+founders : [OcfRecordData]
+founders = [OcfRecordDataStockIssuance aliceFounder, OcfRecordDataStockIssuance bobFounder]
+
+safeCarol : ConvertibleIssuanceOcfData
+safeCarol = (convertibleIssuance "SAFE_CAROL" "SEC_SAFE_CAROL" "STKH_Carol") with
+  custom_id = "SAFE-1"
+  date = D.date 2023 D.Sep 1
+  investment_amount = usd 500000.0
+
+-- | A SAFE from Carol, who joins after it in the same batch.
+safe : [OcfRecordData]
+safe = [OcfRecordDataConvertibleIssuance safeCarol, OcfRecordDataStakeholder (person "STKH_Carol" "Carol")]
+
+seriesADate : Date
+seriesADate = D.date 2024 D.Jun 1
+
+seriesAStock : Text -> Text -> Decimal -> StockIssuanceOcfData
+seriesAStock sec holder qty = (issuance sec holder "SC_SERIES_A" qty seriesADate) with stock_legend_ids = ["LEG_STD"]
+
+ref : OcfObjectType -> Text -> OcfObjectReference
+ref t id = OcfObjectReference with object_type = t; object_id = id
+
+spa : DocumentOcfData
+spa = DocumentOcfData with
+  id = "DOC_SPA"
+  md5 = "0123456789abcdef0123456789abcdef"
+  comments = []
+  related_objects = [ref OcfObjectTypeFinancing "FIN_SERIES_A", ref OcfObjectTypeStockClass "SC_SERIES_A", ref OcfObjectTypeIssuer "ISSUER_DEMO"]
+  path = Some "/docs/series-a-spa.pdf"
+  uri = None
+
+draftDocument : DocumentOcfData
+draftDocument = spa with id = "DOC_DRAFT"; path = Some "/docs/draft.pdf"; related_objects = []
+
+-- | The Series A: the purchase agreement and the financing ahead of what they name, Carol's SAFE
+-- converted into Series A stock, a preferred class converting into common, Erin's purchase, Erin,
+-- and the issuer's authorized shares raised to 17M.
+seriesARound : [OcfRecordData]
+seriesARound =
+  [ OcfRecordDataDocument spa
+  , OcfRecordDataFinancing FinancingOcfData with
+      id = "FIN_SERIES_A"; date = seriesADate; name = "Series A"; comments = []
+      issuance_ids = ["ISS-S_ERIN_A", "ISS-S_CAROL_A", "SAFE_CAROL"]
+  , OcfRecordDataConvertibleConversion ConvertibleConversionOcfData with
+      id = "CONV_SAFE_CAROL"
+      date = seriesADate
+      reason_text = "Series A qualified financing"
+      security_id = "SEC_SAFE_CAROL"
+      trigger_id = "T-SEC_SAFE_CAROL"
+      comments = []
+      resulting_security_ids = ["S_CAROL_A"]
+      balance_security_id = None
+      capitalization_definition = None
+      quantity_converted = None
+  , OcfRecordDataStockClass seriesA
+  , OcfRecordDataStockIssuance (seriesAStock "S_ERIN_A" "STKH_Erin" 1000000.0)
+  , OcfRecordDataStockIssuance (seriesAStock "S_CAROL_A" "STKH_Carol" 600000.0)
+  , OcfRecordDataStakeholder (person "STKH_Erin" "Erin")
+  , OcfRecordDataIssuerAuthorizedSharesAdjustment IssuerAuthorizedSharesAdjustmentOcfData with
+      id = "ISSUER_ADJ_1"; date = seriesADate; issuer_id = "ISSUER_DEMO"; new_shares_authorized = 17000000.0
+      comments = []; board_approval_date = Some seriesADate; stockholder_approval_date = None
+  ]
+
+daveOption : EquityCompensationIssuanceOcfData
+daveOption = (equityCompensationIssuance "EC_DAVE_1" "SEC_EC_DAVE_1" "STKH_Dave") with
+  compensation_type = OcfCompensationTypeOptionIso
+  custom_id = "OPT-1"
+  date = D.date 2025 D.Mar 1
+  quantity = 100000.0
+  exercise_price = Some (usd 0.10)
+  expiration_date = Some (D.date 2035 D.Mar 1)
+  stock_plan_id = Some "PLAN_2025"
+  stock_class_id = Some "SC_COMMON"
+  vesting_terms_id = Some "VT_4Y1C"
+
+-- | Dave joins and is granted options under the plan on the four-year terms, with his vesting
+-- start; the pool grows to 1.5M.
+grant : [OcfRecordData]
+grant =
+  [ OcfRecordDataEquityCompensationIssuance daveOption
+  , OcfRecordDataVestingStart VestingStartOcfData with
+      id = "VS_DAVE_1"; date = D.date 2025 D.Mar 1; security_id = "SEC_EC_DAVE_1"; vesting_condition_id = "start"; comments = []
+  , OcfRecordDataStockPlanPoolAdjustment StockPlanPoolAdjustmentOcfData with
+      id = "POOL_ADJ_1"; date = D.date 2025 D.Feb 15; shares_reserved = 1500000.0; stock_plan_id = "PLAN_2025"
+      comments = []; board_approval_date = Some (D.date 2025 D.Feb 15); stockholder_approval_date = None
+  , OcfRecordDataStakeholder (person "STKH_Dave" "Dave")
+  ]
+
+saleDate : Date
+saleDate = D.date 2025 D.Jun 2
+
+-- | The secondary: Alice sells 500,000 common to Erin at 2.00 USD a share, under the IDs the
+-- register derives in this book, and Erin accepts.
+data Sale = Sale with
+    transfer : StockTransferOcfData
+    to_erin : StockIssuanceOcfData
+    kept_by_alice : StockIssuanceOcfData
+    acceptance : StockAcceptanceOcfData
+
+saleIn : Env -> Sale
+saleIn env =
+  let resultingSec = derived env "S_ALICE_1" 0 DerivedRoleResultingSecurity 0
+      balanceSec = derived env "S_ALICE_1" 0 DerivedRoleBalanceSecurity 0
+  in Sale with
+    transfer = StockTransferOcfData with
+      id = derived env "S_ALICE_1" 0 DerivedRoleEvent 0
+      date = saleDate
+      quantity = 500000.0
+      security_id = "S_ALICE_1"
+      comments = []
+      resulting_security_ids = [resultingSec]
+      balance_security_id = Some balanceSec
+      consideration_text = Some "Secondary sale at 2.00 USD a share"
+    to_erin = (founderStock resultingSec "STKH_Erin" 500000.0) with
+      id = derived env "S_ALICE_1" 0 DerivedRoleResultingIssuance 0; date = saleDate
+      share_price = usd 2.0; cost_basis = Some (usd 1000000.0)
+    kept_by_alice = (founderStock balanceSec "STKH_Alice" 3500000.0) with
+      id = derived env "S_ALICE_1" 0 DerivedRoleBalanceIssuance 0; date = saleDate; cost_basis = Some (usd 350.0)
+    acceptance = StockAcceptanceOcfData with
+      id = derived env resultingSec 0 DerivedRoleEvent 0; date = saleDate; security_id = resultingSec; comments = []
+
+saleOps : Sale -> [ApplyOperation]
+saleOps s =
+  [ ApplyStockTransfer with transfer = s.transfer; resulting = [s.to_erin]; balance = Some s.kept_by_alice
+  , ApplyRecord (OcfRecordDataStockAcceptance s.acceptance)
+  ]
+
+fmv : ValuationOcfData
+fmv = ValuationOcfData with
+  id = "VAL_409A_2025"; effective_date = D.date 2025 D.Jun 30; price_per_share = usd 0.45; stock_class_id = "SC_COMMON"
+  valuation_type = OcfValuationType409a; comments = []; board_approval_date = Some (D.date 2025 D.Jul 10)
+  provider = Some "Valuer LLC"; stockholder_approval_date = None
+
+bobFixed : StakeholderOcfData
+bobFixed = person "STKH_Bob" "Robert Builder"
+
+-- =============================================================================
+-- READING THE BOOK
+-- =============================================================================
+
+-- | The quantities of the active stock states, by stakeholder and class, summed.
+holdings : Env -> Script (Map.Map (Text, Text) Decimal)
+holdings env = do
+  states <- map snd <$> statesOf env
+  pure (foldl (\m s -> Map.insertWith (+) (s.stakeholder_id, s.stock_class_id) s.quantity m) Map.empty states)
+
+-- | The active records of the book, counted by type.
+recordCounts : Env -> Script (Map.Map Text Int)
+recordCounts env = do
+  views <- map snd <$> recordsOf env
+  pure (foldl (\m v -> Map.insertWith (+) (show v.object_type) 1 m) Map.empty views)
+
+expectedCounts : Map.Map Text Int
+expectedCounts = Map.fromList
+  [ ("OcfObjectTypeDocument", 1)
+  , ("OcfObjectTypeFinancing", 1)
+  , ("OcfObjectTypeIssuer", 1)
+  , ("OcfObjectTypeStakeholder", 5)
+  , ("OcfObjectTypeStockClass", 2)
+  , ("OcfObjectTypeStockLegendTemplate", 1)
+  , ("OcfObjectTypeStockPlan", 1)
+  , ("OcfObjectTypeTxConvertibleConversion", 1)
+  , ("OcfObjectTypeTxConvertibleIssuance", 1)
+  , ("OcfObjectTypeTxEquityCompensationIssuance", 1)
+  , ("OcfObjectTypeTxIssuerAuthorizedSharesAdjustment", 1)
+  , ("OcfObjectTypeTxStockAcceptance", 1)
+  , ("OcfObjectTypeTxStockIssuance", 6)
+  , ("OcfObjectTypeTxStockPlanPoolAdjustment", 1)
+  , ("OcfObjectTypeTxStockTransfer", 1)
+  , ("OcfObjectTypeTxVestingStart", 1)
+  , ("OcfObjectTypeValuation", 1)
+  , ("OcfObjectTypeVestingTerms", 2)
+  ]
+
+expectedHoldings : Map.Map (Text, Text) Decimal
+expectedHoldings = Map.fromList
+  [ (("STKH_Alice", "SC_COMMON"), 3500000.0)
+  , (("STKH_Bob", "SC_COMMON"), 3000000.0)
+  , (("STKH_Carol", "SC_SERIES_A"), 600000.0)
+  , (("STKH_Erin", "SC_COMMON"), 500000.0)
+  , (("STKH_Erin", "SC_SERIES_A"), 1000000.0)
+  ]
+
+-- | The finished book: its records by type and payload, its holdings against what the classes and
+-- the issuer authorize (the register does not enforce authorized shares; the book is consistent
+-- with them), and its claimed IDs.
+expectFinishedBook : Env -> Script ()
+expectFinishedBook env = do
+  recordCounts env >>= (=== expectedCounts)
+  let sale = saleIn env
+      corrected = map (\d -> if d == OcfRecordDataStakeholder (person "STKH_Bob" "Bob") then OcfRecordDataStakeholder bobFixed else d)
+  expectRecords env (corrected definitions <> founders <> safe <> seriesARound <> grant)
+  expectRecords env
+    [ OcfRecordDataStockTransfer sale.transfer, OcfRecordDataStockIssuance sale.to_erin
+    , OcfRecordDataStockIssuance sale.kept_by_alice, OcfRecordDataStockAcceptance sale.acceptance
+    , OcfRecordDataValuation fmv
+    ]
+  recordDataOf env "ISSUER_DEMO" >>= (=== OcfRecordDataIssuer acmeIssuer)
+  hs <- holdings env
+  hs === expectedHoldings
+  let outstanding klass = sum [q | ((_, k), q) <- Map.toList hs, k == klass]
+  outstanding "SC_COMMON" === 7000000.0
+  outstanding "SC_SERIES_A" === 1600000.0
+  assertMsg "common within its 12M" (outstanding "SC_COMMON" <= 12000000.0)
+  assertMsg "Series A within its 2M" (outstanding "SC_SERIES_A" <= 2000000.0)
+  assertMsg "all stock within the issuer's 17M" (outstanding "SC_COMMON" + outstanding "SC_SERIES_A" <= 17000000.0)
+  e <- stateOf env (head sale.transfer.resulting_security_ids)
+  (e.stakeholder_id, e.quantity, e.seq, e.last_event_date) === ("STKH_Erin", 500000.0, 1, saleDate)
+  b <- stateOf env "S_BOB_1"
+  b.vesting === StockVestingOnTerms "VT_4Y1C"
+  hasState env "S_ALICE_1" >>= (=== False)
+  epochs <- map ((.stock_class_id) . snd) <$> epochsOf env
+  sort epochs === ["SC_COMMON", "SC_SERIES_A"]
+  -- IDs stay claimed by the records that hold them, across types and after the security is consumed.
+  applyRecordsFails env "security ID already used: S_ALICE_1"
+    [OcfRecordDataStockIssuance ((founderStock "S_ALICE_1" "STKH_Alice" 1.0) with id = "ISS_AGAIN")]
+  applyRecordsFails env "ID already used: STKH_Erin" [OcfRecordDataStockLegendTemplate (legendStd with id = "STKH_Erin")]
+
+-- =============================================================================
+-- THE DEMO
+-- =============================================================================
+
+test_demo_acme_book : Script ()
+test_demo_acme_book = do
+  env <- acmeEnv
+  env.ctx.cap_table_id === "demo-1"
+  recordDataOf env "ISSUER_DEMO" >>= (=== OcfRecordDataIssuer acmeIssuer)
+
+  r1 <- applyRecords env definitions
+  sort (Map.keys r1.records) === sort ["PLAN_2025", "SC_COMMON", "STKH_Alice", "STKH_Bob", "LEG_STD", "VT_DEMO", "VT_4Y1C"]
+  Map.keys r1.epochs === ["SC_COMMON"]
+  expectRecords env definitions
+
+  r2 <- applyRecords env founders
+  sort (Map.keys r2.states) === ["S_ALICE_1", "S_BOB_1"]
+  a <- stateOf env "S_ALICE_1"
+  (a.quantity, a.vesting, a.issue_date) === (4000000.0, StockVestingNone, founderDate)
+  b <- stateOf env "S_BOB_1"
+  (b.quantity, b.vesting) === (3000000.0, StockVestingOnTerms "VT_4Y1C")
+
+  _ <- applyRecords env safe
+  expectRecords env safe
+
+  -- The round, with a draft agreement that is withdrawn below.
+  r3 <- applyRecords env (seriesARound <> [OcfRecordDataDocument draftDocument])
+  Map.size r3.records === 9
+  sort (Map.keys r3.states) === ["S_CAROL_A", "S_ERIN_A"]
+  Map.keys r3.epochs === ["SC_SERIES_A"]
+  expectRecords env (seriesARound <> [OcfRecordDataDocument draftDocument])
+
+  r4 <- applyRecords env grant
+  r4.states === Map.empty
+  expectRecords env grant
+
+  let sale = saleIn env
+  r5 <- applyOps env (saleOps sale)
+  sort (Map.keys r5.states) === sort (sale.transfer.resulting_security_ids <> [sale.kept_by_alice.security_id])
+  hasState env "S_ALICE_1" >>= (=== False)
+
+  _ <- applyRecords env [OcfRecordDataValuation fmv]
+
+  -- Corrections: Bob's legal name, and the draft agreement withdrawn.
+  _ <- restateOps env [RestateEdit (OcfRecordDataStakeholder bobFixed), RestateDelete "DOC_DRAFT"]
+  expectNoRecord env "DOC_DRAFT"
+
+  expectFinishedBook env
+  -- Only the TA writes the book, and the anchor is still the one Acme created.
+  inputs <- allInputs env
+  let frank = [ApplyRecord (OcfRecordDataStakeholder (person "STKH_Frank" "Frank"))]
+  submitMustFail env.issuer do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = frank
+  submitMustFail env.outsider do exerciseCmd env.cap_table CapTable_Apply with inputs; operations = frank
+  Some anchor <- queryContractId env.transfer_agent env.cap_table
+  anchor.status === CapTableStatusActive
+
+-- A TA migrating Acme replays its corrected OCF export into a new book in one batch, in the
+-- export's order (each stock issuance after its class, the sale after Alice's lot): the result is
+-- the same book as the step-by-step one, under the new book's derived IDs.
+test_demo_acme_book_in_one_batch : Script ()
+test_demo_acme_book_in_one_batch = do
+  first <- acmeEnv
+  env <- acmeBook first.system_operator first.issuer first.transfer_agent first.outsider first.factory
+  env.ctx.cap_table_id === "demo-2"
+  let export =
+        map (\d -> if d == OcfRecordDataStakeholder (person "STKH_Bob" "Bob") then OcfRecordDataStakeholder bobFixed else d) definitions
+          <> founders <> safe <> seriesARound <> grant
+      ops = map ApplyRecord export <> saleOps (saleIn env) <> [ApplyRecord (OcfRecordDataValuation fmv)]
+  length ops === 26
+  r <- applyOps env ops
+  Map.size r.records === 28
+  Map.size r.epochs === 2
+  -- Alice's lot was issued and sold within the batch: it leaves no state.
+  Map.size r.states === 5
+  forA_ (Map.toList r.states) \(sec, cid) -> do
+    cid' <- stateCidOf env sec
+    cid' === cid
+  expectFinishedBook env
+  -- Derived IDs are per book: the first book's would differ.
+  assertMsg "derived IDs are per book" ((saleIn env).transfer.id /= (saleIn first).transfer.id)
