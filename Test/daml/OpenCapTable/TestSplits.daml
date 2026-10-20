@@ -14,7 +14,9 @@ import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.Restate (RestateOperation(..))
 import OpenCapTable.Harness
+import OpenCapTable.TestRestate (restatementOf)
 
 splitDay : Date
 splitDay = D.date 2025 D.Jan 10
@@ -147,6 +149,43 @@ test_splits_void_settlement_holds = do
   s.quantity === 1200.0
   lot'' <- settlementLot env "S-A1" 200.0
   _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-2" laterDay [lot'']
+  pure ()
+
+-- A split recorded on or before a lot's last event, which the SDK's split check should refuse,
+-- leaves the lot's split epoch stale, so every event on it fails closed, its hold cancellations
+-- included. A restatement in the split's units brings a held lot current; its settlement hold is
+-- then void, and the TA cancels it and lifts the stop as on any lot.
+test_splits_stale_held_lot_is_restated : Script ()
+test_splits_stale_held_lot_is_restated = do
+  env <- standardBook
+  let holdDay = D.date 2025 D.Jan 5
+      laterDay = D.date 2025 D.Jan 12
+  onDate holdDay
+  lot <- settlementLot env "S-A1" 100.0
+  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
+  [stop] <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" holdDay [stopLot "S-A2"]
+  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 holdDay
+  cancelHoldsFails env "stale split epoch on security S-A1" holdDay
+    [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-1"]
+  s1 <- stateOf env "S-A1"
+  s2 <- stateOf env "S-A2"
+  _ <- restateOps env
+    [ RestateSetState ((restatementOf s1) with quantity = s1.quantity * 2.0)
+    , RestateSetState ((restatementOf s2) with quantity = s2.quantity * 2.0)
+    ]
+  s1' <- stateOf env "S-A1"
+  (s1'.split_epoch, s1'.quantity, map (.hold_id) s1'.holds) === (1, s1.quantity * 2.0, [h.hold_id])
+  onDate laterDay
+  draw <- drawLot env "S-A1" 100.0 1.0 []
+  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+  settleFails env "voided hold" "T-1" laterDay buyer [SettleDraw draw]
+  _ <- cancelHolds env laterDay
+    [ CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-1"
+    , CancelHold with security_id = "S-A2"; hold_id = stop.hold_id; reason_text = "order lifted"
+    ]
+  (.holds) <$> stateOf env "S-A2" >>= (=== [])
+  lot' <- settlementLot env "S-A1" 200.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-2" laterDay [lot']
   pure ()
 
 test_splits_reissuance_names_its_split : Script ()
