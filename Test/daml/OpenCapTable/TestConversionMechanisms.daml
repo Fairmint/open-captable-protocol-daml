@@ -1,0 +1,414 @@
+-- Conversion mechanisms and rights in OCF's v35 shapes: every mechanism's validator, the mechanisms each kind of right allows (convertible, warrant, stock class), and issuances and stock classes that carry every valid variant or one invalid one.
+module OpenCapTable.TestConversionMechanisms where
+
+import DA.Foldable (forA_, mapA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..), OcfRatio(..), OcfStockClassType(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+-- =============================================================================
+-- MECHANISMS
+-- =============================================================================
+
+badCurrency : OcfMonetary
+badCurrency = OcfMonetary with amount = 1.0; currency = ""
+
+mkRatio : Decimal -> Decimal -> OcfRatio
+mkRatio n d = OcfRatio with numerator = n; denominator = d
+
+validRatioMechanism : OcfRatioConversionMechanism
+validRatioMechanism = ratioMechanism
+
+validCustom : OcfCustomConversionMechanism
+validCustom = customMechanism "Custom conversion"
+
+validFixed : OcfFixedAmountConversionMechanism
+validFixed = OcfFixedAmountConversionMechanism with converts_to_quantity = 100.0
+
+validPercent : OcfPercentCapitalizationConversionMechanism
+validPercent = OcfPercentCapitalizationConversionMechanism with
+  converts_to_percent = 0.10
+  capitalization_definition = Some "fully-diluted"
+  capitalization_definition_rules = None
+
+validPps : OcfSharePriceBasedConversionMechanism
+validPps = OcfSharePriceBasedConversionMechanism with
+  description = "20% discount to share price"
+  discount = Some True
+  discount_amount = None
+  discount_percentage = Some 0.20
+
+validValuation : OcfValuationBasedConversionMechanism
+validValuation = OcfValuationBasedConversionMechanism with
+  valuation_type = OcfValuationBasedFormulaTypeCap
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  valuation_amount = Some (usd 10000000.0)
+
+validSafe : OcfSAFEConversionMechanism
+validSafe = OcfSAFEConversionMechanism with
+  conversion_mfn = False
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  conversion_discount = Some 0.20
+  conversion_timing = None
+  conversion_valuation_cap = None
+  exit_multiple = None
+
+interestRate : Decimal -> OcfInterestRate
+interestRate rate = OcfInterestRate with accrual_start_date = d2024; rate; accrual_end_date = None
+
+validNote : OcfNoteConversionMechanism
+validNote = OcfNoteConversionMechanism with
+  compounding_type = OcfCompoundingTypeSimple
+  day_count_convention = OcfDayCountTypeActual365
+  interest_accrual_period = OcfAccrualPeriodTypeAnnual
+  interest_payout = OcfInterestPayoutTypeDeferred
+  interest_rates = [interestRate 0.08]
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  conversion_discount = Some 0.20
+  conversion_mfn = None
+  conversion_valuation_cap = None
+  exit_multiple = None
+
+allRules : OcfCapitalizationDefinitionRules
+allRules = OcfCapitalizationDefinitionRules with
+  include_additional_option_pool_topup = True
+  include_new_money = True
+  include_option_pool_topup_for_promised_options = True
+  include_other_converting_securities = True
+  include_outstanding_options = True
+  include_outstanding_shares = True
+  include_outstanding_unissued_options = True
+  include_this_security = True
+
+-- | Requires each labelled case to validate (`True`) or not (`False`).
+checkAll : (a -> Bool) -> Bool -> [(Text, a)] -> Script ()
+checkAll validate expected cases = forA_ cases \(label, x) ->
+  (if expected then expectValid else expectInvalid) label (validate x)
+
+test_conversion_mechanisms_ratio : Script ()
+test_conversion_mechanisms_ratio = do
+  checkAll validateOcfRatioConversionMechanism True
+    [ ("one for one", validRatioMechanism)
+    , ("two for three, rounded down", validRatioMechanism with ratio = mkRatio 2.0 3.0; rounding_type = OcfRoundingTypeFloor)
+    , ("rounded up", validRatioMechanism with rounding_type = OcfRoundingTypeCeiling)
+    , ("free conversion", validRatioMechanism with conversion_price = usd 0.0)
+    ]
+  checkAll validateOcfRatioConversionMechanism False
+    [ ("zero numerator", validRatioMechanism with ratio = mkRatio 0.0 1.0)
+    , ("zero denominator", validRatioMechanism with ratio = mkRatio 1.0 0.0)
+    , ("negative ratio", validRatioMechanism with ratio = mkRatio (-1.0) 1.0)
+    , ("negative price", validRatioMechanism with conversion_price = usd (-1.0))
+    , ("invalid currency", validRatioMechanism with conversion_price = badCurrency)
+    ]
+
+test_conversion_mechanisms_custom_and_fixed : Script ()
+test_conversion_mechanisms_custom_and_fixed = do
+  expectValid "custom" (validateOcfCustomConversionMechanism validCustom)
+  expectInvalid "custom without description" (validateOcfCustomConversionMechanism (customMechanism ""))
+  expectValid "fixed" (validateOcfFixedAmountConversionMechanism validFixed)
+  expectValid "fractional fixed" (validateOcfFixedAmountConversionMechanism (OcfFixedAmountConversionMechanism with converts_to_quantity = 0.5))
+  expectInvalid "zero fixed" (validateOcfFixedAmountConversionMechanism (OcfFixedAmountConversionMechanism with converts_to_quantity = 0.0))
+  expectInvalid "negative fixed" (validateOcfFixedAmountConversionMechanism (OcfFixedAmountConversionMechanism with converts_to_quantity = -1.0))
+
+test_conversion_mechanisms_percent_capitalization : Script ()
+test_conversion_mechanisms_percent_capitalization = do
+  checkAll validateOcfPercentCapitalizationConversionMechanism True
+    [ ("ten percent", validPercent)
+    , ("the whole capitalization", validPercent with converts_to_percent = 1.0)
+    , ("no definition", validPercent with capitalization_definition = None)
+    , ("with rules", validPercent with capitalization_definition_rules = Some allRules)
+    ]
+  checkAll validateOcfPercentCapitalizationConversionMechanism False
+    [ ("zero percent", validPercent with converts_to_percent = 0.0)
+    , ("over one", validPercent with converts_to_percent = 1.10)
+    , ("negative", validPercent with converts_to_percent = -0.1)
+    , ("empty definition", validPercent with capitalization_definition = Some "")
+    ]
+
+-- OCF's oneOf over (discount, discount_percentage, discount_amount).
+test_conversion_mechanisms_share_price_based : Script ()
+test_conversion_mechanisms_share_price_based = do
+  let pps d p a = validPps with discount = d; discount_percentage = p; discount_amount = a
+  checkAll validateOcfSharePriceBasedConversionMechanism True
+    [ ("discount by percentage", pps (Some True) (Some 0.2) None)
+    , ("discount by amount", pps (Some True) None (Some (usd 1.0)))
+    , ("no discount", pps (Some False) None None)
+    , ("no discount, a percentage", pps (Some False) (Some 0.2) None)
+    , ("no discount, an amount", pps (Some False) None (Some (usd 1.0)))
+    , ("discount unstated", pps None None None)
+    , ("full discount", pps (Some True) (Some 1.0) None)
+    ]
+  checkAll validateOcfSharePriceBasedConversionMechanism False
+    [ ("discount with neither", pps (Some True) None None)
+    , ("discount with both", pps (Some True) (Some 0.2) (Some (usd 1.0)))
+    , ("no discount with both", pps (Some False) (Some 0.2) (Some (usd 1.0)))
+    , ("discount unstated, a percentage", pps None (Some 0.2) None)
+    , ("discount unstated, an amount", pps None None (Some (usd 1.0)))
+    , ("percentage over one", pps (Some True) (Some 1.5) None)
+    , ("negative percentage", pps (Some True) (Some (-0.1)) None)
+    , ("invalid amount", pps (Some True) None (Some badCurrency))
+    , ("empty description", validPps with description = "")
+    ]
+
+test_conversion_mechanisms_valuation_based : Script ()
+test_conversion_mechanisms_valuation_based = do
+  let valuation t a = validValuation with valuation_type = t; valuation_amount = a
+  checkAll validateOcfValuationBasedConversionMechanism True
+    [ ("cap with an amount", valuation OcfValuationBasedFormulaTypeCap (Some (usd 1.0)))
+    , ("fixed with an amount", valuation OcfValuationBasedFormulaTypeFixed (Some (usd 1.0)))
+    , ("actual without an amount", valuation OcfValuationBasedFormulaTypeActual None)
+    , ("actual with an amount", valuation OcfValuationBasedFormulaTypeActual (Some (usd 1.0)))
+    , ("with a definition and rules", validValuation with capitalization_definition = Some "fd"; capitalization_definition_rules = Some allRules)
+    ]
+  checkAll validateOcfValuationBasedConversionMechanism False
+    [ ("cap without an amount", valuation OcfValuationBasedFormulaTypeCap None)
+    , ("fixed without an amount", valuation OcfValuationBasedFormulaTypeFixed None)
+    , ("cap with an invalid amount", valuation OcfValuationBasedFormulaTypeCap (Some badCurrency))
+    , ("actual with an invalid amount", valuation OcfValuationBasedFormulaTypeActual (Some badCurrency))
+    , ("empty definition", validValuation with capitalization_definition = Some "")
+    ]
+
+test_conversion_mechanisms_safe : Script ()
+test_conversion_mechanisms_safe = do
+  checkAll validateOcfSAFEConversionMechanism True
+    [ ("discount", validSafe)
+    , ("zero discount", validSafe with conversion_discount = Some 0.0)
+    , ("no discount", validSafe with conversion_discount = None)
+    , ("MFN, post-money, capped, with an exit multiple", validSafe with
+        conversion_mfn = True
+        conversion_timing = Some OcfConversionTimingTypePostMoney
+        conversion_valuation_cap = Some (usd 16000000.0)
+        exit_multiple = Some (mkRatio 2.0 1.0)
+        capitalization_definition = Some "fd"
+        capitalization_definition_rules = Some allRules)
+    , ("pre-money", validSafe with conversion_timing = Some OcfConversionTimingTypePreMoney)
+    ]
+  checkAll validateOcfSAFEConversionMechanism False
+    [ ("full discount", validSafe with conversion_discount = Some 1.0)
+    , ("negative discount", validSafe with conversion_discount = Some (-0.1))
+    , ("invalid cap", validSafe with conversion_valuation_cap = Some badCurrency)
+    , ("invalid exit multiple", validSafe with exit_multiple = Some (mkRatio 0.0 1.0))
+    , ("empty definition", validSafe with capitalization_definition = Some "")
+    ]
+
+test_conversion_mechanisms_note : Script ()
+test_conversion_mechanisms_note = do
+  checkAll validateOcfNoteConversionMechanism True
+    [ ("one rate", validNote)
+    , ("no interest", validNote with interest_rates = [])
+    , ("zero rate", validNote with interest_rates = [interestRate 0.0])
+    , ("compounding monthly at 30/360, paid in cash, capped", validNote with
+        compounding_type = OcfCompoundingTypeCompounding
+        day_count_convention = OcfDayCountType30360
+        interest_accrual_period = OcfAccrualPeriodTypeMonthly
+        interest_payout = OcfInterestPayoutTypeCash
+        conversion_mfn = Some True
+        conversion_valuation_cap = Some (usd 5000000.0)
+        exit_multiple = Some (mkRatio 3.0 2.0)
+        capitalization_definition = Some "fd")
+    ]
+  checkAll validateOcfNoteConversionMechanism False
+    [ ("rate over one", validNote with interest_rates = [interestRate 1.10])
+    , ("negative rate", validNote with interest_rates = [interestRate (-0.01)])
+    , ("full discount", validNote with conversion_discount = Some 1.0)
+    , ("invalid cap", validNote with conversion_valuation_cap = Some badCurrency)
+    , ("invalid exit multiple", validNote with exit_multiple = Some (mkRatio 1.0 0.0))
+    , ("empty definition", validNote with capitalization_definition = Some "")
+    ]
+
+-- =============================================================================
+-- RIGHTS
+-- =============================================================================
+
+validConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)]
+validConvertibleMechanisms =
+  [ ("SAFE", OcfConvMechSAFE validSafe)
+  , ("NOTE", OcfConvMechNote validNote)
+  , ("CUSTOM", OcfConvMechCustom validCustom)
+  , ("PERCENT", OcfConvMechPercentCapitalization validPercent)
+  , ("FIXED", OcfConvMechFixedAmount validFixed)
+  ]
+
+invalidConvertibleMechanisms : [(Text, OcfConvertibleConversionMechanism)]
+invalidConvertibleMechanisms =
+  [ ("SAFE", OcfConvMechSAFE validSafe with conversion_discount = Some 1.0)
+  , ("NOTE", OcfConvMechNote validNote with interest_rates = [interestRate 1.10])
+  , ("CUSTOM", OcfConvMechCustom (customMechanism ""))
+  , ("PERCENT", OcfConvMechPercentCapitalization validPercent with converts_to_percent = 1.10)
+  , ("FIXED", OcfConvMechFixedAmount validFixed with converts_to_quantity = 0.0)
+  ]
+
+validWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)]
+validWarrantMechanisms =
+  [ ("CUSTOM", OcfWarrantMechanismCustom (customMechanism "Custom warrant conversion"))
+  , ("PERCENT", OcfWarrantMechanismPercentCapitalization validPercent with converts_to_percent = 0.05)
+  , ("FIXED", OcfWarrantMechanismFixedAmount validFixed with converts_to_quantity = 1000.0)
+  , ("VALUATION", OcfWarrantMechanismValuationBased validValuation with valuation_amount = Some (usd 5000000.0))
+  , ("PPS", OcfWarrantMechanismPpsBased validPps with description = "10% warrant discount"; discount_percentage = Some 0.10)
+  ]
+
+invalidWarrantMechanisms : [(Text, OcfWarrantConversionMechanism)]
+invalidWarrantMechanisms =
+  [ ("CUSTOM", OcfWarrantMechanismCustom (customMechanism ""))
+  , ("PERCENT", OcfWarrantMechanismPercentCapitalization validPercent with converts_to_percent = 0.0; capitalization_definition = None)
+  , ("FIXED", OcfWarrantMechanismFixedAmount validFixed with converts_to_quantity = 0.0)
+  , ("VALUATION", OcfWarrantMechanismValuationBased validValuation with valuation_amount = None)
+  , ("PPS", OcfWarrantMechanismPpsBased validPps with discount = Some False; discount_amount = Some (usd 1.0))
+  ]
+
+convertibleRightOf : OcfConvertibleConversionMechanism -> OcfConvertibleConversionRight
+convertibleRightOf m = (convertibleRight m None) with converts_to_future_round = Some True
+
+warrantRightOf : OcfWarrantConversionMechanism -> OcfWarrantConversionRight
+warrantRightOf m = warrantRight m (Some "CLS-A")
+
+test_conversion_rights_convertible : Script ()
+test_conversion_rights_convertible = do
+  checkAll validateOcfConvertibleConversionMechanism True validConvertibleMechanisms
+  checkAll validateOcfConvertibleConversionMechanism False invalidConvertibleMechanisms
+  checkAll (validateOcfConvertibleConversionRight . convertibleRightOf) True validConvertibleMechanisms
+  checkAll (validateOcfConvertibleConversionRight . convertibleRightOf) False invalidConvertibleMechanisms
+  expectValid "with a target" (validateOcfConvertibleConversionRight (convertibleRight (OcfConvMechSAFE validSafe) (Some "CLS-A")))
+  expectInvalid "empty target" (validateOcfConvertibleConversionRight (convertibleRight (OcfConvMechSAFE validSafe) (Some "")))
+
+test_conversion_rights_warrant : Script ()
+test_conversion_rights_warrant = do
+  checkAll validateOcfWarrantConversionMechanism True validWarrantMechanisms
+  checkAll validateOcfWarrantConversionMechanism False invalidWarrantMechanisms
+  checkAll (validateOcfWarrantConversionRight . warrantRightOf) True validWarrantMechanisms
+  checkAll (validateOcfWarrantConversionRight . warrantRightOf) False invalidWarrantMechanisms
+  expectValid "without a target" (validateOcfWarrantConversionRight (warrantRight (OcfWarrantMechanismFixedAmount validFixed) None))
+  expectInvalid "empty target" (validateOcfWarrantConversionRight (warrantRight (OcfWarrantMechanismFixedAmount validFixed) (Some "")))
+
+-- OCF allows a stock class right only a ratio mechanism.
+test_conversion_rights_stock_class : Script ()
+test_conversion_rights_stock_class = do
+  expectValid "ratio" (validateOcfStockClassConversionRight (stockClassRight (Some "CLS-A")))
+  expectValid "future round" (validateOcfStockClassConversionRight ((stockClassRight None) with converts_to_future_round = Some True))
+  expectInvalid "invalid ratio" (validateOcfStockClassConversionRight ((stockClassRight (Some "CLS-A")) with conversion_mechanism = (ratioMechanism with ratio = mkRatio 0.0 1.0)))
+  expectInvalid "invalid price" (validateOcfStockClassConversionRight ((stockClassRight (Some "CLS-A")) with conversion_mechanism = (ratioMechanism with conversion_price = badCurrency)))
+  expectInvalid "empty target" (validateOcfStockClassConversionRight (stockClassRight (Some "")))
+
+test_conversion_rights_any : Script ()
+test_conversion_rights_any = do
+  expectValid "convertible SAFE" (validateOcfAnyConversionRight (OcfRightConvertible (convertibleRightOf (OcfConvMechSAFE validSafe))))
+  expectInvalid "convertible custom" (validateOcfAnyConversionRight (OcfRightConvertible (convertibleRightOf (OcfConvMechCustom (customMechanism "")))))
+  expectValid "warrant custom" (validateOcfAnyConversionRight (OcfRightWarrant (warrantRightOf (OcfWarrantMechanismCustom validCustom))))
+  expectInvalid "warrant valuation" (validateOcfAnyConversionRight (OcfRightWarrant (warrantRightOf (OcfWarrantMechanismValuationBased validValuation with valuation_amount = None))))
+  expectValid "stock class ratio" (validateOcfAnyConversionRight (OcfRightStockClass (stockClassRight (Some "CLS-A"))))
+  expectInvalid "stock class ratio" (validateOcfAnyConversionRight (OcfRightStockClass ((stockClassRight None) with conversion_mechanism = (ratioMechanism with ratio = mkRatio 1.0 0.0))))
+
+-- =============================================================================
+-- RECORDS CARRYING THE RIGHTS
+-- =============================================================================
+
+convertibleTriggerFor : (Text, OcfConvertibleConversionMechanism) -> OcfConvertibleConversionTrigger
+convertibleTriggerFor (suffix, m) =
+  (convertibleTrigger ("CONV-" <> suffix) OcfConversionTriggerTypeElectiveAtWill (convertibleRightOf m)) with
+    nickname = Some suffix
+    trigger_description = Some ("Convertible " <> suffix <> " conversion")
+
+warrantTriggerFor : (Text, OcfWarrantConversionMechanism) -> OcfConversionTrigger
+warrantTriggerFor (suffix, m) =
+  (warrantTrigger ("WARRANT-" <> suffix) OcfConversionTriggerTypeElectiveAtWill (OcfRightWarrant (warrantRightOf m))) with
+    nickname = Some suffix
+    trigger_description = Some ("Warrant " <> suffix <> " conversion")
+
+preferred : Text -> [OcfStockClassConversionRight] -> StockClassOcfData
+preferred id rights = (stockClass id) with
+  class_type = OcfStockClassTypePreferred
+  default_id_prefix = "PAM-"
+  seniority = 2.0
+  conversion_rights = rights
+
+allConvertibleMechanisms : ConvertibleIssuanceOcfData
+allConvertibleMechanisms = (convertibleIssuance "TX_CONVERTIBLE_ALL_CONVERSION_MECHANISMS" "CONV-ALL-MECHANISMS" "SH-A") with
+  custom_id = "CN-ALL"
+  convertible_type = OcfConvertibleTypeConvertibleSecurity
+  conversion_triggers = map convertibleTriggerFor validConvertibleMechanisms
+
+allWarrantMechanisms : WarrantIssuanceOcfData
+allWarrantMechanisms = (warrantIssuance "TX_WARRANT_ALL_CONVERSION_MECHANISMS" "WARRANT-ALL-MECHANISMS" "SH-A") with
+  custom_id = "W-ALL"
+  quantity_source = Some OcfQuantitySourceTypeInstrumentFixed
+  -- A warrant trigger may carry any of the three kinds of right.
+  exercise_triggers = map warrantTriggerFor validWarrantMechanisms <>
+    [ warrantTrigger "WARRANT-AS-CONVERTIBLE" OcfConversionTriggerTypeElectiveAtWill (OcfRightConvertible (convertibleRightOf (OcfConvMechSAFE validSafe)))
+    , warrantTrigger "WARRANT-AS-STOCK-CLASS" OcfConversionTriggerTypeElectiveAtWill (OcfRightStockClass (stockClassRight (Some "CLS-A")))
+    ]
+
+test_conversion_mechanisms_all_valid_variants_create : Script ()
+test_conversion_mechanisms_all_valid_variants_create = do
+  env <- standardBook
+  let cls = preferred "SC_PREFERRED_ALL_CONVERSION_MECHANISMS"
+        [ stockClassRight (Some "CLS-A")
+        , (stockClassRight (Some "CLS-A")) with conversion_mechanism = (ratioMechanism with rounding_type = OcfRoundingTypeFloor; ratio = mkRatio 3.0 2.0)
+        , (stockClassRight (Some "CLS-A")) with conversion_mechanism = (ratioMechanism with rounding_type = OcfRoundingTypeCeiling)
+        , (stockClassRight None) with converts_to_future_round = Some True
+        ]
+      records =
+        [ OcfRecordDataStockClass cls
+        , OcfRecordDataConvertibleIssuance allConvertibleMechanisms
+        , OcfRecordDataWarrantIssuance allWarrantMechanisms
+        ]
+  _ <- applyRecords env records
+  mapA_ (expectRecord env) records
+
+test_conversion_mechanisms_invalid_variants_reject : Script ()
+test_conversion_mechanisms_invalid_variants_reject = do
+  env <- standardBook
+  -- One control of each record type is accepted ...
+  let controls =
+        [ OcfRecordDataStockClass (preferred "SC_VALID_CONVERSION_MECHANISM_CONTROL" [stockClassRight (Some "CLS-A")])
+        , OcfRecordDataConvertibleIssuance (allConvertibleMechanisms with
+            id = "TX_VALID_CONVERTIBLE_CONTROL"; security_id = "CONV-VALID-CONTROL"
+            conversion_triggers = [convertibleTriggerFor ("CUSTOM-VALID-CONTROL", OcfConvMechCustom validCustom)])
+        , OcfRecordDataWarrantIssuance (allWarrantMechanisms with
+            id = "TX_VALID_WARRANT_CONTROL"; security_id = "WARRANT-VALID-CONTROL"
+            exercise_triggers = [warrantTriggerFor ("CUSTOM-VALID-CONTROL", OcfWarrantMechanismCustom validCustom)])
+        ]
+  _ <- applyRecords env controls
+  mapA_ (expectRecord env) controls
+  -- ... and each invalid variant is refused by its record's precondition.
+  applyRecordsFails env "precondition"
+    [OcfRecordDataStockClass (preferred "SC_INVALID" [(stockClassRight (Some "CLS-A")) with conversion_mechanism = (ratioMechanism with ratio = mkRatio 0.0 1.0)])]
+  forA_ invalidConvertibleMechanisms \(suffix, m) ->
+    applyRecordsFails env "precondition"
+      [OcfRecordDataConvertibleIssuance (allConvertibleMechanisms with
+        id = "TX_INVALID_" <> suffix; security_id = "CONV-INVALID-" <> suffix
+        conversion_triggers = [convertibleTriggerFor (suffix, m)])]
+  forA_ invalidWarrantMechanisms \(suffix, m) ->
+    applyRecordsFails env "precondition"
+      [OcfRecordDataWarrantIssuance (allWarrantMechanisms with
+        id = "TX_INVALID_" <> suffix; security_id = "WARRANT-INVALID-" <> suffix
+        exercise_triggers = [warrantTriggerFor (suffix, m)])]
+  applyRecordsFails env "precondition"
+    [OcfRecordDataWarrantIssuance (allWarrantMechanisms with
+      id = "TX_INVALID_STOCK_CLASS_RIGHT"; security_id = "WARRANT-INVALID-STOCK-CLASS-RIGHT"
+      exercise_triggers = [warrantTrigger "W-SC" OcfConversionTriggerTypeElectiveAtWill (OcfRightStockClass (stockClassRight (Some "")))])]
+
+-- Every right's stock class target is checked when the record is written: a stock class's own
+-- rights, and each right in a convertible's or warrant's triggers.
+test_conversion_rights_targets_checked : Script ()
+test_conversion_rights_targets_checked = do
+  env <- standardBook
+  applyRecordsFails env "Stock class SC-P conversion target not found: SC-NONE"
+    [OcfRecordDataStockClass (preferred "SC-P" [stockClassRight (Some "SC-NONE")])]
+  applyRecordsFails env "Convertible conversion trigger conversion target not found: SC-NONE"
+    [OcfRecordDataConvertibleIssuance (allConvertibleMechanisms with
+      conversion_triggers = [convertibleTriggerFor ("SAFE", OcfConvMechSAFE validSafe)] <>
+        [(convertibleTriggerFor ("FIXED", OcfConvMechFixedAmount validFixed)) with conversion_right = convertibleRight (OcfConvMechFixedAmount validFixed) (Some "SC-NONE")])]
+  applyRecordsFails env "Warrant exercise trigger conversion target not found: SC-NONE"
+    [OcfRecordDataWarrantIssuance (allWarrantMechanisms with
+      exercise_triggers = [warrantTrigger "W-SC" OcfConversionTriggerTypeElectiveAtWill (OcfRightStockClass (stockClassRight (Some "SC-NONE")))])]

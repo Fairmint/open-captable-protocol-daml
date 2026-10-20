@@ -1,0 +1,82 @@
+-- Convertible retractions through CapTable_Apply and CapTable_Restate: a record on the convertible's security, its security reference, the retraction validator and the shared edit and delete rules.
+module OpenCapTable.TestConvertibleRetraction where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.ConvertibleRetraction (ConvertibleRetractionOcfData(..), validateConvertibleRetractionOcfData)
+import Fairmint.OpenCapTable.OCF.WarrantRetraction (WarrantRetractionOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+retraction : Text -> Text -> ConvertibleRetractionOcfData
+retraction id sec = ConvertibleRetractionOcfData with
+  id
+  date = D.date 2024 D.Jan 2
+  reason_text = "Administrative error - incorrect investment amount recorded"
+  security_id = sec
+  comments = []
+
+cr : ConvertibleRetractionOcfData -> OcfRecordData
+cr = OcfRecordDataConvertibleRetraction
+
+test_convertible_retraction_create : Script ()
+test_convertible_retraction_create = do
+  env <- instrumentBook
+  let r = retraction "TX_CONV_RETRACT_1" "C-1"
+  _ <- applyRecords env [cr r]
+  expectRecord env (cr r)
+  viewSecurityIds env "TX_CONV_RETRACT_1" >>= (=== ["C-1"])
+  -- The retracted convertible's issuance record stays; correcting it is a restatement.
+  hasRecord env "CI-1" >>= (=== True)
+  applyRecordsFails env "ID already used: TX_CONV_RETRACT_1" [OcfRecordDataStakeholder (stakeholderData "TX_CONV_RETRACT_1")]
+
+test_convertible_retraction_with_comments : Script ()
+test_convertible_retraction_with_comments = do
+  env <- instrumentBook
+  let r = (retraction "TX_CONV_RETRACT_2" "C-1") with
+        date = D.date 2024 D.Jan 3
+        reason_text = "SAFE void ab initio - wire transfer bounced"
+        comments = ["Board resolution 2024-004", "Investor notified"]
+  _ <- applyRecords env [cr r]
+  expectRecord env (cr r)
+
+test_convertible_retraction_security_reference : Script ()
+test_convertible_retraction_security_reference = do
+  env <- instrumentBook
+  applyRecordsFails env "Convertible retraction security not found: C-NONE" [cr (retraction "CR-1" "C-NONE")]
+  applyRecordsFails env "Convertible retraction security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [cr (retraction "CR-1" "W-1")]
+  applyRecordsFails env "Convertible retraction security S-A2 is carried by a OcfObjectTypeTxStockIssuance" [cr (retraction "CR-1" "S-A2")]
+  -- The convertible may be issued later in the same batch.
+  let r = retraction "CR-2" "C-2"
+  _ <- applyRecords env [cr r, OcfRecordDataConvertibleIssuance (convertibleIssuance "CI-2" "C-2" "SH-B")]
+  expectRecord env (cr r)
+
+test_convertible_retraction_validator : Script ()
+test_convertible_retraction_validator = do
+  env <- instrumentBook
+  let base = retraction "CR-V" "C-1"
+      rejects : Text -> Text -> ConvertibleRetractionOcfData -> Script ()
+      rejects label expected r = do
+        expectInvalid label (validateConvertibleRetractionOcfData r)
+        applyRecordsFails env expected [cr r]
+  expectValid "base" (validateConvertibleRetractionOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "empty reason" "precondition" base with reason_text = ""
+  rejects "empty comment" "precondition" base with comments = [""]
+
+test_convertible_retraction_edit_and_delete : Script ()
+test_convertible_retraction_edit_and_delete = do
+  env <- instrumentBook
+  let r = retraction "CR-1" "C-1"
+  _ <- applyRecords env [cr r]
+  restateOpsFails env "precondition" [RestateEdit (cr r with reason_text = "")]
+  restateOpsFails env "Convertible retraction security not found: C-NONE" [RestateEdit (cr r with security_id = "C-NONE")]
+  restateOpsFails env "an edit keeps record CR-1's type"
+    [RestateEdit (OcfRecordDataWarrantRetraction WarrantRetractionOcfData with
+      id = r.id; date = r.date; reason_text = r.reason_text; security_id = "W-1"; comments = [])]
+  checkEditAndDelete env (cr r) (cr r with reason_text = "Issued to the wrong investor")

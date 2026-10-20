@@ -1,0 +1,232 @@
+-- Convertible issuances through CapTable_Apply and CapTable_Restate: the issuance validator with its conversion triggers, the stakeholder and conversion-target references, unique trigger IDs, claimed object and security IDs, and edits and deletes.
+module OpenCapTable.TestConvertibleIssuance where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfSecurityExemption(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..), validateConvertibleIssuanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+ci : ConvertibleIssuanceOcfData -> OcfRecordData
+ci = OcfRecordDataConvertibleIssuance
+
+customRight : Optional Text -> OcfConvertibleConversionRight
+customRight = convertibleRight (OcfConvMechCustom (customMechanism "Custom"))
+
+safeRight : Optional Text -> OcfConvertibleConversionRight
+safeRight = convertibleRight (OcfConvMechSAFE OcfSAFEConversionMechanism with
+  conversion_mfn = False
+  capitalization_definition = None
+  capitalization_definition_rules = None
+  conversion_discount = Some 0.2
+  conversion_timing = None
+  conversion_valuation_cap = None
+  exit_multiple = None)
+
+autoOnDate : Date -> OcfConvertibleConversionTrigger
+autoOnDate d = (convertibleTrigger "AUTO_DATE" OcfConversionTriggerTypeAutomaticOnDate (customRight None)) with trigger_date = Some d
+
+-- | A SAFE whose one trigger converts into `target`.
+withTarget : Text -> Text -> Optional Text -> ConvertibleIssuanceOcfData
+withTarget id sec target =
+  (convertibleIssuance id sec "SH-A") with
+    conversion_triggers = [convertibleTrigger "TRIGGER-1" OcfConversionTriggerTypeUnspecified (safeRight target)]
+
+test_convertible_issuance_create : Script ()
+test_convertible_issuance_create = do
+  env <- standardBook
+  let c = (convertibleIssuance "TX_CONV_ISS_1" "CN-1" "SH-A") with
+        custom_id = "NOTE-1"
+        convertible_type = OcfConvertibleTypeNote
+        conversion_triggers = [autoOnDate d2024]
+  _ <- applyRecords env [ci c]
+  expectRecord env (ci c)
+  viewSecurityIds env "TX_CONV_ISS_1" >>= (=== ["CN-1"])
+  -- A convertible is a record, not a stock state.
+  hasState env "CN-1" >>= (=== False)
+  applyRecordsFails env "ID already used: TX_CONV_ISS_1" [OcfRecordDataStakeholder (stakeholderData "TX_CONV_ISS_1")]
+  applyRecordsFails env "security ID already used: CN-1" [OcfRecordDataWarrantIssuance (warrantIssuance "WI-X" "CN-1" "SH-A")]
+
+test_convertible_issuance_create_and_delete : Script ()
+test_convertible_issuance_create_and_delete = do
+  env <- standardBook
+  let c = (convertibleIssuance "TX_CONV_DEL" "CN-DEL" "SH-A") with
+        custom_id = "NOTE-DEL"
+        investment_amount = usd 50000.0
+        convertible_type = OcfConvertibleTypeNote
+        conversion_triggers = [autoOnDate (D.date 2025 D.Jan 1)]
+  _ <- applyRecords env [ci c]
+  expectRecord env (ci c)
+  _ <- restateOps env [RestateDelete "TX_CONV_DEL"]
+  hasRecord env "TX_CONV_DEL" >>= (=== False)
+  -- The delete released both IDs: the same issuance may be written again.
+  _ <- applyRecords env [ci c]
+  expectRecord env (ci c)
+
+test_convertible_issuance_optionals_some : Script ()
+test_convertible_issuance_optionals_some = do
+  env <- standardBook
+  let c = (convertibleIssuance "TX_CONV_SOME" "CN-3" "SH-A") with
+        date = D.date 2024 D.Feb 1
+        custom_id = "NOTE-3"
+        board_approval_date = Some (D.date 2024 D.Jan 15)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 20)
+        consideration_text = Some "Cash consideration"
+        security_law_exemptions = [OcfSecurityExemption with description = "Rule 504"; jurisdiction = "US-CA"]
+        investment_amount = usd 5000.0
+        convertible_type = OcfConvertibleTypeNote
+        conversion_triggers = [autoOnDate (D.date 2024 D.Jun 1)]
+        pro_rata = Some 0.1
+        comments = ["Issued"]
+  _ <- applyRecords env [ci c]
+  expectRecord env (ci c)
+
+test_convertible_issuance_types : Script ()
+test_convertible_issuance_types = do
+  env <- standardBook
+  forA_ [("NOTE", OcfConvertibleTypeNote), ("SAFE", OcfConvertibleTypeSafe), ("SECURITY", OcfConvertibleTypeConvertibleSecurity)] \(suffix, t) -> do
+    let c = (convertibleIssuance ("CI-" <> suffix) ("C-" <> suffix) "SH-A") with convertible_type = t
+    _ <- applyRecords env [ci c]
+    expectRecord env (ci c)
+
+test_convertible_issuance_validator : Script ()
+test_convertible_issuance_validator = do
+  env <- standardBook
+  let base = convertibleIssuance "CI-V" "C-V" "SH-A"
+      trigger = atWillConvertibleTrigger convertibleTriggerId
+      rejects : Text -> Text -> ConvertibleIssuanceOcfData -> Script ()
+      rejects label expected c = do
+        expectInvalid label (validateConvertibleIssuanceOcfData c)
+        applyRecordsFails env expected [ci c]
+      accepts : Text -> Int -> ConvertibleIssuanceOcfData -> Script ()
+      accepts label n c = do
+        let c' = c with id = "CI-OK-" <> show n; security_id = "C-OK-" <> show n
+        expectValid label (validateConvertibleIssuanceOcfData c')
+        _ <- applyRecords env [ci c']
+        expectRecord env (ci c')
+      withTrigger t = base with conversion_triggers = [t]
+  expectValid "base" (validateConvertibleIssuanceOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "an empty ID cannot be claimed" base with security_id = ""
+  rejects "empty custom_id" "precondition" base with custom_id = ""
+  rejects "empty stakeholder_id" "precondition" base with stakeholder_id = ""
+  rejects "negative investment" "precondition" base with investment_amount = usd (-1.0)
+  rejects "four-letter currency" "precondition" base with investment_amount = OcfMonetary with amount = 1.0; currency = "USDX"
+  rejects "invalid exemption" "precondition" base with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"]
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "empty consideration" "precondition" base with consideration_text = Some ""
+  -- OCF requires at least one conversion trigger, each ID once.
+  rejects "no triggers" "precondition" base with conversion_triggers = []
+  rejects "duplicate trigger IDs" "precondition" base with conversion_triggers = [trigger, trigger]
+  rejects "empty trigger ID" "precondition" (withTrigger (trigger with trigger_id = ""))
+  rejects "empty trigger nickname" "precondition" (withTrigger (trigger with nickname = Some ""))
+  rejects "empty trigger description" "precondition" (withTrigger (trigger with trigger_description = Some ""))
+  rejects "invalid conversion mechanism" "precondition" (withTrigger (trigger with conversion_right = convertibleRight (OcfConvMechCustom (customMechanism "")) None))
+  rejects "empty conversion target" "precondition" (withTrigger (trigger with conversion_right = customRight (Some "")))
+  -- Each trigger type carries exactly the fields it needs.
+  rejects "at-will trigger with a date" "precondition" (withTrigger (trigger with trigger_date = Some d2024))
+  rejects "at-will trigger with a condition" "precondition" (withTrigger (trigger with trigger_condition = Some "Qualified financing"))
+  rejects "automatic-on-date trigger without a date" "precondition" (withTrigger (trigger with type_ = OcfConversionTriggerTypeAutomaticOnDate))
+  rejects "automatic-on-condition trigger without a condition" "precondition" (withTrigger (trigger with type_ = OcfConversionTriggerTypeAutomaticOnCondition))
+  rejects "elective-on-condition trigger with an empty condition" "precondition"
+    (withTrigger (trigger with type_ = OcfConversionTriggerTypeElectiveOnCondition; trigger_condition = Some ""))
+  rejects "elective-in-range trigger without an end" "precondition"
+    (withTrigger (trigger with type_ = OcfConversionTriggerTypeElectiveInRange; start_date = Some d2024))
+  accepts "zero investment" 1 base with investment_amount = usd 0.0
+  accepts "automatic on condition" 2
+    (withTrigger (trigger with type_ = OcfConversionTriggerTypeAutomaticOnCondition; trigger_condition = Some "Qualified financing"))
+  accepts "elective on condition" 3
+    (withTrigger (trigger with type_ = OcfConversionTriggerTypeElectiveOnCondition; trigger_condition = Some "Change of control"))
+  accepts "elective in range" 4
+    (withTrigger (trigger with type_ = OcfConversionTriggerTypeElectiveInRange; start_date = Some d2024; end_date = Some (D.date 2025 D.Jan 1)))
+  accepts "unspecified" 5 (withTrigger (trigger with type_ = OcfConversionTriggerTypeUnspecified; nickname = Some "Maturity"; trigger_description = Some "At maturity"))
+
+test_convertible_issuance_stakeholder_reference : Script ()
+test_convertible_issuance_stakeholder_reference = do
+  env <- standardBook
+  applyRecordsFails env "Convertible issuance stakeholder not found: SH-NONE" [ci (convertibleIssuance "CI-1" "C-1" "SH-NONE")]
+  -- A stakeholder written later in the same batch satisfies the reference.
+  let c = convertibleIssuance "CI-1" "C-1" "SH-NEW"
+  _ <- applyRecords env [ci c, OcfRecordDataStakeholder (stakeholderData "SH-NEW")]
+  expectRecord env (ci c)
+  -- An edit's new stakeholder is checked against the book.
+  restateOpsFails env "Convertible issuance stakeholder not found: SH-NONE" [RestateEdit (ci c with stakeholder_id = "SH-NONE")]
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH_CONVERTIBLE_EDIT_BATCH")]
+  _ <- restateOps env [RestateEdit (ci c with stakeholder_id = "SH_CONVERTIBLE_EDIT_BATCH")]
+  expectRecord env (ci c with stakeholder_id = "SH_CONVERTIBLE_EDIT_BATCH")
+
+test_convertible_issuance_conversion_targets : Script ()
+test_convertible_issuance_conversion_targets = do
+  env <- standardBook
+  applyRecordsFails env "Convertible conversion trigger conversion target not found: SC_MISSING_CONVERTIBLE_TARGET"
+    [ci (withTarget "TX_CONVERTIBLE_MISSING_TARGET" "CONV-MISSING-TARGET" (Some "SC_MISSING_CONVERTIBLE_TARGET"))]
+  applyRecordsFails env "Convertible conversion trigger conversion target SH-B is a OcfObjectTypeStakeholder"
+    [ci (withTarget "CI-T" "C-T" (Some "SH-B"))]
+  -- A target written later in the same batch satisfies the reference.
+  let c = withTarget "TX_CONVERTIBLE_TARGET_REF" "CONV-TARGET-REF" (Some "SC_CONVERTIBLE_TARGET")
+  _ <- applyRecords env [ci c, OcfRecordDataStockClass (stockClass "SC_CONVERTIBLE_TARGET")]
+  expectRecord env (ci c)
+
+test_convertible_issuance_edit_conversion_target : Script ()
+test_convertible_issuance_edit_conversion_target = do
+  env <- standardBook
+  let c = withTarget "TX_CONVERTIBLE_EDIT_TARGET" "CONV-EDIT-TARGET" None
+  _ <- applyRecords env [ci c]
+  restateOpsFails env "Convertible conversion trigger conversion target not found: SC_MISSING_CONVERTIBLE_EDIT_TARGET"
+    [RestateEdit (ci (withTarget "TX_CONVERTIBLE_EDIT_TARGET" "CONV-EDIT-TARGET" (Some "SC_MISSING_CONVERTIBLE_EDIT_TARGET")))]
+  let edited = withTarget "TX_CONVERTIBLE_EDIT_TARGET" "CONV-EDIT-TARGET" (Some "CLS-A")
+  _ <- restateOps env [RestateEdit (ci edited)]
+  expectRecord env (ci edited)
+
+test_convertible_issuance_duplicate_trigger_ids : Script ()
+test_convertible_issuance_duplicate_trigger_ids = do
+  env <- standardBook
+  let c = withTarget "TX_CONVERTIBLE_DUPLICATE_TRIGGER" "CONV-DUPLICATE-TRIGGER" None
+      [t] = c.conversion_triggers
+  applyRecordsFails env "precondition" [ci c with conversion_triggers = [t, t]]
+  _ <- applyRecords env [ci c]
+  restateOpsFails env "precondition" [RestateEdit (ci c with conversion_triggers = [t, t with nickname = Some "Second"])]
+  expectRecord env (ci c)
+
+-- References are checked when the referring record is written; deleting the definitions later is
+-- not re-checked on the ledger (the SDK refuses an orphaning edit or delete).
+test_convertible_issuance_definition_deletes_not_rechecked : Script ()
+test_convertible_issuance_definition_deletes_not_rechecked = do
+  env <- standardBook
+  let c = (withTarget "TX_CONVERTIBLE_DANGLING" "CONV-DANGLING" (Some "SC_CONVERTIBLE_DELETE_TARGET")) with stakeholder_id = "SH-C"
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SH-C")
+    , OcfRecordDataStockClass (stockClass "SC_CONVERTIBLE_DELETE_TARGET")
+    , ci c
+    ]
+  _ <- restateOps env [RestateDelete "SC_CONVERTIBLE_DELETE_TARGET", RestateDelete "SH-C"]
+  mapA (hasRecord env) ["SC_CONVERTIBLE_DELETE_TARGET", "SH-C"] >>= (=== [False, False])
+  expectRecord env (ci c)
+
+test_convertible_issuance_ids : Script ()
+test_convertible_issuance_ids = do
+  env <- instrumentBook
+  applyRecordsFails env "security ID already used: W-1" [ci (convertibleIssuance "CI-2" "W-1" "SH-A")]
+  applyRecordsFails env "security ID already used: S-A2" [ci (convertibleIssuance "CI-2" "S-A2" "SH-A")]
+  applyRecordsFails env "security ID already used: C-1" [ci (convertibleIssuance "CI-2" "C-1" "SH-A")]
+  applyRecordsFails env "ID already used: WI-1" [ci (convertibleIssuance "WI-1" "C-2" "SH-A")]
+  applyRecordsFails env "derived form" [ci (convertibleIssuance (env.ctx.cap_table_id <> ":CI-2") "C-2" "SH-A")]
+
+test_convertible_issuance_edit_and_delete : Script ()
+test_convertible_issuance_edit_and_delete = do
+  env <- instrumentBook
+  let c = convertibleIssuance "CI-1" "C-1" "SH-A"
+  restateOpsFails env "precondition" [RestateEdit (ci c with conversion_triggers = [])]
+  -- A convertible's security ID may change on an edit; a used one is refused.
+  restateOpsFails env "security ID already used: W-1" [RestateEdit (ci c with security_id = "W-1")]
+  _ <- restateOps env [RestateEdit (ci c with security_id = "C-1B")]
+  viewSecurityIds env "CI-1" >>= (=== ["C-1B"])
+  checkEditAndDelete env (ci c with security_id = "C-1B") (ci c with security_id = "C-1B"; investment_amount = usd 125000.0)

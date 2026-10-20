@@ -1,0 +1,271 @@
+-- Convertible conversions through CapTable_Apply and CapTable_Restate: a SAFE converted under one of its own triggers into stock issued in the same batch, whole or partial with a balance convertible, the capitalization definition's references and caps, the conversion validator and the shared edit and delete rules.
+module OpenCapTable.TestConvertibleConversion where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (mapA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..), validateConvertibleConversionOcfData)
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+equityFinancingTriggerId : Text
+equityFinancingTriggerId = "equity-financing-trigger"
+
+-- | Automatic conversion on a qualified equity financing, at a 20% discount under a 16M USD cap.
+equityFinancingTrigger : OcfConvertibleConversionTrigger
+equityFinancingTrigger =
+  (convertibleTrigger equityFinancingTriggerId OcfConversionTriggerTypeAutomaticOnCondition
+    ((convertibleRight (OcfConvMechSAFE OcfSAFEConversionMechanism with
+        conversion_mfn = False
+        capitalization_definition = None
+        capitalization_definition_rules = None
+        conversion_discount = Some 0.20
+        conversion_timing = None
+        conversion_valuation_cap = Some (usd 16000000.0)
+        exit_multiple = None) None) with converts_to_future_round = Some True)) with
+    nickname = Some "Equity Financing"
+    trigger_condition = Some "Qualified equity financing of at least $1,000,000"
+    trigger_description = Some "Automatic conversion upon qualified equity financing"
+
+-- | A SAFE of `amount` USD issued to SH-A on 2023-03-15 with the equity financing trigger.
+safe : Text -> Text -> Decimal -> ConvertibleIssuanceOcfData
+safe id sec amount = (convertibleIssuance id sec "SH-A") with
+  date = D.date 2023 D.Mar 15
+  custom_id = "SAFE-1"
+  investment_amount = usd amount
+  conversion_triggers = [equityFinancingTrigger]
+
+conversionDate : Date
+conversionDate = D.date 2025 D.Nov 10
+
+conversion : Text -> Text -> [Text] -> ConvertibleConversionOcfData
+conversion id sec resulting = ConvertibleConversionOcfData with
+  id
+  date = conversionDate
+  reason_text = "Automatic conversion upon Series Seed-2 equity financing"
+  security_id = sec
+  trigger_id = equityFinancingTriggerId
+  comments = []
+  resulting_security_ids = resulting
+  balance_security_id = None
+  capitalization_definition = None
+  quantity_converted = None
+
+cv : ConvertibleConversionOcfData -> OcfRecordData
+cv = OcfRecordDataConvertibleConversion
+
+-- | A CLS-A stock issuance for SH-A on the conversion date.
+stockOut : Text -> Text -> Decimal -> OcfRecordData
+stockOut sec cls q = OcfRecordDataStockIssuance (issuance sec "SH-A" cls q conversionDate)
+
+capDefinition : [Text] -> [Text] -> [Text] -> [Text] -> OcfCapitalizationDefinition
+capDefinition included excluded classes plans = OcfCapitalizationDefinition with
+  include_security_ids = included
+  exclude_security_ids = excluded
+  include_stock_class_ids = classes
+  include_stock_plans_ids = plans
+
+-- | The standard book plus the SAFE CONV-SEC (CI-SAFE, 100,000 USD).
+safeBook : Script Env
+safeBook = do
+  env <- instrumentBook
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance (safe "CI-SAFE" "CONV-SEC" 100000.0)]
+  pure env
+
+test_convertible_conversion_safe : Script ()
+test_convertible_conversion_safe = do
+  env <- standardBook
+  let sec = "7b8c9d0e-1f2a-3b4c-5d6e-7f8a9b0c1d2e"
+      out = "5f4a6b7c-9d0e-2f3a-6b7c-8d9e0f1a2b3c"
+      src = safe "TX_CONV_ISS_1" sec 100000.0
+      c = (conversion "25d377f8-a8de-4d8d-853c-2d75927e7927" sec [out]) with
+        comments = ["SAFE conversion to Series Seed-2 Preferred for Investor A"]
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance src]
+  _ <- applyRecords env [cv c, stockOut out "CLS-A" 6250.0]
+  expectRecord env (cv c)
+  expectRecord env (stockOut out "CLS-A" 6250.0)
+  viewSecurityIds env c.id >>= (=== [sec, out])
+  -- The resulting stock is a primary issuance with its own state; the convertible never had one
+  -- and keeps its issuance record.
+  st <- stateOf env out
+  st.quantity === 6250.0
+  st.stock_class_id === "CLS-A"
+  st.origin_transaction_id === ("ISS-" <> out)
+  st.vesting === StockVestingNone
+  hasState env sec >>= (=== False)
+  expectRecord env (OcfRecordDataConvertibleIssuance src)
+  applyRecordsFails env ("ID already used: " <> c.id) [OcfRecordDataStakeholder (stakeholderData c.id)]
+
+test_convertible_conversion_with_capitalization_definition : Script ()
+test_convertible_conversion_with_capitalization_definition = do
+  env <- safeBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass (stockClass "COMMON")
+    , OcfRecordDataStockClass (stockClass "PREFERRED")
+    , OcfRecordDataStockPlan (stockPlan "ESOP-2024" ["COMMON"])
+    ]
+  let c = (conversion "TX_CONV_CONVERSION_2" "CONV-SEC" ["SSEC-PREFERRED-001"]) with
+        date = D.date 2025 D.Dec 1
+        reason_text = "Conversion based on fully diluted capitalization at $16M valuation cap"
+        comments = ["Conversion of $250,000 SAFE at $16M post-money valuation cap"]
+        -- Included and excluded securities may be any instrument's.
+        capitalization_definition = Some (capDefinition ["S-A1", "W-1"] ["C-1"] ["COMMON", "PREFERRED"] ["ESOP-2024"])
+        quantity_converted = Some 15625.0
+      out = OcfRecordDataStockIssuance (issuance "SSEC-PREFERRED-001" "SH-A" "PREFERRED" 15625.0 c.date)
+  _ <- applyRecords env [cv c, out]
+  expectRecord env (cv c)
+  expectRecord env out
+  (.stock_class_id) <$> stateOf env "SSEC-PREFERRED-001" >>= (=== "PREFERRED")
+
+test_convertible_conversion_capitalization_references : Script ()
+test_convertible_conversion_capitalization_references = do
+  env <- safeBook
+  let c = conversion "TX_CONV_CONVERSION_MISSING_CAP_REF" "CONV-SEC" ["S-OUT"]
+      out = stockOut "S-OUT" "CLS-A" 100.0
+      withCap d = [cv (c with capitalization_definition = Some d), out]
+      label = "Convertible conversion capitalization definition"
+  applyRecordsFails env (label <> " included security security not found: SEC-MISSING-CAP-REF")
+    (withCap (capDefinition ["SEC-MISSING-CAP-REF"] [] [] []))
+  applyRecordsFails env (label <> " excluded security security not found: SEC-MISSING-CAP-REF")
+    (withCap (capDefinition [] ["SEC-MISSING-CAP-REF"] [] []))
+  -- A security ID, not an issuance's object ID.
+  applyRecordsFails env (label <> " included security security not found: ISS-S-A1")
+    (withCap (capDefinition ["ISS-S-A1"] [] [] []))
+  applyRecordsFails env (label <> " stock class not found: SC-MISSING-CAP-REF")
+    (withCap (capDefinition [] [] ["SC-MISSING-CAP-REF"] []))
+  applyRecordsFails env (label <> " stock class SH-B is a OcfObjectTypeStakeholder, not one of [OcfObjectTypeStockClass]")
+    (withCap (capDefinition [] [] ["SH-B"] []))
+  applyRecordsFails env (label <> " stock plan not found: SP-MISSING-CAP-REF")
+    (withCap (capDefinition [] [] [] ["SP-MISSING-CAP-REF"]))
+  applyRecordsFails env (label <> " stock plan CLS-A is a OcfObjectTypeStockClass, not one of [OcfObjectTypeStockPlan]")
+    (withCap (capDefinition [] [] [] ["CLS-A"]))
+  -- Definitions written later in the same batch satisfy them.
+  let c' = c with capitalization_definition = Some (capDefinition ["S-NEW"] [] ["CLS-NEW"] ["SP-NEW"])
+  _ <- applyRecords env
+    [ cv c'
+    , out
+    , OcfRecordDataStockIssuance (issuance "S-NEW" "SH-B" "CLS-A" 5.0 d2024)
+    , OcfRecordDataStockClass (stockClass "CLS-NEW")
+    , OcfRecordDataStockPlan (stockPlan "SP-NEW" ["CLS-NEW"])
+    ]
+  expectRecord env (cv c')
+
+test_convertible_conversion_partial_with_balance : Script ()
+test_convertible_conversion_partial_with_balance = do
+  env <- standardBook
+  let d = D.date 2025 D.Nov 15
+      c = (conversion "TX_CONV_CONVERSION_3" "CONV-SEC-003" ["SSEC-PREFERRED-002"]) with
+        date = d
+        reason_text = "Partial conversion - investor electing to convert $300,000 of $500,000 SAFE"
+        balance_security_id = Some "CONV-SEC-003-REMAINDER"
+        quantity_converted = Some 300000.0
+      balance = (safe "TX-CONV-PARTIAL-BALANCE" "CONV-SEC-003-REMAINDER" 200000.0) with date = d
+      out = OcfRecordDataStockIssuance (issuance "SSEC-PREFERRED-002" "SH-A" "CLS-A" 18750.0 d)
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance (safe "TX_CONV_ISS_3" "CONV-SEC-003" 500000.0)]
+  _ <- applyRecords env [cv c, out, OcfRecordDataConvertibleIssuance balance]
+  expectRecord env (cv c)
+  expectRecord env (OcfRecordDataConvertibleIssuance balance)
+  viewSecurityIds env "TX_CONV_CONVERSION_3" >>= (=== ["CONV-SEC-003", "SSEC-PREFERRED-002", "CONV-SEC-003-REMAINDER"])
+  (.quantity) <$> stateOf env "SSEC-PREFERRED-002" >>= (=== 18750.0)
+  -- The balance is a convertible, not stock.
+  hasState env "CONV-SEC-003-REMAINDER" >>= (=== False)
+
+test_convertible_conversion_references : Script ()
+test_convertible_conversion_references = do
+  env <- safeBook
+  let c = conversion "CV-1" "CONV-SEC" ["S-OUT"]
+      out = stockOut "S-OUT" "CLS-A" 100.0
+  applyRecordsFails env "Convertible conversion security not found: C-NONE" [out, cv c with security_id = "C-NONE"]
+  applyRecordsFails env "Convertible conversion security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [out, cv c with security_id = "W-1"]
+  applyRecordsFails env "Convertible conversion security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [out, cv c with security_id = "S-A1"]
+  -- The trigger must be one of the converted convertible's own.
+  applyRecordsFails env "Convertible conversion trigger not found: TRIGGER-NONE" [out, cv c with trigger_id = "TRIGGER-NONE"]
+  applyRecordsFails env ("Convertible conversion trigger not found: " <> convertibleTriggerId) [out, cv c with trigger_id = convertibleTriggerId]
+  applyRecordsFails env ("Convertible conversion trigger not found: " <> warrantTriggerId) [out, cv c with trigger_id = warrantTriggerId]
+  -- The resulting securities must be stock issuances, the balance a convertible.
+  applyRecordsFails env "Convertible conversion resulting security security not found: S-OUT" [cv c]
+  applyRecordsFails env "Convertible conversion resulting security security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [cv c with resulting_security_ids = ["C-1"]]
+  applyRecordsFails env "Convertible conversion balance security not found: C-REST" [out, cv c with balance_security_id = Some "C-REST"]
+  applyRecordsFails env "Convertible conversion balance security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [out, cv c with balance_security_id = Some "S-A1"]
+  -- C-1's own trigger serves its own conversion.
+  let c1 = (conversion "CV-C1" "C-1" ["S-C1"]) with trigger_id = convertibleTriggerId
+  _ <- applyRecords env [cv c1, stockOut "S-C1" "CLS-A" 10.0]
+  expectRecord env (cv c1)
+
+test_convertible_conversion_validator : Script ()
+test_convertible_conversion_validator = do
+  env <- safeBook
+  let base = conversion "CV-V" "CONV-SEC" ["S-OUT"]
+      rejects : Text -> Text -> ConvertibleConversionOcfData -> Script ()
+      rejects label expected c = do
+        expectInvalid label (validateConvertibleConversionOcfData c)
+        applyRecordsFails env expected [cv c]
+  expectValid "base" (validateConvertibleConversionOcfData base)
+  expectValid "empty capitalization definition" (validateConvertibleConversionOcfData base with capitalization_definition = Some (capDefinition [] [] [] []))
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "empty trigger_id" "precondition" base with trigger_id = ""
+  rejects "empty reason" "precondition" base with reason_text = ""
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "no resulting securities" "precondition" base with resulting_security_ids = []
+  rejects "empty resulting security" "precondition" base with resulting_security_ids = ["S-OUT", ""]
+  rejects "empty balance security" "precondition" base with balance_security_id = Some ""
+  rejects "zero quantity converted" "precondition" base with quantity_converted = Some 0.0
+  rejects "negative quantity converted" "precondition" base with quantity_converted = Some (-1.0)
+  rejects "empty included security" "precondition" base with capitalization_definition = Some (capDefinition [""] [] [] [])
+  rejects "empty excluded security" "precondition" base with capitalization_definition = Some (capDefinition [] [""] [] [])
+  rejects "empty stock class" "precondition" base with capitalization_definition = Some (capDefinition [] [] [""] [])
+  rejects "empty stock plan" "precondition" base with capitalization_definition = Some (capDefinition [] [] [] [""])
+
+-- A transaction checks at most 100 polymorphic references; a capitalization definition's
+-- securities, classes and plans count toward it, across the batch.
+test_convertible_conversion_polymorphic_reference_cap : Script ()
+test_convertible_conversion_polymorphic_reference_cap = do
+  env <- safeBook
+  let refs n = Some (capDefinition (replicate n "S-A1") [] [] [])
+      c = conversion "CV-P" "CONV-SEC" ["S-OUT"]
+      out = stockOut "S-OUT" "CLS-A" 100.0
+  applyRecordsFails env "more than 100 polymorphic references checked in one transaction"
+    [cv (c with capitalization_definition = Some (capDefinition (replicate 50 "S-A1") (replicate 26 "W-1") (replicate 25 "CLS-A") [])), out]
+  applyRecordsFails env "more than 100 polymorphic references checked in one transaction"
+    [ cv c with capitalization_definition = refs 60
+    , cv (conversion "CV-Q" "CONV-SEC" ["S-OUT"]) with capitalization_definition = refs 41
+    , out
+    ]
+  _ <- applyRecords env [cv (c with capitalization_definition = refs 100), out]
+  expectRecord env (cv c with capitalization_definition = refs 100)
+
+-- A conversion stores at most 1000 capitalization references; a restatement counts only the
+-- references it adds toward the transaction's 100, so a larger definition grows edit by edit.
+test_convertible_conversion_stored_reference_cap : Script ()
+test_convertible_conversion_stored_reference_cap = do
+  env <- safeBook
+  let withRefs n = cv ((conversion "CV-S" "CONV-SEC" ["S-OUT"]) with capitalization_definition = Some (capDefinition [] [] (replicate n "CLS-A") []))
+  _ <- applyRecords env [withRefs 100, stockOut "S-OUT" "CLS-A" 100.0]
+  mapA_ (\i -> restateOps env [RestateEdit (withRefs (i * 100))]) [2 .. 10]
+  expectRecord env (withRefs 1000)
+  restateOpsFails env "OcfObjectTypeTxConvertibleConversion has 1001 capitalization definition references; at most 1000" [RestateEdit (withRefs 1001)]
+  -- An edit that adds more than 100 references in one transaction is refused.
+  _ <- restateOps env [RestateEdit (withRefs 800)]
+  restateOpsFails env "more than 100 polymorphic references checked in one transaction" [RestateEdit (withRefs 901)]
+  expectRecord env (withRefs 800)
+
+test_convertible_conversion_edit_and_delete : Script ()
+test_convertible_conversion_edit_and_delete = do
+  env <- safeBook
+  let c = conversion "CV-1" "CONV-SEC" ["S-OUT"]
+  _ <- applyRecords env [cv c, stockOut "S-OUT" "CLS-A" 100.0]
+  restateOpsFails env "precondition" [RestateEdit (cv c with resulting_security_ids = [])]
+  restateOpsFails env "Convertible conversion trigger not found: TRIGGER-NONE" [RestateEdit (cv c with trigger_id = "TRIGGER-NONE")]
+  restateOpsFails env "Convertible conversion capitalization definition stock plan not found: SP-NONE"
+    [RestateEdit (cv c with capitalization_definition = Some (capDefinition [] [] [] ["SP-NONE"]))]
+  checkEditAndDelete env (cv c) (cv c with quantity_converted = Some 50000.0; comments = ["Corrected"])

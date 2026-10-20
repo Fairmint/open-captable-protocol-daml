@@ -1,0 +1,87 @@
+-- Warrant cancellations through CapTable_Apply and CapTable_Restate: whole and partial cancellations with a balance warrant, their security references, the cancellation validator and the shared edit and delete rules.
+module OpenCapTable.TestWarrantCancellation where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.WarrantCancellation (WarrantCancellationOcfData(..), validateWarrantCancellationOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+cancellation : Text -> Text -> Decimal -> WarrantCancellationOcfData
+cancellation id sec q = WarrantCancellationOcfData with
+  id
+  date = D.date 2024 D.Mar 15
+  quantity = q
+  reason_text = "Warrant expiration - unexercised"
+  security_id = sec
+  comments = []
+  balance_security_id = None
+
+wc : WarrantCancellationOcfData -> OcfRecordData
+wc = OcfRecordDataWarrantCancellation
+
+test_warrant_cancellation_create : Script ()
+test_warrant_cancellation_create = do
+  env <- instrumentBook
+  let c = cancellation "TX_WARRANT_CANCEL_1" "W-1" 100.0
+  _ <- applyRecords env [wc c]
+  expectRecord env (wc c)
+  viewSecurityIds env "TX_WARRANT_CANCEL_1" >>= (=== ["W-1"])
+  -- The cancelled warrant's issuance record stays.
+  expectRecord env (OcfRecordDataWarrantIssuance (warrantIssuance "WI-1" "W-1" "SH-A"))
+  applyRecordsFails env "ID already used: TX_WARRANT_CANCEL_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_CANCEL_1")]
+
+test_warrant_cancellation_partial_with_balance : Script ()
+test_warrant_cancellation_partial_with_balance = do
+  env <- instrumentBook
+  let balance = (warrantIssuance "WI-1-BAL" "W-1-BAL" "SH-A") with date = D.date 2024 D.Jun 30; quantity = Some 75.0
+      c = (cancellation "TX_WARRANT_CANCEL_PARTIAL" "W-1" 25.0) with
+        date = D.date 2024 D.Jun 30
+        reason_text = "Partial cancellation per warrant amendment agreement"
+        balance_security_id = Some "W-1-BAL"
+        comments = ["Partial cancellation approved by board", "Remaining warrants: 75"]
+  -- The balance warrant is issued in the same batch, after the cancellation that names it.
+  _ <- applyRecords env [wc c, OcfRecordDataWarrantIssuance balance]
+  expectRecord env (wc c)
+  expectRecord env (OcfRecordDataWarrantIssuance balance)
+  viewSecurityIds env "TX_WARRANT_CANCEL_PARTIAL" >>= (=== ["W-1", "W-1-BAL"])
+
+test_warrant_cancellation_security_references : Script ()
+test_warrant_cancellation_security_references = do
+  env <- instrumentBook
+  let c = cancellation "WC-1" "W-1" 10.0
+  applyRecordsFails env "Warrant cancellation security not found: W-NONE" [wc c with security_id = "W-NONE"]
+  applyRecordsFails env "Warrant cancellation security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [wc c with security_id = "S-A1"]
+  applyRecordsFails env "Warrant cancellation security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [wc c with security_id = "C-1"]
+  applyRecordsFails env "Warrant cancellation balance security not found: W-BAL-NONE" [wc c with balance_security_id = Some "W-BAL-NONE"]
+  applyRecordsFails env "Warrant cancellation balance security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [wc c with balance_security_id = Some "C-1"]
+
+test_warrant_cancellation_validator : Script ()
+test_warrant_cancellation_validator = do
+  env <- instrumentBook
+  let base = cancellation "WC-V" "W-1" 10.0
+      rejects : Text -> Text -> WarrantCancellationOcfData -> Script ()
+      rejects label expected c = do
+        expectInvalid label (validateWarrantCancellationOcfData c)
+        applyRecordsFails env expected [wc c]
+  expectValid "base" (validateWarrantCancellationOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "zero quantity" "precondition" base with quantity = 0.0
+  rejects "negative quantity" "precondition" base with quantity = -1.0
+  rejects "empty reason" "precondition" base with reason_text = ""
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "empty balance security" "precondition" base with balance_security_id = Some ""
+
+test_warrant_cancellation_edit_and_delete : Script ()
+test_warrant_cancellation_edit_and_delete = do
+  env <- instrumentBook
+  let c = cancellation "WC-1" "W-1" 10.0
+  _ <- applyRecords env [wc c]
+  restateOpsFails env "precondition" [RestateEdit (wc c with quantity = 0.0)]
+  restateOpsFails env "Warrant cancellation balance security not found: W-BAL" [RestateEdit (wc c with balance_security_id = Some "W-BAL")]
+  checkEditAndDelete env (wc c) (wc c with quantity = 20.0; reason_text = "Corrected quantity")

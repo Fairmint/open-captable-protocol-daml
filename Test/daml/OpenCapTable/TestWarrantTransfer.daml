@@ -1,0 +1,107 @@
+-- Warrant transfers through CapTable_Apply and CapTable_Restate: whole and partial transfers into warrants issued in the same batch, their security references, the transfer validator and the shared edit and delete rules.
+module OpenCapTable.TestWarrantTransfer where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.WarrantTransfer (WarrantTransferOcfData(..), validateWarrantTransferOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+transferDate : Date
+transferDate = D.date 2025 D.Mar 15
+
+transfer : Text -> Text -> Decimal -> [Text] -> WarrantTransferOcfData
+transfer id sec q resulting = WarrantTransferOcfData with
+  id
+  date = transferDate
+  quantity = q
+  security_id = sec
+  comments = []
+  resulting_security_ids = resulting
+  balance_security_id = None
+  consideration_text = None
+
+wt : WarrantTransferOcfData -> OcfRecordData
+wt = OcfRecordDataWarrantTransfer
+
+-- | A warrant issued to `sh` on the transfer date for `q` units.
+warrantOut : Text -> Text -> Decimal -> OcfRecordData
+warrantOut sec sh q = OcfRecordDataWarrantIssuance ((warrantIssuance ("WI-" <> sec) sec sh) with date = transferDate; quantity = Some q)
+
+test_warrant_transfer_secondary_sale : Script ()
+test_warrant_transfer_secondary_sale = do
+  env <- instrumentBook
+  let t = (transfer "TX_WARRANT_TRANSFER_1" "W-1" 100.0 ["WSEC-TRANSFERRED-001"]) with
+        comments = ["Warrant transfer per secondary sale agreement"]
+        consideration_text = Some "100 warrants transferred at $0.50 per warrant."
+  _ <- applyRecords env [warrantOut "WSEC-TRANSFERRED-001" "SH-B" 100.0, wt t]
+  expectRecord env (wt t)
+  expectRecord env (warrantOut "WSEC-TRANSFERRED-001" "SH-B" 100.0)
+  viewSecurityIds env "TX_WARRANT_TRANSFER_1" >>= (=== ["W-1", "WSEC-TRANSFERRED-001"])
+  applyRecordsFails env "ID already used: TX_WARRANT_TRANSFER_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_TRANSFER_1")]
+
+test_warrant_transfer_partial_with_balance : Script ()
+test_warrant_transfer_partial_with_balance = do
+  env <- instrumentBook
+  let t = (transfer "TX_WARRANT_TRANSFER_PARTIAL" "W-1" 40.0 ["WSEC-NEW-HOLDER"]) with
+        comments = ["Partial warrant transfer", "Remaining warrants retained by original holder"]
+        balance_security_id = Some "WSEC-PARTIAL-REMAIN"
+        consideration_text = Some "Partial transfer of 40 warrants at $0.75 per warrant."
+  -- The transfer may come before the warrants it names in the batch.
+  _ <- applyRecords env [wt t, warrantOut "WSEC-NEW-HOLDER" "SH-B" 40.0, warrantOut "WSEC-PARTIAL-REMAIN" "SH-A" 60.0]
+  expectRecord env (wt t)
+  viewSecurityIds env "TX_WARRANT_TRANSFER_PARTIAL" >>= (=== ["W-1", "WSEC-NEW-HOLDER", "WSEC-PARTIAL-REMAIN"])
+
+test_warrant_transfer_full_no_consideration : Script ()
+test_warrant_transfer_full_no_consideration = do
+  env <- instrumentBook
+  let t = (transfer "TX_WARRANT_TRANSFER_FULL" "W-1" 100.0 ["WSEC-NEWOWNER"]) with date = D.date 2025 D.Jul 20
+  _ <- applyRecords env [warrantOut "WSEC-NEWOWNER" "SH-B" 100.0, wt t]
+  expectRecord env (wt t)
+
+test_warrant_transfer_security_references : Script ()
+test_warrant_transfer_security_references = do
+  env <- instrumentBook
+  let t = transfer "WT-1" "W-1" 100.0 ["W-OUT"]
+      out = warrantOut "W-OUT" "SH-B" 100.0
+  applyRecordsFails env "Warrant transfer security not found: W-NONE" [out, wt t with security_id = "W-NONE"]
+  applyRecordsFails env "Warrant transfer security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [out, wt t with security_id = "C-1"]
+  -- The resulting and balance securities must be warrants.
+  applyRecordsFails env "Warrant transfer resulting security security not found: W-OUT" [wt t]
+  applyRecordsFails env "Warrant transfer resulting security security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [wt t with resulting_security_ids = ["S-A1"]]
+  applyRecordsFails env "Warrant transfer balance security not found: W-REST" [out, wt t with balance_security_id = Some "W-REST"]
+  applyRecordsFails env "Warrant transfer balance security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [out, wt t with balance_security_id = Some "C-1"]
+
+test_warrant_transfer_validator : Script ()
+test_warrant_transfer_validator = do
+  env <- instrumentBook
+  let base = transfer "WT-V" "W-1" 100.0 ["W-OUT"]
+      rejects : Text -> Text -> WarrantTransferOcfData -> Script ()
+      rejects label expected t = do
+        expectInvalid label (validateWarrantTransferOcfData t)
+        applyRecordsFails env expected [wt t]
+  expectValid "base" (validateWarrantTransferOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "zero quantity" "precondition" base with quantity = 0.0
+  rejects "negative quantity" "precondition" base with quantity = -5.0
+  rejects "no resulting securities" "precondition" base with resulting_security_ids = []
+  rejects "empty resulting security" "precondition" base with resulting_security_ids = [""]
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "empty balance security" "precondition" base with balance_security_id = Some ""
+  rejects "empty consideration" "precondition" base with consideration_text = Some ""
+
+test_warrant_transfer_edit_and_delete : Script ()
+test_warrant_transfer_edit_and_delete = do
+  env <- instrumentBook
+  let t = transfer "WT-1" "W-1" 100.0 ["W-OUT"]
+  _ <- applyRecords env [warrantOut "W-OUT" "SH-B" 100.0, wt t]
+  restateOpsFails env "precondition" [RestateEdit (wt t with quantity = 0.0)]
+  restateOpsFails env "Warrant transfer resulting security security not found: W-OTHER" [RestateEdit (wt t with resulting_security_ids = ["W-OTHER"])]
+  checkEditAndDelete env (wt t) (wt t with consideration_text = Some "Gift"; comments = ["Corrected"])
