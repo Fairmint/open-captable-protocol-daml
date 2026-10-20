@@ -112,7 +112,8 @@ extension in `ocf-extension/`.
 
 The LocalNet OCF replay and cross-participant traffic scripts drove the ledger through
 `ocp-canton-sdk`, which does not support v35 yet. They were removed and return with SDK support; the
-last versions are in git history.
+last versions are in git history, the scripts before `0a15f5c` and the `replay-ocf-database`
+workflow, with its `sdk_ref` input, at `7d693fa`.
 
 See
 [Development and Testing](https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing)
