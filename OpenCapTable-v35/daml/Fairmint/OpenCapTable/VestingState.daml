@@ -11,7 +11,8 @@ module Fairmint.OpenCapTable.VestingState
   , vestedBy
   ) where
 
-import DA.List (dedup, sort, sortOn)
+import DA.Date (addDays)
+import DA.List (groupOn, sortOn)
 import DA.Optional (optionalToList)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
@@ -79,21 +80,14 @@ outputVestedBy t o
 -- the arithmetic is the writer's.
 checkOutputsVesting : Date -> Text -> [StockSecurity] -> [OutputVesting] -> Either Text ()
 checkOutputsVesting d label sources outputs = do
-  let sourceVestedBy t s = case s.vesting of
-        StockVestingTranches ts -> vestedBy t ts
-        StockVestingNone -> s.quantity
-        StockVestingOnTerms _ -> if t <= d then vestedAt s d else s.quantity
-      sourceAt t = sum (map (sourceVestedBy t) sources)
-      outputsAt t = sum (map (outputVestedBy t) outputs)
-      sourceTrancheDates = concatMap (\s -> case s.vesting of
-        StockVestingTranches ts -> map (.date) ts
-        _ -> []) sources
-      laterDates = filter (> d) (dedup (sort (sourceTrancheDates <> concatMap (map (.date) . (.vestings)) outputs)))
-      failing = filter (\t -> outputsAt t > sourceAt t) (d :: laterDates)
-  case failing of
-    [] -> pure ()
-    t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by "
-      <> show t <> ", more than the " <> show (sourceAt t) <> " their source has vested by then")
+  let sourceSteps s = case s.vesting of
+        StockVestingTranches ts -> trancheSteps d ts
+        StockVestingNone -> VestingSteps with at_d = s.quantity; increases = []
+        StockVestingOnTerms _ -> VestingSteps with at_d = vestedAt s d; increases = [(addDays d 1, s.quantity - vestedAt s d)]
+  case firstVestingFailure (\src out -> out > src) d (map sourceSteps sources) (map (outputSteps d) outputs) of
+    None -> pure ()
+    Some (t, src, out) -> Left ("the outputs of " <> label <> " vest " <> show out <> " shares by "
+      <> show t <> ", more than the " <> show src <> " their source has vested by then")
 
 -- | A free transfer conserves vesting, beyond never vesting ahead of its source. From a lot with
 -- tranches or no vesting, it splits tranches, so each date's cumulative vested amount is the same
@@ -113,21 +107,56 @@ checkTransferVesting d label s resulting balance = case s.vesting of
         <> ", but keeps " <> show kept <> " vested shares of security " <> s.security_id)
   _ -> do
     let outputs = resulting <> optionalToList balance
-        sourceAt t = vestedAt s t
-        outputsAt t = sum (map (outputVestedBy t) outputs)
-        sourceTrancheDates = case s.vesting of
-          StockVestingTranches ts -> map (.date) ts
-          _ -> []
-        laterDates = filter (> d) (dedup (sort (sourceTrancheDates <> concatMap (map (.date) . (.vestings)) outputs)))
-        failing = filter (\t -> outputsAt t /= sourceAt t) (d :: laterDates)
+        source = case s.vesting of
+          StockVestingTranches ts -> trancheSteps d ts
+          _ -> VestingSteps with at_d = s.quantity; increases = []
     if any (.on_terms) outputs
       then Left ("the outputs of " <> label <> " split security " <> s.security_id
         <> "'s tranches; none of them replaces them with vesting terms")
       else pure ()
-    case failing of
-      [] -> pure ()
-      t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by " <> show t
-        <> ", but security " <> s.security_id <> " has vested " <> show (sourceAt t) <> " by then")
+    case firstVestingFailure (/=) d [source] (map (outputSteps d) outputs) of
+      None -> pure ()
+      Some (t, src, out) -> Left ("the outputs of " <> label <> " vest " <> show out <> " shares by " <> show t
+        <> ", but security " <> s.security_id <> " has vested " <> show src <> " by then")
+
+-- A cumulative vested amount from a date `d` on: its value at `d` and its increases at later dates.
+data VestingSteps = VestingSteps
+  with
+    at_d : Decimal
+    increases : [(Date, Decimal)]
+
+trancheSteps : Date -> [OcfVesting] -> VestingSteps
+trancheSteps d ts = VestingSteps with
+  at_d = vestedBy d ts
+  increases = map (\t -> (t.date, t.amount)) (filter (\t -> t.date > d) ts)
+
+outputSteps : Date -> OutputVesting -> VestingSteps
+outputSteps d o
+  | not (null o.vestings) = trancheSteps d o.vestings
+  | o.on_terms = VestingSteps with at_d = 0.0; increases = []
+  | otherwise = VestingSteps with at_d = o.quantity; increases = []
+
+-- The first date from `d` on at which `bad` holds of the sources' and the outputs' cumulative
+-- vested amounts, with both: `d` itself, then each later date either changes on, in one sweep over
+-- the sorted changes (so the checks cost O(T log T) in the tranches, not dates × tranches).
+firstVestingFailure : (Decimal -> Decimal -> Bool) -> Date -> [VestingSteps] -> [VestingSteps] -> Optional (Date, Decimal, Decimal)
+firstVestingFailure bad d sources outputs =
+  let src0 = sum (map (.at_d) sources)
+      out0 = sum (map (.at_d) outputs)
+      changes = sortOn (\(t, _, _) -> t)
+        (concatMap (\st -> map (\(t, a) -> (t, a, 0.0)) st.increases) sources
+          <> concatMap (\st -> map (\(t, a) -> (t, 0.0, a)) st.increases) outputs)
+      start = if bad src0 out0 then Some (d, src0, out0) else None
+  in fst (foldl (sweepDate bad) (start, (src0, out0)) (groupOn (\(t, _, _) -> t) changes))
+
+sweepDate : (Decimal -> Decimal -> Bool) -> (Optional (Date, Decimal, Decimal), (Decimal, Decimal))
+  -> [(Date, Decimal, Decimal)] -> (Optional (Date, Decimal, Decimal), (Decimal, Decimal))
+sweepDate bad (found, (src, out)) changesOnDate = case (found, changesOnDate) of
+  (None, (t, _, _) :: _) ->
+    let src' = src + sum (map (\(_, a, _) -> a) changesOnDate)
+        out' = out + sum (map (\(_, _, b) -> b) changesOnDate)
+    in (if bad src' out' then Some (t, src', out') else None, (src', out'))
+  _ -> (found, (src, out))
 
 -- | A balance carries its remaining vesting as explicit tranches that sum to exactly its quantity
 -- when its source has tranches or vesting terms, and no vesting when its source has none, so it can
