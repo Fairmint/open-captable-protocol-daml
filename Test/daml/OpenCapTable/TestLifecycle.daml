@@ -1,0 +1,170 @@
+-- The factory, the authorization and the anchor's teardown, ported from v34's TestOcpFactory and TestArchiveCapTable where TestSetup does not already cover them: who may withdraw or archive an authorization and the factory, who may begin teardown, purge and close a book, the purge's limits and context checks, and what closing leaves behind.
+module OpenCapTable.TestLifecycle where
+
+import DA.Assert ((===))
+import DA.Foldable (mapA_)
+import DA.List (head)
+import qualified DA.Map as Map
+import DA.Optional (isNone)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.IssuerAuthorization
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OcpFactory
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import OpenCapTable.Harness
+
+-- | A fresh authorization for the environment's issuer and TA, from its factory.
+authorize : Env -> Script OcpFactory_AuthorizeIssuerResult
+authorize env = do
+  factory <- head . map fst <$> query @OcpFactory env.system_operator
+  submit env.system_operator do
+    exerciseCmd factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.transfer_agent
+
+stakeholderOp : Text -> ApplyOperation
+stakeholderOp id = ApplyRecord (OcfRecordDataStakeholder (stakeholderData id))
+
+-- =============================================================================
+-- FACTORY AND AUTHORIZATION
+-- =============================================================================
+
+-- v34 testAuthorizeAndWithdraw: an authorization is archived (before the TA signs it) or withdrawn
+-- (at any point before it is used) by the system operator only, and the factory is archived by the
+-- system operator only. Cap tables already created keep working.
+test_lifecycle_authorization_withdraw_and_archive : Script ()
+test_lifecycle_authorization_withdraw_and_archive = do
+  env <- standardBook
+  -- Before the TA accepts, the system operator alone signs it and can archive it.
+  a1 <- authorize env
+  submitMustFail env.issuer do archiveCmd a1.authorization
+  submit env.system_operator do archiveCmd a1.authorization
+  queryContractId env.system_operator a1.authorization >>= assertMsg "archived" . isNone
+  -- Once the TA has accepted, it signs too: the system operator can no longer archive it alone,
+  -- but can still withdraw it; the issuer and the TA cannot.
+  a2 <- authorize env
+  accepted <- submit env.transfer_agent do exerciseCmd a2.authorization IssuerAuthorization_TaAccept
+  submitMustFail env.system_operator do archiveCmd accepted
+  submitMustFail env.issuer do exerciseCmd accepted IssuerAuthorization_Withdraw
+  submitMustFail env.transfer_agent do exerciseCmd accepted IssuerAuthorization_Withdraw
+  submit env.system_operator do exerciseCmd accepted IssuerAuthorization_Withdraw
+  submitMustFail env.issuer do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData
+  -- An authorization used to create a cap table is consumed: there is nothing left to withdraw.
+  a3 <- authorize env
+  accepted3 <- submit env.transfer_agent do exerciseCmd a3.authorization IssuerAuthorization_TaAccept
+  created <- submit env.issuer do
+    exerciseCmd accepted3 IssuerAuthorization_CreateCapTable with transfer_agent = env.transfer_agent; issuer_data = issuerData
+  submitMustFail env.system_operator do exerciseCmd accepted3 IssuerAuthorization_Withdraw
+  Some anchor3 <- queryContractId env.transfer_agent created.cap_table
+  anchor3.context.cap_table_id === a3.cap_table_id
+  -- Only the system operator authorizes and archives the factory.
+  factory <- head . map fst <$> query @OcpFactory env.system_operator
+  submitMustFail env.issuer do
+    exerciseCmd factory OcpFactory_AuthorizeIssuer with issuer = env.issuer; transfer_agent = env.transfer_agent
+  submitMustFail env.issuer do archiveCmd factory
+  submitMustFail env.transfer_agent do archiveCmd factory
+  submit env.system_operator do archiveCmd factory
+  query @OcpFactory env.system_operator >>= (=== 0) . length
+  -- The books it created are unaffected.
+  r <- applyOps env [stakeholderOp "SH-AFTER-FACTORY"]
+  Map.size r.records === 1
+
+-- =============================================================================
+-- TEARDOWN
+-- =============================================================================
+
+-- v34 testArchiveCapTableIssuerFails and testArchiveCapTableRandoFails: only the TA begins a
+-- teardown, and only the system operator purges and closes.
+test_lifecycle_teardown_authority : Script ()
+test_lifecycle_teardown_authority = do
+  env <- standardBook
+  submitMustFail env.issuer do exerciseCmd env.cap_table CapTable_BeginTeardown
+  submitMustFail env.outsider do exerciseCmd env.cap_table CapTable_BeginTeardown
+  -- Close needs a book being torn down.
+  expectSubmitFailure "not CapTableStatusTearingDown" env.system_operator (exerciseCmd env.cap_table CapTable_Close)
+  tearing <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_BeginTeardown
+  -- Teardown is begun once.
+  expectSubmitFailure "not CapTableStatusActive" env.transfer_agent (exerciseCmd tearing CapTable_BeginTeardown)
+  records <- map (PurgeRecord . fst) <$> recordsOf env
+  mapA_ (\p -> submitMustFail p do exerciseCmd tearing CapTable_Purge with targets = records)
+    [env.issuer, env.transfer_agent, env.outsider]
+  mapA_ (\p -> submitMustFail p do exerciseCmd tearing CapTable_Close)
+    [env.issuer, env.transfer_agent, env.outsider]
+  -- No hold, settlement, freeze or restatement on a book being torn down.
+  inputs <- allInputs env
+  expectSubmitFailure "not CapTableStatusActive" env.transfer_agent
+    (exerciseCmd tearing CapTable_Restate with inputs; operations = [RestateDelete "SH-B"])
+  (epoch, _) <- epochOf env "CLS-A"
+  expectSubmitFailure "not CapTableStatusActive" env.transfer_agent
+    (exerciseCmd tearing CapTable_FreezeClass with epoch)
+  closed <- submit env.system_operator do exerciseCmd tearing CapTable_Close
+  Some tomb <- queryContractId env.transfer_agent closed
+  tomb.status === CapTableStatusClosed
+
+-- A purge archives between 1 and 500 contracts, each of this cap table.
+test_lifecycle_purge_limits_and_context : Script ()
+test_lifecycle_purge_limits_and_context = do
+  env1 <- standardBook
+  env2 <- secondCapTable env1
+  -- The issuer and 243 stakeholders: with the 256 shards, 500 contracts.
+  _ <- applyRecords env2 (map (\i -> OcfRecordDataStakeholder (stakeholderData ("SH-" <> show i))) [1 .. 243])
+  tearing <- submit env2.transfer_agent do exerciseCmd env2.cap_table CapTable_BeginTeardown
+  expectSubmitFailure "CapTable_Purge needs at least one contract" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = [])
+  (shard, _) <- head <$> shardsOf env2
+  expectSubmitFailure "CapTable_Purge archives at most 500 contracts" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = replicate 501 (PurgeShard shard))
+  -- Another book's contracts are refused, whatever their kind.
+  record1 <- recordCidOf env1 "SH-A"
+  state1 <- stateCidOf env1 "S-A1"
+  (epoch1, _) <- epochOf env1 "CLS-A"
+  (shard1, _) <- head <$> shardsOf env1
+  expectSubmitFailure "a purged record belongs to another cap table" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = [PurgeRecord record1])
+  expectSubmitFailure "a purged stock state belongs to another cap table" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = [PurgeState state1])
+  expectSubmitFailure "a purged epoch belongs to another cap table" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = [PurgeEpoch epoch1])
+  expectSubmitFailure "a purged shard belongs to another cap table" env2.system_operator
+    (exerciseCmd tearing CapTable_Purge with targets = [PurgeShard shard1])
+  -- Exactly 500 is one purge.
+  shards2 <- map (PurgeShard . fst) <$> shardsOf env2
+  records2 <- map (PurgeRecord . fst) <$> recordsOf env2
+  length (shards2 <> records2) === 500
+  submit env2.system_operator do exerciseCmd tearing CapTable_Purge with targets = shards2 <> records2
+  shardsOf env2 >>= (=== 0) . length
+  recordsOf env2 >>= (=== 0) . length
+  -- The first book is untouched and still writes.
+  length <$> shardsOf env1 >>= (=== 256)
+  _ <- applyRecords env1 [OcfRecordDataStakeholder (stakeholderData "SH-STILL")]
+  hasRecord env1 "SH-STILL" >>= (=== True)
+
+-- v34 testArchiveCapTableEmpty archived a fresh cap table, and testArchiveCapTableFailsWithEntities
+-- refused to archive one that still held records. v35's anchor indexes nothing, so CapTable_Close
+-- cannot tell whether the purge is complete: the system operator purges first, and contracts left
+-- behind stay active under the closed anchor, which refuses every write and every further purge.
+test_lifecycle_close_after_partial_purge : Script ()
+test_lifecycle_close_after_partial_purge = do
+  env <- standardBook
+  tearing <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_BeginTeardown
+  states <- map (PurgeState . fst) <$> statesOf env
+  submit env.system_operator do exerciseCmd tearing CapTable_Purge with targets = states
+  statesOf env >>= (=== 0) . length
+  closed <- submit env.system_operator do exerciseCmd tearing CapTable_Close
+  -- The old anchors are gone; the tombstone remains.
+  queryContractId env.transfer_agent env.cap_table >>= assertMsg "the active anchor is archived" . isNone
+  queryContractId env.transfer_agent tearing >>= assertMsg "the tearing-down anchor is archived" . isNone
+  Some tomb <- queryContractId env.transfer_agent closed
+  tomb.status === CapTableStatusClosed
+  -- What was not purged is still there.
+  recordsOf env >>= (=== 6) . length
+  length <$> shardsOf env >>= (=== 256)
+  records <- map (PurgeRecord . fst) <$> recordsOf env
+  expectSubmitFailure "not CapTableStatusTearingDown" env.system_operator
+    (exerciseCmd closed CapTable_Purge with targets = records)
+  inputs <- allInputs env
+  expectSubmitFailure "not CapTableStatusActive" env.transfer_agent
+    (exerciseCmd closed CapTable_Apply with inputs; operations = [stakeholderOp "SH-X"])
+  expectSubmitFailure "not CapTableStatusTearingDown" env.system_operator (exerciseCmd closed CapTable_Close)

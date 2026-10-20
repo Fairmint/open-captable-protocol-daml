@@ -1,0 +1,298 @@
+-- Equity compensation issuances, ported from v34's TestEquityCompensationIssuance and TestEquityCompensationIssuanceReferences: writes with every optional field, restatement edits and deletes, every validator branch (compensation-type prices, arrays, optional texts, money, the expiration date), the tranche cap, references checked when written, and ID uniqueness.
+module OpenCapTable.TestEquityCompensationIssuance where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfSecurityExemption(..))
+import Fairmint.OpenCapTable.Types.Vesting
+import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : EquityCompensationIssuanceOcfData -> Bool
+valid = validateEquityCompensationIssuanceOcfData
+
+window : Int -> OcfTerminationWindow
+window n = OcfTerminationWindow with reason = OcfTerminationWindowTypeVoluntaryGoodCause; period = n; period_type = OcfPeriodTypeDays
+
+tranche : Decimal -> OcfVesting
+tranche a = OcfVesting with date = D.date 2025 D.Jan 1; amount = a
+
+-- =============================================================================
+-- WRITES, EDITS AND DELETES
+-- =============================================================================
+
+test_ec_issuance_minimal : Script ()
+test_ec_issuance_minimal = do
+  env <- ecBook
+  accept env valid ecRecord (option "EC-1" "SH-A" 100.0)
+  -- A grant opens no stock state.
+  hasState env "EC-1" >>= (=== False)
+  -- Its object ID and its security ID are claimed.
+  applyRecordsFails env "ID already used: ECI-EC-1" [OcfRecordDataStakeholder (stakeholderData "ECI-EC-1")]
+  applyRecordsFails env "security ID already used: EC-1" [ecRecord ((option "EC-1" "SH-B" 1.0) with id = "ECI-OTHER")]
+
+test_ec_issuance_all_optionals : Script ()
+test_ec_issuance_all_optionals = do
+  env <- ecBookWith
+    [ OcfRecordDataStockPlan (stockPlan "PLAN-1" ["CLS-A"])
+    , termsRecord (termsWith "VT-1" "start" OcfVestingStartTrigger)
+    ]
+  accept env valid ecRecord EquityCompensationIssuanceOcfData with
+    id = "ECI-2"
+    compensation_type = OcfCompensationTypeOptionIso
+    custom_id = "EC-CERT-2"
+    date = D.date 2024 D.Feb 1
+    quantity = 500.0
+    security_id = "EC-2"
+    stakeholder_id = "SH-A"
+    comments = ["Initial grant for new hire"]
+    security_law_exemptions = [OcfSecurityExemption with description = "Rule 701"; jurisdiction = "US"]
+    termination_exercise_windows = [window 90]
+    vestings = [OcfVesting with date = D.date 2025 D.Jan 1; amount = 125.0]
+    base_price = Some (usd 2.0)
+    board_approval_date = Some (D.date 2024 D.Jan 15)
+    consideration_text = Some "Employee incentive"
+    early_exercisable = Some True
+    exercise_price = Some (usd 2.5)
+    expiration_date = Some (D.date 2034 D.Feb 1)
+    stock_class_id = Some "CLS-A"
+    stock_plan_id = Some "PLAN-1"
+    stockholder_approval_date = Some (D.date 2024 D.Jan 20)
+    vesting_terms_id = Some "VT-1"
+
+test_ec_issuance_restate_edit_and_delete : Script ()
+test_ec_issuance_restate_edit_and_delete = do
+  env <- ecBook
+  let g = option "EC-1" "SH-A" 100.0
+  _ <- applyRecords env [ecRecord g]
+  restateOpsFails env "changes nothing" [RestateEdit (ecRecord g)]
+  let g' = g with quantity = 150.0; comments = ["Corrected grant size"]
+  _ <- restateOps env [RestateEdit (ecRecord g')]
+  expectRecord env (ecRecord g')
+  _ <- restateOps env [RestateDelete "ECI-EC-1"]
+  expectNoRecord env "ECI-EC-1"
+  -- The delete released both IDs.
+  accept env valid ecRecord g
+
+-- Unlike a stock issuance's, a grant's security ID may be corrected by an edit: the old ID is
+-- released and the new one claimed.
+test_ec_issuance_edit_moves_security_id : Script ()
+test_ec_issuance_edit_moves_security_id = do
+  env <- ecBook
+  let g = option "EC-1" "SH-A" 100.0
+  _ <- applyRecords env [ecRecord g]
+  _ <- restateOps env [RestateEdit (ecRecord (g with security_id = "EC-1B"))]
+  expectRecord env (ecRecord (g with security_id = "EC-1B"))
+  accept env valid ecRecord ((option "EC-1" "SH-B" 10.0) with id = "ECI-NEW")
+  applyRecordsFails env "security ID already used: EC-1B" [ecRecord ((option "EC-1B" "SH-B" 10.0) with id = "ECI-NEW-2")]
+
+-- =============================================================================
+-- VALIDATION
+-- =============================================================================
+
+-- Options need an exercise price, stock appreciation rights a base price, RSUs neither.
+test_ec_issuance_compensation_type_prices : Script ()
+test_ec_issuance_compensation_type_prices = do
+  env <- ecBook
+  let unpriced t = (option "EC-X" "SH-A" 100.0) with compensation_type = t; exercise_price = None; base_price = None
+      options = [OcfCompensationTypeOptionNso, OcfCompensationTypeOptionIso, OcfCompensationTypeOption]
+      sars = [OcfCompensationTypeCsar, OcfCompensationTypeSsar]
+  forA_ options \t -> refuse env valid ecRecord (unpriced t)
+  forA_ sars \t -> refuse env valid ecRecord (unpriced t)
+  -- A SAR's exercise price does not stand in for its base price.
+  forA_ sars \t -> refuse env valid ecRecord ((unpriced t) with exercise_price = Some (usd 1.0))
+  forA_ (zip [1 .. 3] options) \(i, t) ->
+    accept env valid ecRecord ((option ("EC-O" <> show i) "SH-A" 100.0) with compensation_type = t)
+  forA_ (zip [1 .. 2] sars) \(i, t) ->
+    accept env valid ecRecord ((option ("EC-S" <> show i) "SH-A" 100.0) with compensation_type = t; exercise_price = None; base_price = Some (usd 3.0))
+  accept env valid ecRecord (rsu "EC-RSU" "SH-A" 100.0)
+
+test_ec_issuance_required_text : Script ()
+test_ec_issuance_required_text = do
+  env <- ecBook
+  let g = option "EC-R" "SH-A" 100.0
+  -- An empty object or security ID is stopped by its claim, before the record's ensure.
+  refuseWith env "an empty ID cannot be claimed" valid ecRecord (g with id = "")
+  refuseWith env "an empty ID cannot be claimed" valid ecRecord (g with security_id = "")
+  refuse env valid ecRecord (g with custom_id = "")
+  refuse env valid ecRecord (g with stakeholder_id = "")
+
+test_ec_issuance_array_elements : Script ()
+test_ec_issuance_array_elements = do
+  env <- ecBook
+  let g = option "EC-A" "SH-A" 100.0
+  refuse env valid ecRecord (g with comments = ["ok", ""])
+  refuse env valid ecRecord (g with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"])
+  refuse env valid ecRecord (g with security_law_exemptions = [OcfSecurityExemption with description = "Rule 701"; jurisdiction = ""])
+  refuse env valid ecRecord (g with vestings = [tranche 0.0])
+  refuse env valid ecRecord (g with vestings = [tranche (-1.0)])
+  -- Tranches never sum to more than the quantity.
+  refuse env valid ecRecord (g with vestings = [tranche 60.0, tranche 41.0])
+  refuse env valid ecRecord (g with termination_exercise_windows = [window (-1)])
+  -- The boundaries: tranches summing to the quantity, and a zero-length window.
+  accept env valid ecRecord (g with vestings = [tranche 60.0, tranche 40.0]; termination_exercise_windows = [window 0])
+
+test_ec_issuance_optional_text_not_empty : Script ()
+test_ec_issuance_optional_text_not_empty = do
+  env <- ecBook
+  let g = option "EC-T" "SH-A" 100.0
+  refuse env valid ecRecord (g with consideration_text = Some "")
+  refuse env valid ecRecord (g with stock_plan_id = Some "")
+  refuse env valid ecRecord (g with stock_class_id = Some "")
+  refuse env valid ecRecord (g with vesting_terms_id = Some "")
+
+test_ec_issuance_money : Script ()
+test_ec_issuance_money = do
+  env <- ecBook
+  let g = option "EC-M" "SH-A" 100.0
+  refuse env valid ecRecord (g with exercise_price = Some (usd (-0.01)))
+  refuse env valid ecRecord (g with exercise_price = Some (OcfMonetary with amount = 1.0; currency = "US"))
+  refuse env valid ecRecord (g with exercise_price = Some (OcfMonetary with amount = 1.0; currency = ""))
+  refuse env valid ecRecord (g with base_price = Some (usd (-1.0)))
+  refuse env valid ecRecord (g with base_price = Some (OcfMonetary with amount = 1.0; currency = "USDX"))
+  -- A zero price is a price.
+  accept env valid ecRecord (g with exercise_price = Some (usd 0.0))
+
+-- v35 dates are Dates: the grant expires on or after its date.
+test_ec_issuance_expiration_date : Script ()
+test_ec_issuance_expiration_date = do
+  env <- ecBook
+  let g = option "EC-E" "SH-A" 100.0
+  refuse env valid ecRecord (g with expiration_date = Some (D.date 2023 D.Dec 31))
+  accept env valid ecRecord (g with expiration_date = Some d2024)
+
+-- The register caps a record's tranches; the cap is not OCF validity, so the validator has none.
+test_ec_issuance_tranche_cap : Script ()
+test_ec_issuance_tranche_cap = do
+  env <- ecBook
+  let tranches n = map (\i -> OcfVesting with date = D.addDays d2024 i; amount = 1.0) [1 .. n]
+      g = option "EC-CAP" "SH-A" 2000.0
+  assertMsg "the validator caps tranches" (valid (g with vestings = tranches 1501))
+  applyRecordsFails env "1501 vesting tranches; at most 1500" [ecRecord (g with vestings = tranches 1501)]
+  accept env valid ecRecord (g with vestings = tranches 1500)
+
+-- =============================================================================
+-- REFERENCES
+-- =============================================================================
+
+test_ec_issuance_missing_references : Script ()
+test_ec_issuance_missing_references = do
+  env <- ecBook
+  let g = option "EC-M" "SH-A" 100.0
+  applyRecordsFails env "Equity compensation stakeholder not found: SH-X" [ecRecord (g with stakeholder_id = "SH-X")]
+  applyRecordsFails env "Equity compensation stock class not found: SC_MISSING" [ecRecord (g with stock_class_id = Some "SC_MISSING")]
+  applyRecordsFails env "Equity compensation stock plan not found: PLAN_MISSING" [ecRecord (g with stock_plan_id = Some "PLAN_MISSING")]
+  applyRecordsFails env "Equity compensation stock plan not found: PLAN_MISSING"
+    [ecRecord (g with stock_plan_id = Some "PLAN_MISSING"; stock_class_id = Some "CLS-A")]
+  applyRecordsFails env "Equity compensation vesting terms not found: VT_MISSING" [ecRecord (g with vesting_terms_id = Some "VT_MISSING")]
+  expectNoRecord env "ECI-EC-M"
+
+test_ec_issuance_references_have_their_types : Script ()
+test_ec_issuance_references_have_their_types = do
+  env <- ecBookWith [OcfRecordDataStockPlan (stockPlan "PLAN-1" ["CLS-A"])]
+  let g = option "EC-W" "SH-A" 100.0
+  applyRecordsFails env "Equity compensation stakeholder CLS-A is a OcfObjectTypeStockClass" [ecRecord (g with stakeholder_id = "CLS-A")]
+  applyRecordsFails env "Equity compensation stock class PLAN-1 is a OcfObjectTypeStockPlan" [ecRecord (g with stock_class_id = Some "PLAN-1")]
+  applyRecordsFails env "Equity compensation stock plan SH-A is a OcfObjectTypeStakeholder" [ecRecord (g with stock_plan_id = Some "SH-A")]
+  applyRecordsFails env "Equity compensation vesting terms PLAN-1 is a OcfObjectTypeStockPlan" [ecRecord (g with vesting_terms_id = Some "PLAN-1")]
+  -- With a class, the plan must be a stock plan that includes it.
+  applyRecordsFails env "Equity compensation stock plan not found: SH-A" [ecRecord (g with stock_plan_id = Some "SH-A"; stock_class_id = Some "CLS-A")]
+
+-- References are checked after the batch's last operation, so a grant may come before the
+-- definitions it names.
+test_ec_issuance_references_in_same_batch : Script ()
+test_ec_issuance_references_in_same_batch = do
+  env <- setupEnv
+  let g = (option "EC-B" "SH-NEW" 100.0) with
+        stock_class_id = Some "CLS-B"
+        stock_plan_id = Some "PLAN-B"
+        vesting_terms_id = Some "VT-B"
+  _ <- applyRecords env
+    [ ecRecord g
+    , OcfRecordDataStakeholder (stakeholderData "SH-NEW")
+    , OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])
+    , termsRecord (termsWith "VT-B" "start" OcfVestingStartTrigger)
+    ]
+  expectRecord env (ecRecord g)
+
+test_ec_issuance_plan_must_include_class : Script ()
+test_ec_issuance_plan_must_include_class = do
+  env <- ecBookWith [OcfRecordDataStockClass (stockClass "CLS-B"), OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])]
+  let g = (option "EC-P" "SH-A" 100.0) with stock_class_id = Some "CLS-A"
+  applyRecordsFails env "Equity compensation stock plan PLAN-B does not include stock class CLS-A"
+    [ecRecord (g with stock_plan_id = Some "PLAN-B")]
+  -- Also against a plan written later in the same batch.
+  applyRecordsFails env "Equity compensation stock plan PLAN-C does not include stock class CLS-A"
+    [ecRecord (g with stock_plan_id = Some "PLAN-C"), OcfRecordDataStockPlan (stockPlan "PLAN-C" ["CLS-B"])]
+  _ <- applyRecords env [OcfRecordDataStockPlan (stockPlan "PLAN-AB" ["CLS-A", "CLS-B"])]
+  accept env valid ecRecord (g with stock_plan_id = Some "PLAN-AB")
+
+-- A restatement checks the references an edit adds.
+test_ec_issuance_edit_checks_added_references : Script ()
+test_ec_issuance_edit_checks_added_references = do
+  env <- ecBookWith [OcfRecordDataStockClass (stockClass "CLS-B"), OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])]
+  let g = option "EC-ED" "SH-A" 100.0
+  _ <- applyRecords env [ecRecord g]
+  restateOpsFails env "Equity compensation stock plan not found: PLAN_MISSING" [RestateEdit (ecRecord (g with stock_plan_id = Some "PLAN_MISSING"))]
+  restateOpsFails env "Equity compensation stock plan PLAN-B does not include stock class CLS-A"
+    [RestateEdit (ecRecord (g with stock_class_id = Some "CLS-A"; stock_plan_id = Some "PLAN-B"))]
+  restateOpsFails env "Equity compensation stakeholder not found: SH-X" [RestateEdit (ecRecord (g with stakeholder_id = "SH-X"))]
+  restateOpsFails env "Equity compensation vesting terms not found: VT-B" [RestateEdit (ecRecord (g with vesting_terms_id = Some "VT-B"))]
+  -- Once the book holds them, the same edit succeeds.
+  _ <- applyRecords env [termsRecord (termsWith "VT-B" "start" OcfVestingStartTrigger)]
+  let g' = g with stock_class_id = Some "CLS-B"; stock_plan_id = Some "PLAN-B"; vesting_terms_id = Some "VT-B"
+  _ <- restateOps env [RestateEdit (ecRecord g')]
+  expectRecord env (ecRecord g')
+
+-- v35 checks references when a record is written; a definition deleted later is not re-checked
+-- (v34 refused the delete: the SDK refuses it now).
+test_ec_issuance_later_deletes_not_rechecked : Script ()
+test_ec_issuance_later_deletes_not_rechecked = do
+  env <- ecBookWith
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])
+    , termsRecord (termsWith "VT-B" "start" OcfVestingStartTrigger)
+    ]
+  let g = (option "EC-D" "SH-A" 100.0) with
+        stock_class_id = Some "CLS-B"
+        stock_plan_id = Some "PLAN-B"
+        vesting_terms_id = Some "VT-B"
+  _ <- applyRecords env [ecRecord g]
+  _ <- restateOps env [RestateDelete "PLAN-B", RestateDelete "VT-B", RestateDelete "CLS-B"]
+  expectRecord env (ecRecord g)
+  -- An edit that adds no reference does not re-check the ones it keeps.
+  _ <- restateOps env [RestateEdit (ecRecord (g with quantity = 200.0))]
+  expectRecord env (ecRecord (g with quantity = 200.0))
+  -- A new record naming them is refused.
+  applyRecordsFails env "Equity compensation stock class not found: CLS-B" [ecRecord ((option "EC-N" "SH-A" 1.0) with stock_class_id = Some "CLS-B")]
+
+-- =============================================================================
+-- IDS
+-- =============================================================================
+
+test_ec_issuance_ids_unique : Script ()
+test_ec_issuance_ids_unique = do
+  env <- standardBook
+  -- Security IDs are unique across instruments, object IDs across types.
+  applyRecordsFails env "security ID already used: S-A1" [ecRecord (option "S-A1" "SH-A" 1.0)]
+  applyRecordsFails env "ID already used: ISS-S-A1" [ecRecord ((option "EC-U" "SH-A" 1.0) with id = "ISS-S-A1")]
+  applyRecordsFails env "ID already used: SH-B" [ecRecord ((option "EC-U" "SH-A" 1.0) with id = "SH-B")]
+  -- Also within one batch.
+  applyRecordsFails env "security ID already used: EC-U"
+    [ecRecord (option "EC-U" "SH-A" 1.0), ecRecord ((option "EC-U" "SH-B" 2.0) with id = "ECI-EC-U2")]
+  applyRecordsFails env "ID already used: ECI-EC-U"
+    [ecRecord (option "EC-U" "SH-A" 1.0), ecRecord ((option "EC-U2" "SH-B" 2.0) with id = "ECI-EC-U")]
+  -- The derived form is the register's.
+  applyRecordsFails env "derived form" [ecRecord (option (env.ctx.cap_table_id <> ":x") "SH-A" 1.0)]
+  applyRecordsFails env "derived form" [ecRecord ((option "EC-U" "SH-A" 1.0) with id = env.ctx.cap_table_id <> ":y")]
+  -- The two namespaces are distinct: an object ID may equal a security ID.
+  accept env valid ecRecord ((option "SAME" "SH-A" 1.0) with id = "SAME")

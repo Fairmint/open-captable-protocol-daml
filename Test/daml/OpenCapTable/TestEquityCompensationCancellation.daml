@@ -1,0 +1,113 @@
+-- Equity compensation cancellations, ported from v34's TestEquityCompensationCancellation: full and partial cancellations with a balance grant, the validator, and the security and balance references (grants, checked when written).
+module OpenCapTable.TestEquityCompensationCancellation where
+
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
+
+valid : EquityCompensationCancellationOcfData -> Bool
+valid = validateEquityCompensationCancellationOcfData
+
+wrap : EquityCompensationCancellationOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationCancellation
+
+cancellation : Text -> Text -> Decimal -> EquityCompensationCancellationOcfData
+cancellation id sec q = EquityCompensationCancellationOcfData with
+  id
+  date = D.date 2024 D.Mar 15
+  quantity = q
+  reason_text = "Employee termination - unvested options forfeited"
+  security_id = sec
+  comments = []
+  balance_security_id = None
+
+-- | A book with Alice's NSO grant `sec` over `q` shares at 0.10 USD, granted on 2020-01-15.
+grantBook : Text -> Decimal -> Script Env
+grantBook sec q = ecBookWith [ecRecord ((option sec "SH-A" q) with date = D.date 2020 D.Jan 15; exercise_price = Some (usd 0.1))]
+
+-- From production data: the unexercised remainder of a grant cancelled after two exercises.
+test_ec_cancellation_production_remainder : Script ()
+test_ec_cancellation_production_remainder = do
+  let sec = "db5a26d6-3912-4400-87b0-bda74de361af"
+  env <- grantBook sec 250000.0
+  accept env valid wrap EquityCompensationCancellationOcfData with
+    id = "a97d8f4a-0100-41ed-b4bf-91dcccfadbf0"
+    date = D.date 2021 D.Dec 1
+    security_id = sec
+    quantity = 214200.0
+    reason_text = "Cancel all unexercised options after two exercises."
+    balance_security_id = None
+    comments = ["Original grant 250,000; exercised 35,800; remaining 214,200 cancelled."]
+
+test_ec_cancellation_whole_grant : Script ()
+test_ec_cancellation_whole_grant = do
+  env <- grantBook "SEC-EC-002" 100000.0
+  accept env valid wrap (cancellation "TX_EC_CANCEL_2" "SEC-EC-002" 100000.0)
+  -- The grant record stays: a cancellation is a record, not a state change.
+  expectRecord env (ecRecord ((option "SEC-EC-002" "SH-A" 100000.0) with date = D.date 2020 D.Jan 15; exercise_price = Some (usd 0.1)))
+
+test_ec_cancellation_partial_with_balance : Script ()
+test_ec_cancellation_partial_with_balance = do
+  env <- grantBook "SEC-EC-PARTIAL" 500000.0
+  let bal = (option "SEC-EC-PARTIAL-BAL" "SH-A" 350000.0) with id = "TX_EC_ISS_PARTIAL_BALANCE"; date = D.date 2024 D.Jun 30
+      c = (cancellation "TX_EC_CANCEL_PARTIAL" "SEC-EC-PARTIAL" 150000.0) with
+        date = D.date 2024 D.Jun 30
+        reason_text = "Partial forfeiture due to early departure"
+        balance_security_id = Some "SEC-EC-PARTIAL-BAL"
+        comments = ["Partial cancellation per separation agreement", "Remaining vested options: 350,000"]
+  -- The balance grant is written in the same batch, after the cancellation that names it.
+  _ <- applyRecords env [wrap c, ecRecord bal]
+  expectRecord env (wrap c)
+  expectRecord env (ecRecord bal)
+
+test_ec_cancellation_security_reference : Script ()
+test_ec_cancellation_security_reference = do
+  env <- standardBook
+  applyRecordsFails env "Equity compensation cancellation security not found: EC-MISSING" [wrap (cancellation "CXL-1" "EC-MISSING" 1.0)]
+  -- A stock cancellation is ApplyStockCancellation; this record names a grant.
+  applyRecordsFails env "Equity compensation cancellation security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [wrap (cancellation "CXL-1" "S-A1" 1.0)]
+  expectNoRecord env "CXL-1"
+
+test_ec_cancellation_balance_reference : Script ()
+test_ec_cancellation_balance_reference = do
+  env <- standardBook
+  _ <- applyRecords env [ecRecord (option "EC-1" "SH-A" 100.0)]
+  let c = (cancellation "CXL-1" "EC-1" 40.0) with balance_security_id = Some "EC-1-BAL"
+  applyRecordsFails env "Equity compensation cancellation balance security not found: EC-1-BAL" [wrap c]
+  -- The balance is a grant too.
+  applyRecordsFails env "Equity compensation cancellation balance security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [wrap (c with balance_security_id = Some "S-A1")]
+  _ <- applyRecords env [ecRecord (option "EC-1-BAL" "SH-A" 60.0), wrap c]
+  expectRecord env (wrap c)
+
+test_ec_cancellation_validation : Script ()
+test_ec_cancellation_validation = do
+  env <- grantBook "EC-1" 100.0
+  let c = cancellation "CXL-V" "EC-1" 10.0
+  refuseWith env "an empty ID cannot be claimed" valid wrap (c with id = "")
+  refuse env valid wrap (c with security_id = "")
+  refuse env valid wrap (c with quantity = 0.0)
+  refuse env valid wrap (c with quantity = -5.0)
+  refuse env valid wrap (c with reason_text = "")
+  refuse env valid wrap (c with comments = [""])
+  refuse env valid wrap (c with balance_security_id = Some "")
+
+test_ec_cancellation_restate : Script ()
+test_ec_cancellation_restate = do
+  env <- grantBook "EC-1" 100.0
+  let c = cancellation "CXL-1" "EC-1" 10.0
+  _ <- applyRecords env [wrap c]
+  restateOpsFails env "changes nothing" [RestateEdit (wrap c)]
+  -- An edit that adds a balance checks it.
+  restateOpsFails env "Equity compensation cancellation balance security not found: EC-1-BAL"
+    [RestateEdit (wrap (c with balance_security_id = Some "EC-1-BAL"))]
+  let c' = c with quantity = 12.0; reason_text = "Corrected quantity"
+  _ <- restateOps env [RestateEdit (wrap c')]
+  expectRecord env (wrap c')
+  _ <- restateOps env [RestateDelete "CXL-1"]
+  expectNoRecord env "CXL-1"

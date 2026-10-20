@@ -1,0 +1,126 @@
+-- Warrant exercises through CapTable_Apply and CapTable_Restate: an exercise of the whole warrant (OCF gives it no quantity) under one of the warrant's own triggers into stock issued in the same batch, its references, the exercise validator and the shared edit and delete rules.
+module OpenCapTable.TestWarrantExercise where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..), validateWarrantExerciseOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+exerciseDate : Date
+exerciseDate = D.date 2025 D.Jun 15
+
+warrantExercise : Text -> Text -> [Text] -> WarrantExerciseOcfData
+warrantExercise id sec resulting = WarrantExerciseOcfData with
+  id
+  date = exerciseDate
+  security_id = sec
+  trigger_id = warrantTriggerId
+  comments = []
+  resulting_security_ids = resulting
+  consideration_text = None
+
+we : WarrantExerciseOcfData -> OcfRecordData
+we = OcfRecordDataWarrantExercise
+
+-- | A CLS-A stock issuance for SH-A on the exercise date.
+stockOut : Text -> Decimal -> StockIssuanceOcfData
+stockOut sec q = issuance sec "SH-A" "CLS-A" q exerciseDate
+
+test_warrant_exercise_basic : Script ()
+test_warrant_exercise_basic = do
+  env <- instrumentBook
+  let x = (warrantExercise "TX_WARRANT_EXERCISE_1" "W-1" ["SSEC-FROM-WARRANT-001"]) with
+        consideration_text = Some "Exercise of 100 warrants at $1.00 per warrant"
+      s = stockOut "SSEC-FROM-WARRANT-001" 100.0
+  _ <- applyRecords env [OcfRecordDataStockIssuance s, we x]
+  expectRecord env (we x)
+  expectRecord env (OcfRecordDataStockIssuance s)
+  viewSecurityIds env "TX_WARRANT_EXERCISE_1" >>= (=== ["W-1", "SSEC-FROM-WARRANT-001"])
+  -- The resulting stock is a primary issuance with its own state; the warrant never had one.
+  st <- stateOf env "SSEC-FROM-WARRANT-001"
+  st.quantity === 100.0
+  st.stakeholder_id === "SH-A"
+  st.origin_transaction_id === "ISS-SSEC-FROM-WARRANT-001"
+  st.vesting === StockVestingNone
+  hasState env "W-1" >>= (=== False)
+  applyRecordsFails env "ID already used: TX_WARRANT_EXERCISE_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_EXERCISE_1")]
+
+-- OCF's exercise has no quantity: v34's partial exercise becomes an exercise of the whole warrant,
+-- here into two certificates; what the exercise yields is the writer's arithmetic.
+test_warrant_exercise_with_comments_into_two_securities : Script ()
+test_warrant_exercise_with_comments_into_two_securities = do
+  env <- instrumentBook
+  let d = D.date 2025 D.Aug 1
+      x = (warrantExercise "TX_WARRANT_EXERCISE_2" "W-1" ["SSEC-W-2A", "SSEC-W-2B"]) with
+        date = d
+        comments = ["Exercise of warrants issued in Series A financing.", "Split across two certificates."]
+        consideration_text = Some "Cashless exercise pursuant to Section 3.1 of Warrant Agreement"
+      a = issuance "SSEC-W-2A" "SH-A" "CLS-A" 60.0 d
+      b = issuance "SSEC-W-2B" "SH-A" "CLS-A" 40.0 d
+  -- The resulting issuances may come after the exercise in the batch.
+  _ <- applyRecords env [we x, OcfRecordDataStockIssuance a, OcfRecordDataStockIssuance b]
+  expectRecord env (we x)
+  viewSecurityIds env "TX_WARRANT_EXERCISE_2" >>= (=== ["W-1", "SSEC-W-2A", "SSEC-W-2B"])
+  mapA (fmap (.quantity) . stateOf env) ["SSEC-W-2A", "SSEC-W-2B"] >>= (=== [60.0, 40.0])
+
+test_warrant_exercise_minimal_fields : Script ()
+test_warrant_exercise_minimal_fields = do
+  env <- instrumentBook
+  let x = (warrantExercise "TX_WARRANT_EXERCISE_3" "W-1" ["SSEC-FROM-WARRANT-003"]) with date = D.date 2025 D.Sep 30
+  _ <- applyRecords env [we x, OcfRecordDataStockIssuance (issuance "SSEC-FROM-WARRANT-003" "SH-A" "CLS-A" 100.0 x.date)]
+  expectRecord env (we x)
+
+test_warrant_exercise_references : Script ()
+test_warrant_exercise_references = do
+  env <- instrumentBook
+  let x = warrantExercise "WX-1" "W-1" ["S-W1"]
+      s = OcfRecordDataStockIssuance (stockOut "S-W1" 100.0)
+  applyRecordsFails env "Warrant exercise security not found: W-NONE" [s, we x with security_id = "W-NONE"]
+  applyRecordsFails env "Warrant exercise security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [s, we x with security_id = "C-1"]
+  -- The trigger must be one of the exercised warrant's own.
+  applyRecordsFails env "Warrant exercise trigger not found: WR-NONE" [s, we x with trigger_id = "WR-NONE"]
+  applyRecordsFails env ("Warrant exercise trigger not found: " <> convertibleTriggerId) [s, we x with trigger_id = convertibleTriggerId]
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance ((warrantIssuance "WI-3" "W-3" "SH-A") with exercise_triggers = [atWillWarrantTrigger "WR-OTHER"])]
+  applyRecordsFails env "Warrant exercise trigger not found: WR-OTHER" [s, we x with trigger_id = "WR-OTHER"]
+  -- The resulting securities must be stock issuances.
+  applyRecordsFails env "Warrant exercise resulting security security not found: S-W1" [we x]
+  applyRecordsFails env "Warrant exercise resulting security security W-3 is carried by a OcfObjectTypeTxWarrantIssuance"
+    [we x with resulting_security_ids = ["W-3"]]
+  -- The other warrant's trigger serves its own exercise.
+  let x3 = (warrantExercise "WX-3" "W-3" ["S-W3"]) with trigger_id = "WR-OTHER"
+  _ <- applyRecords env [we x3, OcfRecordDataStockIssuance (stockOut "S-W3" 10.0)]
+  expectRecord env (we x3)
+
+test_warrant_exercise_validator : Script ()
+test_warrant_exercise_validator = do
+  env <- instrumentBook
+  let base = warrantExercise "WX-V" "W-1" ["S-W1"]
+      rejects : Text -> Text -> WarrantExerciseOcfData -> Script ()
+      rejects label expected x = do
+        expectInvalid label (validateWarrantExerciseOcfData x)
+        applyRecordsFails env expected [we x]
+  expectValid "base" (validateWarrantExerciseOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "empty trigger_id" "precondition" base with trigger_id = ""
+  rejects "empty consideration" "precondition" base with consideration_text = Some ""
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "no resulting securities" "precondition" base with resulting_security_ids = []
+  rejects "empty resulting security" "precondition" base with resulting_security_ids = ["S-W1", ""]
+
+test_warrant_exercise_edit_and_delete : Script ()
+test_warrant_exercise_edit_and_delete = do
+  env <- instrumentBook
+  let x = warrantExercise "WX-1" "W-1" ["S-W1"]
+  _ <- applyRecords env [we x, OcfRecordDataStockIssuance (stockOut "S-W1" 100.0)]
+  restateOpsFails env "precondition" [RestateEdit (we x with resulting_security_ids = [])]
+  restateOpsFails env "Warrant exercise trigger not found: WR-NONE" [RestateEdit (we x with trigger_id = "WR-NONE")]
+  restateOpsFails env "Warrant exercise resulting security security not found: S-W2" [RestateEdit (we x with resulting_security_ids = ["S-W2"])]
+  checkEditAndDelete env (we x) (we x with consideration_text = Some "Cash exercise"; comments = ["Corrected"])
