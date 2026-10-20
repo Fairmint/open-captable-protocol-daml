@@ -23,7 +23,6 @@ const REQUIRED_RELATIVE_FILES = [
   'Fairmint/OpenCapTable/State/module.js',
   'Fairmint/OpenCapTable/OCF/StockHold/module.js',
   'Fairmint/OpenCapTable/OCF/StockHoldCancellation/module.js',
-  'Fairmint/OpenCapTableApi/ObjectType/module.js',
   'Fairmint/OpenCapTableApi/OcfObject/module.js',
   'Fairmint/OpenCapTableApi/RegisterContract/module.js',
   'Fairmint/OpenCapTableDeliveryProof/DeliveryProof/module.js',

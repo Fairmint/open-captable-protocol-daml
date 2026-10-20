@@ -12,7 +12,7 @@ contracts for Canton. It also publishes generated JavaScript bindings and the bu
 | Package                         | What it holds                                                                                                                                                             |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `OpenCapTable-v35`              | The register: `OcpFactory`, `IssuerAuthorization`, the `CapTable` anchor, one contract per OCF record, and the `StockSecurity`, `StockClassEpoch` and `OcfIdShard` states |
-| `OpenCapTableApi-v01`           | The reader interfaces `OcfObject` and `RegisterContract`, and `OcfObjectType`                                                                                             |
+| `OpenCapTableApi-v01`           | The reader interfaces `OcfObject` and `RegisterContract`, whose views hold only builtin types (OCF `object_type` strings), since an interface package is never upgraded   |
 | `OpenCapTableDeliveryProof-v01` | `DeliveryProof`, which a trade settlement creates and the buyer's acceptance redeems                                                                                      |
 | `Test`                          | Daml Script tests (not released)                                                                                                                                          |
 

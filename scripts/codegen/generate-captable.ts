@@ -6,7 +6,7 @@
  * are hand-written source; only this 51-way dispatch is generated.
  *
  * One naming rule, no overrides: each template `X` in `OCF/X.daml` has the fields `context : Context` and `ocf_data :
- * XOcfData`, and its `OcfObject` instance names its object type (`object_type = OcfObjectType...`).
+ * XOcfData`, and its `OcfObject` instance names its object type (`object_type = ocfObjectTypeValue OcfObjectType...`).
  *
  * The constructors follow `record-order.json`, not the file names: variants stay upgrade-compatible only when
  * constructors are appended, so a new template goes at the end of that list and no entry ever moves or leaves.
@@ -49,9 +49,9 @@ export function parseRecordType(name: string, source: string): RecordType {
   if (!new RegExp(`^validate${dataType}\\s*:`, 'm').test(source)) {
     throw new Error(`OCF/${name}.daml must define validate${dataType}`);
   }
-  const objectType = /object_type\s*=\s*(OcfObjectType\w+)/.exec(source);
+  const objectType = /object_type\s*=\s*ocfObjectTypeValue\s+(OcfObjectType\w+)/.exec(source);
   if (!objectType) {
-    throw new Error(`OCF/${name}.daml must implement OcfObject with object_type = OcfObjectType...`);
+    throw new Error(`OCF/${name}.daml must implement OcfObject with object_type = ocfObjectTypeValue OcfObjectType...`);
   }
   return { name, data_type: dataType, object_type: objectType[1] };
 }
