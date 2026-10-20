@@ -25,7 +25,9 @@ Keep repository guidance synchronized with the code:
   including `npm run check:dar-version-policy` and `npm run verify-dars`.
 - `Fairmint/OpenCapTable/OcfRecords.daml` is generated and gitignored; `CapTable.daml` (the anchor)
   is hand-written. Change `scripts/codegen/generate-captable.ts` or its template instead, then
-  regenerate through the repository scripts (`npm run generate-captable` / `npm run build`).
+  regenerate through the repository scripts (`npm run generate-captable` / `npm run build`). Its
+  constructors follow `scripts/codegen/record-order.json`: append a new OCF template at its end and
+  never reorder or remove an entry, or the generated variants stop being upgrade-compatible.
 - Builds run from `generated/build/` via `canton-dev-tools prepare-build`. Keep source
   `Test/daml.yaml` sibling-relative paths; prepare-build rewrites them for the generated tree.
 - `npm run codegen` uses CDT `codegen-js` → `bundle-dependencies` → `create-root-index` →

@@ -8,6 +8,9 @@
  * One naming rule, no overrides: each template `X` in `OCF/X.daml` has the fields `context : Context` and `ocf_data :
  * XOcfData`, and its `OcfObject` instance names its object type (`object_type = OcfObjectType...`).
  *
+ * The constructors follow `record-order.json`, not the file names: variants stay upgrade-compatible only when
+ * constructors are appended, so a new template goes at the end of that list and no entry ever moves or leaves.
+ *
  * Usage: tsx scripts/codegen/generate-captable.ts
  */
 
@@ -22,6 +25,7 @@ const PACKAGE_DIR = requirePackageConfig('ocp').sourceDir;
 const OCF_DIR = path.join(ROOT, PACKAGE_DIR, 'daml/Fairmint/OpenCapTable/OCF');
 const TEMPLATE_PATH = path.join(__dirname, 'templates/OcfRecords.daml.template');
 const OUTPUT_PATH = path.join(ROOT, PACKAGE_DIR, 'daml/Fairmint/OpenCapTable/OcfRecords.daml');
+const ORDER_PATH = path.join(__dirname, 'record-order.json');
 
 export interface RecordType {
   name: string;
@@ -52,13 +56,37 @@ export function parseRecordType(name: string, source: string): RecordType {
   return { name, data_type: dataType, object_type: objectType[1] };
 }
 
-export function discoverRecordTypes(ocfDir: string = OCF_DIR): RecordType[] {
-  return fs
+/** The template names in constructor order: every OCF module, each exactly once, in the committed order. */
+export function orderRecordTypes(files: string[], order: string[]): string[] {
+  const present = new Set(files);
+  const duplicate = order.find((name, i) => order.indexOf(name) !== i);
+  if (duplicate) throw new Error(`record-order.json lists ${duplicate} twice`);
+  const missing = order.filter((name) => !present.has(name));
+  if (missing.length > 0) {
+    throw new Error(
+      `record-order.json lists ${missing.join(', ')} with no OCF/<name>.daml; a constructor never leaves a released variant`
+    );
+  }
+  const listed = new Set(order);
+  const unlisted = files.filter((name) => !listed.has(name)).sort((a, b) => a.localeCompare(b));
+  if (unlisted.length > 0) {
+    throw new Error(
+      `OCF/${unlisted.join('.daml, OCF/')}.daml ${unlisted.length === 1 ? 'is' : 'are'} not in record-order.json; ` +
+        'append new templates at the end, so the generated variants stay upgrade-compatible'
+    );
+  }
+  return order;
+}
+
+export function discoverRecordTypes(ocfDir: string = OCF_DIR, orderPath: string = ORDER_PATH): RecordType[] {
+  const files = fs
     .readdirSync(ocfDir)
     .filter((file) => file.endsWith('.daml'))
-    .map((file) => file.replace(/\.daml$/, ''))
-    .sort((a, b) => a.localeCompare(b))
-    .map((name) => parseRecordType(name, fs.readFileSync(path.join(ocfDir, `${name}.daml`), 'utf8')));
+    .map((file) => file.replace(/\.daml$/, ''));
+  const { order } = JSON.parse(fs.readFileSync(orderPath, 'utf8')) as { order: string[] };
+  return orderRecordTypes(files, order).map((name) =>
+    parseRecordType(name, fs.readFileSync(path.join(ocfDir, `${name}.daml`), 'utf8'))
+  );
 }
 
 export function render(types: RecordType[]): string {
