@@ -14,16 +14,18 @@ import qualified DA.Map as Map
 import qualified DA.Set as Set
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.Book
-import Fairmint.OpenCapTable.Events (checkRequirements)
+import Fairmint.OpenCapTable.Events (checkRequirementIn, checkRequirements)
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.References
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Core (Context)
 
--- | A stock state as a restatement sets it. `seq` is given only to recreate the state of a
--- security whose consuming record the restatement deletes; it must exceed every seq the security
--- has used, which only the SDK can check, against the replayed OCF.
+-- | A stock state as a restatement sets it, in the units of the splits on or before its last event
+-- date. `accelerated_since_snapshot` is stated like the snapshot it adds to: the shares of a lot on
+-- vesting terms accelerated since it, which bound later accelerations. `seq` is given only to
+-- recreate the state of a security whose consuming record the restatement deletes; it must exceed
+-- every seq the security has used, which only the SDK can check, against the replayed OCF.
 data StateRestatement = StateRestatement
   with
     security_id : Text
@@ -35,6 +37,7 @@ data StateRestatement = StateRestatement
     stock_class_id : Text
     vesting : StockVesting
     snapshot : Optional VestedSnapshot
+    accelerated_since_snapshot : Optional Decimal
     seq : Optional Int
   deriving (Eq, Show)
 
@@ -73,6 +76,8 @@ data Pending
 
 data Progress = Progress
   with
+    -- the book as loaded, before the first operation
+    loaded : Book
     book : Book
     -- object IDs edited or deleted so far: each at most once
     touched : Set.Set Text
@@ -84,7 +89,7 @@ restate : Context -> BookInputs -> [RestateOperation] -> Update RestateResult
 restate ctx inputs operations = do
   when (null operations) (abort "CapTable_Restate needs at least one operation")
   b0 <- loadBook ctx inputs
-  p <- foldlA restateOne (Progress with book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
+  p <- foldlA restateOne (Progress with loaded = b0; book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
   book <- foldlA (resolvePending p) p.book p.pending
   checkRequirements book
   (b1, result) <- flushBook book
@@ -129,13 +134,13 @@ restateOne p op = case op of
     unless (consumedSecurities d == consumedSecurities old.ocf_data)
       (abort ("an edit cannot change the securities record " <> objectId <> " consumed; delete it and write a new one"))
     -- A vesting record on a grant or a warrant, which has no state, may move between two of them;
-    -- a record on a stock lot changed that lot's state and stays on it.
+    -- a record on a stock lot changed that lot's state and stays on it. Where it was is a fact about
+    -- the book as loaded, so a grant the restatement also renames or deletes may be its source.
     moved <- case (subjectSecurity old.ocf_data, subjectSecurity d) of
       (from, to) | from == to -> pure []
-      (Some from, Some to) | isVestingRecord d -> pure
-        [ RequireSecurity with label = "Moved vesting record " <> objectId <> " (from)"; security_id = from; object_types = statelessVestingTargets
-        , RequireSecurity with label = "Moved vesting record " <> objectId; security_id = to; object_types = statelessVestingTargets
-        ]
+      (Some from, Some to) | isVestingRecord d -> do
+        checkRequirementIn p.loaded (RequireSecurity with label = "Moved vesting record " <> objectId <> " (from)"; security_id = from; object_types = statelessVestingTargets)
+        pure [RequireSecurity with label = "Moved vesting record " <> objectId; security_id = to; object_types = statelessVestingTargets]
       _ -> abort ("an edit cannot change the security record " <> objectId <> " is on; delete it and write a new one")
     let oldSec = issuanceSecurityId old.ocf_data
         newSec = issuanceSecurityId d
@@ -208,7 +213,7 @@ restateOne p op = case op of
           holds = []
           delivery = None
           snapshot = r.snapshot
-          accelerated_since_snapshot = None
+          accelerated_since_snapshot = r.accelerated_since_snapshot
           derived_ids = True
     case (lookupState r.security_id b, r.seq) of
       (Some old, None) -> do
@@ -227,9 +232,7 @@ restateOne p op = case op of
             (abort ("security " <> r.security_id <> " carries an open hold, so a restatement keeps its stakeholder, class and last event date"))
           unless (splitEpoch == old.split_epoch)
             (abort ("security " <> r.security_id <> " carries an open hold, so a restatement keeps its split epoch"))
-        -- Accelerations since the snapshot still bound the lot while the snapshot stands.
-        let accelerated = if isOnTerms r.vesting && r.snapshot == old.snapshot then old.accelerated_since_snapshot else None
-        b' <- replaceState (base with seq = old.seq + 1; holds = old.holds; accelerated_since_snapshot = accelerated; derived_ids = old.derived_ids) b
+        b' <- replaceState (base with seq = old.seq + 1; holds = old.holds; derived_ids = old.derived_ids) b
         pure p with book = b'
       (Some _, Some _) -> abort ("security " <> r.security_id <> " has an active state; replace it without a seq")
       (None, Some n) -> do

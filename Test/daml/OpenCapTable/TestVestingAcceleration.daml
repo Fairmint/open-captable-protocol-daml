@@ -1,4 +1,4 @@
--- Vesting accelerations, ported from v34's TestVestingAcceleration: accelerations of option grants and warrants, the validator, the security reference, and accelerations on stock (explicit tranches moved forward, vesting terms bounded by the TA's snapshot, fully vested lots refused, no backdating), restatement and IDs.
+-- Vesting accelerations, ported from v34's TestVestingAcceleration: accelerations of option grants and warrants, the validator, the security reference, and accelerations on stock (explicit tranches moved forward, vesting terms bounded by the TA's snapshot, fully vested lots refused, no backdating), restatement (moves between grants, the stated acceleration count) and IDs.
 module OpenCapTable.TestVestingAcceleration where
 
 import DA.Assert ((===))
@@ -17,6 +17,8 @@ import Fairmint.OpenCapTable.OCF.VestingAcceleration
 import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
 import OpenCapTable.EquityFixtures
 import OpenCapTable.Harness
+import OpenCapTable.StockHelpers (recordSplit)
+import OpenCapTable.TestRestate (restatementOf)
 
 valid : VestingAccelerationOcfData -> Bool
 valid = validateVestingAccelerationOcfData
@@ -333,3 +335,78 @@ test_vesting_acceleration_on_terms_never_double_counts = do
   v' <- stateOf env "S-V"
   (vestedAt v' day, v'.accelerated_since_snapshot) === (75.0, None)
 
+-- Where a moved vesting record was is checked against the book as loaded, so one restatement may
+-- correct a grant's security ID and move its acceleration with it, in either order, or move the
+-- acceleration off a grant it deletes.
+test_vesting_acceleration_restate_follows_grant : Script ()
+test_vesting_acceleration_restate_follows_grant = do
+  env <- ecBookWith [ecRecord (option "EC-1" "SH-A" 100.0), ecRecord (option "EC-2" "SH-A" 100.0)]
+  let a = acceleration "ACC-1" "EC-1" 10.0
+  _ <- applyRecords env [accelerationRecord a]
+  _ <- restateOps env
+    [ RestateEdit (ecRecord ((option "EC-1" "SH-A" 100.0) with security_id = "EC-1B"))
+    , RestateEdit (accelerationRecord (a with security_id = "EC-1B"))
+    ]
+  expectRecord env (accelerationRecord (a with security_id = "EC-1B"))
+  _ <- restateOps env [RestateEdit (accelerationRecord a), RestateEdit (ecRecord (option "EC-1" "SH-A" 100.0))]
+  expectRecord env (accelerationRecord a)
+  _ <- restateOps env [RestateEdit (accelerationRecord (a with security_id = "EC-2")), RestateDelete "ECI-EC-1"]
+  expectRecord env (accelerationRecord (a with security_id = "EC-2"))
+  expectNoRecord env "ECI-EC-1"
+
+-- A restatement states the shares accelerated since the snapshot, as it states the snapshot, so a
+-- deleted or corrected acceleration stops bounding later ones, and a count that does not fit the
+-- lot is refused.
+test_vesting_acceleration_restate_states_count : Script ()
+test_vesting_acceleration_restate_states_count = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    ]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2024 D.Jun 1; vested = 20.0]
+  _ <- applyRecords env [accelerationRecord (acceleration "ACC-1" "S-V" 60.0)]
+  s <- stateOf env "S-V"
+  s.accelerated_since_snapshot === Some 60.0
+  -- The lot is cut to 50 shares and the acceleration goes: 20 vested fits only without the 60.
+  restateOpsFails env "precondition" [RestateDelete "ACC-1", RestateSetState ((restatementOf s) with quantity = 50.0)]
+  _ <- restateOps env [RestateDelete "ACC-1", RestateSetState ((restatementOf s) with quantity = 50.0; accelerated_since_snapshot = None)]
+  let feb = D.date 2025 D.Feb 1
+      mar = D.date 2025 D.Mar 1
+      acc2 = (acceleration "ACC-2" "S-V" 30.0) with date = feb
+  _ <- applyRecords env [accelerationRecord acc2]
+  -- A corrected acceleration restates the count with it.
+  s <- stateOf env "S-V"
+  _ <- restateOps env
+    [ RestateEdit (accelerationRecord (acc2 with quantity = 25.0))
+    , RestateSetState ((restatementOf s) with accelerated_since_snapshot = Some 25.0)
+    ]
+  applyRecordsFails env "exceeds its unvested quantity 5.0" [accelerationRecord ((acceleration "ACC-3" "S-V" 6.0) with date = mar)]
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-3" "S-V" 5.0) with date = mar)]
+  -- Only a lot on vesting terms counts accelerations.
+  s <- stateOf env "S-V"
+  restateOpsFails env "precondition" [RestateSetState ((restatementOf s) with vesting = StockVestingNone; snapshot = None)]
+  _ <- restateOps env [RestateSetState ((restatementOf s) with vesting = StockVestingNone; snapshot = None; accelerated_since_snapshot = None)]
+  pure ()
+
+-- A state restated past a split states its count in the split's units, as an event past the split
+-- would have scaled it.
+test_vesting_acceleration_restate_across_split : Script ()
+test_vesting_acceleration_restate_across_split = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    ]
+  _ <- applyRecords env [accelerationRecord (acceleration "ACC-1" "S-V" 90.0)]
+  recordSplit env "SPLIT-1" "CLS-A" 1.0 10.0 (D.date 2025 D.Feb 1)
+  s <- stateOf env "S-V"
+  let later = (restatementOf s) with last_event_date = D.date 2025 D.Mar 1; quantity = 10.0
+  restateOpsFails env "precondition" [RestateSetState later]
+  _ <- restateOps env [RestateSetState (later with accelerated_since_snapshot = Some 9.0)]
+  s <- stateOf env "S-V"
+  (s.split_epoch, s.quantity, s.accelerated_since_snapshot) === (1, 10.0, Some 9.0)
+  let day = D.date 2025 D.Mar 2
+  applyRecordsFails env "exceeds its unvested quantity 1.0" [accelerationRecord ((acceleration "ACC-2" "S-V" 2.0) with date = day)]
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V" 1.0) with date = day)]
+  pure ()
