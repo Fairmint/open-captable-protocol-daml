@@ -1,6 +1,14 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { checkDateTypes, parseDataBody, pascalCase, resolveSchemaUrl, scanDamlSource } from './check-schema-gaps';
+import {
+  checkDateTypes,
+  checkExtensionSamples,
+  localizeSchemaUrls,
+  parseDataBody,
+  pascalCase,
+  resolveSchemaUrl,
+  scanDamlSource,
+} from './check-schema-gaps';
 
 const OCF = 'https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/6d8c932/schema';
 
@@ -80,4 +88,36 @@ void test('forbids Time and nested optional dates outside comments and module na
   assert.equal(checkDateTypes('    date : Time\n').length, 1);
   assert.equal(checkDateTypes('    vested : Optional Time -- no\n').length, 1);
   assert.equal(checkDateTypes('    expiry : Optional (Optional Date)\n').length, 1);
+});
+
+void test('a hold record validates only once its Object primitive takes the amended ObjectType enum', () => {
+  const ext = 'https://raw.githubusercontent.com/Fairmint/open-captable-protocol-daml/main/ocf-extension/schema';
+  const enumSchema = (id: string, values: string[]) => ({ $id: id, type: 'string', enum: values });
+  const objectSchema = (id: string, enumUrl: string) => ({
+    $id: id,
+    type: 'object',
+    properties: { object_type: { $ref: enumUrl } },
+    required: ['object_type'],
+  });
+  const holdSchema = (objectUrl: string) => ({
+    $id: `${ext}/objects/Hold.schema.json`,
+    allOf: [{ $ref: objectUrl }],
+    properties: { object_type: { const: 'TX_STOCK_HOLD' } },
+  });
+  const shared = [
+    enumSchema(`${OCF}/enums/ObjectType.schema.json`, ['ISSUER']),
+    enumSchema(`${ext}/enums/ObjectType.schema.json`, ['ISSUER', 'TX_STOCK_HOLD']),
+    objectSchema(`${OCF}/primitives/objects/Object.schema.json`, `${OCF}/enums/ObjectType.schema.json`),
+    objectSchema(`${ext}/primitives/objects/Object.schema.json`, `${ext}/enums/ObjectType.schema.json`),
+  ];
+  const samples = [
+    { schema: 'objects/Hold.schema.json', label: 'a hold', valid: true, record: { object_type: 'TX_STOCK_HOLD' } },
+  ];
+  const withObject = (objectUrl: string) => [...shared, holdSchema(objectUrl)].map(localizeSchemaUrls);
+
+  assert.match(
+    checkExtensionSamples(withObject(`${OCF}/primitives/objects/Object.schema.json`), samples).join('\n'),
+    /a hold is rejected/
+  );
+  assert.deepEqual(checkExtensionSamples(withObject(`${ext}/primitives/objects/Object.schema.json`), samples), []);
 });

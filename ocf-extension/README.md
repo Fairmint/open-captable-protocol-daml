@@ -13,6 +13,7 @@ and `TX_STOCK_HOLD_CANCELLATION`, following OCF's primitive pattern (as `Cancell
 | `schema/objects/transactions/hold/StockHold.schema.json`                   | `TX_STOCK_HOLD`: `quantity` required for `REGISTER_SETTLEMENT` and absent for `STOP_TRANSFER` |
 | `schema/objects/transactions/hold/StockHoldCancellation.schema.json`       | `TX_STOCK_HOLD_CANCELLATION`                                                                  |
 | `schema/enums/ObjectType.schema.json`                                      | OCF's `ObjectType`, amended with the two values                                               |
+| `schema/primitives/objects/Object.schema.json`                             | OCF's `Object` primitive, whose `object_type` takes the amended enum; both objects extend it  |
 | `schema/files/TransactionsFile.schema.json`                                | OCF's `TransactionsFile`, whose items also take the two objects                               |
 
 Reading rules: a hold is open until a `TX_STOCK_HOLD_CANCELLATION` names it or its security is

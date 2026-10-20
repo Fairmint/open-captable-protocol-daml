@@ -13,13 +13,15 @@
  * type name plus each OCF value in PascalCase, in OCF order (enums), and that every OCF Date property is a DAML `Date`,
  * `Optional Date` or `[Date]`. It also requires an annotation on every `*OcfData` type in `OCF/`, forbids `Time` and
  * nested optional dates in the OCF and Types modules, and checks the extension against its registry below: exactly the
- * declared types carry extension annotations, and the amended ObjectType enum and TransactionsFile are upstream plus
- * exactly the declared additions.
+ * declared types carry extension annotations, the amended ObjectType enum and TransactionsFile are upstream plus
+ * exactly the declared additions, the amended Object primitive is upstream's with that enum, and sample hold records
+ * validate against the complete schemas, OCF's included.
  *
  * Usage: npx tsx scripts/schema-gap-checker/check-schema-gaps.ts [--package OpenCapTable-v35] [--api-package
  * OpenCapTableApi-v01] [--ocf-schema-dir /path/to/schema] [--extension-schema-dir /path/to/ocf-extension/schema]
  */
 
+import Ajv, { type AnySchema } from 'ajv';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -502,6 +504,183 @@ function checkAmendedFiles(roots: SchemaRoots): string[] {
   return problems;
 }
 
+/** The extension's Object primitive must be OCF's, with `object_type` taking the amended ObjectType enum. */
+function checkObjectPrimitive(roots: SchemaRoots): string[] {
+  const upstream = readSchema(path.join(roots.ocf, 'primitives', 'objects', 'Object.schema.json'));
+  const amended = readSchema(path.join(roots.extension, 'primitives', 'objects', 'Object.schema.json'));
+  const props = (schema: Record<string, unknown>): Record<string, unknown> =>
+    isRecord(schema.properties) ? schema.properties : {};
+  const objectTypeRef = (schema: Record<string, unknown>): string => {
+    const objectType = props(schema).object_type;
+    const resolved =
+      isRecord(objectType) && typeof objectType.$ref === 'string' ? resolveSchemaUrl(objectType.$ref) : null;
+    return resolved ? `${resolved.root}:${resolved.relativePath}` : '?';
+  };
+  const withoutObjectTypeRef = (schema: Record<string, unknown>): string => {
+    const { object_type: objectType, ...rest } = props(schema);
+    const { $ref: _ref, ...objectTypeRest } = isRecord(objectType) ? objectType : {};
+    return JSON.stringify({ properties: { ...rest, object_type: objectTypeRest }, required: schema.required });
+  };
+  const problems: string[] = [];
+  if (objectTypeRef(amended) !== 'extension:enums/ObjectType.schema.json') {
+    problems.push(
+      "primitives/objects/Object.schema.json's object_type must take the amended enums/ObjectType.schema.json"
+    );
+  }
+  if (withoutObjectTypeRef(amended) !== withoutObjectTypeRef(upstream)) {
+    problems.push(
+      "primitives/objects/Object.schema.json must match OCF's Object primitive except for object_type's enum"
+    );
+  }
+  return problems;
+}
+
+// ---------------------------------------------------------------------------
+// Extension records against the complete schemas
+// ---------------------------------------------------------------------------
+
+export interface ExtensionSample {
+  /** Extension schema, relative to its root. */
+  schema: string;
+  label: string;
+  valid: boolean;
+  record: unknown;
+}
+
+const SAMPLE_DATE = '2026-01-15';
+const settlementHold = {
+  object_type: 'TX_STOCK_HOLD',
+  id: 'hold-1',
+  date: SAMPLE_DATE,
+  security_id: 'S-1',
+  hold_type: 'REGISTER_SETTLEMENT',
+  reference: 'T-1',
+  reason_text: 'Settlement of trade T-1',
+  quantity: '100',
+};
+const stopHold = {
+  object_type: 'TX_STOCK_HOLD',
+  id: 'hold-2',
+  date: SAMPLE_DATE,
+  security_id: 'S-1',
+  hold_type: 'STOP_TRANSFER',
+  reference: 'CASE-1',
+  reason_text: 'Court order',
+};
+const holdCancellation = {
+  object_type: 'TX_STOCK_HOLD_CANCELLATION',
+  id: 'hold-1-cancel',
+  date: SAMPLE_DATE,
+  security_id: 'S-1',
+  hold_id: 'hold-1',
+  reason_text: 'Trade released',
+};
+
+/** Records the extension schemas must accept, and must reject, with every `$ref` resolved. */
+export const EXTENSION_SAMPLES: ExtensionSample[] = [
+  {
+    schema: 'objects/transactions/hold/StockHold.schema.json',
+    label: 'a settlement hold',
+    valid: true,
+    record: settlementHold,
+  },
+  { schema: 'objects/transactions/hold/StockHold.schema.json', label: 'a stop', valid: true, record: stopHold },
+  {
+    schema: 'objects/transactions/hold/StockHold.schema.json',
+    label: 'a settlement hold without a quantity',
+    valid: false,
+    record: { ...settlementHold, quantity: undefined },
+  },
+  {
+    schema: 'objects/transactions/hold/StockHold.schema.json',
+    label: 'a stop with a quantity',
+    valid: false,
+    record: { ...stopHold, quantity: '1' },
+  },
+  {
+    schema: 'objects/transactions/hold/StockHoldCancellation.schema.json',
+    label: 'a hold cancellation',
+    valid: true,
+    record: holdCancellation,
+  },
+  {
+    schema: 'objects/transactions/hold/StockHoldCancellation.schema.json',
+    label: 'a hold under the cancellation type',
+    valid: false,
+    record: { ...settlementHold, object_type: 'TX_STOCK_HOLD_CANCELLATION' },
+  },
+  {
+    schema: 'files/TransactionsFile.schema.json',
+    label: 'an extended transactions file with the hold pair',
+    valid: true,
+    record: { file_type: 'OCF_TRANSACTIONS_FILE', items: [settlementHold, stopHold, holdCancellation] },
+  },
+];
+
+const LOCAL_SCHEMA_BASE = 'https://schemas.invalid/';
+
+/**
+ * Rewrites every `$id` and `$ref` URL to `<base><root>/<path>`, so the pinned URLs the extension uses and the `main`
+ * URLs OCF's own schemas use name the same schema, and drops `$schema`.
+ */
+export function localizeSchemaUrls(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(localizeSchemaUrls);
+  if (!isRecord(value)) return value;
+  const out: Record<string, unknown> = {};
+  for (const [key, entry] of Object.entries(value)) {
+    if (key === '$schema') continue;
+    const resolved = (key === '$id' || key === '$ref') && typeof entry === 'string' ? resolveSchemaUrl(entry) : null;
+    out[key] = resolved ? `${LOCAL_SCHEMA_BASE}${resolved.root}/${resolved.relativePath}` : localizeSchemaUrls(entry);
+  }
+  return out;
+}
+
+/** Validates each sample against its extension schema; `schemas` are already localized. */
+export function checkExtensionSamples(schemas: unknown[], samples: ExtensionSample[]): string[] {
+  const ajv = new Ajv({ strict: false, allErrors: true, validateFormats: false });
+  for (const schema of schemas) ajv.addSchema(schema as AnySchema);
+  const problems: string[] = [];
+  for (const sample of samples) {
+    const id = `${LOCAL_SCHEMA_BASE}extension/${sample.schema}`;
+    let valid: boolean;
+    let errors = '';
+    try {
+      const validate = ajv.getSchema(id);
+      if (!validate) {
+        problems.push(`${sample.schema}: no such schema`);
+        continue;
+      }
+      valid = validate(JSON.parse(JSON.stringify(sample.record))) as boolean;
+      errors = valid ? '' : ajv.errorsText(validate.errors?.slice(0, 3));
+    } catch (error) {
+      problems.push(`${sample.schema}: ${error instanceof Error ? error.message : String(error)}`);
+      continue;
+    }
+    if (valid !== sample.valid) {
+      problems.push(
+        `${sample.schema}: ${sample.label} is ${valid ? 'accepted but must be rejected' : `rejected (${errors})`}`
+      );
+    }
+  }
+  return problems;
+}
+
+function schemaFiles(dir: string): string[] {
+  return fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+    const full = path.join(dir, entry.name);
+    if (entry.isDirectory()) return schemaFiles(full);
+    return entry.name.endsWith('.schema.json') ? [full] : [];
+  });
+}
+
+/** The extension's records validate against its complete schemas, OCF's included. */
+function checkExtensionRecords(roots: SchemaRoots): string[] {
+  const schemas = [...schemaFiles(roots.ocf), ...schemaFiles(roots.extension)].map((file) =>
+    localizeSchemaUrls(readSchema(file))
+  );
+  return checkExtensionSamples(schemas, EXTENSION_SAMPLES);
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -605,7 +784,13 @@ function main(): void {
       });
     }
   }
-  for (const message of checkAmendedFiles(roots)) problems.push({ typeName: 'ocf-extension', message });
+  for (const message of [
+    ...checkAmendedFiles(roots),
+    ...checkObjectPrimitive(roots),
+    ...checkExtensionRecords(roots),
+  ]) {
+    problems.push({ typeName: 'ocf-extension', message });
+  }
 
   const annotated = allTypes
     .filter((t) => t.annotations.length > 0)
