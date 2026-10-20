@@ -12,9 +12,10 @@ import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
 -- and apiv2 scale split quantities, tranches and snapshots and divide a balance's cost basis with
 -- it, so it never overstates a quantity, and shared test vectors pin it.
 --
--- It works in units of 10^-10 held as `Numeric 0` integers, where x·a/b = X·A/B units, and splits
--- X = qX·B + rX so that no intermediate exceeds rX·A < B·A. It aborts, failing closed, when
--- x < 0, a < 0 or b <= 0, or when that product needs more than 38 digits (a · b >= 10^18 in value).
+-- It works in units of 10^-10 held as `Numeric 0` integers, where x·a/b = X·A/B units. It splits
+-- X = qX·B + rX and computes ⌊rX·A/B⌋ by long multiplication over base-10^9 digits of A, so every
+-- intermediate stays below 2·B·10^9. It is exact for any b below 5·10^18 in value, and aborts,
+-- failing closed, when x < 0, a < 0 or b <= 0, or when the result itself exceeds a Decimal.
 floorMulDiv : Decimal -> Decimal -> Decimal -> Decimal
 floorMulDiv x a b
   | x < 0.0 || a < 0.0 = error "floorMulDiv: negative operand"
@@ -25,7 +26,7 @@ floorMulDiv x a b
           bUnits = toUnits b
           qx = floorDivUnits xUnits bUnits
           rx = xUnits - qx * bUnits
-      in fromUnits (qx * aUnits + floorDivUnits (rx * aUnits) bUnits)
+      in fromUnits (qx * aUnits + mulDivFloor rx aUnits bUnits)
 
 -- | Scales a quantity by a split ratio (numerator / denominator), flooring at scale 10.
 scaleByRatio : OcfRatio -> Decimal -> Decimal
@@ -42,6 +43,28 @@ toUnits = N.shift
 
 fromUnits : Numeric 0 -> Decimal
 fromUnits = N.shift
+
+-- ⌊r · a / b⌋ for 0 <= r < b, a >= 0, by long multiplication over the base-10^9 digits of `a`,
+-- most significant first. After each digit, (q, rest) hold ⌊r · p / b⌋ and r · p − q · b for the
+-- prefix p of `a` read so far, so rest < b and each step's t = rest · 10^9 + r · digit < 2 · b · 10^9.
+mulDivFloor : Numeric 0 -> Numeric 0 -> Numeric 0 -> Numeric 0
+mulDivFloor r a b = fst (foldl step (0.0, 0.0) (digitsOf a))
+  where
+    step (q, rest) digit =
+      let t = rest * digitBase + r * digit
+          qt = floorDivUnits t b
+      in (q * digitBase + qt, t - qt * b)
+
+digitBase : Numeric 0
+digitBase = 1000000000.0
+
+-- The base-10^9 digits of n >= 0, most significant first.
+digitsOf : Numeric 0 -> [Numeric 0]
+digitsOf n
+  | n < digitBase = [n]
+  | otherwise =
+      let high = floorDivUnits n digitBase
+      in digitsOf high <> [n - high * digitBase]
 
 -- ⌊n / d⌋ for n >= 0 and d > 0. `N.div` rounds half-even, so the result is at most one too high.
 floorDivUnits : Numeric 0 -> Numeric 0 -> Numeric 0

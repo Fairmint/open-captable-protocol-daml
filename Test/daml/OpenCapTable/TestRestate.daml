@@ -6,6 +6,7 @@ import qualified DA.Date as D
 import Daml.Script
 
 import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds (CancelHold(..))
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate hiding (restate)
 import Fairmint.OpenCapTable.State
@@ -169,3 +170,78 @@ test_restate_never_moves_last_event_back = do
   env <- standardBook
   s <- stateOf env "S-A1"
   restateOpsFails env "last event date back" [RestateSetState (restatementOf s) with last_event_date = D.addDays s.last_event_date (-1)]
+
+-- Deleting a stock issuance must show its lot is gone: its state ends in the same restatement, or
+-- the record that consumed it is among the inputs. Otherwise a reissue could give the security a
+-- second state, and a held lot would lose the origin its draw copies.
+test_restate_issuance_delete_needs_its_lot_gone : Script ()
+test_restate_issuance_delete_needs_its_lot_gone = do
+  env <- standardBook
+  restateOpsFails env "only with the end of security S-A2's state" [RestateDelete "ISS-S-A2"]
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "S-A2"]
+  restateOpsFails env "only with the end of security S-A2's state" [RestateDelete "ISS-S-A2"]
+  hasRecord env "ISS-S-A2" >>= (=== True)
+  hasState env "S-A2" >>= (=== True)
+
+-- A security ID is released only with a state ended at seq 0. After any event its derived IDs
+-- exist, and a reissue would start again at seq 0 and derive them a second time.
+test_restate_security_id_stays_claimed_after_events : Script ()
+test_restate_security_id_stays_claimed_after_events = do
+  env <- standardBook
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  [h] <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "S-A2"]
+  _ <- cancelHolds env d [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
+  s <- stateOf env "S-A2"
+  s.seq === 2
+  _ <- restateOps env [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
+  hasState env "S-A2" >>= (=== False)
+  applyRecordsFails env "security ID already used: S-A2" [OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024)]
+  -- The issuance's object ID is released; a corrected issuance takes a new security ID.
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-A3" "SH-A" "CLS-A" 400.0 d2024) with id = "ISS-S-A2")]
+  s' <- stateOf env "S-A3"
+  s'.seq === 0
+
+-- A lot a recorded event consumed is gone, so its issuance can be deleted with that record among
+-- the inputs; the security ID stays claimed, since the event used it.
+test_restate_issuance_delete_after_its_consumer : Script ()
+test_restate_issuance_delete_after_its_consumer = do
+  env <- standardBook
+  let ret = StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Mar 1; reason_text = "x"; security_id = "S-A2"; comments = []
+  _ <- applyRecords env [OcfRecordDataStockRetraction ret]
+  inputs <- allInputs env
+  retCid <- recordCidOf env "RET-1"
+  expectSubmitFailure "only with the end of security S-A2's state" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_Restate with
+      inputs = inputs with records = filter (/= retCid) inputs.records
+      operations = [RestateDelete "ISS-S-A2"])
+  _ <- restateOps env [RestateDelete "ISS-S-A2"]
+  hasRecord env "ISS-S-A2" >>= (=== False)
+  applyRecordsFails env "security ID already used: S-A2" [OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024)]
+
+-- Which lots a stock event consumed is what an issuance delete relies on, so an edit keeps it.
+test_restate_edit_keeps_consumed_securities : Script ()
+test_restate_edit_keeps_consumed_securities = do
+  env <- standardBook
+  let ret = StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Mar 1; reason_text = "x"; security_id = "S-A2"; comments = []
+  _ <- applyRecords env [OcfRecordDataStockRetraction ret]
+  restateOpsFails env "cannot change the securities record RET-1 consumed"
+    [RestateEdit (OcfRecordDataStockRetraction ret with security_id = "S-A1")]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockRetraction ret with reason_text = "corrected")]
+  hasState env "S-A1" >>= (=== True)
+
+-- Every contract a restatement archives counts toward its 500, the shards a release rewrites
+-- included. 250 deletes over 160 shards touch 250 + 160 + 160 = 570 contracts; 200 deletes over
+-- 143 shards touch 486.
+test_restate_counts_rewritten_shards : Script ()
+test_restate_counts_rewritten_shards = do
+  env <- setupEnv
+  let ids = map (\i -> "SH-" <> show i) [1 .. 250]
+  _ <- applyRecords env (map (OcfRecordDataStakeholder . stakeholderData) ids)
+  restateOpsFails env "touches at most 500 contracts" (map RestateDelete ids)
+  _ <- restateOps env (map RestateDelete (take 200 ids))
+  hasRecord env "SH-200" >>= (=== False)
+  hasRecord env "SH-201" >>= (=== True)
+

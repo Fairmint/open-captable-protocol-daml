@@ -23,6 +23,7 @@ import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingAcceleration (VestingAccelerationOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
 import OpenCapTable.Harness
+import OpenCapTable.TestSettlement (vestingTerms4y)
 
 eventDay : Date
 eventDay = D.date 2024 D.Mar 1
@@ -215,6 +216,57 @@ test_events_transfer_conserves_vesting = do
         resulting = [buyer [(OcfVesting with amount = 30.0; date = t1), (OcfVesting with amount = 30.0; date = t2)]]
         balance = Some (balance [(OcfVesting with amount = 20.0; date = t1), (OcfVesting with amount = 20.0; date = t2)])]
   pure ()
+
+-- A free transfer conserves each date's vested amount: it splits tranches, never moves vested
+-- shares to later dates, and never replaces tranches with vesting terms.
+test_events_transfer_keeps_each_dates_vesting : Script ()
+test_events_transfer_keeps_each_dates_vesting = do
+  env <- standardBook
+  let t1 = D.date 2024 D.Feb 1
+      t2 = D.date 2025 D.Feb 1
+      tranches = [(OcfVesting with amount = 50.0; date = t1), (OcfVesting with amount = 50.0; date = t2)]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-V" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)]
+  let t = mkTransfer "TR-V" "S-V" 60.0 ["S-V-B"] (Some "S-V-R")
+      buyer vs = (out "S-V-B" "SH-B" 60.0) with vestings = vs
+      balance vs = (out "S-V-R" "SH-A" 40.0) with vestings = vs
+  applyOpsFails env "but security S-V has vested 50.0"
+    [ApplyStockTransfer with
+        transfer = t
+        resulting = [buyer [(OcfVesting with amount = 30.0; date = t1), (OcfVesting with amount = 30.0; date = t2)]]
+        balance = Some (balance [(OcfVesting with amount = 40.0; date = t2)])]
+  applyOpsFails env "replaces them with vesting terms"
+    [ApplyStockTransfer with
+        transfer = t
+        resulting = [(buyer []) with vesting_terms_id = Some "VT-1"]
+        balance = Some (balance [(OcfVesting with amount = 20.0; date = t1), (OcfVesting with amount = 20.0; date = t2)])]
+  -- A fully vested lot stays fully vested.
+  applyOpsFails env "but security S-A2 has vested 400.0"
+    [ApplyStockTransfer with
+        transfer = mkTransfer "TR-F" "S-A2" 400.0 ["S-A2-B"] None
+        resulting = [(out "S-A2-B" "SH-B" 400.0) with vestings = [OcfVesting with amount = 400.0; date = D.date 2030 D.Jan 1]]
+        balance = None]
+
+-- From a lot on vesting terms, the balance's tranches dated on or before the transfer equal the
+-- vested shares it keeps: the snapshot's 40 less the 30 the resulting issuance takes vested.
+test_events_transfer_from_terms_lot_keeps_vested : Script ()
+test_events_transfer_from_terms_lot_keeps_vested = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataVestingTerms vestingTerms4y]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-V1" "SH-A" "CLS-A" 100.0 d2024) with vesting_terms_id = Some "VT-4Y")]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V1"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
+  let day = D.date 2025 D.Mar 3
+      t = (mkTransfer "TR-T" "S-V1" 30.0 ["S-V1-B"] (Some "S-V1-R")) with date = day
+      resulting = issuance "S-V1-B" "SH-B" "CLS-A" 30.0 day
+      balance vs = (issuance "S-V1-R" "SH-A" "CLS-A" 70.0 day) with vestings = vs
+  applyOpsFails env "but keeps 10.0 vested shares"
+    [ApplyStockTransfer with transfer = t; resulting = [resulting]; balance = Some (balance [OcfVesting with amount = 70.0; date = D.date 2027 D.Jan 1])]
+  _ <- applyOps env
+    [ApplyStockTransfer with
+        transfer = t
+        resulting = [resulting]
+        balance = Some (balance [(OcfVesting with amount = 10.0; date = D.date 2025 D.Mar 1), (OcfVesting with amount = 60.0; date = D.date 2027 D.Jan 1)])]
+  rest <- stateOf env "S-V1-R"
+  rest.quantity === 70.0
 
 test_events_partial_cover_takes_no_partial_event : Script ()
 test_events_partial_cover_takes_no_partial_event = do

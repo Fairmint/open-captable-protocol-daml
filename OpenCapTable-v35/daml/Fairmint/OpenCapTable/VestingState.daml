@@ -4,6 +4,7 @@ module Fairmint.OpenCapTable.VestingState
   , drawTranches
   , accelerateTranches
   , checkOutputsVesting
+  , checkTransferVesting
   , checkBalanceVesting
   , sortTranches
   , trancheTotal
@@ -11,6 +12,7 @@ module Fairmint.OpenCapTable.VestingState
   ) where
 
 import DA.List (dedup, sort, sortOn)
+import DA.Optional (optionalToList)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 
@@ -92,6 +94,40 @@ checkOutputsVesting d label sources outputs = do
     [] -> pure ()
     t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by "
       <> show t <> ", more than the " <> show (sourceAt t) <> " their source has vested by then")
+
+-- | A free transfer conserves vesting, beyond never vesting ahead of its source. From a lot with
+-- tranches or no vesting, it splits tranches, so each date's cumulative vested amount is the same
+-- for the outputs together as for the source at the event date and every later tranche date; no
+-- output replaces tranches with vesting terms. From a lot on vesting terms, the balance's tranches
+-- dated on or before the event equal the vested quantity it keeps: the source's vested quantity
+-- less what the resulting issuances vest at the event date.
+checkTransferVesting : Date -> Text -> StockSecurity -> [OutputVesting] -> Optional OutputVesting -> Either Text ()
+checkTransferVesting d label s resulting balance = case s.vesting of
+  StockVestingOnTerms _ -> case balance of
+    None -> pure ()
+    Some bal -> do
+      let kept = vestedAt s d - sum (map (outputVestedBy d) resulting)
+          balanceVested = vestedBy d bal.vestings
+      if balanceVested == kept then pure ()
+      else Left ("the balance of " <> label <> " vests " <> show balanceVested <> " shares by " <> show d
+        <> ", but keeps " <> show kept <> " vested shares of security " <> s.security_id)
+  _ -> do
+    let outputs = resulting <> optionalToList balance
+        sourceAt t = vestedAt s t
+        outputsAt t = sum (map (outputVestedBy t) outputs)
+        sourceTrancheDates = case s.vesting of
+          StockVestingTranches ts -> map (.date) ts
+          _ -> []
+        laterDates = filter (> d) (dedup (sort (sourceTrancheDates <> concatMap (map (.date) . (.vestings)) outputs)))
+        failing = filter (\t -> outputsAt t /= sourceAt t) (d :: laterDates)
+    if any (.on_terms) outputs
+      then Left ("the outputs of " <> label <> " split security " <> s.security_id
+        <> "'s tranches; none of them replaces them with vesting terms")
+      else pure ()
+    case failing of
+      [] -> pure ()
+      t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by " <> show t
+        <> ", but security " <> s.security_id <> " has vested " <> show (sourceAt t) <> " by then")
 
 -- | A balance carries its remaining vesting as explicit tranches that sum to exactly its quantity
 -- when its source has tranches or vesting terms, and no vesting when its source has none, so it can

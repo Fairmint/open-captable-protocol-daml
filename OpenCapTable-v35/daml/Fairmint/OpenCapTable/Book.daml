@@ -408,13 +408,13 @@ claimId ns id b = do
   (prefix, slot) <- coveringShard bits id b
   when (Set.member hash slot.claimed)
     (abort ((if ns == IdNamespaceSecurity then "security ID" else "ID") <> " already used: " <> id))
-  archiveShardOriginal slot
+  b1 <- archiveShardOriginal slot b
   let claimed' = Set.insert hash slot.claimed
       parts = if Set.size claimed' <= maxHashesPerShard then [(prefix, claimed')] else splitShard prefix claimed'
-  pure b with
+  pure b1 with
     shards = foldl (\m (p, c) -> Map.insert p (ShardSlot with original = None; claimed = c) m)
-      (Map.delete prefix b.shards) parts
-    claims = b.claims + 1
+      (Map.delete prefix b1.shards) parts
+    claims = b1.claims + 1
 
 -- | Releases the ID of a record a restatement deletes. Shards never merge.
 releaseId : IdNamespace -> Text -> Book -> Update Book
@@ -422,9 +422,9 @@ releaseId ns id b = do
   let hash = claimHash ns id
   (prefix, slot) <- coveringShard (hashBits hash) id b
   unless (Set.member hash slot.claimed) (abort ("ID " <> id <> " is not claimed"))
-  archiveShardOriginal slot
-  pure b with
-    shards = Map.insert prefix (ShardSlot with original = None; claimed = Set.delete hash slot.claimed) b.shards
+  b1 <- archiveShardOriginal slot b
+  pure b1 with
+    shards = Map.insert prefix (ShardSlot with original = None; claimed = Set.delete hash slot.claimed) b1.shards
 
 -- | Splits a shard by its next bit regardless of fill, for a large book's replication.
 preSplitShard : Text -> Book -> Update Book
@@ -432,11 +432,11 @@ preSplitShard prefix b = case Map.lookup prefix b.shards of
   None -> abort ("no shard with prefix " <> prefix <> " in this write")
   Some slot -> do
     when (T.length prefix >= 256) (abort ("shard " <> prefix <> " cannot split further"))
-    archiveShardOriginal slot
+    b1 <- archiveShardOriginal slot b
     let (zeros, ones) = partitionByBit (T.length prefix) slot.claimed
-    pure b with
+    pure b1 with
       shards = Map.insert (prefix <> "0") (ShardSlot with original = None; claimed = zeros)
-        (Map.insert (prefix <> "1") (ShardSlot with original = None; claimed = ones) (Map.delete prefix b.shards))
+        (Map.insert (prefix <> "1") (ShardSlot with original = None; claimed = ones) (Map.delete prefix b1.shards))
 
 -- The shard whose prefix starts the hash's bit string. Active shards partition the hash space, so
 -- the shortest matching prefix is the only one.
@@ -452,8 +452,14 @@ coveringPrefix bits shards n
       Some slot -> Some (T.take n bits, slot)
       None -> coveringPrefix bits shards (n + 1)
 
-archiveShardOriginal : ShardSlot -> Update ()
-archiveShardOriginal slot = forA_ slot.original archive
+-- Archives a loaded shard the first time a write changes it, and counts it among the contracts the
+-- write touches.
+archiveShardOriginal : ShardSlot -> Book -> Update Book
+archiveShardOriginal slot b = case slot.original of
+  None -> pure b
+  Some cid -> do
+    archive cid
+    pure b with contracts_touched = b.contracts_touched + 1
 
 splitShard : Text -> Set.Set Text -> [(Text, Set.Set Text)]
 splitShard prefix claimed =

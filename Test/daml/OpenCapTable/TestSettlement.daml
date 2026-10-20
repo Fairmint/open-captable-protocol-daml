@@ -12,11 +12,13 @@ import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.VestingTerms (OcfAllocationType(..), OcfVestingCondition(..), OcfVestingTrigger(..), VestingTermsOcfData(..))
 import OpenCapTable.Harness
+import OpenCapTable.TestRestate (restatementOf)
 
 tradeDay : Date
 tradeDay = D.date 2025 D.Jun 2
@@ -270,6 +272,63 @@ test_settlement_only_ta_settles = do
   inputs <- allInputs env
   submitMustFail env.issuer do
     exerciseCmd env.cap_table CapTable_Settle with inputs; settlement_id = "T-1"; date = tradeDay; buyer; lots = [SettleDraw draw]
+
+-- A restatement can edit a lot's origin issuance without its state. A hold or draw copies the
+-- origin, so it refuses one that no longer names the lot's stakeholder and class.
+test_settlement_origin_must_agree_with_the_lot : Script ()
+test_settlement_origin_must_agree_with_the_lot = do
+  env <- tradeBook
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockIssuance (issuance "S-A1" "SH-B" "CLS-A" 600.0 d2024))]
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  settleFails env "disagrees with security S-A1" "T-1" tradeDay buyer [SettleDraw draw]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockIssuance (issuance "S-A2" "SH-B" "CLS-A" 400.0 d2024))]
+  lot <- settlementLot env "S-A2" 10.0
+  placeHoldsFails env "disagrees with security S-A2" OcfHoldTypeRegisterSettlement "T-2" tradeDay [lot]
+
+-- The origin of a lot a trade sold is never deleted: the transfer a register choice wrote consumed it.
+test_settlement_origin_of_a_sold_lot_is_never_deleted : Script ()
+test_settlement_origin_of_a_sold_lot_is_never_deleted = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  _ <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  restateOpsFails env "which a register choice wrote" [RestateDelete "ISS-S-A1"]
+
+-- While a lot carries a settlement hold, its tranches keep covering its quantity.
+test_settlement_hold_keeps_full_cover : Script ()
+test_settlement_hold_keeps_full_cover = do
+  env <- standardBook
+  let early = OcfVesting with amount = 400.0; date = D.date 2024 D.Jun 1
+      late = OcfVesting with amount = 600.0; date = D.date 2026 D.Jun 1
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-T" "SH-A" "CLS-A" 1000.0 d2024) with vestings = [early, late])]
+  onDate tradeDay
+  lot <- settlementLot env "S-T" 300.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot]
+  s <- stateOf env "S-T"
+  restateOpsFails env "precondition" [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early]]
+  _ <- restateOps env [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early, (late with amount = 300.0), (OcfVesting with amount = 300.0; date = D.date 2027 D.Jun 1)]]
+  pure ()
+
+-- The shared floor function is exact far beyond 10^18: a 2,000,000,000-share lot with a cost
+-- basis of 3,000,000,000.00 USD keeps 2,999,999,998.50 USD on the balance of a one-share draw.
+test_settlement_floor_on_a_large_lot : Script ()
+test_settlement_floor_on_a_large_lot = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-BIG" "SH-A" "CLS-A" 2000000000.0 d2024) with cost_basis = Some (usd 3000000000.0))]
+  onDate tradeDay
+  lot <- settlementLot env "S-BIG" 1.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-BIG" tradeDay [lot]
+  draw <- drawLot env "S-BIG" 1.0 2.0 []
+  draw.balance_cost_basis === Some (usd 2999999998.5)
+  buyer <- buyerB env
+  r <- settle env "T-BIG" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with balance_security_id = Some bal] <- pure r.lots
+  rest <- stateOf env bal
+  rest.quantity === 1999999999.0
+  restIssuance <- issuanceCidOf env rest.origin_transaction_id
+  Some ri <- queryContractId env.transfer_agent restIssuance
+  ri.ocf_data.cost_basis === Some (usd 2999999998.5)
 
 -- Helpers
 

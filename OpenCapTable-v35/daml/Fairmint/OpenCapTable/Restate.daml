@@ -8,7 +8,6 @@ module Fairmint.OpenCapTable.Restate
   ) where
 
 import DA.Action (foldlA, unless, when)
-import DA.Foldable (forA_)
 import DA.List ((\\))
 import DA.Map (Map)
 import qualified DA.Map as Map
@@ -42,7 +41,9 @@ data StateRestatement = StateRestatement
 data RestateOperation
   = -- | Replaces a record (in the inputs) with new data under the same type and OCF ID.
     RestateEdit OcfRecordData
-  | -- | Deletes a record (in the inputs) by object ID and releases its IDs.
+  | -- | Deletes a record (in the inputs) by object ID and releases its object ID. A stock
+    -- issuance's lot must end in the same restatement, or the record that consumed it must be among
+    -- the inputs; its security ID is released only with a state ended at seq 0 (see `resolvePending`).
     RestateDelete Text
   | -- | Replaces a security's state with its successor, or recreates the state of a security whose
     -- consuming record this restatement deletes.
@@ -64,8 +65,9 @@ maxContractsPerRestatement = 500
 
 -- Checks that need the whole restatement, run after its last operation.
 data Pending
-  = PendingEnd with security_id : Text; origin_transaction_id : Text
+  = PendingEnd with security_id : Text; origin_transaction_id : Text; seq : Int
   | PendingRecreate with security_id : Text
+  | PendingIssuanceGone with object_id : Text; security_id : Text
   deriving (Eq, Show)
 
 data Progress = Progress
@@ -82,9 +84,9 @@ restate ctx inputs operations = do
   when (null operations) (abort "CapTable_Restate needs at least one operation")
   b0 <- loadBook ctx inputs
   p <- foldlA restateOne (Progress with book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
-  forA_ p.pending (checkPending p.deleted)
-  checkRequirements p.book
-  (b1, result) <- flushBook p.book
+  book <- foldlA (resolvePending p) p.book p.pending
+  checkRequirements book
+  (b1, result) <- flushBook book
   when (b1.contracts_touched > maxContractsPerRestatement)
     (abort ("CapTable_Restate touches at most " <> show maxContractsPerRestatement <> " contracts"))
   pure RestateResult with
@@ -121,6 +123,9 @@ restateOne p op = case op of
     unless (recordObjectType old.ocf_data == recordObjectType d)
       (abort ("an edit keeps record " <> objectId <> "'s type"))
     when (old.ocf_data == d) (abort ("edit of record " <> objectId <> " changes nothing"))
+    -- Which lots a stock event ended is the evidence a later issuance delete relies on.
+    unless (consumedSecurities d == consumedSecurities old.ocf_data)
+      (abort ("an edit cannot change the securities record " <> objectId <> " consumed; delete it and write a new one"))
     let oldSec = issuanceSecurityId old.ocf_data
         newSec = issuanceSecurityId d
     when (recordObjectType d == OcfObjectTypeTxStockIssuance && oldSec /= newSec)
@@ -156,10 +161,16 @@ restateOne p op = case op of
       _ -> pure p1.book
     b2 <- removeRecord objectId b1
     b3 <- releaseId IdNamespaceObject objectId b2
-    b4 <- case issuanceSecurityId old.ocf_data of
-      Some s -> releaseId IdNamespaceSecurity s b3
-      None -> pure b3
-    pure p1 with book = b4; deleted = Map.insert objectId old.ocf_data p1.deleted
+    -- A stock issuance's security ID waits for the end of the restatement; a warrant's,
+    -- convertible's or equity compensation's, which has no state, is released now.
+    (b4, pending) <- case (old.ocf_data, issuanceSecurityId old.ocf_data) of
+      (OcfRecordDataStockIssuance iss, _) ->
+        pure (b3, (PendingIssuanceGone with object_id = objectId; security_id = iss.security_id) :: p1.pending)
+      (_, Some s) -> do
+        b' <- releaseId IdNamespaceSecurity s b3
+        pure (b', p1.pending)
+      (_, None) -> pure (b3, p1.pending)
+    pure p1 with book = b4; deleted = Map.insert objectId old.ocf_data p1.deleted; pending
   RestateSetState r -> do
     let b = p.book
     e <- requireEpoch r.stock_class_id b
@@ -206,25 +217,55 @@ restateOne p op = case op of
     unless (null s.holds)
       (abort ("security " <> sec <> " carries an open hold; a restatement never ends a lot on hold"))
     b' <- endState sec p.book
-    pure p with book = b'; pending = (PendingEnd with security_id = sec; origin_transaction_id = s.origin_transaction_id) :: p.pending
+    pure p with book = b'; pending = (PendingEnd with security_id = sec; origin_transaction_id = s.origin_transaction_id; seq = s.seq) :: p.pending
 
-checkPending : Map Text OcfRecordData -> Pending -> Update ()
-checkPending deleted pending = case pending of
+-- Runs the checks that need the whole restatement, and releases the security IDs it may.
+resolvePending : Progress -> Book -> Pending -> Update Book
+resolvePending p book pending = case pending of
   PendingEnd with security_id; origin_transaction_id ->
-    unless (Map.member origin_transaction_id deleted)
-      (abort ("a restatement ends security " <> security_id <> "'s state only with the deletion of its origin issuance " <> origin_transaction_id))
+    if Map.member origin_transaction_id p.deleted then pure book
+    else abort ("a restatement ends security " <> security_id <> "'s state only with the deletion of its origin issuance " <> origin_transaction_id)
   PendingRecreate with security_id ->
-    unless (any (consumes security_id) (Map.values deleted))
-      (abort ("a restatement recreates security " <> security_id <> "'s state only with the deletion of the record that consumed it"))
+    if any (consumes security_id) (Map.values p.deleted) then pure book
+    else abort ("a restatement recreates security " <> security_id <> "'s state only with the deletion of the record that consumed it")
+  PendingIssuanceGone with object_id; security_id ->
+    -- Without keys the ledger cannot see a state it is not given, so the delete must show the lot
+    -- is gone: ended here, or consumed by a record among the inputs. Derived IDs are unique only
+    -- while each (security_id, seq) is used once, and a reissue starts at seq 0, so the security
+    -- ID is released only with a state ended here at seq 0, which no event has consumed; otherwise
+    -- it stays claimed and a corrected issuance takes a new security ID.
+    case concatMap (endedAt security_id) p.pending of
+      n :: _
+        | n == 0 && not (isDerivedForm book.context security_id) -> releaseId IdNamespaceSecurity security_id book
+        | otherwise -> pure book
+      [] -> case filter (consumes security_id . (.ocf_data)) (Map.values book.records) of
+        [] -> abort ("a restatement deletes stock issuance " <> object_id <> " only with the end of security "
+          <> security_id <> "'s state, or with the record that consumed it among its inputs")
+        consumer :: _ -> do
+          let consumerId = (recordView book.context consumer.ocf_data).object_id
+          when (isDerivedForm book.context consumerId)
+            (abort ("security " <> security_id <> " was consumed by " <> consumerId
+              <> ", which a register choice wrote, so its issuance " <> object_id <> " is never deleted"))
+          pure book
+
+-- The seq at which this restatement ended the security's state, if it did.
+endedAt : Text -> Pending -> [Int]
+endedAt sec pending = case pending of
+  PendingEnd with security_id; seq -> if security_id == sec then [seq] else []
+  _ -> []
+
+-- The securities a stock record consumed (ended).
+consumedSecurities : OcfRecordData -> [Text]
+consumedSecurities d = case d of
+  OcfRecordDataStockTransfer x -> [x.security_id]
+  OcfRecordDataStockCancellation x -> [x.security_id]
+  OcfRecordDataStockRepurchase x -> [x.security_id]
+  OcfRecordDataStockRetraction x -> [x.security_id]
+  OcfRecordDataStockConversion x -> [x.security_id]
+  OcfRecordDataStockReissuance x -> [x.security_id]
+  OcfRecordDataStockConsolidation x -> x.security_ids
+  _ -> []
 
 -- Whether a stock record consumed (ended) the security.
 consumes : Text -> OcfRecordData -> Bool
-consumes sec d = case d of
-  OcfRecordDataStockTransfer x -> x.security_id == sec
-  OcfRecordDataStockCancellation x -> x.security_id == sec
-  OcfRecordDataStockRepurchase x -> x.security_id == sec
-  OcfRecordDataStockRetraction x -> x.security_id == sec
-  OcfRecordDataStockConversion x -> x.security_id == sec
-  OcfRecordDataStockReissuance x -> x.security_id == sec
-  OcfRecordDataStockConsolidation x -> sec `elem` x.security_ids
-  _ -> False
+consumes sec d = sec `elem` consumedSecurities d
