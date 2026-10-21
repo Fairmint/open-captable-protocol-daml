@@ -30,8 +30,12 @@ const REQUIRED_RELATIVE_FILES = [
   'openCapTableDarPath.js',
 ];
 
-/** V35 has no Splice dependency; a `lib/Splice` tree means a stale bundle config. */
-const FORBIDDEN_RELATIVE_DIRS = ['Splice'];
+/** V35 has no Splice dependency and no delivery-proof package; either tree in `lib/` means a stale bundle config. */
+const FORBIDDEN_RELATIVE_DIRS = [
+  'Splice',
+  'Fairmint/OpenCapTableDeliveryProof',
+  '__bundled__/OpenCapTableDeliveryProof-v01',
+];
 
 function assertRequiredFiles(): void {
   for (const rel of REQUIRED_RELATIVE_FILES) {
@@ -42,7 +46,7 @@ function assertRequiredFiles(): void {
   }
   for (const rel of FORBIDDEN_RELATIVE_DIRS) {
     if (fs.existsSync(path.join(LIB_DIR, rel))) {
-      throw new Error(`Unexpected lib/${rel} in merged lib (OpenCapTable-v35 has no ${rel} dependency)`);
+      throw new Error(`Unexpected lib/${rel} in merged lib (OpenCapTable-v35 does not depend on it)`);
     }
   }
 }
@@ -77,6 +81,7 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (!idx.OCP_INTERFACES || !idx.OCP_INTERFACES.ocfObject || !idx.OCP_INTERFACES.registerContract) process.exit(14);
     if (!idx.Fairmint || !idx.Fairmint.OpenCapTable) process.exit(8);
     if (!idx.Fairmint.OpenCapTableApi) process.exit(16);
+    if (typeof idx.OCP_DELIVERY_PROOF_TEMPLATES !== 'undefined' || typeof idx.Fairmint.OpenCapTableDeliveryProof !== 'undefined') process.exit(15);
     // The bundled sibling and the root namespace must be the same module objects, or decoders would diverge.
     const api = require('./lib/__bundled__/OpenCapTableApi-v01');
     if (api.Fairmint.OpenCapTableApi !== idx.Fairmint.OpenCapTableApi) process.exit(17);

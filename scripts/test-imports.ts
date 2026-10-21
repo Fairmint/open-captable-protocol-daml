@@ -34,6 +34,12 @@ try {
     throw new Error('This package must not export CantonPayments (use @fairmint/daml-js)');
   }
   if (!rootPkg?.Fairmint?.OpenCapTableApi) throw new Error('Root export missing Fairmint.OpenCapTableApi');
+  if (
+    typeof rootPkg?.Fairmint?.OpenCapTableDeliveryProof !== 'undefined' ||
+    typeof rootPkg.OCP_DELIVERY_PROOF_TEMPLATES !== 'undefined'
+  ) {
+    throw new Error('This package must not export a delivery proof; OpenCapTable-v35 has none');
+  }
   for (const [constant, keys] of Object.entries(ENTRY_POINTS)) {
     const missing = keys.filter((key) => typeof rootPkg[constant]?.[key] !== 'string');
     if (missing.length > 0) {
@@ -104,6 +110,9 @@ try {
 
   // Every DAR export resolves to a staged file, and getOpenCapTableDarPaths lists them in upload order.
   const exportsMap = rootPackage.exports as Record<string, unknown>;
+  if ('./opencaptable-delivery-proof.dar' in exportsMap) {
+    throw new Error('package.json exports must not list ./opencaptable-delivery-proof.dar');
+  }
   const darPaths: string[] = [];
   for (const [subpath, helper] of DAR_EXPORTS) {
     if (typeof exportsMap[subpath] !== 'string') throw new Error(`package.json exports missing ${subpath}`);
