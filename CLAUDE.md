@@ -12,9 +12,9 @@ Keep repository guidance synchronized with the code:
 
 - The packages are `OpenCapTable-v35` (the register,
   [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md)),
-  `OpenCapTableApi-v01` (reader interfaces, never upgraded, so their views hold only builtin types)
-  and `OpenCapTableDeliveryProof-v01`, which v35 data-depends on and embeds, plus `Test`. v35
-  targets DevNet only; keep MainNet steps gated off.
+  `OpenCapTableApi-v01` (reader interfaces, never upgraded, so their views hold only builtin types),
+  which v35 data-depends on and embeds, plus `Test`. v35 targets DevNet only; keep MainNet steps
+  gated off.
 - Treat `multi-package.yaml`, each package's `daml.yaml`, `package.json`, `daml-js-bundle.json`, and
   the remaining OCP-specific implementation in `scripts/` as the current source of truth. Shared
   DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions or dependency lists into
@@ -32,10 +32,9 @@ Keep repository guidance synchronized with the code:
 - Builds run from `generated/build/` via `canton-dev-tools prepare-build`. Keep source
   `Test/daml.yaml` sibling-relative paths; prepare-build rewrites them for the generated tree.
 - `npm run codegen` uses CDT `codegen-js` → `bundle-dependencies` → `create-root-index` →
-  `scripts/bundle-local-packages.ts` (bundles the two sibling packages into `lib/`) →
-  `fix-splice-refs`, then DAR staging (`stage-npm-opencaptable-dar`, all three DARs) and npm-runtime
-  lib. The root entry points are `OCP_TEMPLATES`, `OCP_INTERFACES` and
-  `OCP_DELIVERY_PROOF_TEMPLATES` (`daml-js-bundle.json`).
+  `scripts/bundle-local-packages.ts` (bundles the sibling package into `lib/`) → `fix-splice-refs`,
+  then DAR staging (`stage-npm-opencaptable-dar`, both DARs) and npm-runtime lib. The root entry
+  points are `OCP_TEMPLATES` and `OCP_INTERFACES` (`daml-js-bundle.json`).
 - Validate protocol behavior against the official OCF schema, `scripts/schema-gap-checker/`, and
   `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity. The one
   Fairmint OCF extension, the hold pair, lives in `ocf-extension/` and the checker's registry.

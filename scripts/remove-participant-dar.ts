@@ -34,7 +34,7 @@
  *
  * A package of this repository and the packages it depends on, dependents first (the reverse of upload order), with
  * main package ids read from the backed-up DARs: npx tsx scripts/remove-participant-dar.ts --package ocp. For
- * OpenCapTable-v35 that removes OpenCapTable-v35, then OpenCapTableDeliveryProof-v01, then OpenCapTableApi-v01.
+ * OpenCapTable-v35 that removes OpenCapTable-v35, then OpenCapTableApi-v01.
  *
  * The admin protos come from `npm run sync-splice-dars` (run by `npm run remove-participant-dar`).
  */

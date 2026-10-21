@@ -25,9 +25,7 @@ const REQUIRED_RELATIVE_FILES = [
   'Fairmint/OpenCapTable/OCF/StockHoldCancellation/module.js',
   'Fairmint/OpenCapTableApi/OcfObject/module.js',
   'Fairmint/OpenCapTableApi/RegisterContract/module.js',
-  'Fairmint/OpenCapTableDeliveryProof/DeliveryProof/module.js',
   '__bundled__/OpenCapTableApi-v01/index.js',
-  '__bundled__/OpenCapTableDeliveryProof-v01/index.js',
   'DA/Set/Types/module.js',
   'openCapTableDarPath.js',
 ];
@@ -77,9 +75,8 @@ function assertOpenCapTableDarSubpathAndRootSeparation(): void {
     if (!idx.OCP_TEMPLATES.ocpFactory) process.exit(12);
     if (!idx.OCP_TEMPLATES.stockSecurity || !idx.OCP_TEMPLATES.stockClassEpoch || !idx.OCP_TEMPLATES.ocfIdShard) process.exit(13);
     if (!idx.OCP_INTERFACES || !idx.OCP_INTERFACES.ocfObject || !idx.OCP_INTERFACES.registerContract) process.exit(14);
-    if (!idx.OCP_DELIVERY_PROOF_TEMPLATES || !idx.OCP_DELIVERY_PROOF_TEMPLATES.deliveryProof) process.exit(15);
     if (!idx.Fairmint || !idx.Fairmint.OpenCapTable) process.exit(8);
-    if (!idx.Fairmint.OpenCapTableApi || !idx.Fairmint.OpenCapTableDeliveryProof) process.exit(16);
+    if (!idx.Fairmint.OpenCapTableApi) process.exit(16);
     // The bundled sibling and the root namespace must be the same module objects, or decoders would diverge.
     const api = require('./lib/__bundled__/OpenCapTableApi-v01');
     if (api.Fairmint.OpenCapTableApi !== idx.Fairmint.OpenCapTableApi) process.exit(17);

@@ -32,23 +32,21 @@ Splice; `npm run sync-splice-dars` is needed only for the participant admin prot
 `remove-participant-dar` needs.
 
 After changing a package, back up the DAR of every package whose bytes changed before CI's DAR
-policy and upgrade-compat pass. OpenCapTable-v35 embeds OpenCapTableApi-v01 and
-OpenCapTableDeliveryProof-v01, so a change to either also changes the v35 DAR. Use the exact
-discovery names (not the OCP script alias `ocp`; a prefix such as `OpenCapTable` is ambiguous):
+policy and upgrade-compat pass. OpenCapTable-v35 embeds OpenCapTableApi-v01, so a change to it also
+changes the v35 DAR. Use the exact discovery names (not the OCP script alias `ocp`; a prefix such as
+`OpenCapTable` is ambiguous):
 
 ```bash
 npm run build
 npm run backup-dar -- --package OpenCapTableApi-v01 --version <version-from-daml.yaml>
-npm run backup-dar -- --package OpenCapTableDeliveryProof-v01 --version <version-from-daml.yaml>
 npm run backup-dar -- --package OpenCapTable-v35 --version <version-from-daml.yaml>
 ```
 
-Deployment preflight (writes `GITHUB_OUTPUT` when set). v35 deploys to DevNet only, and its two
-dependencies are uploaded and tagged first, so the release workflows check them first too:
+Deployment preflight (writes `GITHUB_OUTPUT` when set). v35 deploys to DevNet only, and its
+dependency is uploaded and tagged first, so the release workflows check it first too:
 
 ```bash
 npm run check:dar-version-policy -- --deployment devnet --package OpenCapTableApi-v01
-npm run check:dar-version-policy -- --deployment devnet --package OpenCapTableDeliveryProof-v01
 npm run check:dar-version-policy -- --deployment devnet --package OpenCapTable-v35
 ```
 

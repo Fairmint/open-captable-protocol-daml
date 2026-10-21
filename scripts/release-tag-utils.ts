@@ -62,8 +62,8 @@ export function parsePackageMajor(packageName: string): PackageMajor | null {
 }
 
 /**
- * Resolve the package a release tag names. Only releasable packages qualify: dependencies (OpenCapTableApi-v01,
- * OpenCapTableDeliveryProof-v01) are uploaded and tagged with the package that depends on them.
+ * Resolve the package a release tag names. Only releasable packages qualify: a dependency (OpenCapTableApi-v01) is
+ * uploaded and tagged with the package that depends on it.
  */
 export function resolveReleasePackage(packageName: string): ResolvedReleasePackage {
   const keys = getPackageKeys().filter((key) => getPackage(key)?.releasable);

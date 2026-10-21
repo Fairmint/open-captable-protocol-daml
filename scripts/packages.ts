@@ -74,20 +74,17 @@ interface PackageDef {
 /**
  * Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands.
  *
- * OpenCapTable-v35 data-depends on the reader interfaces (OpenCapTableApi-v01) and the delivery proof
- * (OpenCapTableDeliveryProof-v01); both are bundled into the npm `lib/` and released with it.
+ * OpenCapTable-v35 data-depends on the reader interfaces (OpenCapTableApi-v01), which are bundled into the npm `lib/`
+ * and released with it.
  */
 const PACKAGE_DEFS = {
   api: {
     sourceDir: 'OpenCapTableApi-v01',
   },
-  deliveryProof: {
-    sourceDir: 'OpenCapTableDeliveryProof-v01',
-  },
   ocp: {
     sourceDir: 'OpenCapTable-v35',
     generated: { createIndex: true, publishNameSuffix: null },
-    dependencies: ['api', 'deliveryProof'],
+    dependencies: ['api'],
     releasable: true,
   },
 } as const satisfies Record<string, PackageDef>;

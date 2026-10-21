@@ -12,14 +12,12 @@ const ocpPackage = requirePackageConfig('ocp');
 const ENTRY_POINTS: Record<string, string[]> = {
   OCP_TEMPLATES: ['ocpFactory', 'issuerAuthorization', 'capTable', 'stockSecurity', 'stockClassEpoch', 'ocfIdShard'],
   OCP_INTERFACES: ['ocfObject', 'registerContract'],
-  OCP_DELIVERY_PROOF_TEMPLATES: ['deliveryProof'],
 };
 
 /** DAR exports: `[package.json export subpath, helper exported by openCapTableDarPath]`. */
 const DAR_EXPORTS: Array<[string, string]> = [
   ['./opencaptable.dar', 'getOpenCapTableDarPath'],
   ['./opencaptable-api.dar', 'getOpenCapTableApiDarPath'],
-  ['./opencaptable-delivery-proof.dar', 'getOpenCapTableDeliveryProofDarPath'],
 ];
 
 try {
@@ -35,9 +33,7 @@ try {
   if (typeof rootPkg.CantonPayments !== 'undefined') {
     throw new Error('This package must not export CantonPayments (use @fairmint/daml-js)');
   }
-  for (const ns of ['OpenCapTableApi', 'OpenCapTableDeliveryProof']) {
-    if (!rootPkg?.Fairmint?.[ns]) throw new Error(`Root export missing Fairmint.${ns}`);
-  }
+  if (!rootPkg?.Fairmint?.OpenCapTableApi) throw new Error('Root export missing Fairmint.OpenCapTableApi');
   for (const [constant, keys] of Object.entries(ENTRY_POINTS)) {
     const missing = keys.filter((key) => typeof rootPkg[constant]?.[key] !== 'string');
     if (missing.length > 0) {
@@ -122,11 +118,9 @@ try {
     darPaths.push(helperPath);
   }
   const uploadOrder = openCapTableDarPathMod.getOpenCapTableDarPaths() as string[];
-  const expectedOrder = [darPaths[1], darPaths[2], darPaths[0]];
+  const expectedOrder = [darPaths[1], darPaths[0]];
   if (JSON.stringify(uploadOrder) !== JSON.stringify(expectedOrder)) {
-    throw new Error(
-      `getOpenCapTableDarPaths() must list Api, DeliveryProof, then OpenCapTable; got ${JSON.stringify(uploadOrder)}`
-    );
+    throw new Error(`getOpenCapTableDarPaths() must list Api, then OpenCapTable; got ${JSON.stringify(uploadOrder)}`);
   }
 
   if (typeof rootPkg.resolveOpenCapTableDarPath !== 'undefined') {
@@ -158,7 +152,7 @@ try {
   }
 
   console.log(
-    'OK: Root package exports Fairmint (OpenCapTable, OpenCapTableApi, OpenCapTableDeliveryProof) and the entry-point constants; OCP factory JSON, DAR exports and the DAR path subpath work'
+    'OK: Root package exports Fairmint (OpenCapTable, OpenCapTableApi) and the entry-point constants; OCP factory JSON, DAR exports and the DAR path subpath work'
   );
 } catch (e) {
   console.error('Import test failed:', getErrorMessage(e));

@@ -1,7 +1,7 @@
 #!/usr/bin/env tsx
 /**
  * Copy the built OpenCapTable DARs to stable paths for npm `exports`: OpenCapTable-v35 to `./opencaptable.dar`, and the
- * two packages it data-depends on to `./opencaptable-api.dar` and `./opencaptable-delivery-proof.dar`.
+ * reader interfaces it data-depends on to `./opencaptable-api.dar`.
  *
  * Run automatically at the end of `npm run codegen` (after `npm run build` produces
  * `generated/build/<pkg>/.daml/dist`). The copied files are gitignored; publish flows run codegen / package:prep so the
@@ -18,7 +18,6 @@ const ROOT = path.join(__dirname, '..');
 const STAGED_DARS: Array<[string, string]> = [
   ['ocp', 'OpenCapTable.dar'],
   ['api', 'OpenCapTableApi.dar'],
-  ['deliveryProof', 'OpenCapTableDeliveryProof.dar'],
 ];
 
 function main(): void {

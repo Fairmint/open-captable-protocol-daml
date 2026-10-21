@@ -1,4 +1,4 @@
--- CapTable_Settle: draws and cancellations of one trade's holds, cost bases, vesting on balances, and the delivery proof.
+-- CapTable_Settle: draws and cancellations of one trade's holds, cost bases, vesting on balances, and the delivered terms.
 module OpenCapTable.TestSettlement where
 
 import DA.Assert ((===))
@@ -6,7 +6,6 @@ import qualified DA.Date as D
 import DA.Optional (isNone)
 import Daml.Script
 
-import Fairmint.OpenCapTableDeliveryProof.DeliveryProof (DeliveredPrice(..), DeliveryProof(..), DeliveryProof_Redeem(..))
 import Fairmint.OpenCapTable.Apply hiding (apply)
 import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
@@ -140,9 +139,10 @@ test_settlement_two_lots_and_a_cancel = do
   length r.lots === 3
   s3 <- stateOf env "S-A3"
   s3.holds === []
-  Some proof <- queryContractId env.transfer_agent r.delivery_proof
-  proof.share_prices === [(DeliveredPrice with amount = 2.0; currency = "USD"), (DeliveredPrice with amount = 2.5; currency = "USD")]
-  proof.quantity === 150.0
+  let drawnPrices = concatMap (\l -> case l of
+        SettleDrawResult with share_price -> [share_price.amount]
+        SettleCancelResult {} -> []) r.lots
+  drawnPrices === [2.0, 2.5]
 
 -- A settlement cancels only its own settlement holds: a stop whose case reference happens to equal
 -- the settlement ID stays on its lot.
@@ -243,41 +243,22 @@ test_settlement_terms_lot_balance = do
   rest.vesting === StockVestingTranches good
   rest.snapshot === None
 
-test_settlement_proof_redeemed_once : Script ()
-test_settlement_proof_redeemed_once = do
+-- The result carries the delivered terms the desk checks against the accepted terms before it pays.
+test_settlement_result_carries_delivered_terms : Script ()
+test_settlement_result_carries_delivered_terms = do
   env <- tradeBook
   draw <- drawLot env "S-A1" 60.0 3.0 []
   buyer <- buyerB env
   r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
-  Some proof <- queryContractId env.transfer_agent r.delivery_proof
-  proof.cap_table_id === env.ctx.cap_table_id
-  proof.settlement_id === "T-1"
-  proof.issuer === env.issuer
-  proof.system_operator === env.system_operator
-  proof.transfer_agent === env.transfer_agent
-  -- Only the issuer redeems it, once.
-  submitMustFail env.transfer_agent do exerciseCmd r.delivery_proof DeliveryProof_Redeem
-  redeemed <- submit env.issuer do exerciseCmd r.delivery_proof DeliveryProof_Redeem
-  redeemed.quantity === 60.0
-  submitMustFail env.issuer do exerciseCmd r.delivery_proof DeliveryProof_Redeem
-
-test_settlement_proof_needs_all_three_keys : Script ()
-test_settlement_proof_needs_all_three_keys = do
-  env <- setupEnv
-  let proof = DeliveryProof with
-        issuer = env.issuer
-        system_operator = env.system_operator
-        transfer_agent = env.transfer_agent
-        cap_table_id = env.ctx.cap_table_id
-        settlement_id = "T-1"
-        seller_stakeholder_id = "SH-A"
-        buyer_stakeholder_id = "SH-B"
-        stock_class_id = "CLS-A"
-        quantity = 1.0
-        share_prices = [(DeliveredPrice with amount = 1.0; currency = "USD")]
-  submitMustFail env.issuer do createCmd proof
-  submitMustFail env.transfer_agent do createCmd proof
-  submitMustFail (actAs [env.issuer, env.transfer_agent]) do createCmd proof
+  r.context === env.ctx
+  r.settlement_id === "T-1"
+  r.seller_stakeholder_id === "SH-A"
+  r.buyer_stakeholder_id === "SH-B"
+  r.stock_class_id === "CLS-A"
+  r.quantity === 60.0
+  [SettleDrawResult with share_price] <- pure r.lots
+  share_price.amount === 3.0
+  share_price.currency === "USD"
 
 test_settlement_only_ta_settles : Script ()
 test_settlement_only_ta_settles = do

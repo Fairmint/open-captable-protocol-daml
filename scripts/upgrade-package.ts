@@ -5,9 +5,9 @@
  * Usage: npm run upgrade-package -- --package <name> --type <major|minor>
  *
  * Examples: `npm run upgrade-package -- --package OpenCapTable --type minor` (OpenCapTable-v35 0.0.1 → 0.0.2) and `npm
- * run upgrade-package -- --package OpenCapTableApi --type minor`. A minor upgrade of OpenCapTableApi-v01 or
- * OpenCapTableDeliveryProof-v01 also rewrites the data-dependency paths in OpenCapTable-v35/daml.yaml and
- * Test/daml.yaml, and changes OpenCapTable-v35's DAR, which embeds them; back up every changed package.
+ * run upgrade-package -- --package OpenCapTableApi --type minor`. A minor upgrade of OpenCapTableApi-v01 also rewrites
+ * the data-dependency paths in OpenCapTable-v35/daml.yaml and Test/daml.yaml, and changes OpenCapTable-v35's DAR, which
+ * embeds it; back up every changed package.
  */
 
 import * as fs from 'fs';

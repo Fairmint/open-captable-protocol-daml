@@ -6,8 +6,8 @@
  *
  * These must be replaced with relative paths before the package is published, otherwise consumers can't use it:
  * `canton-dev-tools bundle-dependencies` bundles the stdlib packages, `scripts/bundle-local-packages.ts` bundles this
- * repository's sibling packages (`daml.js/OpenCapTableApi-v01-…`, `daml.js/OpenCapTableDeliveryProof-v01-…`), and
- * `canton-dev-tools fix-splice-refs --target lib` rewrites the imports onto them.
+ * repository's sibling package (`daml.js/OpenCapTableApi-v01-…`), and `canton-dev-tools fix-splice-refs --target lib`
+ * rewrites the imports onto them.
  *
  * This script catches the issue in CI before publish.
  */

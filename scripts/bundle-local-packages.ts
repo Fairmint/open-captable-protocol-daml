@@ -4,8 +4,8 @@
  *
  * `canton-dev-tools create-root-index` builds `lib/` from one codegen package (`rootIndex.sourcePackage` in
  * `daml-js-bundle.json`, OpenCapTable-v35). That package's generated JS imports its data-dependencies from this
- * repository (OpenCapTableApi-v01, OpenCapTableDeliveryProof-v01) as `daml.js/<name>-<version>`, which no
- * canton-dev-tools preset bundles. This step, run between `create-root-index` and `fix-splice-refs --target lib`:
+ * repository (OpenCapTableApi-v01) as `daml.js/<name>-<version>`, which no canton-dev-tools preset bundles. This step,
+ * run between `create-root-index` and `fix-splice-refs --target lib`:
  *
  * 1. Copies each sibling's `lib/Fairmint/<Namespace>` trees into `lib/Fairmint/`, and any `lib/__bundled__/<dep>` the
  *    merged lib lacks;

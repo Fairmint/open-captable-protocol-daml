@@ -4,10 +4,9 @@
  *
  * Requires fresh builds whose bytes exactly match the committed backups.
  *
- * **Dependencies first:** `--package ocp` (OpenCapTable-v35) uploads OpenCapTableApi-v01, then
- * OpenCapTableDeliveryProof-v01, then OpenCapTable-v35 (`dependencies` in `scripts/packages.ts`). Pass
- * `--no-dependencies` to upload only the named package. A provider that fails on one DAR is not sent the DARs after
- * it.
+ * **Dependencies first:** `--package ocp` (OpenCapTable-v35) uploads OpenCapTableApi-v01, then OpenCapTable-v35
+ * (`dependencies` in `scripts/packages.ts`). Pass `--no-dependencies` to upload only the named package. A provider that
+ * fails on one DAR is not sent the DARs after it.
  *
  * **Networks:** OpenCapTable-v35 targets DevNet only (ADR-040: MainNet is out of scope); `--network mainnet` stays for
  * the release machinery but no workflow runs it for v35.

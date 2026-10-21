@@ -17,10 +17,9 @@ module Fairmint.OpenCapTable.Holds
   ) where
 
 import DA.Action (foldlA, unless, when)
-import DA.List (dedup, head, sort)
+import DA.List (dedup, head)
 import qualified DA.Map as Map
 import DA.Optional (fromSomeNote, isSome)
-import Fairmint.OpenCapTableDeliveryProof.DeliveryProof (DeliveredPrice(..), DeliveryProof(..))
 import Fairmint.OpenCapTable.Apply (maxLotsPerOperation)
 import Fairmint.OpenCapTable.Book
 import Fairmint.OpenCapTable.Events
@@ -304,7 +303,6 @@ data SettleResult = SettleResult
     lots : [SettleLotResult]
     -- Total quantity delivered
     quantity : Decimal
-    delivery_proof : ContractId DeliveryProof
   deriving (Eq, Show)
 
 -- One draw's outputs before the flush gives them contract IDs.
@@ -322,8 +320,8 @@ data PendingDraw = PendingDraw
 -- | Draws or cancels the holds of one trade, in one transaction with its cash leg. Every draw is a
 -- terminal event on a lot of one stakeholder in one class: it writes the TX_STOCK_TRANSFER, the
 -- buyer's TX_STOCK_ISSUANCE and state (carrying the delivery record), and the seller's balance
--- issuance and state when shares remain. One DeliveryProof carries the delivered terms; the buyer's
--- acceptance redeems it to pay.
+-- issuance and state when shares remain. The result carries the delivered terms, which the desk
+-- checks against the accepted terms before it pays.
 settle : Context -> BookInputs -> Text -> Date -> SettleBuyer -> [SettleLot] -> Update SettleResult
 settle ctx inputs settlementId date buyer lots = do
   assertLedgerDate date
@@ -363,18 +361,6 @@ settle ctx inputs settlementId date buyer lots = do
         (b', r) <- cancelOne (Some settlementId) date c b
         pure (b', Right r :: acc)) (b1, []) lots
   let total = sum (map (.quantity) draws)
-      prices = dedup (sort (map (\d -> DeliveredPrice with amount = d.share_price.amount; currency = d.share_price.currency) draws))
-  proof <- create DeliveryProof with
-    issuer = ctx.issuer
-    system_operator = ctx.system_operator
-    transfer_agent = ctx.transfer_agent
-    cap_table_id = ctx.cap_table_id
-    settlement_id = settlementId
-    seller_stakeholder_id = seller
-    buyer_stakeholder_id = buyerId
-    stock_class_id = stockClass
-    quantity = total
-    share_prices = prices
   (_, result) <- flushBook b2
   let stateOf sec = fromSomeNote ("no new state for " <> sec) (Map.lookup sec result.states)
       toResult p = case p of
@@ -405,7 +391,6 @@ settle ctx inputs settlementId date buyer lots = do
     stock_class_id = stockClass
     lots = map toResult (reverse pending)
     quantity = total
-    delivery_proof = proof
 
 drawOne : Text -> Date -> Text -> DrawLot -> Book -> Update (Book, PendingDraw)
 drawOne settlementId date buyerId d b0 = do
