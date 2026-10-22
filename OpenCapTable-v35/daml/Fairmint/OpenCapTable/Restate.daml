@@ -1,0 +1,341 @@
+-- CapTable_Restate: mirrors corrections (edits and deletes) of OCF records and the stock states they affect, within fixed limits the writer is trusted inside.
+module Fairmint.OpenCapTable.Restate
+  ( RestateOperation(..)
+  , StateRestatement(..)
+  , RestateResult(..)
+  , maxContractsPerRestatement
+  , restate
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import qualified DA.Map as Map
+import qualified DA.Set as Set
+import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events (checkRequirementIn, checkRequirements)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.References
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context)
+
+-- | A stock state as a restatement sets it, in the units of the splits on or before its last event
+-- date. `accelerated_since_snapshot` is stated like the snapshot it adds to: the shares of a lot on
+-- vesting terms accelerated since it, which bound later accelerations. `seq` is given only to
+-- recreate the state of a security whose consuming record the restatement deletes. It must exceed
+-- the seq of the state that record ended, or a later event derives an ID that already exists:
+-- derived IDs are not claimed, and snapshots and restatements advance a state's seq with no OCF
+-- record, so the writer reads that seq from the ended state on the ledger, not from the replayed
+-- OCF. Without keys the ledger cannot see the ended state, so it cannot check this.
+data StateRestatement = StateRestatement
+  with
+    security_id : Text
+    issue_date : Date
+    last_event_date : Date
+    origin_transaction_id : Text
+    quantity : Decimal
+    stakeholder_id : Text
+    stock_class_id : Text
+    vesting : StockVesting
+    snapshot : Optional VestedSnapshot
+    accelerated_since_snapshot : Optional Decimal
+    seq : Optional Int
+  deriving (Eq, Show)
+
+data RestateOperation
+  = -- | Replaces a record (in the inputs) with new data under the same type and OCF ID.
+    RestateEdit OcfRecordData
+  | -- | Deletes a record (in the inputs) by object ID and releases its object ID. A stock
+    -- issuance's lot must end in the same restatement, or the record that consumed it must be among
+    -- the inputs or deleted with it; its security ID is released only with an ended state from
+    -- which no event derived an ID (see `resolvePending`).
+    RestateDelete Text
+  | -- | Replaces a security's state with its successor, or recreates the state of a security whose
+    -- consuming record this restatement deletes.
+    RestateSetState StateRestatement
+  | -- | Ends a security's state, with the deletion of its origin issuance in this restatement.
+    RestateEndState Text
+  deriving (Eq, Show)
+
+data RestateResult = RestateResult
+  with
+    records : Map Text OcfRecordCid
+    states : Map Text (ContractId StockSecurity)
+    epochs : Map Text (ContractId StockClassEpoch)
+    shards : Map Text (ContractId OcfIdShard)
+  deriving (Eq, Show)
+
+maxContractsPerRestatement : Int
+maxContractsPerRestatement = 500
+
+-- Checks that need the whole restatement, run after its last operation.
+data Pending
+  = PendingEnd with security_id : Text; origin_transaction_id : Text; derived_ids : Bool
+  | PendingRecreate with security_id : Text
+  | PendingIssuanceGone with object_id : Text; security_id : Text
+  deriving (Eq, Show)
+
+data Progress = Progress
+  with
+    -- the book as loaded, before the first operation
+    loaded : Book
+    book : Book
+    -- object IDs edited or deleted so far: each at most once
+    touched : Set.Set Text
+    -- the data of every record deleted
+    deleted : Map Text OcfRecordData
+    pending : [Pending]
+
+restate : Context -> BookInputs -> [RestateOperation] -> Update RestateResult
+restate ctx inputs operations = do
+  when (null operations) (abort "CapTable_Restate needs at least one operation")
+  b0 <- loadBook ctx inputs
+  p <- foldlA restateOne (Progress with loaded = b0; book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
+  book <- foldlA (resolvePending p) p.book p.pending
+  checkRequirements book
+  (b1, result) <- flushBook book
+  when (b1.contracts_touched > maxContractsPerRestatement)
+    (abort ("CapTable_Restate touches at most " <> show maxContractsPerRestatement <> " contracts"))
+  pure RestateResult with
+    records = result.records
+    states = result.states
+    epochs = result.epochs
+    shards = result.shards
+
+touch : Text -> Progress -> Update Progress
+touch objectId p = do
+  when (Set.member objectId p.touched)
+    (abort ("record " <> objectId <> " is edited or deleted more than once in one restatement"))
+  pure p with touched = Set.insert objectId p.touched
+
+-- Records a package choice wrote (derived IDs), splits and holds are never restated.
+refuseProtected : Context -> Text -> OcfRecordData -> Update ()
+refuseProtected ctx objectId d = do
+  when (isDerivedForm ctx objectId)
+    (abort ("record " <> objectId <> " was written by a register choice and is never restated; correct it with a new record"))
+  case recordObjectType d of
+    OcfObjectTypeTxStockClassSplit -> abort ("split " <> objectId <> " is never restated; rebuild the book to correct it")
+    OcfObjectTypeTxStockHold -> abort "hold records are never restated"
+    OcfObjectTypeTxStockHoldCancellation -> abort "hold records are never restated"
+    _ -> pure ()
+
+restateOne : Progress -> RestateOperation -> Update Progress
+restateOne p op = case op of
+  RestateEdit d -> do
+    let ctx = p.book.context
+        objectId = (recordView ctx d).object_id
+    p1 <- touch objectId p
+    old <- requireRecord objectId p1.book
+    refuseProtected ctx objectId old.ocf_data
+    unless (recordObjectType old.ocf_data == recordObjectType d)
+      (abort ("an edit keeps record " <> objectId <> "'s type"))
+    when (old.ocf_data == d) (abort ("edit of record " <> objectId <> " changes nothing"))
+    -- Which lots a stock event ended is the evidence a later issuance delete relies on, and a
+    -- vesting record or acceptance was checked against its security only when written.
+    unless (consumedSecurities d == consumedSecurities old.ocf_data)
+      (abort ("an edit cannot change the securities record " <> objectId <> " consumed; delete it and write a new one"))
+    -- A vesting record on a grant or a warrant, which has no state, may move between two of them;
+    -- a record on a stock lot changed that lot's state and stays on it. Where it was is a fact about
+    -- the book as loaded, so a grant the restatement also renames or deletes may be its source.
+    moved <- case (subjectSecurity old.ocf_data, subjectSecurity d) of
+      (from, to) | from == to -> pure []
+      (Some from, Some to) | isVestingRecord d -> do
+        checkRequirementIn p.loaded (RequireSecurity with label = "Moved vesting record " <> objectId <> " (from)"; security_id = from; object_types = statelessVestingTargets)
+        pure [RequireSecurity with label = "Moved vesting record " <> objectId; security_id = to; object_types = statelessVestingTargets]
+      _ -> abort ("an edit cannot change the security record " <> objectId <> " is on; delete it and write a new one")
+    let oldSec = issuanceSecurityId old.ocf_data
+        newSec = issuanceSecurityId d
+    when (recordObjectType d == OcfObjectTypeTxStockIssuance && oldSec /= newSec)
+      (abort ("an edit cannot change stock issuance " <> objectId <> "'s security ID; delete it and write a new one"))
+    b1 <- removeRecord objectId p1.book
+    b2 <- if oldSec /= newSec
+      then do
+        b' <- case oldSec of
+          Some s -> releaseId IdNamespaceSecurity s b1
+          None -> pure b1
+        case newSec of
+          Some s -> claimId IdNamespaceSecurity s b'
+          None -> pure b'
+      else pure b1
+    -- An edit checks only the references the old record did not make. It is charged for the
+    -- distinct polymorphic ones among them, or for the references its lists grow by, if more.
+    let oldRequirements = Set.fromList (requirementsOf old.ocf_data)
+        added = filter (\r -> not (Set.member r oldRequirements)) (requirementsOf d)
+        oldPolymorphic = Set.fromList (polymorphicRequirementsOf old.ocf_data)
+        addedPolymorphic = filter (\r -> not (Set.member r oldPolymorphic)) (polymorphicRequirementsOf d)
+        grown = polymorphicReferenceCount d - polymorphicReferenceCount old.ocf_data
+    b3 <- countPolymorphicReferences (max grown (length addedPolymorphic)) b2
+    (b4, _) <- addRecord d b3
+    pure p1 with book = addRequirements (added <> moved) b4
+  RestateDelete objectId -> do
+    let ctx = p.book.context
+    p1 <- touch objectId p
+    old <- requireRecord objectId p1.book
+    refuseProtected ctx objectId old.ocf_data
+    when (recordObjectType old.ocf_data == OcfObjectTypeIssuer)
+      (abort "the issuer record is never deleted; tear the book down instead")
+    b1 <- case old.ocf_data of
+      OcfRecordDataStockClass _ -> do
+        e <- requireEpoch objectId p1.book
+        unless (null e.splits)
+          (abort ("stock class " <> objectId <> " has recorded splits and is never deleted; rebuild the book"))
+        when e.frozen (abort ("stock class " <> objectId <> " is frozen for a split"))
+        removeEpoch objectId p1.book
+      _ -> pure p1.book
+    b2 <- removeRecord objectId b1
+    b3 <- releaseId IdNamespaceObject objectId b2
+    -- A stock issuance's security ID waits for the end of the restatement; a warrant's,
+    -- convertible's or equity compensation's, which has no state, is released now.
+    (b4, pending) <- case (old.ocf_data, issuanceSecurityId old.ocf_data) of
+      (OcfRecordDataStockIssuance iss, _) ->
+        pure (b3, (PendingIssuanceGone with object_id = objectId; security_id = iss.security_id) :: p1.pending)
+      (_, Some s) -> do
+        b' <- releaseId IdNamespaceSecurity s b3
+        pure (b', p1.pending)
+      (_, None) -> pure (b3, p1.pending)
+    pure p1 with book = b4; deleted = Map.insert objectId old.ocf_data p1.deleted; pending
+  RestateSetState r -> do
+    let b = p.book
+    e <- requireEpoch r.stock_class_id b
+    when e.frozen (abort ("stock class " <> r.stock_class_id <> " is frozen for a split"))
+    let splitEpoch = splitsOnOrBefore e.splits r.last_event_date
+        base = StockSecurity with
+          context = b.context
+          security_id = r.security_id
+          issue_date = r.issue_date
+          last_event_date = r.last_event_date
+          origin_transaction_id = r.origin_transaction_id
+          quantity = r.quantity
+          seq = 0
+          split_epoch = splitEpoch
+          stakeholder_id = r.stakeholder_id
+          stock_class_id = r.stock_class_id
+          vesting = r.vesting
+          holds = []
+          delivery = None
+          snapshot = r.snapshot
+          accelerated_since_snapshot = r.accelerated_since_snapshot
+          derived_ids = True
+    case (lookupState r.security_id b, r.seq) of
+      (Some old, None) -> do
+        when (r.last_event_date < old.last_event_date)
+          (abort ("a restatement never moves security " <> r.security_id <> "'s last event date back"))
+        unless (r.origin_transaction_id == old.origin_transaction_id)
+          (abort ("a successor of security " <> r.security_id <> " keeps its origin transaction " <> old.origin_transaction_id))
+        -- Moving a state out of a class changes a state in that class too.
+        when (old.stock_class_id /= r.stock_class_id) do
+          from <- requireEpoch old.stock_class_id b
+          when from.frozen (abort ("stock class " <> old.stock_class_id <> " is frozen for a split"))
+        -- A successor under the same security ID carries every hold forward under its hold ID. With
+        -- the last event date kept, the split epoch differs only when a split was recorded on or
+        -- before it, which left the state stale: the restatement brings it current, and its
+        -- settlement hold is then void, as any split voids one, so the TA can cancel it.
+        unless (null old.holds) do
+          unless (r.stakeholder_id == old.stakeholder_id && r.stock_class_id == old.stock_class_id
+                  && r.last_event_date == old.last_event_date)
+            (abort ("security " <> r.security_id <> " carries an open hold, so a restatement keeps its stakeholder, class and last event date"))
+        b' <- replaceState (base with seq = old.seq + 1; holds = old.holds; derived_ids = old.derived_ids) b
+        pure p with book = b'
+      (Some _, Some _) -> abort ("security " <> r.security_id <> " has an active state; replace it without a seq")
+      (None, Some n) -> do
+        when (Map.member r.security_id b.states)
+          (abort ("security " <> r.security_id <> " already has a state in this write"))
+        when (n < 0) (abort "a state's seq is not negative")
+        -- A recreated state names the issuance that carries its security, when the write has it.
+        forA_ (Map.lookup r.security_id b.securities) \issuanceId ->
+          unless (issuanceId == r.origin_transaction_id)
+            (abort ("security " <> r.security_id <> "'s origin is issuance " <> issuanceId <> ", not " <> r.origin_transaction_id))
+        b' <- addState (base with seq = n) b
+        pure p with book = b'; pending = (PendingRecreate with security_id = r.security_id) :: p.pending
+      (None, None) -> abort ("no active state for security " <> r.security_id <> "; give a seq to recreate one")
+  RestateEndState sec -> do
+    s <- requireState sec p.book
+    e <- requireEpoch s.stock_class_id p.book
+    when e.frozen (abort ("stock class " <> s.stock_class_id <> " is frozen for a split"))
+    unless (null s.holds)
+      (abort ("security " <> sec <> " carries an open hold; a restatement never ends a lot on hold"))
+    b' <- endState sec p.book
+    pure p with book = b'; pending = (PendingEnd with security_id = sec; origin_transaction_id = s.origin_transaction_id; derived_ids = s.derived_ids) :: p.pending
+
+-- Runs the checks that need the whole restatement, and releases the security IDs it may.
+resolvePending : Progress -> Book -> Pending -> Update Book
+resolvePending p book pending = case pending of
+  PendingEnd with security_id; origin_transaction_id ->
+    case Map.lookup origin_transaction_id p.deleted of
+      Some (OcfRecordDataStockIssuance iss) | iss.security_id == security_id -> pure book
+      _ -> abort ("a restatement ends security " <> security_id <> "'s state only with the deletion of its origin issuance " <> origin_transaction_id)
+  PendingRecreate with security_id ->
+    if any (consumes security_id) (Map.values p.deleted) then pure book
+    else abort ("a restatement recreates security " <> security_id <> "'s state only with the deletion of the record that consumed it")
+  PendingIssuanceGone with object_id; security_id ->
+    -- Without keys the ledger cannot see a state it is not given, so the delete must show the lot
+    -- is gone: ended here, or consumed by a record among the inputs or deleted with it. Derived IDs
+    -- are unique only while each (security_id, seq) is used once, and a reissue starts at seq 0, so
+    -- the security ID is released only with a state ended here from which no event derived an ID
+    -- (a recreated state counts as one that did); otherwise it stays claimed and a corrected
+    -- issuance takes a new security ID.
+    case concatMap (endedAt security_id) p.pending of
+      derived :: _
+        | not derived && not (isDerivedForm book.context security_id) -> releaseId IdNamespaceSecurity security_id book
+        | otherwise -> pure book
+      [] -> case filter (consumes security_id . (.ocf_data)) (Map.values book.records) of
+        -- A consumer this restatement deletes shows it too, unless the state is recreated here.
+        [] | any (consumes security_id) (Map.values p.deleted) && not (recreates security_id p.pending) -> pure book
+           | otherwise -> abort ("a restatement deletes stock issuance " <> object_id <> " only with the end of security "
+              <> security_id <> "'s state, or with the record that consumed it among its inputs or deleted with it")
+        consumer :: _ -> do
+          let consumerId = (recordView book.context consumer.ocf_data).object_id
+          when (isDerivedForm book.context consumerId)
+            (abort ("security " <> security_id <> " was consumed by " <> consumerId
+              <> ", which a register choice wrote, so its issuance " <> object_id <> " is never deleted"))
+          pure book
+
+-- Whether this restatement recreates the security's state.
+recreates : Text -> [Pending] -> Bool
+recreates sec = any (\pending -> case pending of
+  PendingRecreate with security_id -> security_id == sec
+  _ -> False)
+
+-- Whether the state this restatement ended for the security had derived IDs, if it ended one.
+endedAt : Text -> Pending -> [Bool]
+endedAt sec pending = case pending of
+  PendingEnd with security_id; derived_ids -> if security_id == sec then [derived_ids] else []
+  _ -> []
+
+-- The securities a stock record consumed (ended).
+consumedSecurities : OcfRecordData -> [Text]
+consumedSecurities d = case d of
+  OcfRecordDataStockTransfer x -> [x.security_id]
+  OcfRecordDataStockCancellation x -> [x.security_id]
+  OcfRecordDataStockRepurchase x -> [x.security_id]
+  OcfRecordDataStockRetraction x -> [x.security_id]
+  OcfRecordDataStockConversion x -> [x.security_id]
+  OcfRecordDataStockReissuance x -> [x.security_id]
+  OcfRecordDataStockConsolidation x -> x.security_ids
+  _ -> []
+
+-- The security a vesting record or a stock acceptance is on: checked against its state or issuance
+-- when written, and named by no requirement an edit would re-check.
+subjectSecurity : OcfRecordData -> Optional Text
+subjectSecurity d = case d of
+  OcfRecordDataVestingStart x -> Some x.security_id
+  OcfRecordDataVestingEvent x -> Some x.security_id
+  OcfRecordDataVestingAcceleration x -> Some x.security_id
+  OcfRecordDataStockAcceptance x -> Some x.security_id
+  _ -> None
+
+isVestingRecord : OcfRecordData -> Bool
+isVestingRecord d = case d of
+  OcfRecordDataVestingStart _ -> True
+  OcfRecordDataVestingEvent _ -> True
+  OcfRecordDataVestingAcceleration _ -> True
+  _ -> False
+
+statelessVestingTargets : [OcfObjectType]
+statelessVestingTargets = [OcfObjectTypeTxWarrantIssuance, OcfObjectTypeTxEquityCompensationIssuance]
+
+-- Whether a stock record consumed (ended) the security.
+consumes : Text -> OcfRecordData -> Bool
+consumes sec d = sec `elem` consumedSecurities d

@@ -1,132 +1,158 @@
+-- Stock consolidations through ApplyStockConsolidation: up to 50 securities of one class retired into one resulting issuance that holds their sum, with IDs derived from the first input, and the consolidation validator.
 module OpenCapTable.TestStockConsolidation where
 
-import Fairmint.OpenCapTable.OCF.StockIssuance
-import Fairmint.OpenCapTable.OCF.StockConsolidation
-import Fairmint.OpenCapTable.OCF.StockCancellation
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, stockSuccessorIssuance)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create stock issuances to consolidate
-createStockIssuance issuer capTableCid securityId quantity =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance StockIssuanceOcfData with
-        id = "TX_STOCK_ISS_" <> securityId
-        date = DT.time (DA.date 2022 Jan 01) 0 0 0
-        security_id = securityId
-        custom_id = "CS-" <> securityId
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = None
-        security_law_exemptions = []
-        stock_class_id = "SC_COMMON"
-        share_price = OcfMonetary with amount = 0.0001, currency = "USD"
-        quantity = quantity
-        cost_basis = None
-        stock_legend_ids = []
-        issuance_type = None
-        share_numbers_issued = []
-        vesting_terms_id = None
-        vestings = []
-        stock_plan_id = None
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..), validateStockConsolidationOcfData)
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
--- Test 1: Basic consolidation of two securities
--- Holder requests single certificate for two separate holdings
-testStockConsolidation_TwoSecurities = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid "SSEC-001A" 25000.0
-  result2 <- createStockIssuance issuer result.updatedCapTableCid "SSEC-001B" 25000.0
-  _ <- submit issuer do
-    exerciseCmd result2.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-CONSOLIDATION-1" "SSEC-001-CONSOLIDATED" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Apr 15) 0 0 0) 50000.0
-        , CT.OcfCreateStockConsolidation StockConsolidationOcfData with
-        id = "TX_STOCK_CONSOLIDATION_1"
-        date = DT.time (DA.date 2025 Apr 15) 0 0 0
-        security_ids = ["SSEC-001A", "SSEC-001B"]
-        resulting_security_id = "SSEC-001-CONSOLIDATED"
-        comments = []
-        reason_text = Some "Holder requested single certificate"]
-      edits = []
-      deletes = []
-  pure ()
+issued : Date
+issued = D.date 2022 D.Jan 1
 
--- Test 2: Consolidation of multiple securities with comments
-testStockConsolidation_MultipleSecurities = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  r1 <- createStockIssuance issuer capTableCid "SSEC-002A" 10000.0
-  r2 <- createStockIssuance issuer r1.updatedCapTableCid "SSEC-002B" 15000.0
-  r3 <- createStockIssuance issuer r2.updatedCapTableCid "SSEC-002C" 20000.0
-  r4 <- createStockIssuance issuer r3.updatedCapTableCid "SSEC-002D" 5000.0
-  _ <- submit issuer do
-    exerciseCmd r4.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-CONSOLIDATION-2" "SSEC-002-CONSOLIDATED" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Jun 30) 0 0 0) 50000.0
-        , CT.OcfCreateStockConsolidation StockConsolidationOcfData with
-        id = "TX_STOCK_CONSOLIDATION_2"
-        date = DT.time (DA.date 2025 Jun 30) 0 0 0
-        security_ids = ["SSEC-002A", "SSEC-002B", "SSEC-002C", "SSEC-002D"]
-        resulting_security_id = "SSEC-002-CONSOLIDATED"
+-- | The standard book plus SH-A's lots of CLS-A, issued 2022-01-01 at 0.0001 USD.
+consolidationBook : [(Text, Decimal)] -> Script Env
+consolidationBook lots = do
+  env <- standardBook
+  _ <- applyRecords env (map (\(sec, q) -> OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-A" q issued) with
+    id = "TX_STOCK_ISS_" <> sec; custom_id = "CS-" <> sec; share_price = usd 0.0001; cost_basis = None)) lots)
+  pure env
+
+mkConsolidation : Text -> Date -> [Text] -> Text -> StockConsolidationOcfData
+mkConsolidation id d secs result = StockConsolidationOcfData with
+  id; date = d; security_ids = secs; resulting_security_id = result; comments = []; reason_text = None
+
+result : Text -> Text -> Date -> Decimal -> StockIssuanceOcfData
+result id sec d q = (issuance sec "SH-A" "CLS-A" q d) with id
+
+consolidate : StockConsolidationOcfData -> StockIssuanceOcfData -> ApplyOperation
+consolidate c r = ApplyStockConsolidation with consolidation = c; resulting_issuance = r
+
+-- Holder requests a single certificate for two separate holdings.
+test_stock_consolidation_two_securities : Script ()
+test_stock_consolidation_two_securities = do
+  env <- consolidationBook [("SSEC-001A", 25000.0), ("SSEC-001B", 25000.0)]
+  let d = D.date 2025 D.Apr 15
+      c = (mkConsolidation "TX_STOCK_CONSOLIDATION_1" d ["SSEC-001A", "SSEC-001B"] "SSEC-001-CONSOLIDATED") with
+        reason_text = Some "Holder requested single certificate"
+      r = result "STOCK-ISS-CONSOLIDATION-1" "SSEC-001-CONSOLIDATED" d 50000.0
+  _ <- applyOps env [consolidate c r]
+  expectRecord env (OcfRecordDataStockConsolidation c)
+  expectRecord env (OcfRecordDataStockIssuance r)
+  hasState env "SSEC-001A" >>= (=== False)
+  hasState env "SSEC-001B" >>= (=== False)
+  s <- stateOf env "SSEC-001-CONSOLIDATED"
+  s.quantity === 50000.0
+  s.stakeholder_id === "SH-A"
+  s.origin_transaction_id === "STOCK-ISS-CONSOLIDATION-1"
+  s.last_event_date === d
+
+test_stock_consolidation_multiple_securities : Script ()
+test_stock_consolidation_multiple_securities = do
+  env <- consolidationBook [("SSEC-002A", 10000.0), ("SSEC-002B", 15000.0), ("SSEC-002C", 20000.0), ("SSEC-002D", 5000.0)]
+  let d = D.date 2025 D.Jun 30
+      c = (mkConsolidation "TX_STOCK_CONSOLIDATION_2" d ["SSEC-002A", "SSEC-002B", "SSEC-002C", "SSEC-002D"] "SSEC-002-CONSOLIDATED") with
         comments = ["Consolidation of four separate stock positions.", "Total: 50,000 shares of Common Stock."]
-        reason_text = Some "Administrative cleanup per annual cap table maintenance"]
-      edits = []
-      deletes = []
-  pure ()
+        reason_text = Some "Administrative cleanup per annual cap table maintenance"
+      r = result "STOCK-ISS-CONSOLIDATION-2" "SSEC-002-CONSOLIDATED" d 50000.0
+  _ <- applyOps env [consolidate c r]
+  expectRecord env (OcfRecordDataStockConsolidation c)
+  (.quantity) <$> stateOf env "SSEC-002-CONSOLIDATED" >>= (=== 50000.0)
+  mapA (hasState env) c.security_ids >>= (=== [False, False, False, False])
 
--- Test 3: Consolidation without reason text
-testStockConsolidation_MinimalFields = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  r1 <- createStockIssuance issuer capTableCid "SSEC-003A" 30000.0
-  r2 <- createStockIssuance issuer r1.updatedCapTableCid "SSEC-003B" 70000.0
-  _ <- submit issuer do
-    exerciseCmd r2.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-CONSOLIDATION-3" "SSEC-003-CONSOLIDATED" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Aug 01) 0 0 0) 100000.0
-        , CT.OcfCreateStockConsolidation StockConsolidationOcfData with
-        id = "TX_STOCK_CONSOLIDATION_3"
-        date = DT.time (DA.date 2025 Aug 01) 0 0 0
-        security_ids = ["SSEC-003A", "SSEC-003B"]
-        resulting_security_id = "SSEC-003-CONSOLIDATED"
-        comments = []
-        reason_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_consolidation_minimal_fields : Script ()
+test_stock_consolidation_minimal_fields = do
+  env <- consolidationBook [("SSEC-003A", 30000.0), ("SSEC-003B", 70000.0)]
+  let d = D.date 2025 D.Aug 1
+      c = mkConsolidation "TX_STOCK_CONSOLIDATION_3" d ["SSEC-003A", "SSEC-003B"] "SSEC-003-CONSOLIDATED"
+  _ <- applyOps env [consolidate c (result "STOCK-ISS-CONSOLIDATION-3" "SSEC-003-CONSOLIDATED" d 100000.0)]
+  expectRecord env (OcfRecordDataStockConsolidation c)
+  (.quantity) <$> stateOf env "SSEC-003-CONSOLIDATED" >>= (=== 100000.0)
 
-testStockConsolidation_RetiresEverySourceBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  let securityId = "SSEC-CONSOLIDATION-BALANCE"
-  result <- createStockIssuance issuer capTableCid securityId 100.0
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockConsolidation StockConsolidationOcfData with
-            id = "TX_STOCK_CONSOLIDATION_BALANCE"
-            date = DT.time (DA.date 2025 Aug 01) 0 0 0
-            security_ids = [securityId]
-            resulting_security_id = "SSEC-CONSOLIDATED-RESULT"
-            comments = []
-            reason_text = None
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_CONSOLIDATION"
-            date = DT.time (DA.date 2025 Aug 01) 0 0 0
-            security_id = securityId
-            quantity = 1.0
-            balance_security_id = None
-            reason_text = "Cannot reduce a consolidated source"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+-- The consolidation's own IDs derive from its first input.
+test_stock_consolidation_derived_ids_from_first_input : Script ()
+test_stock_consolidation_derived_ids_from_first_input = do
+  env <- consolidationBook [("SSEC-A", 1.0), ("SSEC-B", 2.0)]
+  let d = D.date 2025 D.Aug 1
+      cid = derived env "SSEC-A" 0 DerivedRoleEvent 0
+      rsec = derived env "SSEC-A" 0 DerivedRoleResultingSecurity 0
+      riss = derived env "SSEC-A" 0 DerivedRoleResultingIssuance 0
+      c = mkConsolidation cid d ["SSEC-A", "SSEC-B"] rsec
+  -- An ID derived from the second input is not the consolidation's own.
+  applyOpsFails env "derived form"
+    [consolidate (c with id = derived env "SSEC-B" 0 DerivedRoleEvent 0) (result riss rsec d 3.0)]
+  _ <- applyOps env [consolidate c (result riss rsec d 3.0)]
+  expectRecord env (OcfRecordDataStockConsolidation c)
+  (.quantity) <$> stateOf env rsec >>= (=== 3.0)
+
+-- Every source is retired, so no later operation in the batch may use it.
+test_stock_consolidation_retires_every_source : Script ()
+test_stock_consolidation_retires_every_source = do
+  env <- consolidationBook [("SSEC-CONSOLIDATION-BALANCE", 100.0)]
+  let d = D.date 2025 D.Aug 1
+      c = mkConsolidation "TX_STOCK_CONSOLIDATION_BALANCE" d ["SSEC-CONSOLIDATION-BALANCE"] "SSEC-CONSOLIDATED-RESULT"
+      cxl = StockCancellationOcfData with
+        id = "TX_STOCK_CANCEL_AFTER_CONSOLIDATION"; date = d; security_id = "SSEC-CONSOLIDATION-BALANCE"; quantity = 1.0
+        balance_security_id = None; reason_text = "Cannot reduce a consolidated source"; comments = []
+  applyOpsFails env "no active state for security SSEC-CONSOLIDATION-BALANCE in this write"
+    [ consolidate c (result "ISS-RESULT" "SSEC-CONSOLIDATED-RESULT" d 100.0)
+    , ApplyStockCancellation with cancellation = cxl; balance = None
+    ]
+  -- Alone, a one-lot consolidation is fine.
+  _ <- applyOps env [consolidate c (result "ISS-RESULT" "SSEC-CONSOLIDATED-RESULT" d 100.0)]
+  hasState env "SSEC-CONSOLIDATION-BALANCE" >>= (=== False)
+
+test_stock_consolidation_rules : Script ()
+test_stock_consolidation_rules = do
+  env <- consolidationBook [("SSEC-A", 10.0), ("SSEC-B", 20.0)]
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B"), OcfRecordDataStockIssuance ((issuance "SSEC-C" "SH-A" "CLS-B" 5.0 issued) with id = "ISS-SSEC-C")]
+  let d = D.date 2025 D.Aug 1
+      c = mkConsolidation "CONS-1" d ["SSEC-A", "SSEC-B"] "SSEC-ALL"
+      r = result "ISS-ALL" "SSEC-ALL" d 30.0
+  applyOpsFails env "consolidation CONS-1 must yield the sum of its inputs" [consolidate c (r with quantity = 29.0)]
+  applyOpsFails env "a consolidation names each security once" [consolidate (c with security_ids = ["SSEC-A", "SSEC-A"]) (r with quantity = 20.0)]
+  applyOpsFails env "a consolidation's securities share one class" [consolidate (c with security_ids = ["SSEC-A", "SSEC-C"]) (r with quantity = 15.0)]
+  applyOpsFails env "consolidation CONS-1 must write its resulting security SSEC-ALL" [consolidate c (r with security_id = "SSEC-OTHER")]
+  applyOpsFails env "a consolidation's resulting security stays in its inputs' class" [consolidate c (r with stock_class_id = "CLS-B")]
+  -- A consolidation merges one holder's positions: the inputs share a stakeholder, and the result keeps it.
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "SSEC-D" "SH-B" "CLS-A" 5.0 issued) with id = "ISS-SSEC-D")]
+  applyOpsFails env "a consolidation's securities share one stakeholder" [consolidate (c with security_ids = ["SSEC-A", "SSEC-D"]) (r with quantity = 15.0)]
+  applyOpsFails env "a consolidation's securities share one stakeholder" [consolidate (c with security_ids = ["SSEC-A", "SSEC-D"]) (r with quantity = 15.0; stakeholder_id = "SH-B")]
+  applyOpsFails env "a consolidation's resulting security stays with its inputs' stakeholder" [consolidate c (r with stakeholder_id = "SH-B")]
+  applyOpsFails env "no active state for security SSEC-NONE" [consolidate (c with security_ids = ["SSEC-A", "SSEC-NONE"]) r]
+  applyOpsFails env "a consolidation needs at least one security" [consolidate (c with security_ids = []) r]
+  applyOpsFails env "a consolidation takes at most 50 securities"
+    [consolidate (c with security_ids = map (\i -> "SSEC-" <> show i) [1 .. 51]) r]
+  applyOpsFails env "precedes the last event on security SSEC-A" [consolidate (c with date = D.date 2021 D.Dec 31) r]
+  -- Nothing was retired.
+  hasState env "SSEC-A" >>= (=== True)
+  hasState env "SSEC-B" >>= (=== True)
+  hasState env "SSEC-D" >>= (=== True)
+
+test_stock_consolidation_validator : Script ()
+test_stock_consolidation_validator = do
+  env <- consolidationBook [("SSEC-A", 10.0), ("SSEC-B", 20.0)]
+  let d = D.date 2025 D.Aug 1
+      c = mkConsolidation "CONS-1" d ["SSEC-A", "SSEC-B"] "SSEC-ALL"
+      r = result "ISS-ALL" "SSEC-ALL" d 30.0
+  applyOpsFails env "precondition" [consolidate (c with reason_text = Some "") r]
+  applyOpsFails env "precondition" [consolidate (c with comments = [""]) r]
+  applyOpsFails env "precondition" [consolidate (c with resulting_security_id = "") (r with security_id = "")]
+  applyOpsFails env "no active state for security  in this write" [consolidate (c with security_ids = ["SSEC-A", ""]) r]
+  applyOpsFails env "an empty ID cannot be claimed" [consolidate (c with id = "") r]
+  let ok = validateStockConsolidationOcfData
+  expectTrue "the fixture" (ok c)
+  expectTrue "a reason" (ok c with reason_text = Some "Cleanup")
+  expectFalse "empty id" (ok c with id = "")
+  expectFalse "empty resulting_security_id" (ok c with resulting_security_id = "")
+  expectFalse "an empty reason_text" (ok c with reason_text = Some "")
+  expectFalse "an empty comment" (ok c with comments = [""])
+  expectFalse "an empty security ID" (ok c with security_ids = ["SSEC-A", ""])
+  expectFalse "no securities" (ok c with security_ids = [])

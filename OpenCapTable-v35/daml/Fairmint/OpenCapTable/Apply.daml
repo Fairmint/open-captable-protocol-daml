@@ -1,0 +1,387 @@
+-- CapTable_Apply: writes new OCF records, stock security events, splits, vesting snapshots and shard pre-splits in one bounded batch.
+module Fairmint.OpenCapTable.Apply
+  ( ApplyOperation(..)
+  , ApplyResult(..)
+  , maxOperationsPerApply
+  , maxLotsPerOperation
+  , apply
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.List (dedup, head, last)
+import DA.Map (Map)
+import DA.Optional (fromOptional, isNone, isSome, optionalToList)
+import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockConversion (StockConversionOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.References
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.VestingState
+
+-- | One operation of a `CapTable_Apply` batch. Every record a stock event writes goes in its
+-- operation, so the event consumes its state and creates its outputs atomically.
+data ApplyOperation
+  = -- | Any OCF record that is not one of the bundled stock events below, a hold record or the
+    -- issuer: definitions, class-, plan- and issuer-level records, warrant, convertible and
+    -- equity-compensation records, primary stock issuances (which create a state), stock classes
+    -- (which create their epoch), splits (recorded on a frozen epoch), stock acceptances and
+    -- retractions, and vesting records (an event on the security's state when the write holds
+    -- one, otherwise a warrant or equity-compensation record).
+    ApplyRecord OcfRecordData
+  | ApplyStockTransfer with
+      transfer : StockTransferOcfData
+      resulting : [StockIssuanceOcfData]
+      balance : Optional StockIssuanceOcfData
+  | ApplyStockCancellation with
+      cancellation : StockCancellationOcfData
+      balance : Optional StockIssuanceOcfData
+  | ApplyStockRepurchase with
+      repurchase : StockRepurchaseOcfData
+      balance : Optional StockIssuanceOcfData
+  | ApplyStockConversion with
+      conversion : StockConversionOcfData
+      resulting : [StockIssuanceOcfData]
+      balance : Optional StockIssuanceOcfData
+  | ApplyStockReissuance with
+      reissuance : StockReissuanceOcfData
+      resulting : [StockIssuanceOcfData]
+  | ApplyStockConsolidation with
+      consolidation : StockConsolidationOcfData
+      resulting_issuance : StockIssuanceOcfData
+  | -- | The TA's vested quantity for a security on vesting terms, as of a date. Monotone.
+    ApplyVestingSnapshot with
+      security_id : Text
+      as_of : Date
+      vested : Decimal
+  | -- | Splits an ID shard by its next bit, ahead of a large book's replication.
+    ApplyPreSplitShard with
+      prefix : Text
+  deriving (Eq, Show)
+
+data ApplyResult = ApplyResult
+  with
+    -- The OCF records created, by object ID
+    records : Map Text OcfRecordCid
+    -- The stock states created, by security ID
+    states : Map Text (ContractId StockSecurity)
+    -- The epochs created, by stock class ID
+    epochs : Map Text (ContractId StockClassEpoch)
+    -- The ID shards created, by prefix
+    shards : Map Text (ContractId OcfIdShard)
+  deriving (Eq, Show)
+
+maxOperationsPerApply : Int
+maxOperationsPerApply = 500
+
+-- | Lots per hold placement, settlement or consolidation.
+maxLotsPerOperation : Int
+maxLotsPerOperation = 50
+
+apply : Context -> BookInputs -> [ApplyOperation] -> Update ApplyResult
+apply ctx inputs operations = do
+  when (null operations) (abort "CapTable_Apply needs at least one operation")
+  when (length operations > maxOperationsPerApply)
+    (abort ("CapTable_Apply takes at most " <> show maxOperationsPerApply <> " operations"))
+  b0 <- loadBook ctx inputs
+  b1 <- foldlA applyOperation b0 operations
+  checkRequirements b1
+  (_, result) <- flushBook b1
+  pure ApplyResult with
+    records = result.records
+    states = result.states
+    epochs = result.epochs
+    shards = result.shards
+
+applyOperation : Book -> ApplyOperation -> Update Book
+applyOperation b op = case op of
+  ApplyRecord d -> applyRecord b d
+  ApplyStockTransfer with transfer; resulting; balance -> applyTransfer b transfer resulting balance
+  ApplyStockCancellation with cancellation; balance ->
+    applyReduction b (OcfRecordDataStockCancellation cancellation) cancellation.id cancellation.date
+      cancellation.security_id cancellation.quantity cancellation.balance_security_id balance
+  ApplyStockRepurchase with repurchase; balance ->
+    applyReduction b (OcfRecordDataStockRepurchase repurchase) repurchase.id repurchase.date
+      repurchase.security_id repurchase.quantity repurchase.balance_security_id balance
+  ApplyStockConversion with conversion; resulting; balance -> applyConversion b conversion resulting balance
+  ApplyStockReissuance with reissuance; resulting -> applyReissuance b reissuance resulting
+  ApplyStockConsolidation with consolidation; resulting_issuance -> applyConsolidation b consolidation resulting_issuance
+  ApplyVestingSnapshot with security_id; as_of; vested -> applySnapshot b security_id as_of vested
+  ApplyPreSplitShard with prefix -> preSplitShard prefix b
+
+-- =============================================================================
+-- STATELESS RECORDS AND SINGLE-RECORD EVENTS
+-- =============================================================================
+
+-- Claims a record's writer-chosen IDs: its object ID, and an issuance's security ID.
+claimRecordIds : OcfRecordData -> Book -> Update Book
+claimRecordIds d b0 = do
+  b1 <- claimId IdNamespaceObject (recordView b0.context d).object_id b0
+  case issuanceSecurityId d of
+    Some sec -> claimId IdNamespaceSecurity sec b1
+    None -> pure b1
+
+-- Claims, creates and queues the references of a record with no state.
+writeStatelessRecord : OcfRecordData -> [Requirement] -> Book -> Update Book
+writeStatelessRecord d extra b0 = do
+  b1 <- claimRecordIds d b0
+  b2 <- countPolymorphicReferences (polymorphicReferenceCount d) b1
+  (b3, _) <- addRecord d b2
+  pure (addRequirements (requirementsOf d <> extra) b3)
+
+-- Writes the event's own record, its ID derived or claimed, with its references.
+writeEventRecord : StockSecurity -> Text -> OcfRecordData -> Book -> Update Book
+writeEventRecord s id d b0 = do
+  b1 <- resolveId IdNamespaceObject s DerivedRoleEvent 0 id b0
+  (b2, _) <- addRecord d b1
+  pure (addRequirements (requirementsOf d) b2)
+
+applyRecord : Book -> OcfRecordData -> Update Book
+applyRecord b d = case d of
+  OcfRecordDataIssuer _ -> abort "the issuer record is written when the cap table is created and edited by CapTable_Restate"
+  OcfRecordDataStockHold _ -> abort "holds are placed by CapTable_PlaceHolds"
+  OcfRecordDataStockHoldCancellation _ -> abort "holds are canceled by CapTable_CancelHolds or CapTable_Settle"
+  OcfRecordDataStockTransfer _ -> abort "write a stock transfer with ApplyStockTransfer"
+  OcfRecordDataStockCancellation _ -> abort "write a stock cancellation with ApplyStockCancellation"
+  OcfRecordDataStockRepurchase _ -> abort "write a stock repurchase with ApplyStockRepurchase"
+  OcfRecordDataStockConversion _ -> abort "write a stock conversion with ApplyStockConversion"
+  OcfRecordDataStockReissuance _ -> abort "write a stock reissuance with ApplyStockReissuance"
+  OcfRecordDataStockConsolidation _ -> abort "write a stock consolidation with ApplyStockConsolidation"
+  OcfRecordDataStockIssuance iss -> applyPrimaryIssuance b iss
+  OcfRecordDataStockClass cls -> do
+    b' <- writeStatelessRecord d [] b
+    addEpoch (StockClassEpoch with context = b.context; stock_class_id = cls.id; frozen = False; splits = []) b'
+  OcfRecordDataStockClassSplit sp -> applySplitRecord b sp
+  OcfRecordDataStockAcceptance x -> do
+    (s, _) <- beginEvent b x.security_id x.date False
+    b' <- writeEventRecord s x.id d b
+    replaceState (successorAfter b.context s x.id) b'
+  OcfRecordDataStockRetraction x -> do
+    (s, _) <- beginEvent b x.security_id x.date False
+    requireNoHolds s
+    b' <- writeEventRecord s x.id d b
+    endState s.security_id b'
+  OcfRecordDataVestingStart x -> applyVestingRecord b d x.id x.security_id x.date
+  OcfRecordDataVestingEvent x -> applyVestingRecord b d x.id x.security_id x.date
+  OcfRecordDataVestingAcceleration x -> case lookupState x.security_id b of
+    Some _ -> do
+      (s, _) <- beginEvent b x.security_id x.date False
+      (vesting', accelerated') <- case s.vesting of
+        StockVestingNone -> abort ("security " <> s.security_id <> " is fully vested and cannot be accelerated")
+        StockVestingTranches ts -> do
+          ts' <- liftEither (accelerateTranches x.date x.quantity s ts)
+          pure (StockVestingTranches ts', s.accelerated_since_snapshot)
+        StockVestingOnTerms _ -> do
+          -- The TA's snapshot stays the vested quantity until the next snapshot, which counts every
+          -- acceleration recorded before it. The shares accelerated since the snapshot bound later
+          -- accelerations, so together they never exceed the unvested quantity.
+          let accelerated = fromOptional 0.0 s.accelerated_since_snapshot
+              unvested = s.quantity - vestedAt s x.date - accelerated
+          when (x.quantity > unvested)
+            (abort ("acceleration of " <> show x.quantity <> " on security " <> s.security_id
+              <> " exceeds its unvested quantity " <> show unvested))
+          pure (s.vesting, Some (accelerated + x.quantity))
+      b' <- writeEventRecord s x.id d b
+      replaceState ((successorAfter b.context s x.id) with vesting = vesting'; accelerated_since_snapshot = accelerated') b'
+    None -> writeStatelessRecord d [nonStockVestingTarget x.security_id] b
+  _ -> writeStatelessRecord d [] b
+
+nonStockVestingTarget : Text -> Requirement
+nonStockVestingTarget sec = RequireSecurity with
+  label = "Vesting record (no stock state in this write)"
+  security_id = sec
+  object_types = [OcfObjectTypeTxWarrantIssuance, OcfObjectTypeTxEquityCompensationIssuance]
+
+-- Vesting starts and events carry no quantity and may be backdated: the one exception to
+-- per-security date order. On a stock state they are non-terminal events.
+applyVestingRecord : Book -> OcfRecordData -> Text -> Text -> Date -> Update Book
+applyVestingRecord b d id sec date = case lookupState sec b of
+  Some _ -> do
+    (s, _) <- beginEvent b sec date True
+    b' <- writeEventRecord s id d b
+    replaceState (successorAfter b.context s id) b'
+  None -> writeStatelessRecord d [nonStockVestingTarget sec] b
+
+applyPrimaryIssuance : Book -> StockIssuanceOcfData -> Update Book
+applyPrimaryIssuance b0 iss = do
+  let d = OcfRecordDataStockIssuance iss
+  e <- requireEpoch iss.stock_class_id b0
+  when e.frozen (abort ("stock class " <> iss.stock_class_id <> " is frozen for a split"))
+  b1 <- writeStatelessRecord d [] b0
+  addState (stateForIssuance b1 e iss.date iss) b1
+
+-- A split touches no stock state: it is recorded on its class's frozen epoch, dated after the
+-- class's latest split, and each state applies it at its next event.
+applySplitRecord : Book -> StockClassSplitOcfData -> Update Book
+applySplitRecord b0 sp = do
+  e <- requireEpoch sp.stock_class_id b0
+  unless e.frozen (abort ("stock class " <> sp.stock_class_id <> " must be frozen to record a split"))
+  when (length e.splits >= maxSplitsPerClass)
+    (abort ("stock class " <> sp.stock_class_id <> " already has " <> show maxSplitsPerClass <> " splits"))
+  unless (null e.splits || sp.date > (last e.splits).date)
+    (abort ("split " <> sp.id <> " must be dated after the class's latest recorded split"))
+  b1 <- writeStatelessRecord (OcfRecordDataStockClassSplit sp) [] b0
+  replaceEpoch (e with splits = e.splits <> [RecordedSplit with split_id = sp.id; date = sp.date; ratio = sp.split_ratio]) b1
+
+applySnapshot : Book -> Text -> Date -> Decimal -> Update Book
+applySnapshot b sec asOf vested = do
+  (s, _) <- beginEvent b sec asOf False
+  case s.vesting of
+    StockVestingOnTerms _ -> pure ()
+    _ -> abort ("security " <> sec <> " is not on vesting terms; only its tranches say what has vested")
+  -- A snapshot counts the accelerations recorded since the last one, whose shares vested at once, so
+  -- the TA records a same-day acceleration before the snapshot that counts it.
+  let previous = optional 0.0 (.vested) s.snapshot
+      accelerated = fromOptional 0.0 s.accelerated_since_snapshot
+  when (vested < previous)
+    (abort ("vesting snapshot for security " <> sec <> " goes backwards: " <> show vested <> " < " <> show previous))
+  when (vested < previous + accelerated)
+    (abort ("vesting snapshot for security " <> sec <> " of " <> show vested <> " leaves out the " <> show accelerated
+      <> " accelerated since the last snapshot of " <> show previous))
+  when (vested > s.quantity)
+    (abort ("vesting snapshot for security " <> sec <> " exceeds its quantity"))
+  replaceState ((successor s) with snapshot = Some (VestedSnapshot with as_of = asOf; vested); accelerated_since_snapshot = None) b
+
+-- =============================================================================
+-- BUNDLED STOCK EVENTS
+-- =============================================================================
+
+-- The checks every partial or whole terminal event with an optional balance shares: the event
+-- quantity fits, the balance exists exactly when shares remain and is named by the event, stays with
+-- the source's stakeholder and class, holds exactly the remainder, and a partial event needs full
+-- tranche cover.
+checkBalance : StockSecurity -> Decimal -> Optional Text -> Optional StockIssuanceOcfData -> Update ()
+checkBalance s quantity namedBalance balance = do
+  when (quantity > s.quantity)
+    (abort ("event quantity " <> show quantity <> " exceeds the " <> show s.quantity <> " of security " <> s.security_id))
+  let remaining = s.quantity - quantity
+  case (remaining > 0.0, balance) of
+    (True, Some bal) -> do
+      unless (namedBalance == Some bal.security_id)
+        (abort ("the event must name its balance security " <> bal.security_id))
+      unless (bal.quantity == remaining)
+        (abort ("balance " <> bal.security_id <> " must hold the remaining " <> show remaining))
+      unless (bal.stakeholder_id == s.stakeholder_id && bal.stock_class_id == s.stock_class_id)
+        (abort ("balance " <> bal.security_id <> " must stay with the source's stakeholder and class"))
+      unless (fullyCovered s)
+        (abort ("security " <> s.security_id <> " has tranches covering less than its quantity and takes no partial event"))
+      liftEither (checkBalanceVesting s (outputVesting bal))
+    (True, None) -> abort ("a partial event on security " <> s.security_id <> " needs a balance issuance")
+    (False, Some _) -> abort ("an event on the whole of security " <> s.security_id <> " has no balance")
+    (False, None) ->
+      unless (isNone namedBalance) (abort "the event names a balance security but writes none")
+
+checkResultingIds : [Text] -> [StockIssuanceOcfData] -> Update ()
+checkResultingIds named resulting =
+  unless (named == map (.security_id) resulting)
+    (abort "the resulting issuances must be the event's resulting securities, in order")
+
+writeOutputs : StockSecurity -> Date -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> Book -> Update Book
+writeOutputs s d resulting balance b0 = do
+  b1 <- foldlA (\b (i, iss) -> addOutputIssuance s d (DerivedRoleResultingIssuance, DerivedRoleResultingSecurity, i) iss b) b0 (zip [0 .. length resulting - 1] resulting)
+  case balance of
+    Some bal -> addOutputIssuance s d (DerivedRoleBalanceIssuance, DerivedRoleBalanceSecurity, 0) bal b1
+    None -> pure b1
+
+applyTransfer : Book -> StockTransferOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> Update Book
+applyTransfer b0 t resulting balance = do
+  (s, _) <- beginEvent b0 t.security_id t.date False
+  requireNoHolds s
+  checkResultingIds t.resulting_security_ids resulting
+  checkBalance s t.quantity t.balance_security_id balance
+  unless (all (\r -> r.stock_class_id == s.stock_class_id) resulting)
+    (abort "a stock transfer's resulting securities stay in the source's class")
+  unless (sum (map (.quantity) resulting) == t.quantity)
+    (abort ("the resulting securities of transfer " <> t.id <> " must hold exactly its quantity " <> show t.quantity))
+  liftEither (checkOutputsVesting t.date ("transfer " <> t.id) [s] (map outputVesting (resulting <> optionalToList balance)))
+  liftEither (checkTransferVesting t.date ("transfer " <> t.id) s (map outputVesting resulting) (outputVesting <$> balance))
+  b1 <- writeEventRecord s t.id (OcfRecordDataStockTransfer t) b0
+  b2 <- endState s.security_id b1
+  writeOutputs s t.date resulting balance b2
+
+-- Cancellations and repurchases retire part or all of a security and may leave a balance.
+applyReduction : Book -> OcfRecordData -> Text -> Date -> Text -> Decimal -> Optional Text -> Optional StockIssuanceOcfData -> Update Book
+applyReduction b0 d id date sec quantity namedBalance balance = do
+  (s, _) <- beginEvent b0 sec date False
+  requireNoHolds s
+  checkBalance s quantity namedBalance balance
+  liftEither (checkOutputsVesting date ("event " <> id) [s] (map outputVesting (optionalToList balance)))
+  b1 <- writeEventRecord s id d b0
+  b2 <- endState s.security_id b1
+  writeOutputs s date [] balance b2
+
+-- A conversion's arithmetic is the writer's, in the source's class as in any other (OCF ties no
+-- resulting quantity to quantity_converted): the ledger checks the converted quantity against the
+-- source, the balance, and that same-class outputs never vest ahead of the source.
+applyConversion : Book -> StockConversionOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> Update Book
+applyConversion b0 c resulting balance = do
+  (s, _) <- beginEvent b0 c.security_id c.date False
+  requireNoHolds s
+  checkResultingIds c.resulting_security_ids resulting
+  checkBalance s c.quantity_converted c.balance_security_id balance
+  let sameClass = filter (\r -> r.stock_class_id == s.stock_class_id) resulting
+  liftEither (checkOutputsVesting c.date ("conversion " <> c.id) [s] (map outputVesting (sameClass <> optionalToList balance)))
+  b1 <- writeEventRecord s c.id (OcfRecordDataStockConversion c) b0
+  b2 <- endState s.security_id b1
+  writeOutputs s c.date resulting balance b2
+
+-- A reissuance retires the whole security. Into its own class it conserves the quantity; one that
+-- names a split is same-class and yields the post-split quantity, the split having been applied to
+-- the source first.
+applyReissuance : Book -> StockReissuanceOcfData -> [StockIssuanceOcfData] -> Update Book
+applyReissuance b0 r resulting = do
+  (s, _) <- beginEvent b0 r.security_id r.date False
+  requireNoHolds s
+  checkResultingIds r.resulting_security_ids resulting
+  let allSameClass = all (\x -> x.stock_class_id == s.stock_class_id) resulting
+  when (isSome r.split_transaction_id && not allSameClass)
+    (abort ("reissuance " <> r.id <> " names a split, so its resulting securities stay in the source's class"))
+  when (allSameClass && sum (map (.quantity) resulting) /= s.quantity)
+    (abort ("same-class reissuance " <> r.id <> " must conserve the quantity " <> show s.quantity))
+  let sameClass = filter (\x -> x.stock_class_id == s.stock_class_id) resulting
+  liftEither (checkOutputsVesting r.date ("reissuance " <> r.id) [s] (map outputVesting sameClass))
+  b1 <- writeEventRecord s r.id (OcfRecordDataStockReissuance r) b0
+  let b1' = addRequirements
+        (map (\sp -> RequireSplitOfClass with label = "Stock reissuance " <> r.id; split_id = sp; stock_class_id = s.stock_class_id; on_or_before = r.date)
+          (optionalToList r.split_transaction_id)) b1
+  b2 <- endState s.security_id b1'
+  writeOutputs s r.date resulting None b2
+
+-- A consolidation retires up to 50 securities of one stakeholder and class into one resulting security
+-- of that stakeholder and class that holds their sum. Its IDs derive from its first input.
+applyConsolidation : Book -> StockConsolidationOcfData -> StockIssuanceOcfData -> Update Book
+applyConsolidation b0 c resulting = do
+  when (null c.security_ids) (abort "a consolidation needs at least one security")
+  when (length c.security_ids > maxLotsPerOperation)
+    (abort ("a consolidation takes at most " <> show maxLotsPerOperation <> " securities"))
+  unless (dedup c.security_ids == c.security_ids) (abort "a consolidation names each security once")
+  sources <- mapA (\sec -> fst <$> beginEvent b0 sec c.date False) c.security_ids
+  forA_ sources requireNoHolds
+  let first = head sources
+  unless (all (\s -> s.stock_class_id == first.stock_class_id) sources)
+    (abort "a consolidation's securities share one class")
+  unless (all (\s -> s.stakeholder_id == first.stakeholder_id) sources)
+    (abort "a consolidation's securities share one stakeholder")
+  unless (resulting.security_id == c.resulting_security_id)
+    (abort ("consolidation " <> c.id <> " must write its resulting security " <> c.resulting_security_id))
+  unless (resulting.stock_class_id == first.stock_class_id)
+    (abort "a consolidation's resulting security stays in its inputs' class")
+  unless (resulting.stakeholder_id == first.stakeholder_id)
+    (abort "a consolidation's resulting security stays with its inputs' stakeholder")
+  unless (resulting.quantity == sum (map (.quantity) sources))
+    (abort ("consolidation " <> c.id <> " must yield the sum of its inputs"))
+  liftEither (checkOutputsVesting c.date ("consolidation " <> c.id) sources [outputVesting resulting])
+  b1 <- writeEventRecord first c.id (OcfRecordDataStockConsolidation c) b0
+  b2 <- foldlA (\b s -> endState s.security_id b) b1 sources
+  addOutputIssuance first c.date (DerivedRoleResultingIssuance, DerivedRoleResultingSecurity, 0) resulting b2

@@ -1,0 +1,174 @@
+-- Vesting rules the register enforces on stock states: draws from the earliest vested tranches, accelerations, and outputs that never vest ahead of their source.
+module Fairmint.OpenCapTable.VestingState
+  ( OutputVesting(..)
+  , drawTranches
+  , accelerateTranches
+  , checkOutputsVesting
+  , checkTransferVesting
+  , checkBalanceVesting
+  , sortTranches
+  , trancheTotal
+  , vestedBy
+  ) where
+
+import DA.Date (addDays)
+import DA.List (groupOn, sortOn)
+import DA.Optional (optionalToList)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+
+-- | How an output issuance of a terminal event vests, from its OCF record: explicit `vestings`,
+-- else vesting terms (unvested until the TA records a snapshot), else fully vested.
+data OutputVesting = OutputVesting
+  with
+    quantity : Decimal
+    vestings : [OcfVesting]
+    on_terms : Bool
+  deriving (Eq, Show)
+
+sortTranches : [OcfVesting] -> [OcfVesting]
+sortTranches = sortOn (.date)
+
+-- | The amount of explicit tranches dated on or before a date.
+vestedBy : Date -> [OcfVesting] -> Decimal
+vestedBy d ts = trancheTotal (filter (\t -> t.date <= d) ts)
+
+-- | Takes `q` from the earliest tranches, in date order, dropping emptied tranches. A partial
+-- settlement draw takes vested shares this way, so the balance keeps the later tranches.
+drawTranches : Decimal -> [OcfVesting] -> [OcfVesting]
+drawTranches q ts = drawSorted q (sortTranches ts)
+
+drawSorted : Decimal -> [OcfVesting] -> [OcfVesting]
+drawSorted _ [] = []
+drawSorted remaining (t :: rest)
+  | remaining <= 0.0 = t :: rest
+  | t.amount <= remaining = drawSorted (remaining - t.amount) rest
+  | otherwise = (t with amount = t.amount - remaining) :: rest
+
+-- | Accelerates `q` shares of a tranche lot at date `d`: requires 0 < q <= quantity − vested(d),
+-- and moves q to `d` from the earliest tranches dated after `d`, then, if those are short, from the
+-- shares no tranche covers. Taking the earliest unvested tranches first never overstates vested
+-- shares at any later date.
+accelerateTranches : Date -> Decimal -> StockSecurity -> [OcfVesting] -> Either Text [OcfVesting]
+accelerateTranches d q s ts = do
+  let sorted = sortTranches ts
+      unvested = s.quantity - vestedBy d sorted
+  if q <= 0.0 || q > unvested
+    then Left ("acceleration of " <> show q <> " on security " <> s.security_id
+      <> " must be positive and at most its unvested quantity " <> show unvested)
+    else pure ()
+  let (onOrBefore, after) = (filter (\t -> t.date <= d) sorted, filter (\t -> t.date > d) sorted)
+      after' = drawTranches q after
+      accelerated = q
+      atD = trancheTotal (filter (\t -> t.date == d) onOrBefore) + accelerated
+      before = filter (\t -> t.date < d) onOrBefore
+  pure (before <> [OcfVesting with amount = atD; date = d] <> after')
+
+-- | Cumulative vested quantity of an output at a date: its explicit tranches dated on or before
+-- it, nothing on vesting terms, everything if it carries no vesting.
+outputVestedBy : Date -> OutputVesting -> Decimal
+outputVestedBy t o
+  | not (null o.vestings) = vestedBy t o.vestings
+  | o.on_terms = 0.0
+  | otherwise = o.quantity
+
+-- | No output of a terminal event becomes more vested than its sources at any date from the event
+-- on. At the event date `d` the outputs together vest at most what the sources have vested; at
+-- every later tranche date of a source or an output, at most what the sources will have vested by
+-- then (a source on vesting terms counts at most its whole quantity after `d`, since its schedule
+-- is the TA's). Outputs in another class (conversions) are not passed in: their units differ and
+-- the arithmetic is the writer's.
+checkOutputsVesting : Date -> Text -> [StockSecurity] -> [OutputVesting] -> Either Text ()
+checkOutputsVesting d label sources outputs = do
+  let sourceSteps s = case s.vesting of
+        StockVestingTranches ts -> trancheSteps d ts
+        StockVestingNone -> VestingSteps with at_d = s.quantity; increases = []
+        StockVestingOnTerms _ -> VestingSteps with at_d = vestedAt s d; increases = [(addDays d 1, s.quantity - vestedAt s d)]
+  case firstVestingFailure (\src out -> out > src) d (map sourceSteps sources) (map (outputSteps d) outputs) of
+    None -> pure ()
+    Some (t, src, out) -> Left ("the outputs of " <> label <> " vest " <> show out <> " shares by "
+      <> show t <> ", more than the " <> show src <> " their source has vested by then")
+
+-- | A free transfer conserves vesting, beyond never vesting ahead of its source. From a lot with
+-- tranches or no vesting, it splits tranches, so each date's cumulative vested amount is the same
+-- for the outputs together as for the source at the event date and every later tranche date; no
+-- output replaces tranches with vesting terms. From a lot on vesting terms, the balance's tranches
+-- dated on or before the event equal the vested quantity it keeps: the source's vested quantity
+-- less what the resulting issuances vest at the event date. A whole transfer from such a lot leaves
+-- no balance; its outputs never vest ahead of the source, and an output on terms counts as unvested
+-- until the TA's snapshot on it.
+checkTransferVesting : Date -> Text -> StockSecurity -> [OutputVesting] -> Optional OutputVesting -> Either Text ()
+checkTransferVesting d label s resulting balance = case s.vesting of
+  StockVestingOnTerms _ -> case balance of
+    None -> pure ()
+    Some bal -> do
+      let kept = vestedAt s d - sum (map (outputVestedBy d) resulting)
+          balanceVested = vestedBy d bal.vestings
+      if balanceVested == kept then pure ()
+      else Left ("the balance of " <> label <> " vests " <> show balanceVested <> " shares by " <> show d
+        <> ", but keeps " <> show kept <> " vested shares of security " <> s.security_id)
+  _ -> do
+    let outputs = resulting <> optionalToList balance
+        source = case s.vesting of
+          StockVestingTranches ts -> trancheSteps d ts
+          _ -> VestingSteps with at_d = s.quantity; increases = []
+    if any (.on_terms) outputs
+      then Left ("the outputs of " <> label <> " split security " <> s.security_id
+        <> "'s tranches; none of them replaces them with vesting terms")
+      else pure ()
+    case firstVestingFailure (/=) d [source] (map (outputSteps d) outputs) of
+      None -> pure ()
+      Some (t, src, out) -> Left ("the outputs of " <> label <> " vest " <> show out <> " shares by " <> show t
+        <> ", but security " <> s.security_id <> " has vested " <> show src <> " by then")
+
+-- A cumulative vested amount from a date `d` on: its value at `d` and its increases at later dates.
+data VestingSteps = VestingSteps
+  with
+    at_d : Decimal
+    increases : [(Date, Decimal)]
+
+trancheSteps : Date -> [OcfVesting] -> VestingSteps
+trancheSteps d ts = VestingSteps with
+  at_d = vestedBy d ts
+  increases = map (\t -> (t.date, t.amount)) (filter (\t -> t.date > d) ts)
+
+outputSteps : Date -> OutputVesting -> VestingSteps
+outputSteps d o
+  | not (null o.vestings) = trancheSteps d o.vestings
+  | o.on_terms = VestingSteps with at_d = 0.0; increases = []
+  | otherwise = VestingSteps with at_d = o.quantity; increases = []
+
+-- The first date from `d` on at which `bad` holds of the sources' and the outputs' cumulative
+-- vested amounts, with both: `d` itself, then each later date either changes on, in one sweep over
+-- the sorted changes (so the checks cost O(T log T) in the tranches, not dates × tranches).
+firstVestingFailure : (Decimal -> Decimal -> Bool) -> Date -> [VestingSteps] -> [VestingSteps] -> Optional (Date, Decimal, Decimal)
+firstVestingFailure bad d sources outputs =
+  let src0 = sum (map (.at_d) sources)
+      out0 = sum (map (.at_d) outputs)
+      changes = sortOn (\(t, _, _) -> t)
+        (concatMap (\st -> map (\(t, a) -> (t, a, 0.0)) st.increases) sources
+          <> concatMap (\st -> map (\(t, a) -> (t, 0.0, a)) st.increases) outputs)
+      start = if bad src0 out0 then Some (d, src0, out0) else None
+  in fst (foldl (sweepDate bad) (start, (src0, out0)) (groupOn (\(t, _, _) -> t) changes))
+
+sweepDate : (Decimal -> Decimal -> Bool) -> (Optional (Date, Decimal, Decimal), (Decimal, Decimal))
+  -> [(Date, Decimal, Decimal)] -> (Optional (Date, Decimal, Decimal), (Decimal, Decimal))
+sweepDate bad (found, (src, out)) changesOnDate = case (found, changesOnDate) of
+  (None, (t, _, _) :: _) ->
+    let src' = src + sum (map (\(_, a, _) -> a) changesOnDate)
+        out' = out + sum (map (\(_, _, b) -> b) changesOnDate)
+    in (if bad src' out' then Some (t, src', out') else None, (src', out'))
+  _ -> (found, (src, out))
+
+-- | A balance carries its remaining vesting as explicit tranches that sum to exactly its quantity
+-- when its source has tranches or vesting terms, and no vesting when its source has none, so it can
+-- be audited from OCF alone.
+checkBalanceVesting : StockSecurity -> OutputVesting -> Either Text ()
+checkBalanceVesting s b = case s.vesting of
+  StockVestingNone ->
+    if null b.vestings && not b.on_terms then pure ()
+    else Left ("the balance of fully vested security " <> s.security_id <> " must carry no vesting")
+  _ ->
+    if not (null b.vestings) && trancheTotal b.vestings == b.quantity then pure ()
+    else Left ("the balance of security " <> s.security_id
+      <> " must carry explicit vestings that sum to its quantity " <> show b.quantity)

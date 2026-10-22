@@ -1,131 +1,216 @@
+-- Vesting starts, ported from v34's TestVestingStart: starts on option and RSU grants and on warrants, the validator, starts on stock (an event that consumes the state and may be backdated), restatement and IDs. Vesting condition references are in TestVestingConditionReferences.
 module OpenCapTable.TestVestingStart where
 
-import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
-import Fairmint.OpenCapTable.OCF.VestingStart
-import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, defaultVestingTermsWithCondition)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create an equity compensation issuance with vesting
-createEquityCompensationIssuance issuer capTableCid securityId quantity vestingConditionId =
-  let vestingTermsId = "VT-" <> securityId in
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateVestingTerms (defaultVestingTermsWithCondition vestingTermsId vestingConditionId OcfVestingStartTrigger)
-        , CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
-            id = "TX_EC_ISS_1"
-            date = DT.time (DA.date 2025 Jul 01) 0 0 0
-            security_id = securityId
-            custom_id = "OPT-001"
-            stakeholder_id = "SH-1"
-            board_approval_date = None
-            stockholder_approval_date = None
-            consideration_text = None
-            security_law_exemptions = []
-            stock_plan_id = None
-            stock_class_id = None
-            compensation_type = OcfCompensationTypeOptionISO
-            quantity = quantity
-            base_price = None
-            early_exercisable = Some False
-            exercise_price = Some (OcfMonetary with amount = 1.25, currency = "USD")
-            expiration_date = Some (DT.time (DA.date 2035 Jul 01) 0 0 0)
-            termination_exercise_windows = []
-            vestings = []
-            vesting_terms_id = Some vestingTermsId
-            comments = []
-        ]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Ids (DerivedRole(..))
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
 
--- Test 1: Basic vesting start
--- Based on prod: Option grant vesting commencement on start date
-testVestingStart_BasicStart = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ec7d8e9f-0a1b-2c3d-4e5f-6a7b8c9d0e1f"
-  result <- createEquityCompensationIssuance issuer capTableCid securityId 50000.0 "vesting-start"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingStart VestingStartOcfData with
-        id = "f2a3b4c5-d6e7-8f9a-0b1c-2d3e4f5a6b7c"
-        date = DT.time (DA.date 2025 Jul 01) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "vesting-start"
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+valid : VestingStartOcfData -> Bool
+valid = validateVestingStartOcfData
 
--- Test 2: Vesting start with comments
-testVestingStart_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ECSEC-002"
-  result <- createEquityCompensationIssuance issuer capTableCid securityId 100000.0 "vesting-commencement"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingStart VestingStartOcfData with
-        id = "TX_VESTING_START_2"
-        date = DT.time (DA.date 2025 Aug 15) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "vesting-commencement"
-        comments = ["Vesting commences on employee start date per offer letter.", "4-year vesting with 1-year cliff."]]
-      edits = []
-      deletes = []
-  pure ()
+-- | An ISO grant `sec` for SH-A over `q` shares at 1.25 USD, granted on `d` and expiring ten years
+-- later, on vesting terms "VT-" <> `sec` with one start condition `cond`.
+isoOnTerms : Text -> Decimal -> Date -> Text -> [OcfRecordData]
+isoOnTerms sec q d cond =
+  [ termsRecord (termsWith ("VT-" <> sec) cond OcfVestingStartTrigger)
+  , ecRecord ((option sec "SH-A" q) with
+      id = "TX_EC_ISS_" <> sec
+      compensation_type = OcfCompensationTypeOptionIso
+      custom_id = "OPT-" <> sec
+      date = d
+      exercise_price = Some (usd 1.25)
+      expiration_date = Some (D.addDays d 3652)
+      vesting_terms_id = Some ("VT-" <> sec))
+  ]
 
--- Test 3: Vesting start for RSU grant
-testVestingStart_RSUGrant = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ECSEC-RSU-001"
-  let vestingTermsId = "VT-" <> securityId
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateVestingTerms (defaultVestingTermsWithCondition vestingTermsId "rsu-vesting-start" OcfVestingStartTrigger)
-        , CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
-            id = "TX_EC_ISS_RSU"
-            date = DT.time (DA.date 2025 Sep 01) 0 0 0
-            security_id = securityId
-            custom_id = "RSU-001"
-            stakeholder_id = "SH-1"
-            board_approval_date = None
-            stockholder_approval_date = None
-            consideration_text = None
-            security_law_exemptions = []
-            stock_plan_id = None
-            stock_class_id = None
-            compensation_type = OcfCompensationTypeRSU
-            quantity = 25000.0
-            base_price = None
-            early_exercisable = None
-            exercise_price = None
-            expiration_date = None
-            termination_exercise_windows = []
-            vestings = []
-            vesting_terms_id = Some vestingTermsId
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingStart VestingStartOcfData with
-        id = "TX_VESTING_START_RSU"
-        date = DT.time (DA.date 2025 Sep 01) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "rsu-vesting-start"
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+-- | A book with SH-A, SH-B, CLS-A and Alice's grant EC-1 on terms VT-EC-1 (start condition "start").
+grantBook : Script Env
+grantBook = ecBookWith (grantOnTerms "EC-1" "start" OcfVestingStartTrigger)
+
+-- | The standard book plus Alice's 100 shares S-V on terms VT-S (start condition "start").
+stockBook : Script Env
+stockBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "start" OcfVestingStartTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    ]
+  pure env
+
+-- =============================================================================
+-- GRANTS AND WARRANTS
+-- =============================================================================
+
+-- From production: an option grant whose vesting commences on its grant date.
+test_vesting_start_option_grant : Script ()
+test_vesting_start_option_grant = do
+  let sec = "ec7d8e9f-0a1b-2c3d-4e5f-6a7b8c9d0e1f"
+  env <- ecBookWith (isoOnTerms sec 50000.0 (D.date 2025 D.Jul 1) "vesting-start")
+  accept env valid startRecord VestingStartOcfData with
+    id = "f2a3b4c5-d6e7-8f9a-0b1c-2d3e4f5a6b7c"
+    date = D.date 2025 D.Jul 1
+    security_id = sec
+    vesting_condition_id = "vesting-start"
+    comments = []
+  -- A start on a grant touches no stock state.
+  statesOf env >>= assertMsg "no stock state" . null
+
+test_vesting_start_with_comments : Script ()
+test_vesting_start_with_comments = do
+  env <- ecBookWith (isoOnTerms "ECSEC-002" 100000.0 (D.date 2025 D.Jul 1) "vesting-commencement")
+  accept env valid startRecord VestingStartOcfData with
+    id = "TX_VESTING_START_2"
+    date = D.date 2025 D.Aug 15
+    security_id = "ECSEC-002"
+    vesting_condition_id = "vesting-commencement"
+    comments = ["Vesting commences on employee start date per offer letter.", "4-year vesting with 1-year cliff."]
+
+test_vesting_start_rsu_grant : Script ()
+test_vesting_start_rsu_grant = do
+  let sec = "ECSEC-RSU-001"
+  env <- ecBookWith
+    [ termsRecord (termsWith ("VT-" <> sec) "rsu-vesting-start" OcfVestingStartTrigger)
+    , ecRecord ((rsu sec "SH-A" 25000.0) with id = "TX_EC_ISS_RSU"; date = D.date 2025 D.Sep 1; vesting_terms_id = Some ("VT-" <> sec))
+    ]
+  accept env valid startRecord VestingStartOcfData with
+    id = "TX_VESTING_START_RSU"
+    date = D.date 2025 D.Sep 1
+    security_id = sec
+    vesting_condition_id = "rsu-vesting-start"
+    comments = []
+
+-- v35: a warrant on vesting terms takes vesting records as a grant does.
+test_vesting_start_warrant : Script ()
+test_vesting_start_warrant = do
+  env <- ecBookWith
+    [ termsRecord (termsWith "VT-W" "start" OcfVestingStartTrigger)
+    , OcfRecordDataWarrantIssuance ((warrant "W-1" "SH-A") with vesting_terms_id = Some "VT-W")
+    ]
+  accept env valid startRecord (vestingStart "VS-W" "W-1" "start")
+
+-- =============================================================================
+-- VALIDATION
+-- =============================================================================
+
+test_vesting_start_validation : Script ()
+test_vesting_start_validation = do
+  env <- grantBook
+  let s = vestingStart "VS-V" "EC-1" "start"
+  -- An empty object ID is stopped by its claim, before the record's ensure.
+  refuseWith env "an empty ID cannot be claimed" valid startRecord (s with id = "")
+  refuse env valid startRecord (s with security_id = "")
+  refuse env valid startRecord (s with vesting_condition_id = "")
+  refuse env valid startRecord (s with comments = [""])
+  refuse env valid startRecord (s with comments = ["ok", ""])
+  -- A start may be dated before the grant: the register does not order vesting records.
+  accept env valid startRecord (s with date = D.date 2023 D.Dec 1; comments = ["Backdated commencement"])
+
+-- =============================================================================
+-- STOCK
+-- =============================================================================
+
+-- On stock, a start is a non-terminal event: it consumes the state and creates its successor.
+test_vesting_start_on_stock_consumes_state : Script ()
+test_vesting_start_on_stock_consumes_state = do
+  env <- stockBook
+  before <- stateOf env "S-V"
+  beforeCid <- stateCidOf env "S-V"
+  let s = (vestingStart "VS-1" "S-V" "start") with comments = ["Commencement"]
+  _ <- applyRecords env [startRecord s]
+  expectRecord env (startRecord s)
+  after <- stateOf env "S-V"
+  after === (before with seq = 1)
+  after.vesting === StockVestingOnTerms "VT-S"
+  afterCid <- stateCidOf env "S-V"
+  assertMsg "the state was consumed and recreated" (afterCid /= beforeCid)
+  -- The writer-chosen ID was claimed.
+  applyRecordsFails env "ID already used: VS-1" [OcfRecordDataStakeholder (stakeholderData "VS-1")]
+
+-- Vesting starts and events are the one exception to per-security date order.
+test_vesting_start_on_stock_backdated : Script ()
+test_vesting_start_on_stock_backdated = do
+  env <- stockBook
+  let accepted = D.date 2024 D.Jun 1
+  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = accepted; security_id = "S-V"; comments = []]
+  (.last_event_date) <$> stateOf env "S-V" >>= (=== accepted)
+  -- Another event dated before the acceptance is refused ...
+  applyRecordsFails env "precedes the last event on security S-V"
+    [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-2"; date = D.date 2024 D.Mar 1; security_id = "S-V"; comments = []]
+  -- ... but a vesting start may be backdated, and leaves the last event date where it was.
+  let s = (vestingStart "VS-1" "S-V" "start") with date = D.date 2024 D.Jan 15
+  _ <- applyRecords env [startRecord s]
+  expectRecord env (startRecord s)
+  st <- stateOf env "S-V"
+  st.last_event_date === accepted
+  st.seq === 2
+
+-- A start on stock may take the event's derived ID, which needs no claim and is never restated.
+test_vesting_start_on_stock_derived_id : Script ()
+test_vesting_start_on_stock_derived_id = do
+  env <- stockBook
+  -- A derived ID of another event on the security is refused.
+  applyRecordsFails env "derived form" [startRecord (vestingStart (derived env "S-V" 3 DerivedRoleEvent 0) "S-V" "start")]
+  let did = derived env "S-V" 0 DerivedRoleEvent 0
+      s = vestingStart did "S-V" "start"
+  _ <- applyRecords env [startRecord s]
+  expectRecord env (startRecord s)
+  (.seq) <$> stateOf env "S-V" >>= (=== 1)
+  restateOpsFails env "was written by a register choice and is never restated" [RestateEdit (startRecord (s with comments = ["x"]))]
+  restateOpsFails env "was written by a register choice and is never restated" [RestateDelete did]
+
+-- Once a stock security's state has ended, no vesting record can be written on it.
+test_vesting_start_on_retired_stock : Script ()
+test_vesting_start_on_retired_stock = do
+  env <- stockBook
+  _ <- applyRecords env [OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Feb 1; reason_text = "Issued in error"; security_id = "S-V"; comments = []]
+  hasState env "S-V" >>= (=== False)
+  applyRecordsFails env "Vesting record (no stock state in this write) security S-V is carried by a OcfObjectTypeTxStockIssuance"
+    [startRecord (vestingStart "VS-1" "S-V" "start")]
+  expectNoRecord env "VS-1"
+
+-- =============================================================================
+-- RESTATEMENT AND IDS
+-- =============================================================================
+
+test_vesting_start_restate : Script ()
+test_vesting_start_restate = do
+  env <- grantBook
+  let s = vestingStart "VS-1" "EC-1" "start"
+  _ <- applyRecords env [startRecord s]
+  restateOpsFails env "changes nothing" [RestateEdit (startRecord s)]
+  let s' = s with date = D.date 2024 D.Feb 1; comments = ["Corrected commencement date"]
+  _ <- restateOps env [RestateEdit (startRecord s')]
+  expectRecord env (startRecord s')
+  -- An edit cannot change the record's type.
+  restateOpsFails env "an edit keeps record VS-1's type" [RestateEdit (eventRecord (vestingEvent "VS-1" "EC-1" "start"))]
+  _ <- restateOps env [RestateDelete "VS-1"]
+  expectNoRecord env "VS-1"
+  -- The delete released the ID.
+  accept env valid startRecord s
+
+test_vesting_start_ids_unique : Script ()
+test_vesting_start_ids_unique = do
+  env <- grantBook
+  _ <- applyRecords env [startRecord (vestingStart "VS-1" "EC-1" "start")]
+  applyRecordsFails env "ID already used: VS-1" [startRecord ((vestingStart "VS-1" "EC-1" "start") with date = D.date 2024 D.Mar 1)]
+  -- Object IDs are unique across types, and within one batch.
+  applyRecordsFails env "ID already used: SH-A" [startRecord (vestingStart "SH-A" "EC-1" "start")]
+  applyRecordsFails env "ID already used: VT-EC-1" [startRecord (vestingStart "VT-EC-1" "EC-1" "start")]
+  applyRecordsFails env "ID already used: VS-2"
+    [startRecord (vestingStart "VS-2" "EC-1" "start"), startRecord ((vestingStart "VS-2" "EC-1" "start") with comments = ["again"])]
+  -- On a grant there is no derived ID: the derived form cannot be claimed.
+  applyRecordsFails env "derived form" [startRecord (vestingStart (env.ctx.cap_table_id <> ":x") "EC-1" "start")]
+  -- The object and security namespaces are distinct.
+  accept env valid startRecord (vestingStart "EC-1" "EC-1" "start")

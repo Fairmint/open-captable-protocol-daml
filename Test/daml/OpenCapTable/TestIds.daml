@@ -1,0 +1,230 @@
+-- Claimed and derived IDs: uniqueness across types and instruments, the derived-form rule, shard selection, splitting and release.
+module OpenCapTable.TestIds where
+
+import DA.Assert ((===))
+import DA.List (head, sort)
+import qualified DA.Set as Set
+import qualified DA.Text as T
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State (OcfIdShard(..), validateOcfIdShard)
+import OpenCapTable.Harness
+
+-- 65 stakeholder IDs whose object-namespace claim hashes all start with the bits 11101011
+-- (precomputed from the shared encoding; test_ids_split_ids_share_a_shard re-derives them).
+splitIds : [Text]
+splitIds =
+  [ "SH-SPLIT-0"
+  , "SH-SPLIT-230"
+  , "SH-SPLIT-247"
+  , "SH-SPLIT-255"
+  , "SH-SPLIT-311"
+  , "SH-SPLIT-543"
+  , "SH-SPLIT-1349"
+  , "SH-SPLIT-1578"
+  , "SH-SPLIT-1708"
+  , "SH-SPLIT-1857"
+  , "SH-SPLIT-2366"
+  , "SH-SPLIT-3695"
+  , "SH-SPLIT-4139"
+  , "SH-SPLIT-4231"
+  , "SH-SPLIT-5192"
+  , "SH-SPLIT-5235"
+  , "SH-SPLIT-5372"
+  , "SH-SPLIT-7154"
+  , "SH-SPLIT-7234"
+  , "SH-SPLIT-7279"
+  , "SH-SPLIT-7285"
+  , "SH-SPLIT-7732"
+  , "SH-SPLIT-7802"
+  , "SH-SPLIT-8033"
+  , "SH-SPLIT-8058"
+  , "SH-SPLIT-8166"
+  , "SH-SPLIT-9353"
+  , "SH-SPLIT-9695"
+  , "SH-SPLIT-9964"
+  , "SH-SPLIT-10398"
+  , "SH-SPLIT-10467"
+  , "SH-SPLIT-10552"
+  , "SH-SPLIT-10632"
+  , "SH-SPLIT-10884"
+  , "SH-SPLIT-10964"
+  , "SH-SPLIT-11005"
+  , "SH-SPLIT-11048"
+  , "SH-SPLIT-11065"
+  , "SH-SPLIT-11255"
+  , "SH-SPLIT-11409"
+  , "SH-SPLIT-11519"
+  , "SH-SPLIT-11831"
+  , "SH-SPLIT-12354"
+  , "SH-SPLIT-12558"
+  , "SH-SPLIT-12867"
+  , "SH-SPLIT-12999"
+  , "SH-SPLIT-13064"
+  , "SH-SPLIT-13265"
+  , "SH-SPLIT-13442"
+  , "SH-SPLIT-13601"
+  , "SH-SPLIT-14152"
+  , "SH-SPLIT-14558"
+  , "SH-SPLIT-14851"
+  , "SH-SPLIT-15005"
+  , "SH-SPLIT-15814"
+  , "SH-SPLIT-16085"
+  , "SH-SPLIT-17103"
+  , "SH-SPLIT-17233"
+  , "SH-SPLIT-17504"
+  , "SH-SPLIT-17892"
+  , "SH-SPLIT-17900"
+  , "SH-SPLIT-18016"
+  , "SH-SPLIT-18280"
+  , "SH-SPLIT-18476"
+  , "SH-SPLIT-18529"
+  ]
+
+splitPrefix : Text
+splitPrefix = "11101011"
+
+test_ids_split_ids_share_a_shard : Script ()
+test_ids_split_ids_share_a_shard = do
+  length splitIds === 65
+  all (\i -> T.take 8 (hashBits (claimHash IdNamespaceObject i)) == splitPrefix) splitIds === True
+
+test_ids_object_ids_unique_across_types : Script ()
+test_ids_object_ids_unique_across_types = do
+  env <- standardBook
+  -- A stock class may not reuse a stakeholder's ID, nor a legend a class's.
+  applyRecordsFails env "ID already used: SH-A" [OcfRecordDataStockClass (stockClass "SH-A")]
+  applyRecordsFails env "ID already used: CLS-A" [OcfRecordDataStockLegendTemplate (legend "CLS-A")]
+  -- Two creates of one ID in one batch.
+  applyRecordsFails env "ID already used: SH-N"
+    [OcfRecordDataStakeholder (stakeholderData "SH-N"), OcfRecordDataStakeholder (stakeholderData "SH-N")]
+
+test_ids_security_ids_unique_across_instruments : Script ()
+test_ids_security_ids_unique_across_instruments = do
+  env <- standardBook
+  applyRecordsFails env "security ID already used: S-A1"
+    [OcfRecordDataStockIssuance ((issuance "S-A1" "SH-B" "CLS-A" 1.0 d2024) with id = "ISS-OTHER")]
+
+test_ids_derived_form_never_claimed : Script ()
+test_ids_derived_form_never_claimed = do
+  env <- standardBook
+  let fake = env.ctx.cap_table_id <> ":deadbeef"
+  applyRecordsFails env "derived form" [OcfRecordDataStakeholder (stakeholderData fake)]
+  -- Another cap table's derived form is an ordinary ID here.
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "other-9:deadbeef")]
+  pure ()
+
+test_ids_missing_shard_refused : Script ()
+test_ids_missing_shard_refused = do
+  env <- standardBook
+  inputs <- allInputs env
+  expectSubmitFailure "no shard in this write covers" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_Apply with
+      inputs = inputs with shards = []
+      operations = [ApplyRecord (OcfRecordDataStakeholder (stakeholderData "SH-NEW"))])
+
+test_ids_claim_rewrites_only_its_shard : Script ()
+test_ids_claim_rewrites_only_its_shard = do
+  env <- standardBook
+  before <- shardsOf env
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-NEW")]
+  after <- shardsOf env
+  length after === 256
+  let changed = filter (\(cid, _) -> cid `notElem` map fst before) after
+  length changed === 1
+  let [(_, sh)] = changed
+  T.isPrefixOf sh.prefix (hashBits (claimHash IdNamespaceObject "SH-NEW")) === True
+  Set.member (claimHash IdNamespaceObject "SH-NEW") sh.claimed === True
+
+-- The 65th hash in a shard splits it by the next bit.
+test_ids_full_shard_splits : Script ()
+test_ids_full_shard_splits = do
+  env <- setupEnv
+  _ <- applyRecords env (map (OcfRecordDataStakeholder . stakeholderData) splitIds)
+  shards <- map snd <$> shardsOf env
+  length shards === 257
+  let children = filter (\s -> T.isPrefixOf splitPrefix s.prefix) shards
+  sort (map (.prefix) children) === [splitPrefix <> "0", splitPrefix <> "1"]
+  sum (map (Set.size . (.claimed)) children) === 65
+  all (\s -> Set.size s.claimed <= 64) shards === True
+  -- Every claimed ID is still refused a second time.
+  applyRecordsFails env "ID already used" [OcfRecordDataStockClass (stockClass (head splitIds))]
+
+test_ids_pre_split : Script ()
+test_ids_pre_split = do
+  env <- setupEnv
+  _ <- applyOps env [ApplyPreSplitShard with prefix = "00000000"]
+  shards <- map snd <$> shardsOf env
+  length shards === 257
+  sort (map (.prefix) (filter (\s -> T.isPrefixOf "00000000" s.prefix) shards)) === ["000000000", "000000001"]
+  applyOpsFails env "no shard with prefix" [ApplyPreSplitShard with prefix = "00000000"]
+
+test_ids_overlapping_shard_inputs_refused : Script ()
+test_ids_overlapping_shard_inputs_refused = do
+  env <- setupEnv
+  [(oldCid, _)] <- filter (\(_, s) -> s.prefix == "00000000") <$> shardsOf env
+  _ <- applyOps env [ApplyPreSplitShard with prefix = "00000000"]
+  -- The archived parent cannot be passed again.
+  inputs <- allInputs env
+  submitMustFail env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with
+      inputs = inputs with shards = oldCid :: inputs.shards
+      operations = [ApplyRecord (OcfRecordDataStakeholder (stakeholderData "SH-X"))]
+
+test_ids_released_on_delete : Script ()
+test_ids_released_on_delete = do
+  env <- setupEnv
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-GONE")]
+  _ <- restateOps env [RestateDelete "SH-GONE"]
+  hasRecord env "SH-GONE" >>= (=== False)
+  -- The ID is free again.
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-GONE")]
+  pure ()
+
+test_ids_claims_per_transaction_capped : Script ()
+test_ids_claims_per_transaction_capped = do
+  env <- setupEnv
+  -- 251 issuances claim 502 IDs (object and security), over the 500 a transaction may claim.
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SH-A")
+    , OcfRecordDataStockClass (stockClass "CLS-A")
+    ]
+  applyOpsFails env "claimed IDs in one transaction"
+    (map (\i -> ApplyRecord (OcfRecordDataStockIssuance (issuance ("S-" <> show i) "SH-A" "CLS-A" 1.0 d2024))) [1 .. 251])
+
+-- A shard's precondition, which runs on every create and fetch: a bit prefix of 8 to 256 bits, at
+-- most 64 hashes, each 64 characters whose leading bits are the prefix.
+test_ids_shard_precondition : Script ()
+test_ids_shard_precondition = do
+  env <- setupEnv
+  let hashOf i = claimHash IdNamespaceObject ("X-" <> show i)
+      hashes = map hashOf [1 .. 2000]
+      under p = filter (\h -> T.isPrefixOf p (hashBits h)) hashes
+      shard p hs = OcfIdShard with context = env.ctx; prefix = p; claimed = Set.fromList hs
+      p8 = T.take 8 (hashBits (hashOf 1))
+      p10 = T.take 10 (hashBits (hashOf 1))
+      mine = under p8
+      other = head (filter (\h -> not (T.isPrefixOf p8 (hashBits h))) hashes)
+  assertMsg "some hashes share the prefix" (length mine >= 2)
+  validateOcfIdShard (shard p8 mine) === True
+  validateOcfIdShard (shard p10 (under p10)) === True
+  validateOcfIdShard (shard p8 []) === True
+  -- The prefix: 8 to 256 bits, only "0" and "1".
+  validateOcfIdShard (shard (T.take 7 p8) []) === False
+  validateOcfIdShard (shard (p8 <> "2") []) === False
+  validateOcfIdShard (shard (T.implode (replicate 257 "0")) []) === False
+  -- A hash outside the prefix, of the wrong length, or not hex in its leading digits.
+  validateOcfIdShard (shard p8 (other :: mine)) === False
+  validateOcfIdShard (shard p8 [T.take 63 (head mine)]) === False
+  validateOcfIdShard (shard p8 [head mine <> "0"]) === False
+  validateOcfIdShard (shard p8 ["zz" <> T.drop 2 (head mine)]) === False
+  -- At most 64 hashes: 65 distinct ones under the prefix are refused.
+  let many = map (\i -> T.take 2 (head mine) <> T.drop 2 (hashOf i)) [1 .. 65]
+  Set.size (Set.fromList many) === 65
+  validateOcfIdShard (shard p8 (take 64 many)) === True
+  validateOcfIdShard (shard p8 many) === False

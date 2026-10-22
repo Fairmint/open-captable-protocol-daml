@@ -1,0 +1,149 @@
+-- Steps shared by every event on a stock state: bringing the state to the event's date, resolving the IDs the event writes, and creating output issuances with their states.
+module Fairmint.OpenCapTable.Events
+  ( beginEvent
+  , requireNoHolds
+  , assertLedgerDate
+  , resolveId
+  , successor
+  , successorAfter
+  , stateForIssuance
+  , vestingOfIssuance
+  , outputVesting
+  , addOutputIssuance
+  , checkRequirements
+  , checkRequirementIn
+  , liftEither
+  ) where
+
+import DA.Action (unless, when)
+import DA.Date (addDays)
+import DA.Foldable (forA_)
+import DA.List (dedup)
+import DA.Optional (isSome)
+import DA.Time (isLedgerTimeGE, isLedgerTimeLT, time)
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.References
+import Fairmint.OpenCapTable.Splits (applySplits)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context)
+import Fairmint.OpenCapTable.VestingState (OutputVesting(..), sortTranches)
+
+liftEither : Either Text a -> Update a
+liftEither = either abort pure
+
+-- | Brings the security's current state to an event dated `d`: its class's epoch must be in the
+-- working set and not frozen, the event may not predate the state's last event (unless
+-- `backdatable`: vesting starts and events), and every split dated after the state's last event
+-- and on or before the event is applied. Returns the state and its epoch; the caller consumes the
+-- state through `replaceState` or `endState`.
+beginEvent : Book -> Text -> Date -> Bool -> Update (StockSecurity, StockClassEpoch)
+beginEvent b sec d backdatable = do
+  s <- requireState sec b
+  e <- requireEpoch s.stock_class_id b
+  when e.frozen (abort ("stock class " <> s.stock_class_id <> " is frozen for a split"))
+  unless (backdatable || d >= s.last_event_date)
+    (abort ("event dated " <> show d <> " precedes the last event on security " <> sec
+      <> " (" <> show s.last_event_date <> ")"))
+  s' <- liftEither (applySplits e.splits d s)
+  pure (s', e)
+
+-- | Terminal events other than a settlement hold's own draw are refused while any hold is open.
+requireNoHolds : StockSecurity -> Update ()
+requireNoHolds s =
+  unless (null s.holds)
+    (abort ("security " <> s.security_id <> " carries an open hold; the TA must cancel or lift it first"))
+
+-- | Placements and draws are dated on the ledger date, so no trade is backdated past a split. A
+-- submission that crosses midnight fails and is retried with the new date.
+assertLedgerDate : Date -> Update ()
+assertLedgerDate d = do
+  ge <- isLedgerTimeGE (time d 0 0 0)
+  lt <- isLedgerTimeLT (time (addDays d 1) 0 0 0)
+  unless (ge && lt) (abort (show d <> " is not the ledger date"))
+
+-- | An ID an event on state `s` writes for `role` and `index`: the derived ID needs no claim; any
+-- other ID the writer names is claimed in `ns` (and so may not have the derived form).
+resolveId : IdNamespace -> StockSecurity -> DerivedRole -> Int -> Text -> Book -> Update Book
+resolveId ns s role index given b =
+  if given == deriveId b.context s.security_id s.seq role index
+    then pure b
+    else claimId ns given b
+
+-- | The state after a non-terminal event: one more event, the same holds under the same hold IDs,
+-- and no delivery record.
+successor : StockSecurity -> StockSecurity
+successor s = s with seq = s.seq + 1; delivery = None
+
+-- | The successor after a non-terminal event whose record took the ID `id`, remembering whether
+-- that ID was derived from the security.
+successorAfter : Context -> StockSecurity -> Text -> StockSecurity
+successorAfter ctx s id = (successor s) with
+  derived_ids = s.derived_ids || id == deriveId ctx s.security_id s.seq DerivedRoleEvent 0
+
+-- | How an issuance's security vests: explicit tranches first (OCF reads `vestings` ahead of
+-- `vesting_terms_id`), else its vesting terms, else fully vested.
+vestingOfIssuance : StockIssuanceOcfData -> StockVesting
+vestingOfIssuance iss
+  | not (null iss.vestings) = StockVestingTranches (sortTranches iss.vestings)
+  | otherwise = optional StockVestingNone StockVestingOnTerms iss.vesting_terms_id
+
+outputVesting : StockIssuanceOcfData -> OutputVesting
+outputVesting iss = OutputVesting with
+  quantity = iss.quantity
+  vestings = iss.vestings
+  on_terms = null iss.vestings && isSome iss.vesting_terms_id
+
+-- | The new state of a security an issuance creates. Its quantity is in the units of the event
+-- date `eventDate` (a primary issuance's own date), so it starts at that date's split epoch.
+stateForIssuance : Book -> StockClassEpoch -> Date -> StockIssuanceOcfData -> StockSecurity
+stateForIssuance b e eventDate iss = StockSecurity with
+  context = b.context
+  security_id = iss.security_id
+  issue_date = iss.date
+  last_event_date = eventDate
+  origin_transaction_id = iss.id
+  quantity = iss.quantity
+  seq = 0
+  split_epoch = splitsOnOrBefore e.splits eventDate
+  stakeholder_id = iss.stakeholder_id
+  stock_class_id = iss.stock_class_id
+  vesting = vestingOfIssuance iss
+  holds = []
+  delivery = None
+  snapshot = None
+  accelerated_since_snapshot = None
+  derived_ids = False
+
+-- | Writes an output issuance of an event on source state `src` dated `d`: the issuance is dated
+-- `d`, because its new state starts at the event's date and split epoch and its quantity is in the
+-- event's units; resolves its object and security IDs against the derived ones for the roles,
+-- creates the record and the new security's state (its class's epoch must be in the working set
+-- and not frozen), and queues the issuance's own references.
+addOutputIssuance : StockSecurity -> Date -> (DerivedRole, DerivedRole, Int) -> StockIssuanceOcfData -> Book -> Update Book
+addOutputIssuance src d (issuanceRole, securityRole, index) iss b0 = do
+  unless (iss.date == d)
+    (abort ("output issuance " <> iss.id <> " is dated " <> show iss.date <> ", not on its event's date " <> show d))
+  b1 <- resolveId IdNamespaceObject src issuanceRole index iss.id b0
+  b2 <- resolveId IdNamespaceSecurity src securityRole index iss.security_id b1
+  e <- requireEpoch iss.stock_class_id b2
+  when e.frozen (abort ("stock class " <> iss.stock_class_id <> " is frozen for a split"))
+  (b3, _) <- addRecord (OcfRecordDataStockIssuance iss) b2
+  b4 <- addState (stateForIssuance b3 e d iss) b3
+  pure (addRequirements (requirementsOf (OcfRecordDataStockIssuance iss)) b4)
+
+-- | Evaluates every deferred requirement against the final working set.
+checkRequirements : Book -> Update ()
+checkRequirements b = forA_ (dedup b.requirements) (checkRequirementIn b)
+
+-- | Evaluates one requirement against a working set now.
+checkRequirementIn : Book -> Requirement -> Update ()
+checkRequirementIn b = liftEither . checkRequirement (bookLookups b)
+
+bookLookups : Book -> Lookups
+bookLookups b = Lookups with
+  record = (`lookupRecordData` b)
+  security = (`lookupSecurity` b)
+  epoch_splits = \cls -> (.splits) <$> lookupEpoch cls b

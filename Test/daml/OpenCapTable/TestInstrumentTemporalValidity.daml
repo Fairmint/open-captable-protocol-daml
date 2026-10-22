@@ -1,0 +1,204 @@
+-- The date rules a warrant, convertible or equity compensation issuance checks on itself: each trigger type's fields, elective ranges that start on or before they end, warrant triggers within the expiration, expirations on or after the issuance, unique trigger IDs, and consistent note interest schedules.
+module OpenCapTable.TestInstrumentTemporalValidity where
+
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..), validateConvertibleIssuanceOcfData)
+import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (validateEquityCompensationIssuanceOcfData)
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..), validateWarrantIssuanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
+
+dec31, jan01, jan02, jan03, jan04 : Date
+dec31 = D.date 2023 D.Dec 31
+jan01 = D.date 2024 D.Jan 1
+jan02 = D.date 2024 D.Jan 2
+jan03 = D.date 2024 D.Jan 3
+jan04 = D.date 2024 D.Jan 4
+
+-- | A trigger with a fixed-amount right into CLS-A and the given dates.
+fixedConvertibleTrigger : Text -> OcfConversionTriggerType -> Optional Date -> Optional Date -> Optional Date -> OcfConvertibleConversionTrigger
+fixedConvertibleTrigger triggerId t start end on =
+  (convertibleTrigger triggerId t
+    (convertibleRight (OcfConvMechFixedAmount OcfFixedAmountConversionMechanism with converts_to_quantity = 100.0) (Some "CLS-A"))) with
+    start_date = start; end_date = end; trigger_date = on
+
+fixedWarrantTrigger : Text -> OcfConversionTriggerType -> Optional Date -> Optional Date -> Optional Date -> OcfConversionTrigger
+fixedWarrantTrigger triggerId t start end on =
+  (warrantTrigger triggerId t
+    (OcfRightWarrant (warrantRight (OcfWarrantMechanismFixedAmount OcfFixedAmountConversionMechanism with converts_to_quantity = 100.0) (Some "CLS-A")))) with
+    start_date = start; end_date = end; trigger_date = on
+
+convertibleWith : Text -> [OcfConvertibleConversionTrigger] -> ConvertibleIssuanceOcfData
+convertibleWith sec triggers = (convertibleIssuance ("TX-" <> sec) sec "SH-A") with conversion_triggers = triggers
+
+warrantWith : Text -> [OcfConversionTrigger] -> Optional Date -> WarrantIssuanceOcfData
+warrantWith sec triggers expiration = (warrantIssuance ("TX-" <> sec) sec "SH-A") with
+  exercise_triggers = triggers
+  warrant_expiration_date = expiration
+
+-- | Writes the convertible and checks its payload, or requires the precondition to refuse it.
+convertibleAccepted, convertibleRefused : Env -> ConvertibleIssuanceOcfData -> Script ()
+convertibleAccepted env c = do
+  expectValid c.security_id (validateConvertibleIssuanceOcfData c)
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance c]
+  expectRecord env (OcfRecordDataConvertibleIssuance c)
+convertibleRefused env c = do
+  expectInvalid c.security_id (validateConvertibleIssuanceOcfData c)
+  applyRecordsFails env "precondition" [OcfRecordDataConvertibleIssuance c]
+
+warrantAccepted, warrantRefused : Env -> WarrantIssuanceOcfData -> Script ()
+warrantAccepted env w = do
+  expectValid w.security_id (validateWarrantIssuanceOcfData w)
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance w]
+  expectRecord env (OcfRecordDataWarrantIssuance w)
+warrantRefused env w = do
+  expectInvalid w.security_id (validateWarrantIssuanceOcfData w)
+  applyRecordsFails env "precondition" [OcfRecordDataWarrantIssuance w]
+
+-- Each trigger type requires and forbids its own fields (OCF's concrete trigger schemas each set
+-- additionalProperties: false).
+test_instrument_temporal_trigger_fields : Script ()
+test_instrument_temporal_trigger_fields = do
+  let fields label t start end condition on expected =
+        (if expected then expectValid else expectInvalid) label
+          (validateOcfConversionTriggerFields t start end condition on)
+      cond = Some "Qualified financing"
+  fields "automatic on date" OcfConversionTriggerTypeAutomaticOnDate None None None (Some jan02) True
+  fields "automatic on date without a date" OcfConversionTriggerTypeAutomaticOnDate None None None None False
+  fields "automatic on date with a condition" OcfConversionTriggerTypeAutomaticOnDate None None cond (Some jan02) False
+  fields "automatic on date with a start" OcfConversionTriggerTypeAutomaticOnDate (Some jan01) None None (Some jan02) False
+  fields "automatic on date with an end" OcfConversionTriggerTypeAutomaticOnDate None (Some jan03) None (Some jan02) False
+  fields "automatic on condition" OcfConversionTriggerTypeAutomaticOnCondition None None cond None True
+  fields "automatic on condition without one" OcfConversionTriggerTypeAutomaticOnCondition None None None None False
+  fields "automatic on an empty condition" OcfConversionTriggerTypeAutomaticOnCondition None None (Some "") None False
+  fields "automatic on condition with a date" OcfConversionTriggerTypeAutomaticOnCondition None None cond (Some jan02) False
+  fields "automatic on condition with a range" OcfConversionTriggerTypeAutomaticOnCondition (Some jan01) (Some jan02) cond None False
+  fields "elective on condition" OcfConversionTriggerTypeElectiveOnCondition None None cond None True
+  fields "elective on condition without one" OcfConversionTriggerTypeElectiveOnCondition None None None None False
+  fields "elective on condition with a date" OcfConversionTriggerTypeElectiveOnCondition None None cond (Some jan02) False
+  fields "elective in range" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan03) None None True
+  fields "elective in a one-day range" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan02) None None True
+  fields "elective in a reversed range" OcfConversionTriggerTypeElectiveInRange (Some jan03) (Some jan02) None None False
+  fields "elective in range without a start" OcfConversionTriggerTypeElectiveInRange None (Some jan03) None None False
+  fields "elective in range without an end" OcfConversionTriggerTypeElectiveInRange (Some jan02) None None None False
+  fields "elective in range with a condition" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan03) cond None False
+  fields "elective in range with a date" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan03) None (Some jan02) False
+  forA_ [("elective at will", OcfConversionTriggerTypeElectiveAtWill), ("unspecified", OcfConversionTriggerTypeUnspecified)] \(label, t) -> do
+    fields label t None None None None True
+    fields (label <> " with a date") t None None None (Some jan02) False
+    fields (label <> " with a condition") t None None cond None False
+    fields (label <> " with a start") t (Some jan01) None None None False
+    fields (label <> " with an end") t None (Some jan01) None None False
+
+test_instrument_temporal_reversed_trigger_ranges : Script ()
+test_instrument_temporal_reversed_trigger_ranges = do
+  env <- standardBook
+  convertibleRefused env (convertibleWith "SEC-CV-RANGE-REVERSED"
+    [fixedConvertibleTrigger "CV-RANGE-REVERSED" OcfConversionTriggerTypeElectiveInRange (Some jan03) (Some jan02) None])
+  warrantRefused env (warrantWith "SEC-WR-RANGE-REVERSED"
+    [fixedWarrantTrigger "WR-RANGE-REVERSED" OcfConversionTriggerTypeElectiveInRange (Some jan03) (Some jan02) None] None)
+  -- A range may start and end on the same day.
+  convertibleAccepted env (convertibleWith "SEC-CV-RANGE-ONE-DAY"
+    [fixedConvertibleTrigger "CV-RANGE-ONE-DAY" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan02) None])
+  warrantAccepted env (warrantWith "SEC-WR-RANGE-ONE-DAY"
+    [fixedWarrantTrigger "WR-RANGE-ONE-DAY" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some jan02) None] None)
+
+-- A warrant trigger's date, and an elective range's end, fall on or before the warrant's
+-- expiration; with no expiration, they are unbounded.
+test_instrument_temporal_triggers_within_warrant_expiration : Script ()
+test_instrument_temporal_triggers_within_warrant_expiration = do
+  env <- standardBook
+  let auto on = fixedWarrantTrigger "WR-AUTO" OcfConversionTriggerTypeAutomaticOnDate None None (Some on)
+      range end = fixedWarrantTrigger "WR-RANGE" OcfConversionTriggerTypeElectiveInRange (Some jan02) (Some end) None
+  expectInvalid "pure: date after expiration" (validateOcfConversionTriggerWithinExpiration (Some jan03) None (Some jan04))
+  expectInvalid "pure: end after expiration" (validateOcfConversionTriggerWithinExpiration (Some jan03) (Some jan04) None)
+  expectValid "pure: on the expiration" (validateOcfConversionTriggerWithinExpiration (Some jan03) (Some jan03) (Some jan03))
+  expectValid "pure: no expiration" (validateOcfConversionTriggerWithinExpiration None (Some jan04) (Some jan04))
+  warrantRefused env (warrantWith "SEC-WR-AUTO-AFTER-EXPIRATION" [auto jan04] (Some jan03))
+  warrantRefused env (warrantWith "SEC-WR-RANGE-AFTER-EXPIRATION" [range jan04] (Some jan03))
+  -- One trigger past the expiration refuses the warrant even when the others are within it.
+  warrantRefused env (warrantWith "SEC-WR-ONE-AFTER-EXPIRATION"
+    [auto jan04, (range jan03) with trigger_id = "WR-OK"] (Some jan03))
+  warrantAccepted env (warrantWith "SEC-WR-AUTO-ON-EXPIRATION" [auto jan03] (Some jan03))
+  warrantAccepted env (warrantWith "SEC-WR-RANGE-ON-EXPIRATION" [range jan03] (Some jan03))
+  warrantAccepted env (warrantWith "SEC-WR-NO-EXPIRATION" [auto jan04, (range jan04) with trigger_id = "WR-RANGE-2"] None)
+  -- An at-will trigger has no dates to bound.
+  warrantAccepted env (warrantWith "SEC-WR-AT-WILL" [atWillWarrantTrigger "WR-AT-WILL"] (Some jan01))
+
+test_instrument_temporal_trigger_ids_unique : Script ()
+test_instrument_temporal_trigger_ids_unique = do
+  env <- standardBook
+  let cvAuto on = fixedConvertibleTrigger "CV-DUPLICATE" OcfConversionTriggerTypeAutomaticOnDate None None (Some on)
+      wrAuto on = fixedWarrantTrigger "WR-DUPLICATE" OcfConversionTriggerTypeAutomaticOnDate None None (Some on)
+  -- Two triggers with one ID are refused even when they differ.
+  convertibleRefused env (convertibleWith "SEC-CV-DUPLICATE-TRIGGER" [cvAuto jan02, cvAuto jan03])
+  warrantRefused env (warrantWith "SEC-WR-DUPLICATE-TRIGGER" [wrAuto jan02, wrAuto jan03] None)
+  convertibleAccepted env (convertibleWith "SEC-CV-TWO-TRIGGERS" [cvAuto jan02, (cvAuto jan03) with trigger_id = "CV-SECOND"])
+  warrantAccepted env (warrantWith "SEC-WR-TWO-TRIGGERS" [wrAuto jan02, (wrAuto jan03) with trigger_id = "WR-SECOND"] None)
+  -- Trigger IDs are scoped to their issuance: another instrument may reuse one.
+  convertibleAccepted env (convertibleWith "SEC-CV-REUSED-TRIGGER" [cvAuto jan02])
+
+test_instrument_temporal_expiration_before_issuance : Script ()
+test_instrument_temporal_expiration_before_issuance = do
+  env <- standardBook
+  let warrant = (warrantWith "SEC-WR-INVALID-EXPIRATION" [atWillWarrantTrigger "WR-INVALID-EXPIRATION"] (Some dec31)) with date = jan01
+      ec = (equityCompensationIssuance "TX-EC-INVALID-EXPIRATION" "SEC-EC-INVALID-EXPIRATION" "SH-A") with
+        date = jan01
+        expiration_date = Some dec31
+  warrantRefused env warrant
+  expectInvalid "equity compensation expiring before its issuance" (validateEquityCompensationIssuanceOcfData ec)
+  applyRecordsFails env "precondition" [OcfRecordDataEquityCompensationIssuance ec]
+  -- Both may expire on their issuance date.
+  warrantAccepted env (warrant with warrant_expiration_date = Some jan01)
+  let ec' = ec with expiration_date = Some jan01
+  expectValid "equity compensation expiring on its issuance date" (validateEquityCompensationIssuanceOcfData ec')
+  _ <- applyRecords env [OcfRecordDataEquityCompensationIssuance ec']
+  expectRecord env (OcfRecordDataEquityCompensationIssuance ec')
+
+-- A note's interest periods, in any order, do not overlap: each ends before the next starts,
+-- and an open period ends where the next begins. A period may begin before the issuance.
+test_instrument_temporal_note_interest_schedule : Script ()
+test_instrument_temporal_note_interest_schedule = do
+  env <- standardBook
+  let rate start end = OcfInterestRate with accrual_start_date = start; accrual_end_date = end; rate = 0.08
+      noteWith sec rates = convertibleWith sec
+        [ (convertibleTrigger ("CV-NOTE-" <> sec) OcfConversionTriggerTypeUnspecified
+            (convertibleRight (OcfConvMechNote OcfNoteConversionMechanism with
+              compounding_type = OcfCompoundingTypeSimple
+              day_count_convention = OcfDayCountTypeActual365
+              interest_accrual_period = OcfAccrualPeriodTypeAnnual
+              interest_payout = OcfInterestPayoutTypeDeferred
+              interest_rates = rates
+              capitalization_definition = None
+              capitalization_definition_rules = None
+              conversion_discount = None
+              conversion_mfn = None
+              conversion_valuation_cap = None
+              exit_multiple = None) None)) ]
+      valid =
+        [ ("VALID", [rate jan03 None, rate jan01 (Some jan02)])
+        , ("IMPLICIT-END", [rate jan01 None, rate jan03 None])
+        , ("PRE-ISSUANCE", [rate dec31 None])
+        , ("ONE-DAY", [rate jan02 (Some jan02)])
+        , ("NONE", [])
+        ]
+      invalid =
+        [ ("REVERSED", [rate jan03 (Some jan02)])
+        , ("OVERLAP", [rate jan01 (Some jan03), rate jan03 None])
+        , ("DUPLICATE-START", [rate jan01 None, rate jan01 None])
+        , ("CONTAINED", [rate jan01 (Some jan04), rate jan02 (Some jan03)])
+        , ("RATE-OVER-ONE", [(rate jan01 None) with rate = 1.10])
+        ]
+  forA_ valid \(label, rates) -> do
+    expectValid label (validateOcfInterestRateSchedule rates)
+    convertibleAccepted env (noteWith ("SEC-CV-NOTE-" <> label) rates)
+  forA_ invalid \(label, rates) -> do
+    expectInvalid label (validateOcfInterestRateSchedule rates)
+    convertibleRefused env (noteWith ("SEC-CV-NOTE-" <> label) rates)
+  expectValid "one rate ending the day it starts" (validateOcfInterestRate (rate jan02 (Some jan02)))
+  expectInvalid "one rate ending before it starts" (validateOcfInterestRate (rate jan02 (Some jan01)))

@@ -1,0 +1,364 @@
+-- CapTable_Settle: draws and cancellations of one trade's holds, cost bases, vesting on balances, and the delivered terms.
+module OpenCapTable.TestSettlement where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Optional (isNone)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfAllocationType(..), OcfVestingCondition(..), OcfVestingTrigger(..), VestingTermsOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.TestRestate (restatementOf)
+
+tradeDay : Date
+tradeDay = D.date 2025 D.Jun 2
+
+-- The standard book with a 100-share settlement hold on S-A1 under T-1, on the trade day.
+tradeBook : Script Env
+tradeBook = do
+  env <- standardBook
+  onDate tradeDay
+  lot <- settlementLot env "S-A1" 100.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot]
+  pure env
+
+buyerB : Env -> Script SettleBuyer
+buyerB env = SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+
+test_settlement_partial_draw : Script ()
+test_settlement_partial_draw = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  r.seller_stakeholder_id === "SH-A"
+  r.buyer_stakeholder_id === "SH-B"
+  r.stock_class_id === "CLS-A"
+  r.quantity === 60.0
+  [SettleDrawResult with transfer_id; buyer_security_id; balance_security_id = Some bal] <- pure r.lots
+  -- IDs derive from the source state's security ID and seq (1 after the hold placement).
+  transfer_id === derived env "S-A1" 1 DerivedRoleEvent 0
+  buyer_security_id === derived env "S-A1" 1 DerivedRoleResultingSecurity 0
+  bal === derived env "S-A1" 1 DerivedRoleBalanceSecurity 0
+  hasState env "S-A1" >>= (=== False)
+  b <- stateOf env buyer_security_id
+  b.quantity === 60.0
+  b.vesting === StockVestingNone
+  b.holds === []
+  rest <- stateOf env bal
+  rest.quantity === 540.0
+  rest.holds === []
+  rest.delivery === None
+  -- The transfer record names the source, the buyer's security and the balance.
+  Some (OcfRecordCidStockTransfer tcid) <- Some <$> recordCidOf env transfer_id
+  Some t <- queryContractId env.transfer_agent tcid
+  t.ocf_data.quantity === 60.0
+  t.ocf_data.resulting_security_ids === [buyer_security_id]
+  t.ocf_data.balance_security_id === Some bal
+  -- Cost bases: 180.00 on the buyer's issuance, 600 × 540 / 600 = 540.00 on the balance.
+  bi <- issuanceCidOf env b.origin_transaction_id
+  Some bIss <- queryContractId env.transfer_agent bi
+  bIss.ocf_data.cost_basis === Some (usd 180.0)
+  bIss.ocf_data.share_price === usd 3.0
+  bIss.ocf_data.custom_id === "BUY-S-A1"
+  ri <- issuanceCidOf env rest.origin_transaction_id
+  Some rIss <- queryContractId env.transfer_agent ri
+  rIss.ocf_data.cost_basis === Some (usd 540.0)
+
+test_settlement_full_draw_has_no_balance : Script ()
+test_settlement_full_draw_has_no_balance = do
+  env <- standardBook
+  onDate tradeDay
+  lot <- settlementLot env "S-A2" 400.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-9" tradeDay [lot]
+  draw <- drawLot env "S-A2" 400.0 1.5 []
+  buyer <- buyerB env
+  r <- settle env "T-9" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with balance_security_id; balance_state] <- pure r.lots
+  isNone balance_security_id === True
+  isNone balance_state === True
+
+test_settlement_draw_checks : Script ()
+test_settlement_draw_checks = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  settleFails env "is not the ledger date" "T-1" (D.addDays tradeDay 1) buyer [SettleDraw draw]
+  settleFails env "at most hold" "T-1" tradeDay buyer [SettleDraw draw with quantity = 101.0; buyer_cost_basis = usd 303.0]
+  settleFails env "must be positive" "T-1" tradeDay buyer [SettleDraw draw with quantity = 0.0]
+  settleFails env "is not a settlement hold under T-2" "T-2" tradeDay buyer [SettleDraw draw]
+  settleFails env "is not open" "T-1" tradeDay buyer [SettleDraw draw with hold_id = "nope"]
+  settleFails env "buyer cost basis must be" "T-1" tradeDay buyer [SettleDraw draw with buyer_cost_basis = usd 179.0]
+  settleFails env "balance cost basis must be" "T-1" tradeDay buyer [SettleDraw draw with balance_cost_basis = Some (usd 1.0)]
+  settleFails env "needs at least one lot" "T-1" tradeDay buyer []
+  let c = CancelHold with security_id = "S-A1"; hold_id = draw.hold_id; reason_text = "x"
+  settleFails env "draws at least one lot" "T-1" tradeDay buyer [SettleCancel c]
+  seller <- SettleBuyerExisting <$> stakeholderCidOf env "SH-A"
+  settleFails env "the same stakeholder" "T-1" tradeDay seller [SettleDraw draw]
+  other <- issuanceCidOf env "ISS-S-A2"
+  settleFails env "is not the origin" "T-1" tradeDay buyer [SettleDraw draw with origin_issuance = other]
+
+test_settlement_new_buyer_stakeholder : Script ()
+test_settlement_new_buyer_stakeholder = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 10.0 2.0 []
+  r <- settle env "T-1" tradeDay (SettleBuyerNew (stakeholderData "SH-NEW")) [SettleDraw draw]
+  r.buyer_stakeholder_id === "SH-NEW"
+  hasRecord env "SH-NEW" >>= (=== True)
+
+test_settlement_new_buyer_id_must_be_free : Script ()
+test_settlement_new_buyer_id_must_be_free = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 10.0 2.0 []
+  settleFails env "ID already used: SH-B" "T-1" tradeDay (SettleBuyerNew (stakeholderData "SH-B")) [SettleDraw draw]
+
+test_settlement_two_lots_and_a_cancel : Script ()
+test_settlement_two_lots_and_a_cancel = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-A3" "SH-A" "CLS-A" 50.0 d2024)]
+  onDate tradeDay
+  l1 <- settlementLot env "S-A1" 100.0
+  l2 <- settlementLot env "S-A2" 100.0
+  l3 <- settlementLot env "S-A3" 50.0
+  [_, _, h3] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [l1, l2, l3]
+  d1 <- drawLot env "S-A1" 100.0 2.0 []
+  d2 <- drawLot env "S-A2" 50.0 2.5 []
+  buyer <- buyerB env
+  r <- settle env "T-1" tradeDay buyer
+    [SettleDraw d1, SettleDraw d2, SettleCancel CancelHold with security_id = "S-A3"; hold_id = h3.hold_id; reason_text = "undrawn"]
+  r.quantity === 150.0
+  length r.lots === 3
+  s3 <- stateOf env "S-A3"
+  s3.holds === []
+  let drawnPrices = concatMap (\l -> case l of
+        SettleDrawResult with share_price -> [share_price]
+        SettleCancelResult {} -> []) r.lots
+  drawnPrices === [usd 2.0, usd 2.5]
+
+-- A settlement cancels only its own settlement holds: a stop whose case reference happens to equal
+-- the settlement ID stays on its lot.
+test_settlement_cancels_only_its_settlement_holds : Script ()
+test_settlement_cancels_only_its_settlement_holds = do
+  env <- tradeBook
+  [stop] <- placeHolds env OcfHoldTypeStopTransfer "T-1" tradeDay [stopLot "S-A2"]
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  settleFails env "is not a settlement hold under T-1" "T-1" tradeDay buyer
+    [SettleDraw draw, SettleCancel CancelHold with security_id = "S-A2"; hold_id = stop.hold_id; reason_text = "undrawn"]
+  s2 <- stateOf env "S-A2"
+  map (.hold_type) s2.holds === [OcfHoldTypeStopTransfer]
+  _ <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  pure ()
+
+test_settlement_lots_of_one_stakeholder_and_class : Script ()
+test_settlement_lots_of_one_stakeholder_and_class = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-C"), OcfRecordDataStockIssuance (issuance "S-C1" "SH-C" "CLS-A" 50.0 d2024)]
+  onDate tradeDay
+  l1 <- settlementLot env "S-A1" 10.0
+  lc <- settlementLot env "S-C1" 10.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [l1]
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lc]
+  d1 <- drawLot env "S-A1" 10.0 1.0 []
+  dc <- drawLot env "S-C1" 10.0 1.0 []
+  buyer <- buyerB env
+  settleFails env "one stakeholder in one class" "T-1" tradeDay buyer [SettleDraw d1, SettleDraw dc]
+
+test_settlement_canceled_hold_cannot_settle : Script ()
+test_settlement_canceled_hold_cannot_settle = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  _ <- cancelHolds env tradeDay [CancelHold with security_id = "S-A1"; hold_id = draw.hold_id; reason_text = "released"]
+  buyer <- buyerB env
+  settleFails env "is not open" "T-1" tradeDay buyer [SettleDraw draw]
+
+-- A stop on a drawn lot cancels its hold, so the settlement fails and can only be released.
+test_settlement_stop_before_settle : Script ()
+test_settlement_stop_before_settle = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" tradeDay [stopLot "S-A1"]
+  buyer <- buyerB env
+  settleFails env "is stopped" "T-1" tradeDay buyer [SettleDraw draw]
+
+-- A tranche lot: the draw takes the earliest vested tranches and the balance keeps the rest.
+test_settlement_tranche_lot_balance : Script ()
+test_settlement_tranche_lot_balance = do
+  env <- standardBook
+  let tranches =
+        [ OcfVesting with amount = 25.0; date = D.date 2025 D.Jan 1
+        , OcfVesting with amount = 25.0; date = D.date 2025 D.Apr 1
+        , OcfVesting with amount = 25.0; date = D.date 2025 D.Jul 1
+        , OcfVesting with amount = 25.0; date = D.date 2025 D.Oct 1
+        ]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-T1" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)]
+  onDate tradeDay
+  lot <- settlementLot env "S-T1" 30.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot]
+  -- The ledger computes a tranche lot's balance vesting; passing one is refused.
+  draw <- drawLot env "S-T1" 30.0 1.0 []
+  buyer <- buyerB env
+  settleFails env "the ledger's to compute" "T-1" tradeDay buyer [SettleDraw draw with balance_vestings = tranches]
+  r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with balance_security_id = Some bal] <- pure r.lots
+  rest <- stateOf env bal
+  rest.quantity === 70.0
+  rest.vesting === StockVestingTranches
+    [ OcfVesting with amount = 20.0; date = D.date 2025 D.Apr 1
+    , OcfVesting with amount = 25.0; date = D.date 2025 D.Jul 1
+    , OcfVesting with amount = 25.0; date = D.date 2025 D.Oct 1
+    ]
+
+-- A lot on vesting terms: the TA's snapshot says what has vested, and the balance carries its
+-- remaining vesting as explicit tranches that the ledger checks.
+test_settlement_terms_lot_balance : Script ()
+test_settlement_terms_lot_balance = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataVestingTerms vestingTerms4y]
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-V1" "SH-A" "CLS-A" 100.0 d2024) with vesting_terms_id = Some "VT-4Y")]
+  _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V1"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
+  onDate tradeDay
+  lot <- settlementLot env "S-V1" 41.0
+  placeHoldsFails env "at most its vested" OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot]
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot with quantity = Some 30.0]
+  buyer <- buyerB env
+  let good = [(OcfVesting with amount = 10.0; date = D.date 2025 D.Mar 1), (OcfVesting with amount = 60.0; date = D.date 2027 D.Jan 1)]
+  bad1 <- drawLot env "S-V1" 30.0 1.0 [(OcfVesting with amount = 70.0; date = D.date 2027 D.Jan 1)]
+  settleFails env "must equal the vested 10.0" "T-1" tradeDay buyer [SettleDraw bad1]
+  bad2 <- drawLot env "S-V1" 30.0 1.0 [(OcfVesting with amount = 10.0; date = D.date 2025 D.Mar 1)]
+  settleFails env "must sum to its quantity" "T-1" tradeDay buyer [SettleDraw bad2]
+  draw <- drawLot env "S-V1" 30.0 1.0 good
+  r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with balance_security_id = Some bal] <- pure r.lots
+  rest <- stateOf env bal
+  rest.vesting === StockVestingTranches good
+  rest.snapshot === None
+
+-- The result carries the delivered terms the desk checks against the accepted terms before it pays,
+-- and a trade's draw settles once: the draw consumed its lot, so a second settle finds no state.
+test_settlement_result_carries_delivered_terms : Script ()
+test_settlement_result_carries_delivered_terms = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  r.context === env.ctx
+  r.settlement_id === "T-1"
+  r.seller_stakeholder_id === "SH-A"
+  r.buyer_stakeholder_id === "SH-B"
+  r.stock_class_id === "CLS-A"
+  r.quantity === 60.0
+  [SettleDrawResult with share_price] <- pure r.lots
+  share_price === usd 3.0
+  settleFails env "no active state for security S-A1" "T-1" tradeDay buyer [SettleDraw draw]
+
+test_settlement_only_ta_settles : Script ()
+test_settlement_only_ta_settles = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  inputs <- allInputs env
+  submitMustFail env.issuer do
+    exerciseCmd env.cap_table CapTable_Settle with inputs; settlement_id = "T-1"; date = tradeDay; buyer; lots = [SettleDraw draw]
+  submitMustFail env.system_operator do
+    exerciseCmd env.cap_table CapTable_Settle with inputs; settlement_id = "T-1"; date = tradeDay; buyer; lots = [SettleDraw draw]
+
+-- A restatement can edit a lot's origin issuance without its state. A hold or draw copies the
+-- origin, so it refuses one that no longer names the lot's stakeholder and class.
+test_settlement_origin_must_agree_with_the_lot : Script ()
+test_settlement_origin_must_agree_with_the_lot = do
+  env <- tradeBook
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockIssuance (issuance "S-A1" "SH-B" "CLS-A" 600.0 d2024))]
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  settleFails env "disagrees with security S-A1" "T-1" tradeDay buyer [SettleDraw draw]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockIssuance (issuance "S-A2" "SH-B" "CLS-A" 400.0 d2024))]
+  lot <- settlementLot env "S-A2" 10.0
+  placeHoldsFails env "disagrees with security S-A2" OcfHoldTypeRegisterSettlement "T-2" tradeDay [lot]
+
+-- The origin of a lot a trade sold is never deleted: the transfer a register choice wrote consumed it.
+test_settlement_origin_of_a_sold_lot_is_never_deleted : Script ()
+test_settlement_origin_of_a_sold_lot_is_never_deleted = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  _ <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  restateOpsFails env "which a register choice wrote" [RestateDelete "ISS-S-A1"]
+
+-- While a lot carries a settlement hold, its tranches keep covering its quantity.
+test_settlement_hold_keeps_full_cover : Script ()
+test_settlement_hold_keeps_full_cover = do
+  env <- standardBook
+  let early = OcfVesting with amount = 400.0; date = D.date 2024 D.Jun 1
+      late = OcfVesting with amount = 600.0; date = D.date 2026 D.Jun 1
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-T" "SH-A" "CLS-A" 1000.0 d2024) with vestings = [early, late])]
+  onDate tradeDay
+  lot <- settlementLot env "S-T" 300.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [lot]
+  s <- stateOf env "S-T"
+  restateOpsFails env "precondition" [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early]]
+  _ <- restateOps env [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early, (late with amount = 300.0), (OcfVesting with amount = 300.0; date = D.date 2027 D.Jun 1)]]
+  pure ()
+
+-- The shared floor function is exact far beyond 10^18: a 2,000,000,000-share lot with a cost
+-- basis of 3,000,000,000.00 USD keeps 2,999,999,998.50 USD on the balance of a one-share draw.
+test_settlement_floor_on_a_large_lot : Script ()
+test_settlement_floor_on_a_large_lot = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-BIG" "SH-A" "CLS-A" 2000000000.0 d2024) with cost_basis = Some (usd 3000000000.0))]
+  onDate tradeDay
+  lot <- settlementLot env "S-BIG" 1.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-BIG" tradeDay [lot]
+  draw <- drawLot env "S-BIG" 1.0 2.0 []
+  draw.balance_cost_basis === Some (usd 2999999998.5)
+  buyer <- buyerB env
+  r <- settle env "T-BIG" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with balance_security_id = Some bal] <- pure r.lots
+  rest <- stateOf env bal
+  rest.quantity === 1999999999.0
+  restIssuance <- issuanceCidOf env rest.origin_transaction_id
+  Some ri <- queryContractId env.transfer_agent restIssuance
+  ri.ocf_data.cost_basis === Some (usd 2999999998.5)
+
+-- A restatement cannot end a buyer's lot by pointing it at an unrelated record it deletes.
+test_settlement_buyer_lot_is_not_ended_by_a_restatement : Script ()
+test_settlement_buyer_lot_is_not_ended_by_a_restatement = do
+  env <- tradeBook
+  draw <- drawLot env "S-A1" 60.0 3.0 []
+  buyer <- buyerB env
+  r <- settle env "T-1" tradeDay buyer [SettleDraw draw]
+  [SettleDrawResult with buyer_security_id] <- pure r.lots
+  bought <- stateOf env buyer_security_id
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-X")]
+  restateOpsFails env "keeps its origin transaction"
+    [RestateSetState ((restatementOf bought) with origin_transaction_id = "SH-X"), RestateDelete "SH-X", RestateEndState buyer_security_id]
+  restateOpsFails env "was written by a register choice" [RestateDelete bought.origin_transaction_id, RestateEndState buyer_security_id]
+  hasState env buyer_security_id >>= (=== True)
+
+-- Helpers
+
+vestingTerms4y : VestingTermsOcfData
+vestingTerms4y = VestingTermsOcfData with
+  id = "VT-4Y"
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  description = "Four years"
+  name = "4Y"
+  comments = []
+  vesting_conditions =
+    [ OcfVestingCondition with
+        id = "VC-START"
+        trigger = OcfVestingStartTrigger
+        next_condition_ids = []
+        description = None
+        portion = None
+        quantity = Some 0.0
+    ]

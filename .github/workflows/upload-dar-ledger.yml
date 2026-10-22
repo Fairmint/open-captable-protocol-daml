@@ -1,5 +1,9 @@
-# Manual: build the current backed-up OCP DAR and upload it to the selected Canton network.
+# Manual: build the current backed-up OCP DARs and upload them to the selected Canton network. `ocp` uploads
+# OpenCapTableApi-v01 before OpenCapTable-v35, and each gets its deployment tag.
 # This is intentionally separate from the package release workflow: it does not publish npm or touch the other network.
+#
+# ADR-040: OpenCapTable-v35 goes to a fresh DevNet stack and MainNet is out of scope. The MainNet steps are kept but
+# gated off by MAINNET_RELEASES_ENABLED below; a MainNet run fails fast until a MainNet rollout is decided.
 
 name: Upload selected DAR to Canton
 
@@ -20,6 +24,9 @@ on:
           - devnet
           - mainnet
 
+env:
+  MAINNET_RELEASES_ENABLED: 'false'
+
 concurrency:
   # Serialize this workflow with the package release workflow.
   group: package-release-ocp
@@ -33,6 +40,12 @@ jobs:
       contents: write
 
     steps:
+      - name: Refuse MainNet while it is out of scope
+        if: inputs.network == 'mainnet' && env.MAINNET_RELEASES_ENABLED != 'true'
+        run: |
+          echo "::error::OpenCapTable-v35 deploys to DevNet only (ADR-040: MainNet is out of scope). Set MAINNET_RELEASES_ENABLED once a MainNet rollout is decided."
+          exit 1
+
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
@@ -169,22 +182,26 @@ jobs:
           NETWORK_INPUT: ${{ inputs.network }}
         run: |
           npx tsx -e \
-            "import { requirePackageConfig } from './scripts/packages'; process.stdout.write(JSON.stringify(requirePackageConfig(process.env.PACKAGE_INPUT ?? '')))" \
+            "import { getUploadOrder } from './scripts/packages'; process.stdout.write(JSON.stringify(getUploadOrder(process.env.PACKAGE_INPUT ?? '')))" \
             > package-metadata.json
           node <<'NODE'
           const fs = require('fs');
 
-          const pkg = JSON.parse(fs.readFileSync('package-metadata.json', 'utf8'));
-          const lockKey = `${pkg.name}/${pkg.version}/${pkg.darName}.dar`;
+          // Upload order: the dependency DARs first, the selected package last.
+          const order = JSON.parse(fs.readFileSync('package-metadata.json', 'utf8'));
           const lock = JSON.parse(fs.readFileSync('dars/dars.lock', 'utf8'));
-          const entry = lock.packages[lockKey];
-          if (!entry) throw new Error(`Missing DAR lock entry: ${lockKey}`);
-          const tag = `dar-deploy/${process.env.NETWORK_INPUT}/${pkg.name}/v${pkg.version}`;
+          const deployments = order.map((pkg) => {
+            const lockKey = `${pkg.name}/${pkg.version}/${pkg.darName}.dar`;
+            const entry = lock.packages[lockKey];
+            if (!entry) throw new Error(`Missing DAR lock entry: ${lockKey}`);
+            return { name: pkg.name, version: pkg.version, sha256: entry.sha256, tag: `dar-deploy/${process.env.NETWORK_INPUT}/${pkg.name}/v${pkg.version}` };
+          });
+          fs.writeFileSync('deployment-tags.txt', deployments.map((d) => `${d.tag} ${d.name} ${d.version} ${d.sha256}`).join('\n') + '\n');
+          const pkg = deployments[deployments.length - 1];
           const outputs = {
             name: pkg.name,
             version: pkg.version,
-            sha256: entry.sha256,
-            tag,
+            dependencies: deployments.slice(0, -1).map((d) => d.name).join(' '),
           };
           for (const [key, value] of Object.entries(outputs)) {
             fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${value}\n`);
@@ -193,7 +210,13 @@ jobs:
 
       - name: Check deployment policy
         id: deployment
-        run: npm run check:dar-version-policy -- --deployment ${{ inputs.network }} --package ${{ steps.package.outputs.name }}
+        env:
+          DEPENDENCIES: ${{ steps.package.outputs.dependencies }}
+        run: |
+          for dep in $DEPENDENCIES; do
+            GITHUB_OUTPUT=/dev/null npm run check:dar-version-policy -- --deployment ${{ inputs.network }} --package "$dep"
+          done
+          npm run check:dar-version-policy -- --deployment ${{ inputs.network }} --package ${{ steps.package.outputs.name }}
 
       - name: Upload DAR to DevNet
         if: inputs.network == 'devnet' && steps.deployment.outputs.tag_exists != 'true'
@@ -203,7 +226,7 @@ jobs:
         run: npm run upload-dar -- --package ${{ inputs.package }} --network devnet
 
       - name: Upload DAR to Mainnet
-        if: inputs.network == 'mainnet' && steps.deployment.outputs.tag_exists != 'true'
+        if: env.MAINNET_RELEASES_ENABLED == 'true' && inputs.network == 'mainnet' && steps.deployment.outputs.tag_exists != 'true'
         env:
           CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
           CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_5N_LEDGER_JSON_API_CLIENT_SECRET }}
@@ -214,7 +237,7 @@ jobs:
         env:
           NETWORK_INPUT: ${{ inputs.network }}
         run: |
-          npx tsx scripts/detect-factory-need.ts --package ${{ inputs.package }} | tee factory-need.json
+          npx tsx scripts/detect-factory-need.ts --package ${{ inputs.package }} --networks "$NETWORK_INPUT" | tee factory-need.json
           node <<'NODE'
           const fs = require('fs');
           const result = JSON.parse(fs.readFileSync('factory-need.json', 'utf8'));
@@ -230,25 +253,27 @@ jobs:
         run: npx tsx scripts/create-ocp-factory.ts --network devnet
 
       - name: Create Mainnet factory
-        if: inputs.network == 'mainnet' && steps.factory.outputs.needs_factory == 'true'
+        if: env.MAINNET_RELEASES_ENABLED == 'true' && inputs.network == 'mainnet' && steps.factory.outputs.needs_factory == 'true'
         env:
           CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET: ${{ secrets.CANTON_MAINNET_INTELLECT_LEDGER_JSON_API_CLIENT_SECRET }}
-        run: npx tsx scripts/create-ocp-factory.ts --network mainnet
+        run: npx tsx scripts/create-ocp-factory.ts --network mainnet --allow-mainnet
 
-      - name: Record successful deployment tag
+      - name: Record successful deployment tags
         if: steps.deployment.outputs.tag_exists != 'true'
-        env:
-          DAR_DEPLOY_TAG: ${{ steps.package.outputs.tag }}
-          DAR_SHA256: ${{ steps.package.outputs.sha256 }}
-          PACKAGE_NAME: ${{ steps.package.outputs.name }}
-          PACKAGE_VERSION: ${{ steps.package.outputs.version }}
         run: |
           set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git remote set-url origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
-          git tag -a "$DAR_DEPLOY_TAG" -m "Deployed ${PACKAGE_NAME} v${PACKAGE_VERSION} to ${{ inputs.network }} (${DAR_SHA256})"
-          git push --no-verify origin "refs/tags/$DAR_DEPLOY_TAG"
+          # Dependencies first, then the selected package (deployment-tags.txt is in upload order).
+          while read -r tag name version sha256; do
+            if git show-ref --verify --quiet "refs/tags/${tag}"; then
+              echo "${tag} already recorded"
+              continue
+            fi
+            git tag -a "$tag" -m "Deployed ${name} v${version} to ${{ inputs.network }} (${sha256})"
+            git push --no-verify origin "refs/tags/$tag"
+          done < deployment-tags.txt
 
       - name: Upload factory metadata artifact
         if: always()

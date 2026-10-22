@@ -1,0 +1,104 @@
+-- End-to-end smoke tests of the v35 register: setup, issuance, a free transfer, a hold and the design's worked settlement example.
+module OpenCapTable.TestSmoke where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import OpenCapTable.Harness
+
+test_smoke_setup : Script ()
+test_smoke_setup = do
+  env <- setupEnv
+  env.ctx.cap_table_id === "test-1"
+  shards <- shardsOf env
+  length shards === 256
+  Some anchor <- queryContractId env.transfer_agent env.cap_table
+  anchor.status === CapTableStatusActive
+  env2 <- secondCapTable env
+  env2.ctx.cap_table_id === "test-2"
+
+test_smoke_issue_and_transfer : Script ()
+test_smoke_issue_and_transfer = do
+  env <- standardBook
+  s <- stateOf env "S-A1"
+  s.quantity === 600.0
+  s.seq === 0
+  let transferId = derived env "S-A1" 0 DerivedRoleEvent 0
+      resultingSec = derived env "S-A1" 0 DerivedRoleResultingSecurity 0
+      balanceSec = derived env "S-A1" 0 DerivedRoleBalanceSecurity 0
+      t = StockTransferOcfData with
+        id = transferId
+        date = D.date 2024 D.Feb 1
+        quantity = 100.0
+        security_id = "S-A1"
+        comments = []
+        resulting_security_ids = [resultingSec]
+        balance_security_id = Some balanceSec
+        consideration_text = None
+      resulting = (issuance resultingSec "SH-B" "CLS-A" 100.0 (D.date 2024 D.Feb 1)) with id = derived env "S-A1" 0 DerivedRoleResultingIssuance 0
+      balance = (issuance balanceSec "SH-A" "CLS-A" 500.0 (D.date 2024 D.Feb 1)) with id = derived env "S-A1" 0 DerivedRoleBalanceIssuance 0
+  _ <- applyOps env [ApplyStockTransfer with transfer = t; resulting = [resulting]; balance = Some balance]
+  hasState env "S-A1" >>= (=== False)
+  b <- stateOf env resultingSec
+  b.quantity === 100.0
+  b.stakeholder_id === "SH-B"
+  r <- stateOf env balanceSec
+  r.quantity === 500.0
+  -- Overdraw and conservation failures
+  applyOpsFails env "exceeds"
+    [ApplyStockTransfer with transfer = (t with security_id = "S-A2"; quantity = 500.0); resulting = [resulting with quantity = 500.0]; balance = None]
+
+-- The design's worked example: the buyer takes 750 of lot S's 1,000 shares on hold at 2.00 USD a
+-- share, and S's issuance has a cost basis of 1,000.00 USD.
+test_smoke_worked_settlement : Script ()
+test_smoke_worked_settlement = do
+  env <- setupEnv
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SELLER")
+    , OcfRecordDataStakeholder (stakeholderData "BUYER")
+    , OcfRecordDataStockClass (stockClass "CLS")
+    , OcfRecordDataStockIssuance (issuance "S" "SELLER" "CLS" 1000.0 d2024)
+    ]
+  let tradeDay = D.date 2025 D.Mar 3
+  onDate tradeDay
+  lot <- settlementLot env "S" 750.0
+  [placed] <- placeHolds env OcfHoldTypeRegisterSettlement "TRADE-1" tradeDay [lot]
+  placed.hold_id === derived env "S" 0 DerivedRoleHold 0
+  held <- stateOf env "S"
+  held.seq === 1
+  length held.holds === 1
+  draw <- drawLot env "S" 750.0 2.0 []
+  buyer <- stakeholderCidOf env "BUYER"
+  result <- settle env "TRADE-1" tradeDay (SettleBuyerExisting buyer) [SettleDraw draw]
+  result.quantity === 750.0
+  [SettleDrawResult with buyer_security_id; balance_security_id = Some balanceSec; transfer_id] <- pure result.lots
+  transfer_id === derived env "S" 1 DerivedRoleEvent 0
+  bought <- stateOf env buyer_security_id
+  bought.quantity === 750.0
+  bought.delivery === Some Delivery with reference = "TRADE-1"; seller_stakeholder_id = "SELLER"; transfer_id
+  rest <- stateOf env balanceSec
+  rest.quantity === 250.0
+  rest.holds === []
+  -- Cost bases: 1,500.00 USD on the buyer's issuance, 250.00 USD kept on the balance.
+  boughtIssuance <- issuanceCidOf env bought.origin_transaction_id
+  Some bi <- queryContractId env.transfer_agent boughtIssuance
+  bi.ocf_data.cost_basis === Some (usd 1500.0)
+  restIssuance <- issuanceCidOf env rest.origin_transaction_id
+  Some ri <- queryContractId env.transfer_agent restIssuance
+  ri.ocf_data.cost_basis === Some (usd 250.0)
+  -- The result carries the delivered terms the desk checks before it pays.
+  result.settlement_id === "TRADE-1"
+  result.seller_stakeholder_id === "SELLER"
+  result.buyer_stakeholder_id === "BUYER"
+  result.stock_class_id === "CLS"
+  [SettleDrawResult with share_price] <- pure result.lots
+  share_price === usd 2.0

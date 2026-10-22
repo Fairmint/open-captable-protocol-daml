@@ -1,139 +1,158 @@
+-- Stock reissuances through ApplyStockReissuance: a terminal event that retires the whole security, conserving the quantity into its own class (the post-split quantity when it names a split), its split reference, and the reissuance validator.
 module OpenCapTable.TestStockReissuance where
 
-import Fairmint.OpenCapTable.OCF.StockIssuance
-import Fairmint.OpenCapTable.OCF.StockReissuance
-import Fairmint.OpenCapTable.OCF.StockCancellation
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, stockClassSplit, stockSuccessorIssuance)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create a stock issuance to reissue
-createStockIssuance issuer capTableCid securityId quantity =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance StockIssuanceOcfData with
-        id = "TX_STOCK_ISS_1"
-        date = DT.time (DA.date 2022 Jan 01) 0 0 0
-        security_id = securityId
-        custom_id = "CS-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = None
-        security_law_exemptions = []
-        stock_class_id = "SC_COMMON"
-        share_price = OcfMonetary with amount = 0.0001, currency = "USD"
-        quantity = quantity
-        cost_basis = None
-        stock_legend_ids = []
-        issuance_type = None
-        share_numbers_issued = []
-        vesting_terms_id = None
-        vestings = []
-        stock_plan_id = None
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..), validateStockReissuanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
--- Test 1: Basic reissuance (certificate replacement)
-testStockReissuance_CertificateReplacement = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  let securityId = "SSEC-001"
-  result <- createStockIssuance issuer capTableCid securityId 50000.0
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-REISSUANCE-1" "SSEC-001-REISSUED" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Mar 15) 0 0 0) 50000.0
-        , CT.OcfCreateStockReissuance StockReissuanceOcfData with
-        id = "TX_STOCK_REISSUANCE_1"
-        date = DT.time (DA.date 2025 Mar 15) 0 0 0
-        security_id = securityId
-        resulting_security_ids = ["SSEC-001-REISSUED"]
-        comments = []
-        reason_text = Some "Lost certificate replacement"
-        split_transaction_id = None]
-      edits = []
-      deletes = []
-  pure ()
+issued : Date
+issued = D.date 2022 D.Jan 1
 
--- Test 2: Reissuance due to stock split
-testStockReissuance_StockSplit = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  let securityId = "SSEC-002"
-  result <- createStockIssuance issuer capTableCid securityId 25000.0
-  splitResult <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClassSplit (stockClassSplit "TX_STOCK_CLASS_SPLIT_1" "SC_COMMON" 2.0 1.0)]
-      edits = []
-      deletes = []
-  _ <- submit issuer do
-    exerciseCmd splitResult.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-REISSUANCE-2" "SSEC-002-SPLIT" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Jul 01) 0 0 0) 50000.0
-        , CT.OcfCreateStockReissuance StockReissuanceOcfData with
-        id = "TX_STOCK_REISSUANCE_2"
-        date = DT.time (DA.date 2025 Jul 01) 0 0 0
-        security_id = securityId
-        resulting_security_ids = ["SSEC-002-SPLIT"]
+-- | The standard book plus SH-A's lot `sec` of `q` shares of CLS-A.
+reissuanceBook : Text -> Decimal -> Script Env
+reissuanceBook sec q = do
+  env <- standardBook
+  _ <- applyRecords env
+    [OcfRecordDataStockIssuance ((issuance sec "SH-A" "CLS-A" q issued) with id = "TX_STOCK_ISS_1"; custom_id = "CS-1"; share_price = usd 0.0001)]
+  pure env
+
+mkReissuance : Text -> Text -> Date -> [Text] -> StockReissuanceOcfData
+mkReissuance id sec d resulting = StockReissuanceOcfData with
+  id; date = d; security_id = sec; resulting_security_ids = resulting; comments = []
+  reason_text = None; split_transaction_id = None
+
+out : Text -> Text -> Date -> Decimal -> StockIssuanceOcfData
+out id sec d q = (issuance sec "SH-A" "CLS-A" q d) with id
+
+reissue : StockReissuanceOcfData -> [StockIssuanceOcfData] -> ApplyOperation
+reissue r rs = ApplyStockReissuance with reissuance = r; resulting = rs
+
+test_stock_reissuance_certificate_replacement : Script ()
+test_stock_reissuance_certificate_replacement = do
+  env <- reissuanceBook "SSEC-001" 50000.0
+  let d = D.date 2025 D.Mar 15
+      r = (mkReissuance "TX_STOCK_REISSUANCE_1" "SSEC-001" d ["SSEC-001-REISSUED"]) with reason_text = Some "Lost certificate replacement"
+      o = out "STOCK-ISS-REISSUANCE-1" "SSEC-001-REISSUED" d 50000.0
+  _ <- applyOps env [reissue r [o]]
+  expectRecord env (OcfRecordDataStockReissuance r)
+  expectRecord env (OcfRecordDataStockIssuance o)
+  hasState env "SSEC-001" >>= (=== False)
+  s <- stateOf env "SSEC-001-REISSUED"
+  s.quantity === 50000.0
+  s.origin_transaction_id === "STOCK-ISS-REISSUANCE-1"
+
+-- A reissuance that names a split is in post-split units: the split applies to the source first.
+test_stock_reissuance_after_split : Script ()
+test_stock_reissuance_after_split = do
+  env <- reissuanceBook "SSEC-002" 25000.0
+  recordSplit env "TX_STOCK_CLASS_SPLIT_1" "CLS-A" 2.0 1.0 (D.date 2025 D.Jun 1)
+  let d = D.date 2025 D.Jul 1
+      r = (mkReissuance "TX_STOCK_REISSUANCE_2" "SSEC-002" d ["SSEC-002-SPLIT"]) with
         comments = ["Certificate re-papered following 2-for-1 stock split.", "New certificate reflects 50,000 shares."]
         reason_text = Some "Stock split adjustment"
-        split_transaction_id = Some "TX_STOCK_CLASS_SPLIT_1"]
-      edits = []
-      deletes = []
-  pure ()
+        split_transaction_id = Some "TX_STOCK_CLASS_SPLIT_1"
+      o = out "STOCK-ISS-REISSUANCE-2" "SSEC-002-SPLIT" d 50000.0
+  applyOpsFails env "same-class reissuance TX_STOCK_REISSUANCE_2 must conserve the quantity 50000.0" [reissue r [o with quantity = 25000.0]]
+  _ <- applyOps env [reissue r [o]]
+  expectRecord env (OcfRecordDataStockReissuance r)
+  s <- stateOf env "SSEC-002-SPLIT"
+  s.quantity === 50000.0
+  s.split_epoch === 1
 
--- Test 3: Reissuance with multiple resulting securities (legend removal + split)
-testStockReissuance_MultipleResulting = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  let securityId = "SSEC-003"
-  result <- createStockIssuance issuer capTableCid securityId 100000.0
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-REISSUANCE-3A" "SSEC-003-FREE-A" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Sep 01) 0 0 0) 50000.0
-        , stockSuccessorIssuance "STOCK-ISS-REISSUANCE-3B" "SSEC-003-FREE-B" "SH-1" "SC_COMMON" (DT.time (DA.date 2025 Sep 01) 0 0 0) 50000.0
-        , CT.OcfCreateStockReissuance StockReissuanceOcfData with
-        id = "TX_STOCK_REISSUANCE_3"
-        date = DT.time (DA.date 2025 Sep 01) 0 0 0
-        security_id = securityId
-        resulting_security_ids = ["SSEC-003-FREE-A", "SSEC-003-FREE-B"]
-        comments = []
+-- Legend removal and a certificate split per holder request.
+test_stock_reissuance_multiple_resulting : Script ()
+test_stock_reissuance_multiple_resulting = do
+  env <- reissuanceBook "SSEC-003" 100000.0
+  let d = D.date 2025 D.Sep 1
+      r = (mkReissuance "TX_STOCK_REISSUANCE_3" "SSEC-003" d ["SSEC-003-FREE-A", "SSEC-003-FREE-B"]) with
         reason_text = Some "Legend removal and certificate split per holder request"
-        split_transaction_id = None]
-      edits = []
-      deletes = []
-  pure ()
+      oa = out "STOCK-ISS-REISSUANCE-3A" "SSEC-003-FREE-A" d 50000.0
+      ob = out "STOCK-ISS-REISSUANCE-3B" "SSEC-003-FREE-B" d 50000.0
+  applyOpsFails env "must conserve the quantity 100000.0" [reissue r [oa, ob with quantity = 49999.0]]
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order" [reissue r [ob, oa]]
+  _ <- applyOps env [reissue r [oa, ob]]
+  expectRecord env (OcfRecordDataStockReissuance r)
+  (.quantity) <$> stateOf env "SSEC-003-FREE-A" >>= (=== 50000.0)
+  (.quantity) <$> stateOf env "SSEC-003-FREE-B" >>= (=== 50000.0)
 
-testStockReissuance_RetiresSourceBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  let securityId = "SSEC-REISSUANCE-BALANCE"
-  result <- createStockIssuance issuer capTableCid securityId 100.0
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockReissuance StockReissuanceOcfData with
-            id = "TX_STOCK_REISSUANCE_BALANCE"
-            date = DT.time (DA.date 2025 Sep 01) 0 0 0
-            security_id = securityId
-            resulting_security_ids = ["SSEC-REISSUED-RESULT"]
-            comments = []
-            reason_text = None
-            split_transaction_id = None
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_REISSUANCE"
-            date = DT.time (DA.date 2025 Sep 01) 0 0 0
-            security_id = securityId
-            quantity = 1.0
-            balance_security_id = None
-            reason_text = "Cannot reduce a reissued source"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_reissuance_retires_source : Script ()
+test_stock_reissuance_retires_source = do
+  env <- reissuanceBook "SSEC-REISSUANCE-BALANCE" 100.0
+  let d = D.date 2025 D.Sep 1
+      r = mkReissuance "TX_STOCK_REISSUANCE_BALANCE" "SSEC-REISSUANCE-BALANCE" d ["SSEC-REISSUED-RESULT"]
+      cxl = StockCancellationOcfData with
+        id = "TX_STOCK_CANCEL_AFTER_REISSUANCE"; date = d; security_id = "SSEC-REISSUANCE-BALANCE"; quantity = 1.0
+        balance_security_id = None; reason_text = "Cannot reduce a reissued source"; comments = []
+  applyOpsFails env "no active state for security SSEC-REISSUANCE-BALANCE in this write"
+    [ reissue r [out "ISS-RESULT" "SSEC-REISSUED-RESULT" d 100.0]
+    , ApplyStockCancellation with cancellation = cxl; balance = None
+    ]
+  hasState env "SSEC-REISSUANCE-BALANCE" >>= (=== True)
+
+-- Into another class the arithmetic is the writer's; a reissuance that names a split stays in the
+-- source's class.
+test_stock_reissuance_into_another_class : Script ()
+test_stock_reissuance_into_another_class = do
+  env <- reissuanceBook "SSEC-X" 100.0
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B")]
+  recordSplit env "SPLIT-A" "CLS-A" 2.0 1.0 (D.date 2025 D.Jun 1)
+  let d = D.date 2025 D.Jul 1
+      r = mkReissuance "REISS-X" "SSEC-X" d ["SSEC-X-B"]
+      o = (out "ISS-X-B" "SSEC-X-B" d 80.0) with stock_class_id = "CLS-B"
+  applyOpsFails env "reissuance REISS-X names a split, so its resulting securities stay in the source's class"
+    [reissue (r with split_transaction_id = Some "SPLIT-A") [o]]
+  _ <- applyOps env [reissue r [o]]
+  s <- stateOf env "SSEC-X-B"
+  s.stock_class_id === "CLS-B"
+  s.quantity === 80.0
+
+test_stock_reissuance_split_reference : Script ()
+test_stock_reissuance_split_reference = do
+  env <- reissuanceBook "SSEC-S" 100.0
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B")]
+  recordSplit env "SPLIT-B" "CLS-B" 2.0 1.0 (D.date 2025 D.Jun 1)
+  recordSplit env "SPLIT-A-LATE" "CLS-A" 2.0 1.0 (D.date 2025 D.Aug 1)
+  let d = D.date 2025 D.Jul 1
+      r = mkReissuance "REISS-S" "SSEC-S" d ["SSEC-S-R"]
+      o = out "ISS-S-R" "SSEC-S-R" d 100.0
+  applyOpsFails env "Stock reissuance REISS-S split SPLIT-B is of stock class CLS-B, not CLS-A"
+    [reissue (r with split_transaction_id = Some "SPLIT-B") [o]]
+  applyOpsFails env "Stock reissuance REISS-S split SPLIT-A-LATE is dated after the reissuance"
+    [reissue (r with split_transaction_id = Some "SPLIT-A-LATE") [o]]
+  applyOpsFails env "Stock reissuance REISS-S split transaction not found: SH-B"
+    [reissue (r with split_transaction_id = Some "SH-B") [o]]
+  hasState env "SSEC-S" >>= (=== True)
+
+test_stock_reissuance_validator : Script ()
+test_stock_reissuance_validator = do
+  env <- reissuanceBook "SSEC-V" 100.0
+  let d = D.date 2025 D.Sep 1
+      r = mkReissuance "REISS-V" "SSEC-V" d ["SSEC-V-R"]
+      o = out "ISS-V-R" "SSEC-V-R" d 100.0
+  applyOpsFails env "precondition" [reissue (r with reason_text = Some "") [o]]
+  applyOpsFails env "precondition" [reissue (r with comments = [""]) [o]]
+  -- The record's ensure runs before the split reference is checked.
+  applyOpsFails env "precondition" [reissue (r with split_transaction_id = Some "") [o]]
+  applyOpsFails env "precondition" [reissue (r with resulting_security_ids = [""]) [o with security_id = ""]]
+  -- With no resulting securities nothing conserves the quantity.
+  applyOpsFails env "must conserve the quantity 100.0" [reissue (r with resulting_security_ids = []) []]
+  applyOpsFails env "an empty ID cannot be claimed" [reissue (r with id = "") [o]]
+  hasState env "SSEC-V" >>= (=== True)
+  let ok = validateStockReissuanceOcfData
+  expectTrue "the fixture" (ok r)
+  expectTrue "a reason and a split" (ok r with reason_text = Some "Split"; split_transaction_id = Some "SPLIT-1")
+  expectFalse "empty id" (ok r with id = "")
+  expectFalse "empty security_id" (ok r with security_id = "")
+  expectFalse "an empty reason_text" (ok r with reason_text = Some "")
+  expectFalse "an empty split_transaction_id" (ok r with split_transaction_id = Some "")
+  expectFalse "an empty comment" (ok r with comments = [""])
+  expectFalse "an empty resulting security ID" (ok r with resulting_security_ids = [""])
+  expectFalse "no resulting securities" (ok r with resulting_security_ids = [])

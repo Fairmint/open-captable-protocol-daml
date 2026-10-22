@@ -10,13 +10,13 @@
  * (simultaneously vetted, upgrade-incompatible package lineages).
  *
  * Usage: npx tsx scripts/vet-package-allow-incompatible-upgrade.ts\
- * --network mainnet --provider intellect\
+ * --network devnet --provider intellect --synchronizer-id 'global-domain::1220...'\
  * --package-id 6b6a969fa6a621479a29fcf7fb2d9596317545eabc088ed4c62c43c0c0ac2173
  *
- * Dry run (validate request without applying): ... --dry-run
+ * `--network` is required. OpenCapTable-v35 deploys to DevNet only (ADR-040), which needs `--synchronizer-id`; MainNet
+ * defaults to the Catalyst / TA global-domain (the legacy CantonPayments case).
  *
- * Override synchronizer (default: global-domain for mainnet Catalyst / TA): ... --synchronizer-id
- * 'global-domain::1220...'
+ * Dry run (validate request without applying): ... --dry-run
  */
 
 import type { ProviderType } from '@fairmint/canton-node-sdk';
@@ -33,11 +33,11 @@ function parseArgs(): {
   synchronizerId: string;
 } {
   const argv = process.argv.slice(2);
-  let network: 'mainnet' | 'devnet' = 'mainnet';
+  let network: 'mainnet' | 'devnet' | undefined;
   let provider: ProviderType = 'intellect';
   let packageId: string | undefined;
   let dryRun = false;
-  let synchronizerId = DEFAULT_MAINNET_SYNCHRONIZER_ID;
+  let synchronizerId: string | undefined;
 
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--network' && argv[i + 1]) {
@@ -57,6 +57,15 @@ function parseArgs(): {
 
   if (!packageId || !/^[0-9a-f]{64}$/.test(packageId)) {
     console.error('Missing or invalid --package-id (64 hex chars, no prefix).');
+    process.exit(1);
+  }
+  if (!network) {
+    console.error('Missing --network (devnet or mainnet).');
+    process.exit(1);
+  }
+  synchronizerId ??= network === 'mainnet' ? DEFAULT_MAINNET_SYNCHRONIZER_ID : undefined;
+  if (!synchronizerId) {
+    console.error(`Missing --synchronizer-id (required for ${network}).`);
     process.exit(1);
   }
 

@@ -1,134 +1,87 @@
+-- Stock retractions through CapTable_Apply: a terminal record on the security's state with no outputs, refused while a hold is open, and the retraction validator.
 module OpenCapTable.TestStockRetraction where
 
-import Fairmint.OpenCapTable.OCF.StockIssuance
-import Fairmint.OpenCapTable.OCF.StockRetraction
-import Fairmint.OpenCapTable.OCF.StockCancellation
-import Fairmint.OpenCapTable.OCF.StockClass
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfStockClassType(..), OcfInitialSharesAuthorized(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..), validateStockRetractionOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
-createStockClass issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
-        id = "SC_COMMON"
-        name = "Common"
-        class_type = OcfStockClassTypeCommon
-        default_id_prefix = "CS-"
-        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
-        votes_per_share = 1.0
-        seniority = 1.0
-        board_approval_date = None
-        stockholder_approval_date = None
-        par_value = None
-        price_per_share = None
-        liquidation_preference_multiple = None
-        participation_cap_multiple = None
-        conversion_rights = []
-        comments = []]
-      edits = []
-      deletes = []
+retractionBook : Script Env
+retractionBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [OcfRecordDataStockIssuance ((issuance "SEC-STOCK-1" "SH-A" "CLS-A" 100.0 d2024) with id = "TX_STOCK_ISS_1"; custom_id = "CERT-1")]
+  pure env
 
-createStockIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance StockIssuanceOcfData with
-        id = "TX_STOCK_ISS_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-STOCK-1"
-        custom_id = "CERT-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = None
-        security_law_exemptions = []
-        stock_class_id = "SC_COMMON"
-        stock_plan_id = None
-        share_numbers_issued = []
-        share_price = OcfMonetary with amount = 1.0, currency = "USD"
-        quantity = 100.0
-        vesting_terms_id = None
-        vestings = []
-        cost_basis = None
-        stock_legend_ids = []
-        issuance_type = None
-        comments = []]
-      edits = []
-      deletes = []
+mkRetraction : Text -> Date -> Text -> StockRetractionOcfData
+mkRetraction id d reason = StockRetractionOcfData with
+  id; date = d; security_id = "SEC-STOCK-1"; reason_text = reason; comments = []
 
-createStockRetraction issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockRetraction StockRetractionOcfData with
-        id = "TX_STOCK_RETRACT_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-STOCK-1"
-        reason_text = "Administrative error - incorrect share count recorded"
-        comments = []]
-      edits = []
-      deletes = []
+test_stock_retraction_create : Script ()
+test_stock_retraction_create = do
+  env <- retractionBook
+  let r = mkRetraction "TX_STOCK_RETRACT_1" (D.date 2024 D.Jan 2) "Administrative error - incorrect share count recorded"
+  _ <- applyRecords env [OcfRecordDataStockRetraction r]
+  expectRecord env (OcfRecordDataStockRetraction r)
+  hasState env "SEC-STOCK-1" >>= (=== False)
+  -- The retracted issuance's record stays.
+  hasRecord env "TX_STOCK_ISS_1" >>= (=== True)
 
-testStockRetraction_CreateAndArchiveByIssuer = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- createStockRetraction issuer result.updatedCapTableCid
-  pure ()
+test_stock_retraction_with_comments : Script ()
+test_stock_retraction_with_comments = do
+  env <- retractionBook
+  let r = (mkRetraction "TX_STOCK_RETRACT_2" (D.date 2024 D.Jan 3) "Issuance void ab initio due to failed consideration") with
+        comments = ["Board resolution 2024-003", "Legal counsel reviewed"]
+  _ <- applyRecords env [OcfRecordDataStockRetraction r]
+  expectRecord env (OcfRecordDataStockRetraction r)
+  hasState env "SEC-STOCK-1" >>= (=== False)
 
-testStockRetraction_CreateAndArchiveBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- createStockRetraction issuer result.updatedCapTableCid
-  pure ()
+test_stock_retraction_retires_source : Script ()
+test_stock_retraction_retires_source = do
+  env <- retractionBook
+  let d = D.date 2024 D.Jan 2
+      cxl = StockCancellationOcfData with
+        id = "TX_STOCK_CANCEL_AFTER_RETRACTION"; date = d; security_id = "SEC-STOCK-1"; quantity = 1.0
+        balance_security_id = None; reason_text = "Cannot reduce a retracted security"; comments = []
+  applyOpsFails env "no active state for security SEC-STOCK-1 in this write"
+    [ ApplyRecord (OcfRecordDataStockRetraction (mkRetraction "TX_STOCK_RETRACT_BALANCE" d "Void the issuance"))
+    , ApplyStockCancellation with cancellation = cxl; balance = None
+    ]
+  hasState env "SEC-STOCK-1" >>= (=== True)
 
--- Test with comments (non-empty array)
-testStockRetraction_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockRetraction StockRetractionOcfData with
-        id = "TX_STOCK_RETRACT_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-STOCK-1"
-        reason_text = "Issuance void ab initio due to failed consideration"
-        comments = ["Board resolution 2024-003", "Legal counsel reviewed"]]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_retraction_rules : Script ()
+test_stock_retraction_rules = do
+  env <- retractionBook
+  applyRecordsFails env "precedes the last event on security SEC-STOCK-1"
+    [OcfRecordDataStockRetraction (mkRetraction "RET-1" (D.date 2023 D.Dec 31) "Void")]
+  applyRecordsFails env "no active state for security SEC-NONE"
+    [OcfRecordDataStockRetraction ((mkRetraction "RET-1" (D.date 2024 D.Jan 2) "Void") with security_id = "SEC-NONE")]
+  -- Refused while any hold is open on the security.
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "SEC-STOCK-1"]
+  applyRecordsFails env "security SEC-STOCK-1 carries an open hold"
+    [OcfRecordDataStockRetraction (mkRetraction "RET-1" d "Void")]
+  hasState env "SEC-STOCK-1" >>= (=== True)
 
-testStockRetraction_RetiresSourceBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockRetraction StockRetractionOcfData with
-            id = "TX_STOCK_RETRACT_BALANCE"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-STOCK-1"
-            reason_text = "Void the issuance"
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_RETRACTION"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-STOCK-1"
-            quantity = 1.0
-            balance_security_id = None
-            reason_text = "Cannot reduce a retracted security"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_retraction_validator : Script ()
+test_stock_retraction_validator = do
+  env <- retractionBook
+  let r = mkRetraction "RET-1" (D.date 2024 D.Jan 2) "Void"
+  applyRecordsFails env "precondition" [OcfRecordDataStockRetraction (r with reason_text = "")]
+  applyRecordsFails env "precondition" [OcfRecordDataStockRetraction (r with comments = [""])]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockRetraction (r with id = "")]
+  hasState env "SEC-STOCK-1" >>= (=== True)
+  let ok = validateStockRetractionOcfData
+  expectTrue "the fixture" (ok r)
+  expectFalse "empty id" (ok r with id = "")
+  expectFalse "empty security_id" (ok r with security_id = "")
+  expectFalse "empty reason_text" (ok r with reason_text = "")
+  expectFalse "an empty comment" (ok r with comments = ["Board", ""])

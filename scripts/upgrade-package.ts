@@ -4,8 +4,10 @@
  *
  * Usage: npm run upgrade-package -- --package <name> --type <major|minor>
  *
- * Example: npm run upgrade-package -- --package Subscriptions --type major npm run upgrade-package -- --package
- * Subscriptions --type minor
+ * Examples: `npm run upgrade-package -- --package OpenCapTable --type minor` (OpenCapTable-v35 0.0.1 → 0.0.2) and `npm
+ * run upgrade-package -- --package OpenCapTableApi --type minor`. A minor upgrade of OpenCapTableApi-v01 also rewrites
+ * the data-dependency paths in OpenCapTable-v35/daml.yaml and Test/daml.yaml, and changes OpenCapTable-v35's DAR, which
+ * embeds it; back up every changed package.
  */
 
 import * as fs from 'fs';
@@ -64,7 +66,7 @@ function findPackageFolder(packageName: string): string {
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "OpenCapTable-v34", "Subscriptions-v05", etc.
+      // Match patterns like "OpenCapTable-v35", "OpenCapTableApi-v01", etc.
       const match = entry.name.match(new RegExp(`^${packageName}-(v(\\d+))$`, 'i'));
       if (match) {
         const version = parseInt(match[2], 10);
@@ -187,7 +189,7 @@ function searchAndReplaceInFiles(
   directory: string,
   oldText: string,
   newText: string,
-  fileExtensions: string[] = ['.yaml', '.ts', '.md', '.json', '.daml']
+  fileExtensions: string[] = ['.yaml', '.yml', '.ts', '.md', '.json', '.daml']
 ): number {
   let replacementCount = 0;
 
@@ -197,9 +199,13 @@ function searchAndReplaceInFiles(
     for (const entry of entries) {
       const fullPath = path.join(dir, entry.name);
 
-      // Skip node_modules, .daml, and other build directories
+      // Skip node_modules, build output, DAR backups (immutable history) and a local wiki checkout
       if (entry.isDirectory()) {
-        if (['node_modules', '.daml', 'lib', 'generated'].includes(entry.name)) {
+        if (
+          ['node_modules', '.daml', '.git', 'lib', 'libs', 'generated', 'dars', 'published-dars', 'wiki'].includes(
+            entry.name
+          )
+        ) {
           continue;
         }
         processDirectory(fullPath);
@@ -267,7 +273,7 @@ function performMajorUpgrade(info: PackageInfo): void {
   console.log('\n✅ Major upgrade completed successfully!');
   console.log(`\nNext steps:`);
   console.log(`1. Review changes: git diff`);
-  console.log(`2. Build the package: cd ${info.newFolder} && daml build`);
+  console.log(`2. Build: npm run build, then back up the DAR (see AGENTS.md)`);
   console.log(`3. Test the changes`);
   console.log(`4. Commit: git add -A && git commit -m "Upgrade ${info.newFolder} to ${info.newFullVersion}"`);
 }
@@ -299,7 +305,7 @@ function performMinorUpgrade(info: PackageInfo): void {
   console.log('\n✅ Minor upgrade completed successfully!');
   console.log(`\nNext steps:`);
   console.log(`1. Review changes: git diff`);
-  console.log(`2. Build the package: cd ${info.currentFolder} && daml build`);
+  console.log(`2. Build: npm run build, then back up the DAR (see AGENTS.md)`);
   console.log(`3. Test the changes`);
   console.log(`4. Commit: git add -A && git commit -m "Upgrade ${info.currentFolder} to ${info.newFullVersion}"`);
 }
@@ -320,8 +326,8 @@ function main(): void {
     console.error('\nUsage:');
     console.error('  npm run upgrade-package -- --package <name> --type <major|minor>');
     console.error('\nExample:');
-    console.error('  npm run upgrade-package -- --package Subscriptions --type major');
-    console.error('  npm run upgrade-package -- --package Subscriptions --type minor');
+    console.error('  npm run upgrade-package -- --package OpenCapTable --type minor');
+    console.error('  npm run upgrade-package -- --package OpenCapTableApi --type minor');
     process.exit(1);
   }
 }

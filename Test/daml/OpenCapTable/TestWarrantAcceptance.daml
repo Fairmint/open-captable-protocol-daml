@@ -1,80 +1,89 @@
+-- Warrant acceptances through CapTable_Apply and CapTable_Restate: a record on the warrant's security, checked against a warrant issuance in the write's inputs, with the acceptance validator and the shared edit and delete rules.
 module OpenCapTable.TestWarrantAcceptance where
 
-import Fairmint.OpenCapTable.OCF.WarrantIssuance
-import Fairmint.OpenCapTable.OCF.WarrantAcceptance
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder)
-import OpenCapTable.HelpersTriggers (ocfTriggerElectiveAtWill)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
-createWarrantIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
-        id = "TX_WARRANT_ISS_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-WARRANT-1"
-        custom_id = "W-001"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = Some "Issued as part of debt financing"
-        security_law_exemptions = []
-        quantity = Some 10000.0
-        quantity_source = Some OcfQuantityUnspecified
-        exercise_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
-        purchase_price = OcfMonetary with amount = 0.01, currency = "USD"
-        exercise_triggers = [ ocfTriggerElectiveAtWill ]
-        warrant_expiration_date = None
-        vesting_terms_id = None
-        vestings = []
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.WarrantAcceptance (WarrantAcceptanceOcfData(..), validateWarrantAcceptanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
 
-createWarrantAcceptance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantAcceptance WarrantAcceptanceOcfData with
-        id = "TX_WARRANT_ACCEPT_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-WARRANT-1"
-        comments = []]
-      edits = []
-      deletes = []
+acceptance : Text -> Text -> Date -> WarrantAcceptanceOcfData
+acceptance id sec d = WarrantAcceptanceOcfData with id; date = d; security_id = sec; comments = []
 
-testWarrantAcceptance_CreateAndArchiveByIssuer = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- createWarrantAcceptance issuer result.updatedCapTableCid
-  pure ()
+wa : WarrantAcceptanceOcfData -> OcfRecordData
+wa = OcfRecordDataWarrantAcceptance
 
-testWarrantAcceptance_CreateAndArchiveBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- createWarrantAcceptance issuer result.updatedCapTableCid
-  pure ()
+test_warrant_acceptance_create : Script ()
+test_warrant_acceptance_create = do
+  env <- instrumentBook
+  let a = acceptance "TX_WARRANT_ACCEPT_1" "W-1" (D.date 2024 D.Jan 2)
+  _ <- applyRecords env [wa a]
+  expectRecord env (wa a)
+  viewSecurityIds env "TX_WARRANT_ACCEPT_1" >>= (=== ["W-1"])
+  -- The warrant keeps its issuance record and has no stock state.
+  hasRecord env "WI-1" >>= (=== True)
+  hasState env "W-1" >>= (=== False)
+  applyRecordsFails env "ID already used: TX_WARRANT_ACCEPT_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_ACCEPT_1")]
 
--- Test with comments (non-empty array)
-testWarrantAcceptance_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantAcceptance WarrantAcceptanceOcfData with
-        id = "TX_WARRANT_ACCEPT_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-WARRANT-1"
-        comments = ["Warrant certificate delivered", "Holder acknowledged terms"]]
-      edits = []
-      deletes = []
-  pure ()
+test_warrant_acceptance_with_comments : Script ()
+test_warrant_acceptance_with_comments = do
+  env <- instrumentBook
+  let a = (acceptance "TX_WARRANT_ACCEPT_2" "W-1" (D.date 2024 D.Jan 3)) with
+        comments = ["Warrant certificate delivered", "Holder acknowledged terms"]
+  _ <- applyRecords env [wa a]
+  expectRecord env (wa a)
+
+test_warrant_acceptance_security_reference : Script ()
+test_warrant_acceptance_security_reference = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant acceptance security not found: W-NONE" [wa (acceptance "WA-1" "W-NONE" eventDate)]
+  -- The security must be a warrant's.
+  applyRecordsFails env "Warrant acceptance security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [wa (acceptance "WA-1" "C-1" eventDate)]
+  applyRecordsFails env "Warrant acceptance security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [wa (acceptance "WA-1" "S-A1" eventDate)]
+  -- An object ID is not a security ID.
+  applyRecordsFails env "Warrant acceptance security not found: WI-1" [wa (acceptance "WA-1" "WI-1" eventDate)]
+  -- The warrant may be issued later in the same batch.
+  let a = acceptance "WA-2" "W-2" eventDate
+  _ <- applyRecords env [wa a, OcfRecordDataWarrantIssuance (warrantIssuance "WI-2" "W-2" "SH-B")]
+  expectRecord env (wa a)
+
+-- The referenced issuance must be among the write's inputs.
+test_warrant_acceptance_needs_issuance_in_inputs : Script ()
+test_warrant_acceptance_needs_issuance_in_inputs = do
+  env <- instrumentBook
+  inputs <- allInputs env
+  wiCid <- recordCidOf env "WI-1"
+  let a = acceptance "WA-1" "W-1" eventDate
+  expectSubmitFailure "Warrant acceptance security not found: W-1" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_Apply with
+      inputs = inputs with records = filter (/= wiCid) inputs.records
+      operations = [ApplyRecord (wa a)])
+  _ <- applyWith env (inputs with records = [wiCid]) [ApplyRecord (wa a)]
+  expectRecord env (wa a)
+
+test_warrant_acceptance_validator : Script ()
+test_warrant_acceptance_validator = do
+  env <- instrumentBook
+  let base = acceptance "WA-V" "W-1" eventDate
+  expectValid "base" (validateWarrantAcceptanceOcfData base)
+  expectInvalid "empty id" (validateWarrantAcceptanceOcfData base with id = "")
+  expectInvalid "empty security_id" (validateWarrantAcceptanceOcfData base with security_id = "")
+  expectInvalid "empty comment" (validateWarrantAcceptanceOcfData base with comments = [""])
+  applyRecordsFails env "an empty ID cannot be claimed" [wa base with id = ""]
+  applyRecordsFails env "precondition" [wa base with security_id = ""]
+  applyRecordsFails env "precondition" [wa base with comments = ["ok", ""]]
+
+test_warrant_acceptance_edit_and_delete : Script ()
+test_warrant_acceptance_edit_and_delete = do
+  env <- instrumentBook
+  let a = acceptance "WA-1" "W-1" eventDate
+  _ <- applyRecords env [wa a]
+  restateOpsFails env "precondition" [RestateEdit (wa a with comments = [""])]
+  restateOpsFails env "Warrant acceptance security not found: W-NONE" [RestateEdit (wa a with security_id = "W-NONE")]
+  checkEditAndDelete env (wa a) (wa a with date = D.date 2024 D.Mar 2; comments = ["Re-dated"])

@@ -1,82 +1,120 @@
+-- Equity compensation releases, ported from v34's TestEquityCompensationRelease: RSU releases into resulting stock issuances, the validator (Date settlement date, release price, at least one resulting security), and the security and resulting-security references.
 module OpenCapTable.TestEquityCompensationRelease where
 
-import Fairmint.OpenCapTable.OCF.EquityCompensationRelease
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, addEquityCompensationIssuanceWithQuantity, addPrerequisites, stockSuccessorIssuance)
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationRelease
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
 
--- Test: Create and archive RSU release/settlement
-testCreateAndArchiveEquityCompensationRelease = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add stakeholder and equity compensation issuance before releasing
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addEquityCompensationIssuanceWithQuantity issuer cap_table "EC-ISS-RSU-1" "SEC_RSU_001" "SH-1" 20_000.0
-  -- RSU vesting and release
-  _ <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-EC-RELEASE-1" "SEC_STOCK_101" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Apr 03) 0 0 0) 5000.0
-        , CT.OcfCreateEquityCompensationRelease EquityCompensationReleaseOcfData with
+valid : EquityCompensationReleaseOcfData -> Bool
+valid = validateEquityCompensationReleaseOcfData
+
+wrap : EquityCompensationReleaseOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationRelease
+
+release : Text -> Text -> Decimal -> [Text] -> EquityCompensationReleaseOcfData
+release id sec q resulting = EquityCompensationReleaseOcfData with
+  id
+  date = D.date 2024 D.Jul 1
+  quantity = q
+  release_price = usd 52.0
+  security_id = sec
+  settlement_date = D.date 2024 D.Jul 5
+  comments = []
+  resulting_security_ids = resulting
+  consideration_text = None
+
+released : Text -> Decimal -> Date -> OcfRecordData
+released sec q d = OcfRecordDataStockIssuance (issuance sec "SH-A" "CLS-A" q d)
+
+-- | A book with Alice's RSU grant `sec` over `q` units of class CLS-A.
+grantBook : Text -> Decimal -> Script Env
+grantBook sec q = ecBookWith [ecRecord ((rsu sec "SH-A" q) with stock_class_id = Some "CLS-A")]
+
+test_ec_release_rsu_cliff : Script ()
+test_ec_release_rsu_cliff = do
+  env <- grantBook "SEC_RSU_001" 20000.0
+  let r = EquityCompensationReleaseOcfData with
         id = "TX_EC_RELEASE_1"
-        date = DT.time (DA.date 2024 Apr 01) 0 0 0
+        date = D.date 2024 D.Apr 1
         security_id = "SEC_RSU_001"
-        settlement_date = DT.time (DA.date 2024 Apr 03) 0 0 0
-        release_price = OcfMonetary with amount = 45.50; currency = "USD"
+        settlement_date = D.date 2024 D.Apr 3
+        release_price = OcfMonetary with amount = 45.5; currency = "USD"
         quantity = 5000.0
         resulting_security_ids = ["SEC_STOCK_101"]
         consideration_text = Some "RSU cliff vest - 25% of total grant"
-        comments = ["First anniversary cliff vest for Employee A"]]
-      edits = []
-      deletes = []
-  pure ()
+        comments = ["First anniversary cliff vest for Employee A"]
+  _ <- applyRecords env [released "SEC_STOCK_101" 5000.0 (D.date 2024 D.Apr 3), wrap r]
+  expectRecord env (wrap r)
+  (.quantity) <$> stateOf env "SEC_STOCK_101" >>= (=== 5000.0)
 
+test_ec_release_quarterly_net_settlement : Script ()
+test_ec_release_quarterly_net_settlement = do
+  env <- grantBook "SEC_RSU_002" 5000.0
+  let r = (release "TX_EC_RELEASE_2" "SEC_RSU_002" 1250.0 ["SEC_STOCK_102", "SEC_STOCK_103"]) with
+        comments = ["Q3 2024 quarterly vest", "Net settlement after tax withholding"]
+  _ <- applyRecords env
+    [ wrap r
+    , released "SEC_STOCK_102" 625.0 (D.date 2024 D.Jul 5)
+    , released "SEC_STOCK_103" 625.0 (D.date 2024 D.Jul 5)
+    ]
+  expectRecord env (wrap r)
 
--- Test: Create and archive with Archive choice (quarterly RSU vest)
-testCreateAndArchiveEquityCompensationReleaseQuarterly = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add stakeholder and equity compensation issuance before releasing
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addEquityCompensationIssuanceWithQuantity issuer cap_table "EC-ISS-RSU-2" "SEC_RSU_002" "SH-1" 5_000.0
-  -- Quarterly RSU vest with tax withholding
-  _ <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "STOCK-ISS-EC-RELEASE-2A" "SEC_STOCK_102" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Jul 05) 0 0 0) 625.0
-        , stockSuccessorIssuance "STOCK-ISS-EC-RELEASE-2B" "SEC_STOCK_103" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Jul 05) 0 0 0) 625.0
-        , CT.OcfCreateEquityCompensationRelease EquityCompensationReleaseOcfData with
-        id = "TX_EC_RELEASE_2"
-        date = DT.time (DA.date 2024 Jul 01) 0 0 0
-        security_id = "SEC_RSU_002"
-        settlement_date = DT.time (DA.date 2024 Jul 05) 0 0 0
-        release_price = OcfMonetary with amount = 52.00; currency = "USD"
-        quantity = 1250.0
-        resulting_security_ids = ["SEC_STOCK_102", "SEC_STOCK_103"]
-        consideration_text = None
-        comments = ["Q3 2024 quarterly vest", "Net settlement after tax withholding"]]
-      edits = []
-      deletes = []
-  pure ()
+-- v35 settlement dates are Dates; the register does not order them against the release date.
+test_ec_release_settlement_date_is_a_date : Script ()
+test_ec_release_settlement_date_is_a_date = do
+  env <- grantBook "RSU-1" 100.0
+  _ <- applyRecords env [released "S-1" 10.0 d2024]
+  accept env valid wrap ((release "REL-1" "RSU-1" 10.0 ["S-1"]) with settlement_date = D.date 2024 D.Jul 1)
+  accept env valid wrap ((release "REL-2" "RSU-1" 10.0 ["S-1"]) with settlement_date = D.date 2024 D.Jun 28)
 
-testEquityCompensationRelease_OverdrawRejected = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  capTableCid <- addEquityCompensationIssuanceWithQuantity issuer capTableCid "EC-ISS-RSU-OVERDRAW" "SEC_RSU_OVERDRAW" "SH-1" 100.0
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationRelease EquityCompensationReleaseOcfData with
-        id = "TX_EC_RELEASE_OVERDRAW"
-        date = DT.time (DA.date 2024 Jul 01) 0 0 0
-        security_id = "SEC_RSU_OVERDRAW"
-        settlement_date = DT.time (DA.date 2024 Jul 05) 0 0 0
-        release_price = OcfMonetary with amount = 52.00; currency = "USD"
-        quantity = 101.0
-        resulting_security_ids = ["SEC_STOCK_OVERDRAW"]
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+test_ec_release_security_reference : Script ()
+test_ec_release_security_reference = do
+  env <- grantBook "RSU-1" 100.0
+  _ <- applyRecords env [released "S-1" 10.0 d2024]
+  applyRecordsFails env "Equity compensation release security not found: RSU-MISSING" [wrap (release "REL-1" "RSU-MISSING" 1.0 ["S-1"])]
+  applyRecordsFails env "Equity compensation release security S-1 is carried by a OcfObjectTypeTxStockIssuance" [wrap (release "REL-1" "S-1" 1.0 ["S-1"])]
+  expectNoRecord env "REL-1"
+
+test_ec_release_resulting_securities_are_stock : Script ()
+test_ec_release_resulting_securities_are_stock = do
+  env <- grantBook "RSU-1" 100.0
+  _ <- applyRecords env [ecRecord (rsu "RSU-2" "SH-A" 10.0)]
+  applyRecordsFails env "Equity compensation release resulting security security not found: S-X" [wrap (release "REL-1" "RSU-1" 10.0 ["S-X"])]
+  applyRecordsFails env "Equity compensation release resulting security security RSU-2 is carried by a OcfObjectTypeTxEquityCompensationIssuance"
+    [wrap (release "REL-1" "RSU-1" 10.0 ["RSU-2"])]
+  expectNoRecord env "REL-1"
+
+test_ec_release_validation : Script ()
+test_ec_release_validation = do
+  env <- grantBook "RSU-1" 100.0
+  let r = release "REL-V" "RSU-1" 10.0 ["S-1"]
+  refuseWith env "an empty ID cannot be claimed" valid wrap (r with id = "")
+  refuse env valid wrap (r with security_id = "")
+  refuse env valid wrap (r with quantity = 0.0)
+  refuse env valid wrap (r with quantity = -10.0)
+  refuse env valid wrap (r with release_price = usd (-1.0))
+  refuse env valid wrap (r with release_price = OcfMonetary with amount = 52.0; currency = "us")
+  -- A release results in at least one security, none of them empty.
+  refuse env valid wrap (r with resulting_security_ids = [])
+  refuse env valid wrap (r with resulting_security_ids = ["S-1", ""])
+  refuse env valid wrap (r with comments = [""])
+  refuse env valid wrap (r with consideration_text = Some "")
+
+test_ec_release_restate : Script ()
+test_ec_release_restate = do
+  env <- grantBook "RSU-1" 100.0
+  let r = release "REL-1" "RSU-1" 10.0 ["S-1"]
+  _ <- applyRecords env [released "S-1" 10.0 d2024, wrap r]
+  restateOpsFails env "changes nothing" [RestateEdit (wrap r)]
+  let r' = r with release_price = usd 50.0
+  _ <- restateOps env [RestateEdit (wrap r')]
+  expectRecord env (wrap r')
+  _ <- restateOps env [RestateDelete "REL-1"]
+  expectNoRecord env "REL-1"

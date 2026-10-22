@@ -1,0 +1,208 @@
+-- The cap table anchor: its identity and status, and the entry point for every register write. It indexes nothing, and every write exercises it without consuming it.
+module Fairmint.OpenCapTable.CapTable
+  ( CapTable(..)
+  , CapTableStatus(..)
+  , PurgeTarget(..)
+  , CapTable_Apply(..)
+  , CapTable_PlaceHolds(..)
+  , CapTable_CancelHolds(..)
+  , CapTable_CancelHoldsResult(..)
+  , CapTable_Settle(..)
+  , CapTable_FreezeClass(..)
+  , CapTable_UnfreezeClass(..)
+  , CapTable_Restate(..)
+  , CapTable_BeginTeardown(..)
+  , CapTable_Purge(..)
+  , CapTable_Close(..)
+  , maxContractsPerPurge
+  ) where
+
+import DA.Action (unless, when)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..))
+import Fairmint.OpenCapTable.Apply (ApplyOperation, ApplyResult, apply)
+import Fairmint.OpenCapTable.Book (BookInputs, fetchChecked)
+import Fairmint.OpenCapTable.Holds
+import Fairmint.OpenCapTable.OcfRecords (OcfRecordCid, archiveRecord, fetchRecord)
+import Fairmint.OpenCapTable.Restate (RestateOperation, RestateResult, restate)
+import Fairmint.OpenCapTable.State (OcfIdShard, StockClassEpoch(..), StockSecurity)
+import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType)
+
+data CapTableStatus
+  = CapTableStatusActive
+  | CapTableStatusTearingDown
+  | CapTableStatusClosed
+  deriving (Eq, Show)
+
+-- | A contract `CapTable_Purge` archives.
+data PurgeTarget
+  = PurgeRecord OcfRecordCid
+  | PurgeState (ContractId StockSecurity)
+  | PurgeEpoch (ContractId StockClassEpoch)
+  | PurgeShard (ContractId OcfIdShard)
+  deriving (Eq, Show)
+
+maxContractsPerPurge : Int
+maxContractsPerPurge = 500
+
+-- | The anchor of one cap table. It holds no per-object data, so no write grows with the book.
+-- The transfer agent (TA) controls every write; the issuer acts only at setup; the system operator
+-- only purges and closes a book the TA has begun to tear down. Each choice body holds the issuer's,
+-- the system operator's and the TA's authority, which every register contract needs.
+template CapTable
+  with
+    context : Context
+    status : CapTableStatus
+  where
+    signatory context.issuer, context.system_operator, context.transfer_agent
+
+    ensure validateContext context
+
+    interface instance RegisterContract for CapTable where
+      view = RegisterContractView with
+        cap_table_id = context.cap_table_id
+        kind = "CAP_TABLE"
+        key = context.cap_table_id
+
+    -- | A non-empty batch of at most 500 operations: OCF creates, stock security events, splits,
+    -- vesting snapshots and shard pre-splits. Edits and deletes go through `CapTable_Restate`.
+    nonconsuming choice CapTable_Apply : ApplyResult
+      with
+        inputs : BookInputs
+        operations : [ApplyOperation]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        apply context inputs operations
+
+    -- | Places one hold per lot, on at most 50 lots, under one reference, dated on the ledger date.
+    nonconsuming choice CapTable_PlaceHolds : [PlaceHoldResult]
+      with
+        inputs : BookInputs
+        hold_type : OcfHoldType
+        reference : Text
+        date : Date
+        reason_text : Text
+        lots : [PlaceHoldLot]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        placeHolds context inputs hold_type reference date reason_text lots
+
+    -- | Cancels whole holds, current or voided, settlement or stop.
+    nonconsuming choice CapTable_CancelHolds : CapTable_CancelHoldsResult
+      with
+        inputs : BookInputs
+        date : Date
+        holds : [CancelHold]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        (canceled, states) <- cancelHolds context inputs date holds
+        pure CapTable_CancelHoldsResult with canceled; states
+
+    -- | Draws or cancels the holds of one trade and returns the delivered terms.
+    nonconsuming choice CapTable_Settle : SettleResult
+      with
+        inputs : BookInputs
+        settlement_id : Text
+        date : Date
+        buyer : SettleBuyer
+        lots : [SettleLot]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        settle context inputs settlement_id date buyer lots
+
+    -- | Starts recording a split: consumes the class's epoch and recreates it frozen, so writes in
+    -- flight that fetched it fail, and no write that creates or changes a stock state in the class
+    -- commits until it unfreezes.
+    nonconsuming choice CapTable_FreezeClass : ContractId StockClassEpoch
+      with
+        epoch : ContractId StockClassEpoch
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        e <- fetchChecked context "the stock class epoch" epoch
+        when e.frozen (abort ("stock class " <> e.stock_class_id <> " is already frozen"))
+        archive epoch
+        create e with frozen = True
+
+    -- | Ends recording a split.
+    nonconsuming choice CapTable_UnfreezeClass : ContractId StockClassEpoch
+      with
+        epoch : ContractId StockClassEpoch
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        e <- fetchChecked context "the stock class epoch" epoch
+        unless e.frozen (abort ("stock class " <> e.stock_class_id <> " is not frozen"))
+        archive epoch
+        create e with frozen = False
+
+    -- | Mirrors edits and deletes, within fixed limits.
+    nonconsuming choice CapTable_Restate : RestateResult
+      with
+        inputs : BookInputs
+        operations : [RestateOperation]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        restate context inputs operations
+
+    -- | Ends every write to a book being rebuilt: writes sequenced after it fail, because they
+    -- exercise the anchor it consumes.
+    choice CapTable_BeginTeardown : ContractId CapTable
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        create this with status = CapTableStatusTearingDown
+
+    -- | Archives up to 500 of a torn-down book's contracts.
+    nonconsuming choice CapTable_Purge : ()
+      with
+        targets : [PurgeTarget]
+      controller context.system_operator
+      do
+        requireStatus CapTableStatusTearingDown status
+        when (null targets) (abort "CapTable_Purge needs at least one contract")
+        when (length targets > maxContractsPerPurge)
+          (abort ("CapTable_Purge archives at most " <> show maxContractsPerPurge <> " contracts"))
+        forA_ targets (purgeOne context)
+
+    -- | Leaves the anchor as a tombstone.
+    choice CapTable_Close : ContractId CapTable
+      controller context.system_operator
+      do
+        requireStatus CapTableStatusTearingDown status
+        create this with status = CapTableStatusClosed
+
+data CapTable_CancelHoldsResult = CapTable_CancelHoldsResult
+  with
+    canceled : [CancelHoldResult]
+    -- The new states, by security ID
+    states : Map Text (ContractId StockSecurity)
+  deriving (Eq, Show)
+
+requireStatus : CapTableStatus -> CapTableStatus -> Update ()
+requireStatus expected actual =
+  unless (actual == expected)
+    (abort ("the cap table is " <> show actual <> ", not " <> show expected))
+
+purgeOne : Context -> PurgeTarget -> Update ()
+purgeOne ctx target = case target of
+  PurgeRecord rcid -> do
+    (rctx, _) <- fetchRecord rcid
+    unless (rctx == ctx) (abort "a purged record belongs to another cap table")
+    archiveRecord rcid
+  PurgeState cid -> do
+    _ <- fetchChecked ctx "a purged stock state" cid
+    archive cid
+  PurgeEpoch cid -> do
+    _ <- fetchChecked ctx "a purged epoch" cid
+    archive cid
+  PurgeShard cid -> do
+    _ <- fetchChecked ctx "a purged shard" cid
+    archive cid

@@ -1,84 +1,299 @@
+-- Warrant issuances through CapTable_Apply and CapTable_Restate: the issuance validator, its stakeholder, vesting-terms and conversion-target references, unique trigger IDs, claimed object and security IDs, the tranche cap, and edits and deletes.
 module OpenCapTable.TestWarrantIssuance where
-import Fairmint.OpenCapTable.OCF.WarrantIssuance
-import OpenCapTable.HelpersTriggers (ocfTriggerElectiveAtWill)
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (forA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Conversion
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..), OcfSecurityExemption(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, defaultVestingTerms)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
-import Daml.Script
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..), validateWarrantIssuanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
 
-createWarrantIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
-        id = "TX_WARRANT_ISSUANCE_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "WSEC-1"
-        custom_id = "W-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = None
-        security_law_exemptions = []
-        quantity = Some 100.0
-        quantity_source = Some OcfQuantityUnspecified
-        exercise_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
-        purchase_price = OcfMonetary with amount = 0.0, currency = "USD"
-        exercise_triggers = [ ocfTriggerElectiveAtWill ]
-        warrant_expiration_date = None
-        vesting_terms_id = None
-        vestings = []
-        comments = []]
-      edits = []
-      deletes = []
+wi : WarrantIssuanceOcfData -> OcfRecordData
+wi = OcfRecordDataWarrantIssuance
 
-testCreateAndArchiveWarrantIssuance = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  _ <- createWarrantIssuance issuer capTableCid
-  pure ()
+warrantWithTriggers : Text -> Text -> [OcfConversionTrigger] -> WarrantIssuanceOcfData
+warrantWithTriggers id sec triggers = (warrantIssuance id sec "SH-A") with exercise_triggers = triggers
 
-testCreateAndArchiveWarrantIssuanceBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  _ <- createWarrantIssuance issuer capTableCid
-  pure ()
+atWill : Text -> OcfAnyConversionRight -> OcfConversionTrigger
+atWill id right = warrantTrigger id OcfConversionTriggerTypeElectiveAtWill right
 
--- Base helper already covers None/empty where applicable
+-- The three kinds of conversion right a warrant's exercise trigger may carry, by target.
+fixedWarrantRight : Optional Text -> OcfAnyConversionRight
+fixedWarrantRight target =
+  OcfRightWarrant (warrantRight (OcfWarrantMechanismFixedAmount (OcfFixedAmountConversionMechanism with converts_to_quantity = 100.0)) target)
 
--- Optionals Some and arrays non-empty
-testWarrantIssuance_OptionalsSome_ArraysNonEmpty = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  _ <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateVestingTerms (defaultVestingTerms "VT_W")
-        , CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
-            id = "TX_WARRANT_SOME"
-            date = DT.time (DA.date 2024 Feb 01) 0 0 0
-            security_id = "WSEC-3"
-            custom_id = "W-3"
-            stakeholder_id = "SH-1"
-            board_approval_date = Some (DT.time (DA.date 2024 Jan 15) 0 0 0)
-            stockholder_approval_date = Some (DT.time (DA.date 2024 Jan 20) 0 0 0)
-            consideration_text = Some "Cash"
-            security_law_exemptions = [ OcfSecurityExemption with description = "Reg D", jurisdiction = "US-DE" ]
-            quantity = Some 100.0
-            quantity_source = Some OcfQuantityInstrumentFixed
-            exercise_price = Some (OcfMonetary with amount = 1.5, currency = "USD")
-            purchase_price = OcfMonetary with amount = 0.1, currency = "USD"
-            exercise_triggers = [ ocfTriggerElectiveAtWill ]
-            warrant_expiration_date = Some (DT.time (DA.date 2025 Jan 01) 0 0 0)
-            vesting_terms_id = Some "VT_W"
-            vestings = [ OcfVesting with date = DT.time (DA.date 2024 Mar 01) 0 0 0, amount = 10.0 ]
-            comments = ["Issued"]
+customConvertibleRight : Optional Text -> OcfAnyConversionRight
+customConvertibleRight target = OcfRightConvertible (convertibleRight (OcfConvMechCustom (customMechanism "Custom")) target)
+
+ratioStockClassRight : Optional Text -> OcfAnyConversionRight
+ratioStockClassRight target = OcfRightStockClass (stockClassRight target)
+
+tranches : Int -> [OcfVesting]
+tranches n = map (\i -> OcfVesting with amount = 1.0; date = D.addDays d2024 i) [1 .. n]
+
+test_warrant_issuance_create : Script ()
+test_warrant_issuance_create = do
+  env <- standardBook
+  let w = warrantIssuance "TX_WARRANT_ISSUANCE_1" "WSEC-1" "SH-A"
+  _ <- applyRecords env [wi w]
+  expectRecord env (wi w)
+  viewSecurityIds env "TX_WARRANT_ISSUANCE_1" >>= (=== ["WSEC-1"])
+  -- A warrant is a record, not a stock state.
+  hasState env "WSEC-1" >>= (=== False)
+  -- Its object ID and its security ID are claimed.
+  applyRecordsFails env "ID already used: TX_WARRANT_ISSUANCE_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_ISSUANCE_1")]
+  applyRecordsFails env "security ID already used: WSEC-1" [OcfRecordDataStockIssuance (issuance "WSEC-1" "SH-A" "CLS-A" 10.0 d2024)]
+
+test_warrant_issuance_optionals_and_arrays : Script ()
+test_warrant_issuance_optionals_and_arrays = do
+  env <- standardBook
+  let w = (warrantIssuance "TX_WARRANT_SOME" "WSEC-3" "SH-A") with
+        date = D.date 2024 D.Feb 1
+        board_approval_date = Some (D.date 2024 D.Jan 15)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 20)
+        consideration_text = Some "Cash"
+        security_law_exemptions = [OcfSecurityExemption with description = "Reg D"; jurisdiction = "US-DE"]
+        quantity_source = Some OcfQuantitySourceTypeInstrumentFixed
+        exercise_price = Some (usd 1.5)
+        purchase_price = usd 0.1
+        warrant_expiration_date = Some (D.date 2025 D.Jan 1)
+        vesting_terms_id = Some "VT_W"
+        vestings = [OcfVesting with date = D.date 2024 D.Mar 1; amount = 10.0]
+        comments = ["Issued"]
+  -- The vesting terms come later in the batch: references are checked after its last operation.
+  _ <- applyRecords env [wi w, OcfRecordDataVestingTerms (vestingTerms "VT_W")]
+  expectRecord env (wi w)
+  expectRecord env (OcfRecordDataVestingTerms (vestingTerms "VT_W"))
+
+-- OCF requires exercise_triggers but sets no minItems, so a warrant may carry none.
+test_warrant_issuance_without_triggers : Script ()
+test_warrant_issuance_without_triggers = do
+  env <- standardBook
+  let w = (warrantIssuance "WI-NT" "W-NT" "SH-A") with exercise_triggers = []
+  _ <- applyRecords env [wi w]
+  expectRecord env (wi w)
+
+test_warrant_issuance_validator : Script ()
+test_warrant_issuance_validator = do
+  env <- standardBook
+  let base = warrantIssuance "WI-V" "W-V" "SH-A"
+      trigger = atWillWarrantTrigger warrantTriggerId
+      rejects : Text -> Text -> WarrantIssuanceOcfData -> Script ()
+      rejects label expected w = do
+        expectInvalid label (validateWarrantIssuanceOcfData w)
+        applyRecordsFails env expected [wi w]
+      accepts : Text -> Int -> WarrantIssuanceOcfData -> Script ()
+      accepts label n w = do
+        let w' = w with id = "WI-OK-" <> show n; security_id = "W-OK-" <> show n
+        expectValid label (validateWarrantIssuanceOcfData w')
+        _ <- applyRecords env [wi w']
+        expectRecord env (wi w')
+  expectValid "base" (validateWarrantIssuanceOcfData base)
+  -- Empty IDs fail their claim before the record is created.
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "an empty ID cannot be claimed" base with security_id = ""
+  rejects "empty custom_id" "precondition" base with custom_id = ""
+  rejects "empty stakeholder_id" "precondition" base with stakeholder_id = ""
+  rejects "exemption without description" "precondition"
+    base with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"]
+  rejects "exemption without jurisdiction" "precondition"
+    base with security_law_exemptions = [OcfSecurityExemption with description = "Reg D"; jurisdiction = ""]
+  rejects "empty comment" "precondition" base with comments = ["ok", ""]
+  rejects "negative purchase price" "precondition" base with purchase_price = usd (-1.0)
+  rejects "two-letter currency" "precondition" base with purchase_price = OcfMonetary with amount = 1.0; currency = "US"
+  rejects "empty consideration" "precondition" base with consideration_text = Some ""
+  rejects "duplicate trigger IDs" "precondition" base with exercise_triggers = [trigger, trigger]
+  rejects "empty trigger ID" "precondition" base with exercise_triggers = [trigger with trigger_id = ""]
+  rejects "empty trigger nickname" "precondition" base with exercise_triggers = [trigger with nickname = Some ""]
+  rejects "empty trigger description" "precondition" base with exercise_triggers = [trigger with trigger_description = Some ""]
+  rejects "at-will trigger with a date" "precondition" base with exercise_triggers = [trigger with trigger_date = Some d2024]
+  rejects "invalid trigger right" "precondition"
+    base with exercise_triggers = [atWill "T" (OcfRightWarrant (warrantRight (OcfWarrantMechanismCustom (customMechanism "")) None))]
+  rejects "empty conversion target" "precondition" base with exercise_triggers = [atWill "T" (fixedWarrantRight (Some ""))]
+  rejects "expiration before the issuance" "precondition" base with warrant_expiration_date = Some (D.date 2023 D.Dec 31)
+  rejects "empty vesting terms ID" "precondition" base with vesting_terms_id = Some ""
+  rejects "zero vesting" "precondition" base with vestings = [OcfVesting with amount = 0.0; date = d2024]
+  rejects "negative vesting" "precondition" base with vestings = [OcfVesting with amount = -1.0; date = d2024]
+  -- Vestings stay within the quantity when it is a fixed or maximum instrument quantity ...
+  let over = base with vestings = [(OcfVesting with amount = 60.0; date = d2024), (OcfVesting with amount = 41.0; date = D.date 2025 D.Jan 1)]
+  rejects "vestings over a fixed quantity" "precondition" over with quantity_source = Some OcfQuantitySourceTypeInstrumentFixed
+  rejects "vestings over a maximum quantity" "precondition" over with quantity_source = Some OcfQuantitySourceTypeInstrumentMax
+  -- ... and are not bounded by a minimum, estimated, unspecified or absent source, or no quantity.
+  accepts "vestings over a minimum quantity" 1 over with quantity_source = Some OcfQuantitySourceTypeInstrumentMin
+  accepts "vestings over a human estimate" 2 over with quantity_source = Some OcfQuantitySourceTypeHumanEstimated
+  accepts "vestings over a machine estimate" 3 over with quantity_source = Some OcfQuantitySourceTypeMachineEstimated
+  accepts "vestings over an unspecified quantity" 4 over with quantity_source = Some OcfQuantitySourceTypeUnspecified
+  accepts "vestings with no quantity source" 5 over
+  accepts "vestings with no quantity" 6 over with quantity = None; quantity_source = Some OcfQuantitySourceTypeInstrumentFixed
+  accepts "vestings equal to a fixed quantity" 7
+    base with quantity_source = Some OcfQuantitySourceTypeInstrumentFixed; vestings = [OcfVesting with amount = 100.0; date = d2024]
+  -- The expiration may fall on the issuance date.
+  accepts "expiration on the issuance date" 8 base with warrant_expiration_date = Some d2024
+
+-- A present exercise price is a valid OCF Monetary, as the equity compensation issuance's is.
+test_warrant_issuance_exercise_price_validated : Script ()
+test_warrant_issuance_exercise_price_validated = do
+  env <- standardBook
+  let base = warrantIssuance "WI-P" "W-P" "SH-A"
+  applyRecordsFails env "precondition" [wi base with exercise_price = Some (usd (-1.0))]
+  applyRecordsFails env "precondition" [wi base with exercise_price = Some (OcfMonetary with amount = 1.0; currency = "")]
+
+test_warrant_issuance_stakeholder_reference : Script ()
+test_warrant_issuance_stakeholder_reference = do
+  env <- standardBook
+  applyRecordsFails env "Warrant issuance stakeholder not found: SH-NONE" [wi (warrantIssuance "WI-1" "W-1" "SH-NONE")]
+  applyRecordsFails env "Warrant issuance stakeholder ISS-S-A1 is a OcfObjectTypeTxStockIssuance, not one of [OcfObjectTypeStakeholder]"
+    [wi (warrantIssuance "WI-1" "W-1" "ISS-S-A1")]
+  -- A stakeholder written later in the same batch satisfies the reference.
+  let w = warrantIssuance "WI-1" "W-1" "SH-NEW"
+  _ <- applyRecords env [wi w, OcfRecordDataStakeholder (stakeholderData "SH-NEW")]
+  expectRecord env (wi w)
+
+test_warrant_issuance_vesting_terms_reference : Script ()
+test_warrant_issuance_vesting_terms_reference = do
+  env <- standardBook
+  let w = (warrantIssuance "TX_WARRANT_REF" "WARRANT-REF" "SH-A") with vesting_terms_id = Some "VT_MISSING_WARRANT"
+  applyRecordsFails env "Warrant vesting terms not found: VT_MISSING_WARRANT" [wi w]
+  applyRecordsFails env "Warrant vesting terms SH-B is a OcfObjectTypeStakeholder, not one of [OcfObjectTypeVestingTerms]"
+    [wi w with vesting_terms_id = Some "SH-B"]
+  let w' = w with vesting_terms_id = Some "VT_WARRANT_REF"
+  _ <- applyRecords env [OcfRecordDataVestingTerms (vestingTerms "VT_WARRANT_REF"), wi w']
+  expectRecord env (wi w')
+
+test_warrant_issuance_edit_references : Script ()
+test_warrant_issuance_edit_references = do
+  env <- standardBook
+  let w = warrantIssuance "TX_WARRANT_EDIT" "WARRANT-EDIT" "SH-A"
+  _ <- applyRecords env [wi w]
+  -- The references an edit adds are checked against the book.
+  restateOpsFails env "Warrant vesting terms not found: VT_MISSING_WARRANT_ON_EDIT"
+    [RestateEdit (wi w with vesting_terms_id = Some "VT_MISSING_WARRANT_ON_EDIT")]
+  restateOpsFails env "Warrant issuance stakeholder not found: SH-NONE" [RestateEdit (wi w with stakeholder_id = "SH-NONE")]
+  -- Definitions written before the edit satisfy them.
+  _ <- applyRecords env [OcfRecordDataVestingTerms (vestingTerms "VT_WARRANT_EDIT"), OcfRecordDataStakeholder (stakeholderData "SH_WARRANT_EDIT_NEW")]
+  let edited = w with vesting_terms_id = Some "VT_WARRANT_EDIT"; stakeholder_id = "SH_WARRANT_EDIT_NEW"
+  _ <- restateOps env [RestateEdit (wi edited)]
+  expectRecord env (wi edited)
+
+-- References are checked when the referring record is written. A later delete of the definition
+-- is not re-checked on the ledger: refusing an edit or delete that orphans a live reference is
+-- the SDK's job.
+test_warrant_issuance_definition_deletes_not_rechecked : Script ()
+test_warrant_issuance_definition_deletes_not_rechecked = do
+  env <- standardBook
+  let w = (warrantWithTriggers "WI-1" "W-1" [atWill "T-1" (fixedWarrantRight (Some "CLS-W"))]) with
+        stakeholder_id = "SH-W"
+        vesting_terms_id = Some "VT-W"
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SH-W")
+    , OcfRecordDataVestingTerms (vestingTerms "VT-W")
+    , OcfRecordDataStockClass (stockClass "CLS-W")
+    , wi w
+    ]
+  _ <- restateOps env [RestateDelete "SH-W", RestateDelete "VT-W", RestateDelete "CLS-W"]
+  mapA (hasRecord env) ["SH-W", "VT-W", "CLS-W"] >>= (=== [False, False, False])
+  expectRecord env (wi w)
+
+test_warrant_issuance_ids : Script ()
+test_warrant_issuance_ids = do
+  env <- instrumentBook
+  -- Security IDs are unique across stock, warrants and convertibles ...
+  applyRecordsFails env "security ID already used: S-A1" [wi (warrantIssuance "WI-2" "S-A1" "SH-A")]
+  applyRecordsFails env "security ID already used: C-1" [wi (warrantIssuance "WI-2" "C-1" "SH-A")]
+  applyRecordsFails env "security ID already used: W-1" [wi (warrantIssuance "WI-2" "W-1" "SH-A")]
+  -- ... and within one batch.
+  applyRecordsFails env "security ID already used: W-2"
+    [wi (warrantIssuance "WI-2" "W-2" "SH-A"), OcfRecordDataConvertibleIssuance (convertibleIssuance "CI-2" "W-2" "SH-A")]
+  -- Object IDs are unique across types.
+  applyRecordsFails env "ID already used: SH-B" [wi (warrantIssuance "SH-B" "W-2" "SH-A")]
+  applyRecordsFails env "ID already used: CI-1" [wi (warrantIssuance "CI-1" "W-2" "SH-A")]
+  -- Neither may have the book's derived form.
+  applyRecordsFails env "derived form" [wi (warrantIssuance (env.ctx.cap_table_id <> ":WI-2") "W-2" "SH-A")]
+  applyRecordsFails env "derived form" [wi (warrantIssuance "WI-2" (env.ctx.cap_table_id <> ":W-2") "SH-A")]
+  -- Object and security IDs are separate namespaces: one text may be both.
+  let w = warrantIssuance "W-2" "W-2" "SH-A"
+  _ <- applyRecords env [wi w]
+  expectRecord env (wi w)
+
+test_warrant_issuance_edit_and_delete : Script ()
+test_warrant_issuance_edit_and_delete = do
+  env <- instrumentBook
+  let w = warrantIssuance "WI-1" "W-1" "SH-A"
+  restateOpsFails env "precondition" [RestateEdit (wi w with custom_id = "")]
+  restateOpsFails env "keeps record WI-1's type" [RestateEdit (OcfRecordDataConvertibleIssuance (convertibleIssuance "WI-1" "W-1" "SH-A"))]
+  checkEditAndDelete env (wi w) (wi w with quantity = Some 150.0; comments = ["Amended"])
+  -- The delete released the security ID with the object ID.
+  let w2 = warrantIssuance "WI-NEW" "W-1" "SH-A"
+  _ <- applyRecords env [wi w2]
+  expectRecord env (wi w2)
+
+-- A warrant's security ID may change on an edit: the old one is released and the new one claimed.
+test_warrant_issuance_edit_security_id : Script ()
+test_warrant_issuance_edit_security_id = do
+  env <- instrumentBook
+  let w = warrantIssuance "WI-1" "W-1" "SH-A"
+  restateOpsFails env "security ID already used: C-1" [RestateEdit (wi w with security_id = "C-1")]
+  _ <- restateOps env [RestateEdit (wi w with security_id = "W-1B")]
+  expectRecord env (wi w with security_id = "W-1B")
+  viewSecurityIds env "WI-1" >>= (=== ["W-1B"])
+  applyRecordsFails env "security ID already used: W-1B" [wi (warrantIssuance "WI-2" "W-1B" "SH-A")]
+  let w2 = warrantIssuance "WI-2" "W-1" "SH-A"
+  _ <- applyRecords env [wi w2]
+  expectRecord env (wi w2)
+
+test_warrant_issuance_tranche_cap : Script ()
+test_warrant_issuance_tranche_cap = do
+  env <- standardBook
+  let w = warrantIssuance "WI-T" "W-T" "SH-A"
+  applyRecordsFails env "OcfObjectTypeTxWarrantIssuance has 1501 vesting tranches; at most 1500" [wi w with vestings = tranches 1501]
+  _ <- applyRecords env [wi w with vestings = tranches 1500]
+  expectRecord env (wi w with vestings = tranches 1500)
+
+test_warrant_issuance_conversion_targets : Script ()
+test_warrant_issuance_conversion_targets = do
+  env <- standardBook
+  -- Each kind of right a warrant trigger may carry has its target stock class checked.
+  forA_ [fixedWarrantRight, customConvertibleRight, ratioStockClassRight] \right ->
+    applyRecordsFails env "Warrant exercise trigger conversion target not found: SC_MISSING_WARRANT_TARGET"
+      [wi (warrantWithTriggers "WI-M" "W-M" [atWill "T-1" (right (Some "SC_MISSING_WARRANT_TARGET"))])]
+  applyRecordsFails env "Warrant exercise trigger conversion target SH-B is a OcfObjectTypeStakeholder"
+    [wi (warrantWithTriggers "WI-M" "W-M" [atWill "T-1" (fixedWarrantRight (Some "SH-B"))])]
+  -- A target written later in the same batch satisfies all three.
+  let w = warrantWithTriggers "WI-T" "W-T"
+        [ atWill "T-W" (fixedWarrantRight (Some "SC_WARRANT_TARGET"))
+        , atWill "T-C" (customConvertibleRight (Some "SC_WARRANT_TARGET"))
+        , atWill "T-S" (ratioStockClassRight (Some "SC_WARRANT_TARGET"))
         ]
-      edits = []
-      deletes = []
-  pure ()
+  _ <- applyRecords env [wi w, OcfRecordDataStockClass (stockClass "SC_WARRANT_TARGET")]
+  expectRecord env (wi w)
+
+test_warrant_issuance_edit_conversion_target : Script ()
+test_warrant_issuance_edit_conversion_target = do
+  env <- standardBook
+  let w = warrantWithTriggers "WI-E" "W-E" [atWill "T-1" (fixedWarrantRight None)]
+  _ <- applyRecords env [wi w]
+  restateOpsFails env "Warrant exercise trigger conversion target not found: SC_MISSING_WARRANT_EDIT_TARGET"
+    [RestateEdit (wi w with exercise_triggers = [atWill "T-1" (fixedWarrantRight (Some "SC_MISSING_WARRANT_EDIT_TARGET"))])]
+  let edited = w with exercise_triggers = [atWill "T-1" (fixedWarrantRight (Some "CLS-A"))]
+  _ <- restateOps env [RestateEdit (wi edited)]
+  expectRecord env (wi edited)
+
+test_warrant_issuance_duplicate_trigger_ids : Script ()
+test_warrant_issuance_duplicate_trigger_ids = do
+  env <- standardBook
+  let t = atWill "TRIGGER-1" (fixedWarrantRight None)
+      w = warrantWithTriggers "WI-D" "W-D" [t]
+  applyRecordsFails env "precondition" [wi w with exercise_triggers = [t, t]]
+  -- One ID on two different triggers is refused too.
+  applyRecordsFails env "precondition" [wi w with exercise_triggers = [t, t with nickname = Some "Other"]]
+  _ <- applyRecords env [wi w]
+  restateOpsFails env "precondition" [RestateEdit (wi w with exercise_triggers = [t, t])]
+  expectRecord env (wi w)

@@ -1,152 +1,126 @@
+-- Balance securities: a stock event writes its balance issuance in the same operation; a warrant, convertible or equity-compensation cancellation references a balance issuance of its own instrument, checked at the end of the batch and again when a restatement adds it.
 module OpenCapTable.TestBalanceSecurityReferences where
 
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.OCF.ConvertibleCancellation (ConvertibleCancellationOcfData(..))
-import Fairmint.OpenCapTable.OCF.EquityCompensationCancellation (EquityCompensationCancellationOcfData(..))
-import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
-import Fairmint.OpenCapTable.OCF.WarrantCancellation (WarrantCancellationOcfData(..))
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers
-  ( addDefaultConvertibleIssuance
-  , addDefaultEquityCompensationIssuance
-  , addDefaultStakeholder
-  , addDefaultStockIssuance
-  , addDefaultWarrantIssuance
-  , addPrerequisites
-  , defaultStockIssuance
-  , defaultTestDate
-  )
+import DA.Assert ((===))
 import Daml.Script
 
-testBalanceSecurityReferences_MissingStockSuccessorFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
-        id = "TX-STOCK-MISSING-BALANCE"
-        date = defaultTestDate
-        quantity = 10.0
-        reason_text = "Partial cancellation"
-        security_id = "SEC-STOCK-1"
-        comments = []
-        balance_security_id = Some "SEC-STOCK-MISSING-BALANCE"]
-      edits = []
-      deletes = []
+stockCancellation : Text -> Optional Text -> StockCancellationOcfData
+stockCancellation id balance = StockCancellationOcfData with
+  id; date = eventDate; quantity = 10.0; reason_text = "Partial cancellation"; security_id = "S-A2"
+  comments = []; balance_security_id = balance
 
-testBalanceSecurityReferences_MissingWarrantSuccessorFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  capTableCid <- addDefaultWarrantIssuance issuer capTableCid
+-- =============================================================================
+-- MISSING SUCCESSORS
+-- =============================================================================
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantCancellation WarrantCancellationOcfData with
-        id = "TX-WARRANT-MISSING-BALANCE"
-        date = defaultTestDate
-        quantity = 10.0
-        reason_text = "Partial cancellation"
-        security_id = "SEC-WR-1"
-        comments = []
-        balance_security_id = Some "SEC-WARRANT-MISSING-BALANCE"]
-      edits = []
-      deletes = []
+-- A stock event's balance is the issuance written in its own operation: naming one without
+-- writing it is a partial event without a balance.
+test_balance_refs_missing_stock_successor_fails : Script ()
+test_balance_refs_missing_stock_successor_fails = do
+  env <- standardBook
+  applyOpsFails env "a partial event on security S-A2 needs a balance issuance"
+    [ApplyStockCancellation with cancellation = stockCancellation "TX-STOCK-MISSING-BALANCE" (Some "SEC-STOCK-MISSING-BALANCE"); balance = None]
+  -- An existing security cannot stand in for it: the balance issuance is always new.
+  applyOpsFails env "security ID already used: S-A1"
+    [ApplyStockCancellation with
+        cancellation = stockCancellation "TX-STOCK-MISSING-BALANCE" (Some "S-A1")
+        balance = Some ((issuance "S-A1" "SH-A" "CLS-A" 390.0 eventDate) with id = "ISS-BAL")]
+  (.quantity) <$> stateOf env "S-A2" >>= (=== 400.0)
 
-testBalanceSecurityReferences_MissingConvertibleSuccessorFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  capTableCid <- addDefaultConvertibleIssuance issuer capTableCid
+test_balance_refs_missing_warrant_successor_fails : Script ()
+test_balance_refs_missing_warrant_successor_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant cancellation balance security not found: SEC-WARRANT-MISSING-BALANCE"
+    [OcfRecordDataWarrantCancellation (warrantCancellation "TX-WARRANT-MISSING-BALANCE" "W-1" (Some "SEC-WARRANT-MISSING-BALANCE"))]
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleCancellation ConvertibleCancellationOcfData with
-        id = "TX-CONVERTIBLE-MISSING-BALANCE"
-        amount = OcfMonetary with amount = 10.0, currency = "USD"
-        date = defaultTestDate
-        reason_text = "Partial cancellation"
-        security_id = "SEC-CV-1"
-        comments = []
-        balance_security_id = Some "SEC-CONVERTIBLE-MISSING-BALANCE"]
-      edits = []
-      deletes = []
+test_balance_refs_missing_convertible_successor_fails : Script ()
+test_balance_refs_missing_convertible_successor_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Convertible cancellation balance security not found: SEC-CONVERTIBLE-MISSING-BALANCE"
+    [OcfRecordDataConvertibleCancellation (convertibleCancellation "TX-CONVERTIBLE-MISSING-BALANCE" "CV-1" (Some "SEC-CONVERTIBLE-MISSING-BALANCE"))]
 
-testBalanceSecurityReferences_MissingEquityCompensationSuccessorFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultEquityCompensationIssuance issuer capTableCid
+test_balance_refs_missing_equity_compensation_successor_fails : Script ()
+test_balance_refs_missing_equity_compensation_successor_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Equity compensation cancellation balance security not found: SEC-EC-MISSING-BALANCE"
+    [OcfRecordDataEquityCompensationCancellation (equityCompensationCancellation "TX-EC-MISSING-BALANCE" "EC-1" (Some "SEC-EC-MISSING-BALANCE"))]
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationCancellation EquityCompensationCancellationOcfData with
-        id = "TX-EC-MISSING-BALANCE"
-        date = defaultTestDate
-        quantity = 10.0
-        reason_text = "Partial cancellation"
-        security_id = "SEC-EC-1"
-        comments = []
-        balance_security_id = Some "SEC-EC-MISSING-BALANCE"]
-      edits = []
-      deletes = []
+-- A balance of another instrument is refused.
+test_balance_refs_successor_must_be_same_instrument : Script ()
+test_balance_refs_successor_must_be_same_instrument = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant cancellation balance security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [OcfRecordDataWarrantCancellation (warrantCancellation "TX-W" "W-1" (Some "S-A1"))]
+  applyRecordsFails env "Convertible cancellation balance security W-1 is carried by a OcfObjectTypeTxWarrantIssuance"
+    [OcfRecordDataConvertibleCancellation (convertibleCancellation "TX-CV" "CV-1" (Some "W-1"))]
+  applyRecordsFails env "Equity compensation cancellation balance security CV-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [OcfRecordDataEquityCompensationCancellation (equityCompensationCancellation "TX-EC" "EC-1" (Some "CV-1"))]
 
-testBalanceSecurityReferences_StockSuccessorCreatedInSameBatchSucceeds = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-  let balanceIssuance = (defaultStockIssuance
-        "TX-STOCK-BALANCE-SUCCESSOR"
-        "SEC-STOCK-BALANCE-SUCCESSOR"
-        "SH-1"
-        "SC_COMMON") with quantity = 90.0
+-- =============================================================================
+-- SUCCESSORS IN THE SAME BATCH
+-- =============================================================================
 
-  _ <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockIssuance balanceIssuance
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX-STOCK-CANCELLATION-BALANCE-SUCCESSOR"
-            date = defaultTestDate
-            quantity = 10.0
-            reason_text = "Partial cancellation"
-            security_id = "SEC-STOCK-1"
-            comments = []
-            balance_security_id = Some "SEC-STOCK-BALANCE-SUCCESSOR"
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_balance_refs_stock_successor_in_same_operation : Script ()
+test_balance_refs_stock_successor_in_same_operation = do
+  env <- standardBook
+  let c = stockCancellation "TX-STOCK-CANCELLATION-BALANCE-SUCCESSOR" (Some "SEC-STOCK-BALANCE-SUCCESSOR")
+      b = (issuance "SEC-STOCK-BALANCE-SUCCESSOR" "SH-A" "CLS-A" 390.0 eventDate) with id = "TX-STOCK-BALANCE-SUCCESSOR"
+  _ <- applyOps env [ApplyStockCancellation with cancellation = c; balance = Some b]
+  expectRecord env (OcfRecordDataStockCancellation c)
+  expectRecord env (OcfRecordDataStockIssuance b)
+  (.quantity) <$> stateOf env "SEC-STOCK-BALANCE-SUCCESSOR" >>= (=== 390.0)
 
-testBalanceSecurityReferences_EditCanCreateStockSuccessorInSameBatch = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-  let cancellation = StockCancellationOcfData with
-        id = "TX-STOCK-EDIT-BALANCE"
-        date = defaultTestDate
-        quantity = 10.0
-        reason_text = "Partial cancellation"
-        security_id = "SEC-STOCK-1"
-        comments = []
-        balance_security_id = None
+-- References are checked at the end of the batch, so the successor may follow the cancellation.
+test_balance_refs_instrument_successors_created_in_same_batch : Script ()
+test_balance_refs_instrument_successors_created_in_same_batch = do
+  env <- instrumentBook
+  let wc = warrantCancellation "TX-W-CXL" "W-1" (Some "W-1-BAL")
+      wb = (warrantIssuance "W-1-BAL" "SH-A") with quantity = Some 90.0
+      cc = convertibleCancellation "TX-CV-CXL" "CV-1" (Some "CV-1-BAL")
+      cb = (convertibleIssuance "CV-1-BAL" "SH-A") with investment_amount = usd 9990.0
+      ec = equityCompensationCancellation "TX-EC-CXL" "EC-1" (Some "EC-1-BAL")
+      eb = (equityCompensationIssuance "EC-1-BAL" "SH-A") with quantity = 90.0
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantCancellation wc
+    , OcfRecordDataConvertibleCancellation cc
+    , OcfRecordDataEquityCompensationCancellation ec
+    , OcfRecordDataWarrantIssuance wb
+    , OcfRecordDataConvertibleIssuance cb
+    , OcfRecordDataEquityCompensationIssuance eb
+    ]
+  expectRecord env (OcfRecordDataWarrantCancellation wc)
+  expectRecord env (OcfRecordDataConvertibleCancellation cc)
+  expectRecord env (OcfRecordDataEquityCompensationCancellation ec)
+  expectRecord env (OcfRecordDataWarrantIssuance wb)
+  expectRecord env (OcfRecordDataConvertibleIssuance cb)
+  expectRecord env (OcfRecordDataEquityCompensationIssuance eb)
 
-  created <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockCancellation cancellation]
-      edits = []
-      deletes = []
+-- =============================================================================
+-- RESTATEMENTS
+-- =============================================================================
 
-  let balanceIssuance = (defaultStockIssuance
-        "TX-STOCK-EDIT-BALANCE-SUCCESSOR"
-        "SEC-STOCK-EDIT-BALANCE-SUCCESSOR"
-        "SH-1"
-        "SC_COMMON") with quantity = 90.0
-
-  _ <- submit issuer do
-    exerciseCmd created.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance balanceIssuance]
-      edits = [CT.OcfEditStockCancellation (cancellation with
-        balance_security_id = Some "SEC-STOCK-EDIT-BALANCE-SUCCESSOR")]
-      deletes = []
-  pure ()
+-- A restatement creates no records, so a cancellation's new balance is written first and the edit
+-- that names it then finds it; an edit naming a missing balance is refused.
+test_balance_refs_edit_adds_successor : Script ()
+test_balance_refs_edit_adds_successor = do
+  env <- instrumentBook
+  let wc = warrantCancellation "TX-W-EDIT-BALANCE" "W-1" None
+  _ <- applyRecords env [OcfRecordDataWarrantCancellation wc]
+  restateOpsFails env "Warrant cancellation balance security not found: W-1-EDIT-BALANCE"
+    [RestateEdit (OcfRecordDataWarrantCancellation (wc with balance_security_id = Some "W-1-EDIT-BALANCE"))]
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance ((warrantIssuance "W-1-EDIT-BALANCE" "SH-A") with quantity = Some 90.0)]
+  let edited = wc with balance_security_id = Some "W-1-EDIT-BALANCE"
+  _ <- restateOps env [RestateEdit (OcfRecordDataWarrantCancellation edited)]
+  expectRecord env (OcfRecordDataWarrantCancellation edited)
+  -- The same holds for equity compensation.
+  let ec = equityCompensationCancellation "TX-EC-EDIT-BALANCE" "EC-1" None
+  _ <- applyRecords env [OcfRecordDataEquityCompensationCancellation ec]
+  restateOpsFails env "Equity compensation cancellation balance security not found: EC-1-EDIT-BALANCE"
+    [RestateEdit (OcfRecordDataEquityCompensationCancellation (ec with balance_security_id = Some "EC-1-EDIT-BALANCE"))]

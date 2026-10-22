@@ -1,0 +1,190 @@
+-- Benchmarks for a Canton sandbox (`dpm sandbox`): the 1-lot and 50-lot settlements, and a book filled by 250-issuance batches and then split. Each takes an argument, so `dpm test` does not run them.
+module OpenCapTable.Benchmarks where
+
+import DA.Action (foldlA, unless)
+import DA.Date (addDays, toDateUTC)
+import DA.Foldable (forA_)
+import DA.List (dedup)
+import DA.Optional (fromOptional)
+import DA.Map (Map)
+import qualified DA.Map as Map
+import qualified DA.Text as T
+import DA.Time (convertRelTimeToMicroseconds, subTime)
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Book (BookInputs(..))
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OcpFactory (OcpFactory(..))
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import OpenCapTable.Harness
+
+data SettleBench = SettleBench
+  with
+    run : Text
+    lots : Int
+    tranches_per_lot : Int
+  deriving (Eq, Show)
+
+-- A cap table set up as `setupEnv` does, with party hints unique to the run.
+benchEnv : Text -> Script Env
+benchEnv run = do
+  sysOp <- allocateParty ("SystemOperator-" <> run)
+  issuer <- allocateParty ("Issuer-" <> run)
+  ta <- allocateParty ("TransferAgent-" <> run)
+  outsider <- allocateParty ("Outsider-" <> run)
+  factory <- submit sysOp do
+    createCmd OcpFactory with system_operator = sysOp; factory_id = "bench-" <> run; next_cap_table_number = 1
+  newCapTable sysOp issuer ta outsider factory
+
+data BenchStep = BenchStep
+  with
+    step : Text
+    micros : Int
+  deriving (Eq, Show)
+
+timed : Text -> Script a -> Script (a, BenchStep)
+timed name act = do
+  t0 <- getTime
+  r <- act
+  t1 <- getTime
+  pure (r, BenchStep with step = name; micros = convertRelTimeToMicroseconds (subTime t1 t0))
+
+-- | Issues `lots` lots of 1,000 shares to SH-S, each with `tranches_per_lot` vested tranches, places
+-- one settlement hold on each and settles them all in one `CapTable_Settle`. The ledger date is the
+-- sandbox's wall-clock date.
+bench_settle : SettleBench -> Script [BenchStep]
+bench_settle cfg = do
+  -- Daml is strict: every binding below is evaluated even when unused.
+  env <- benchEnv cfg.run
+  today <- toDateUTC <$> getTime
+  let issued = addDays today (-400)
+      perTranche = if cfg.tranches_per_lot > 0 then 1000.0 / intToDecimal cfg.tranches_per_lot else 0.0
+      lastTranche = 1000.0 - perTranche * intToDecimal (cfg.tranches_per_lot - 1)
+      tranches = map (\i -> OcfVesting with amount = (if i == cfg.tranches_per_lot then lastTranche else perTranche); date = addDays issued i) [1 .. cfg.tranches_per_lot]
+      lot i = (issuance ("S-" <> show i) "SH-S" "CLS" 1000.0 issued) with
+        vestings = if cfg.tranches_per_lot > 0 then tranches else []
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-S"), OcfRecordDataStakeholder (stakeholderData "SH-B"), OcfRecordDataStockClass (stockClass "CLS")]
+  (_, s1) <- timed "issue" (forA_ (chunks 50 [1 .. cfg.lots]) \is -> applyRecords env (map (OcfRecordDataStockIssuance . lot) is))
+  holdLots <- mapA (\i -> settlementLot env ("S-" <> show i) 500.0) [1 .. cfg.lots]
+  -- A writer passes exactly what the write reads: the lots' states and their class's epoch.
+  let lotInputs = do
+        states <- mapA (\i -> stateCidOf env ("S-" <> show i)) [1 .. cfg.lots]
+        (epoch, _) <- epochOf env "CLS"
+        pure BookInputs with states; epochs = [epoch]; shards = []; records = []
+  inputs <- lotInputs
+  (_, s2) <- timed "place holds" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = OcfHoldTypeRegisterSettlement; reference = "BENCH-1"; date = today
+      reason_text = "benchmark"; lots = holdLots)
+  draws <- mapA (\i -> drawLot env ("S-" <> show i) 500.0 2.0 []) [1 .. cfg.lots]
+  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+  inputs' <- lotInputs
+  (_, s3) <- timed "settle" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Settle with
+      inputs = inputs'; settlement_id = "BENCH-1"; date = today; buyer; lots = map SettleDraw draws)
+  pure [s1, s2, s3]
+
+data BookBench = BookBench
+  with
+    run : Text
+    -- Fresh issuances, in batches of 250 (500 claimed IDs each)
+    issuances : Int
+    -- Bits each initial 8-bit shard is pre-split by before the batches (0 for none)
+    presplit_bits : Int
+  deriving (Eq, Show)
+
+type ShardMap = Map Text (ContractId OcfIdShard)
+
+-- | Fills one class with `issuances` states in batches of 250 and then records a split. Every write
+-- passes exactly what it reads: the shards covering its IDs, the class's epoch and the referenced
+-- records. Times the ledger submissions, an active-contract read of the stock states, the freeze,
+-- the split, the unfreeze and one event that applies the split to its state.
+bench_book : BookBench -> Script [BenchStep]
+bench_book cfg = do
+  env <- benchEnv cfg.run
+  today <- toDateUTC <$> getTime
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-S"), OcfRecordDataStockClass (stockClass "CLS")]
+  holder <- recordCidOf env "SH-S"
+  cls <- recordCidOf env "CLS"
+  (epoch, _) <- epochOf env "CLS"
+  shards0 <- Map.fromList . map (\(cid, s) -> (s.prefix, cid)) <$> shardsOf env
+  -- Pre-split 32 initial shards per write: 32 × (2^bits − 1) operations, at most 480 for 4 bits.
+  (shards1, presplits) <- foldlA (\(m, acc) ps -> do
+      let ops = concatMap (\p -> concatMap (\k -> map (\sfx -> ApplyPreSplitShard with prefix = p <> sfx) (bitStrings k)) [0 .. cfg.presplit_bits - 1]) ps
+          inputs = BookInputs with states = []; epochs = []; shards = map (at m) ps; records = []
+      (r, step) <- timed ("presplit " <> show (length ops)) (submit env.transfer_agent do
+        exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops)
+      pure (mergeShards m ps r.shards, step :: acc))
+    (shards0, []) (if cfg.presplit_bits > 0 then chunks 32 (Map.keys shards0) else [])
+  let batch b = map (\i -> issuance ("S-" <> show b <> "-" <> show i) "SH-S" "CLS" 10.0 (addDays today (-2))) [1 .. 250]
+  (shards2, epoch', firstState, batches) <- foldlA (\(m, ep, first, acc) b -> do
+      let issued = batch b
+          prefixes = dedup (concatMap (\iss -> [cover m (claimBits IdNamespaceObject iss.id), cover m (claimBits IdNamespaceSecurity iss.security_id)]) issued)
+          inputs = BookInputs with states = []; epochs = [ep]; shards = map (at m) prefixes; records = [holder, cls]
+      (r, step) <- timed ("batch " <> show b) (submit env.transfer_agent do
+        exerciseCmd env.cap_table CapTable_Apply with inputs; operations = map (ApplyRecord . OcfRecordDataStockIssuance) issued)
+      pure (mergeShards m prefixes r.shards, fromOptional ep (Map.lookup "CLS" r.epochs), optional first Some (Map.lookup "S-1-1" r.states), step :: acc))
+    (shards1, epoch, None, []) [1 .. cfg.issuances / 250]
+  (states, readStep) <- timed "read stock states" (query @StockSecurity env.transfer_agent)
+  let read = readStep with step = "read " <> show (length states) <> " stock states"
+  (frozen, s1) <- timed "freeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = epoch')
+  let splitInputs = BookInputs with states = []; epochs = [frozen]; shards = [at shards2 (cover shards2 (claimBits IdNamespaceObject "SPLIT-1"))]; records = [cls]
+  (sr, s2) <- timed "split" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with
+      inputs = splitInputs; operations = [ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS" 2.0 1.0 today))])
+  let shards3 = mergeShards shards2 [cover shards2 (claimBits IdNamespaceObject "SPLIT-1")] sr.shards
+  Some splitEpoch <- pure (Map.lookup "CLS" sr.epochs)
+  (thawed, s3) <- timed "unfreeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = splitEpoch)
+  -- The first event after the split applies it to its state.
+  Some st <- pure firstState
+  let acc = StockAcceptanceOcfData with id = "ACC-1"; date = today; security_id = "S-1-1"; comments = []
+      accInputs = BookInputs with states = [st]; epochs = [thawed]; shards = [at shards3 (cover shards3 (claimBits IdNamespaceObject "ACC-1"))]; records = []
+  (ar, s4) <- timed "event applying the split" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with inputs = accInputs; operations = [ApplyRecord (OcfRecordDataStockAcceptance acc)])
+  Some after <- pure (Map.lookup "S-1-1" ar.states)
+  Some s <- queryContractId env.transfer_agent after
+  unless (s.quantity == 20.0) (fail ("the split was not applied: " <> show s.quantity))
+  pure (reverse presplits <> reverse batches <> [read, s1, s2, s3, s4])
+
+claimBits : IdNamespace -> Text -> Text
+claimBits ns id = hashBits (claimHash ns id)
+
+-- The prefix of the active shard covering a hash's bits: active shards partition the hash space.
+cover : ShardMap -> Text -> Text
+cover m bits = case coverFrom m bits 8 of
+  Some p -> p
+  None -> error ("no shard covers " <> bits)
+
+-- The shard with this prefix (Daml is strict: a missing one fails only when looked up).
+at : ShardMap -> Text -> ContractId OcfIdShard
+at m p = case Map.lookup p m of
+  Some cid -> cid
+  None -> error ("no shard " <> p)
+
+coverFrom : ShardMap -> Text -> Int -> Optional Text
+coverFrom m bits n
+  | n > T.length bits = None
+  | Map.member (T.take n bits) m = Some (T.take n bits)
+  | otherwise = coverFrom m bits (n + 1)
+
+-- After a write that read the shards `read`: each one it rewrote or split is replaced by what it created.
+mergeShards : ShardMap -> [Text] -> ShardMap -> ShardMap
+mergeShards m read created =
+  let createdPrefixes = Map.keys created
+      replaced = filter (\p -> any (T.isPrefixOf p) createdPrefixes) read
+  in Map.union created (foldl (flip Map.delete) m replaced)
+
+bitStrings : Int -> [Text]
+bitStrings 0 = [""]
+bitStrings k = concatMap (\s -> [s <> "0", s <> "1"]) (bitStrings (k - 1))
+
+chunks : Int -> [a] -> [[a]]
+chunks _ [] = []
+chunks n xs = take n xs :: chunks n (drop n xs)

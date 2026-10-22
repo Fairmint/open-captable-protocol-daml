@@ -1,0 +1,134 @@
+-- The vesting checks on terminal-event outputs, swept once over sorted tranche changes, agree with the direct per-date definition on generated cases.
+module OpenCapTable.TestVestingChecks where
+
+import DA.Assert ((===))
+import DA.Date (addDays)
+import qualified DA.Date as D
+import DA.List (dedup, sort, sortOn)
+import DA.Optional (optionalToList)
+import Daml.Script
+
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.VestingState
+
+eventDate : Date
+eventDate = D.date 2025 D.Mar 1
+
+-- The definition the checks implement: compare the cumulative amounts at the event date and at
+-- every later tranche date.
+referenceOutputs : Date -> Text -> [StockSecurity] -> [OutputVesting] -> Either Text ()
+referenceOutputs d label sources outputs =
+  let sourceVestedBy t s = case s.vesting of
+        StockVestingTranches ts -> vestedBy t ts
+        StockVestingNone -> s.quantity
+        StockVestingOnTerms _ -> if t <= d then vestedAt s d else s.quantity
+      sourceAt t = sum (map (sourceVestedBy t) sources)
+      outputsAt t = sum (map (outputAt t) outputs)
+      laterDates = filter (> d) (dedup (sort (concatMap trancheDates sources <> concatMap (map (.date) . (.vestings)) outputs
+        <> map (const (addDays d 1)) (filter (isOnTerms . (.vesting)) sources))))
+  in case filter (\t -> outputsAt t > sourceAt t) (d :: laterDates) of
+    [] -> Right ()
+    t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by "
+      <> show t <> ", more than the " <> show (sourceAt t) <> " their source has vested by then")
+
+referenceTransfer : Date -> Text -> StockSecurity -> [OutputVesting] -> Optional OutputVesting -> Either Text ()
+referenceTransfer d label s resulting balance =
+  let outputs = resulting <> optionalToList balance
+      outputsAt t = sum (map (outputAt t) outputs)
+      laterDates = filter (> d) (dedup (sort (trancheDates s <> concatMap (map (.date) . (.vestings)) outputs)))
+  in case filter (\t -> outputsAt t /= vestedAt s t) (d :: laterDates) of
+    [] -> Right ()
+    t :: _ -> Left ("the outputs of " <> label <> " vest " <> show (outputsAt t) <> " shares by " <> show t
+      <> ", but security " <> s.security_id <> " has vested " <> show (vestedAt s t) <> " by then")
+
+outputAt : Date -> OutputVesting -> Decimal
+outputAt t o
+  | not (null o.vestings) = vestedBy t o.vestings
+  | o.on_terms = 0.0
+  | otherwise = o.quantity
+
+trancheDates : StockSecurity -> [Date]
+trancheDates s = case s.vesting of
+  StockVestingTranches ts -> map (.date) ts
+  _ -> []
+
+-- A deterministic generator: a linear congruential sequence.
+next : Int -> Int
+next x = (x * 1103515245 + 12345) % 2147483648
+
+draws : Int -> Int -> [Int]
+draws _ 0 = []
+draws seed n = let x = next seed in x :: draws x (n - 1)
+
+-- Tranches from successive draws: each pair gives a date within 40 days of the event and an amount.
+tranchesOf : [Int] -> [OcfVesting]
+tranchesOf (a :: b :: rest) = (OcfVesting with date = addDays eventDate ((a % 81) - 40); amount = intToDecimal (1 + b % 9)) :: tranchesOf rest
+tranchesOf _ = []
+
+lot : Context -> Int -> Int -> StockSecurity
+lot ctx seed i =
+  let ts = sortOn (.date) (tranchesOf (draws (seed + i) (2 * (seed % 6))))
+      vesting = case (seed + i) % 4 of
+        0 -> StockVestingNone
+        1 -> StockVestingOnTerms "VT"
+        _ -> if null ts then StockVestingNone else StockVestingTranches ts
+      quantity' = trancheTotal ts + intToDecimal ((seed + i) % 3)
+      quantity = if quantity' > 0.0 then quantity' else 5.0
+  in StockSecurity with
+      context = ctx
+      security_id = "S-" <> show i
+      issue_date = addDays eventDate (-100)
+      last_event_date = eventDate
+      origin_transaction_id = "ISS-" <> show i
+      quantity
+      seq = 0
+      split_epoch = 0
+      stakeholder_id = "SH"
+      stock_class_id = "CLS"
+      vesting
+      holds = []
+      delivery = None
+      snapshot = if isOnTerms vesting then Some VestedSnapshot with as_of = eventDate; vested = min quantity (intToDecimal (seed % 4)) else None
+      accelerated_since_snapshot = None
+      derived_ids = False
+
+outputOf : Int -> Int -> OutputVesting
+outputOf seed i =
+  let ts = tranchesOf (draws (seed * 7 + i) (2 * ((seed + i) % 5)))
+  in OutputVesting with
+      quantity = trancheTotal ts + intToDecimal ((seed + i) % 2)
+      vestings = ts
+      on_terms = null ts && (seed + i) % 3 == 0
+
+test_vesting_checks_match_their_definition : Script ()
+test_vesting_checks_match_their_definition = do
+  i <- allocateParty "I"
+  s <- allocateParty "S"
+  t <- allocateParty "T"
+  let ctx = Context with cap_table_id = "test-1"; issuer = i; system_operator = s; transfer_agent = t
+      cases = [1 .. 300]
+      sourcesOf seed = map (lot ctx seed) [1 .. 1 + seed % 3]
+      outputsOf seed = map (outputOf seed) [1 .. 1 + seed % 4]
+      outputsAgree = map (\seed ->
+        checkOutputsVesting eventDate "event" (sourcesOf seed) (outputsOf seed)
+          == referenceOutputs eventDate "event" (sourcesOf seed) (outputsOf seed)) cases
+      transfersAgree = map (\seed ->
+        let src = lot ctx seed 0
+            outs = outputsOf seed
+            (resulting, balance) = case outs of
+              b :: r :: rest -> (r :: rest, Some b)
+              _ -> (outs, None)
+        in case src.vesting of
+          StockVestingOnTerms _ -> True
+          _ -> any (.on_terms) outs
+            || checkTransferVesting eventDate "transfer" src resulting balance
+              == referenceTransfer eventDate "transfer" src resulting balance) cases
+  -- Every generated state is one the ledger could hold.
+  all (\seed -> all validateStockSecurity (sourcesOf seed <> [lot ctx seed 0])) cases === True
+  filter not outputsAgree === []
+  filter not transfersAgree === []
+  -- The cases exercise both outcomes.
+  assertMsg "some outputs check passes" (any (\seed -> checkOutputsVesting eventDate "event" (sourcesOf seed) (outputsOf seed) == Right ()) cases)
+  assertMsg "some outputs check fails" (any (\seed -> checkOutputsVesting eventDate "event" (sourcesOf seed) (outputsOf seed) /= Right ()) cases)

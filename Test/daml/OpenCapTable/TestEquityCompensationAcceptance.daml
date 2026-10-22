@@ -1,82 +1,91 @@
+-- Equity compensation acceptances, ported from v34's TestEquityCompensationAcceptance: the record as written and restated, its validator, and its security reference (an equity compensation grant, checked when written).
 module OpenCapTable.TestEquityCompensationAcceptance where
 
-import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
-import Fairmint.OpenCapTable.OCF.EquityCompensationAcceptance
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import qualified DA.Date as D
 import Daml.Script
 
-createEquityCompensationIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
-        id = "TX_EC_ISS_1"
-        date = DT.time (DA.date 2024 Feb 01) 0 0 0
-        security_id = "SEC-OPTION-1"
-        custom_id = "OPT-001"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = Some "Services rendered"
-        security_law_exemptions = []
-        stock_plan_id = None
-        stock_class_id = None
-        compensation_type = OcfCompensationTypeOptionISO
-        quantity = 10000.0
-        exercise_price = Some (OcfMonetary with amount = 0.50, currency = "USD")
-        base_price = None
-        vesting_terms_id = None
-        vestings = []
-        expiration_date = None
-        termination_exercise_windows = []
-        early_exercisable = None
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.EquityCompensationAcceptance
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
 
-createEquityCompensationAcceptance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationAcceptance EquityCompensationAcceptanceOcfData with
-        id = "TX_EC_ACCEPT_1"
-        date = DT.time (DA.date 2024 Feb 02) 0 0 0
-        security_id = "SEC-OPTION-1"
-        comments = []]
-      edits = []
-      deletes = []
+valid : EquityCompensationAcceptanceOcfData -> Bool
+valid = validateEquityCompensationAcceptanceOcfData
 
-testEquityCompensationAcceptance_CreateAndArchiveByIssuer = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createEquityCompensationIssuance issuer capTableCid
-  _ <- createEquityCompensationAcceptance issuer result.updatedCapTableCid
-  pure ()
+wrap : EquityCompensationAcceptanceOcfData -> OcfRecordData
+wrap = OcfRecordDataEquityCompensationAcceptance
 
-testEquityCompensationAcceptance_CreateAndArchiveBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createEquityCompensationIssuance issuer capTableCid
-  _ <- createEquityCompensationAcceptance issuer result.updatedCapTableCid
-  pure ()
+acceptance : Text -> Text -> EquityCompensationAcceptanceOcfData
+acceptance id sec = EquityCompensationAcceptanceOcfData with
+  id
+  date = D.date 2024 D.Feb 2
+  security_id = sec
+  comments = []
 
--- Test with comments (non-empty array)
-testEquityCompensationAcceptance_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createEquityCompensationIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationAcceptance EquityCompensationAcceptanceOcfData with
-        id = "TX_EC_ACCEPT_2"
-        date = DT.time (DA.date 2024 Feb 03) 0 0 0
-        security_id = "SEC-OPTION-1"
-        comments = ["Employee signed option agreement", "Grant notice acknowledged"]]
-      edits = []
-      deletes = []
-  pure ()
+-- | A book with Alice's ISO grant SEC-OPTION-1 over 10,000 shares at 0.50 USD.
+grantBook : Script Env
+grantBook = ecBookWith [ecRecord ((option "SEC-OPTION-1" "SH-A" 10000.0) with exercise_price = Some (usd 0.5); consideration_text = Some "Services rendered")]
+
+test_ec_acceptance_writes_record : Script ()
+test_ec_acceptance_writes_record = do
+  env <- grantBook
+  accept env valid wrap (acceptance "TX_EC_ACCEPT_1" "SEC-OPTION-1")
+  -- Acceptance touches no stock state; the grant is unchanged.
+  statesOf env >>= assertMsg "no stock state" . null
+  accept env valid wrap ((acceptance "TX_EC_ACCEPT_2" "SEC-OPTION-1") with
+    date = D.date 2024 D.Feb 3
+    comments = ["Employee signed option agreement", "Grant notice acknowledged"])
+
+test_ec_acceptance_with_grant_in_same_batch : Script ()
+test_ec_acceptance_with_grant_in_same_batch = do
+  env <- ecBook
+  let a = acceptance "TX_EC_ACCEPT_1" "EC-NEW"
+  -- The acceptance comes first: its reference is checked after the batch's last operation.
+  _ <- applyRecords env [wrap a, ecRecord (option "EC-NEW" "SH-A" 100.0)]
+  expectRecord env (wrap a)
+
+test_ec_acceptance_security_reference : Script ()
+test_ec_acceptance_security_reference = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance (warrant "W-1" "SH-A")]
+  applyRecordsFails env "Equity compensation acceptance security not found: EC-MISSING" [wrap (acceptance "ACC-1" "EC-MISSING")]
+  -- The security must be a grant, not a stock security or a warrant.
+  applyRecordsFails env "Equity compensation acceptance security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [wrap (acceptance "ACC-1" "S-A1")]
+  applyRecordsFails env "Equity compensation acceptance security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [wrap (acceptance "ACC-1" "W-1")]
+  -- An object ID is not a security ID.
+  _ <- applyRecords env [ecRecord (option "EC-1" "SH-A" 100.0)]
+  applyRecordsFails env "security not found: ECI-EC-1" [wrap (acceptance "ACC-1" "ECI-EC-1")]
+  expectNoRecord env "ACC-1"
+
+test_ec_acceptance_validation : Script ()
+test_ec_acceptance_validation = do
+  env <- grantBook
+  let a = acceptance "ACC-V" "SEC-OPTION-1"
+  refuseWith env "an empty ID cannot be claimed" valid wrap (a with id = "")
+  refuse env valid wrap (a with security_id = "")
+  refuse env valid wrap (a with comments = [""])
+  refuse env valid wrap (a with comments = ["ok", ""])
+
+test_ec_acceptance_ids_unique : Script ()
+test_ec_acceptance_ids_unique = do
+  env <- grantBook
+  _ <- applyRecords env [wrap (acceptance "ACC-1" "SEC-OPTION-1")]
+  applyRecordsFails env "ID already used: ACC-1" [wrap ((acceptance "ACC-1" "SEC-OPTION-1") with date = D.date 2024 D.Mar 1)]
+  -- Object IDs are unique across types.
+  applyRecordsFails env "ID already used: SH-A" [wrap (acceptance "SH-A" "SEC-OPTION-1")]
+  applyRecordsFails env "ID already used: ECI-SEC-OPTION-1" [wrap (acceptance "ECI-SEC-OPTION-1" "SEC-OPTION-1")]
+
+test_ec_acceptance_restate : Script ()
+test_ec_acceptance_restate = do
+  env <- grantBook
+  let a = acceptance "ACC-1" "SEC-OPTION-1"
+  _ <- applyRecords env [wrap a]
+  restateOpsFails env "changes nothing" [RestateEdit (wrap a)]
+  let a' = a with comments = ["Countersigned"]
+  _ <- restateOps env [RestateEdit (wrap a')]
+  expectRecord env (wrap a')
+  -- An edit that moves the acceptance to a missing security is refused.
+  restateOpsFails env "Equity compensation acceptance security not found: EC-X" [RestateEdit (wrap (a' with security_id = "EC-X"))]
+  _ <- restateOps env [RestateDelete "ACC-1"]
+  expectNoRecord env "ACC-1"

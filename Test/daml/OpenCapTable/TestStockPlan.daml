@@ -1,67 +1,231 @@
+-- Stock plans and their plan-level records, ported from v34's TestStockPlan, TestStockPlanPoolAdjustment, TestStockPlanReturnToPool and TestStockPlanReferences: writes, edits and deletes, every validator branch, the classes-per-plan cap, and the references to plans and classes.
 module OpenCapTable.TestStockPlan where
-import Fairmint.OpenCapTable.OCF.StockPlan
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.OCF.VestingTerms
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStockClass)
-import Daml.Script
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
 
-testCreatePlanWithVestingTerms = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add stock class that the plan will reference
-  capTableCid <- addDefaultStockClass issuer cap_table
-  -- Add vesting terms
-  let vtCond = OcfVestingCondition with
-        id = "start"
-        description = Some "All at start"
-        portion = None
-        quantity = Some 1000.0
-        trigger = OcfVestingStartTrigger
-        next_condition_ids = []
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingTerms VestingTermsOcfData with
+import qualified DA.Date as D
+import DA.Foldable (mapA_)
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.StockPlan
+import Fairmint.OpenCapTable.OCF.StockPlanPoolAdjustment
+import Fairmint.OpenCapTable.OCF.StockPlanReturnToPool
+import Fairmint.OpenCapTable.OCF.VestingTerms
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+poolAdjustment : Text -> Text -> Decimal -> StockPlanPoolAdjustmentOcfData
+poolAdjustment id plan shares = StockPlanPoolAdjustmentOcfData with
+  id
+  date = D.date 2024 D.Jan 1
+  shares_reserved = shares
+  stock_plan_id = plan
+  comments = []
+  board_approval_date = None
+  stockholder_approval_date = None
+
+returnToPool : Text -> Text -> Text -> Decimal -> StockPlanReturnToPoolOcfData
+returnToPool id plan sec q = StockPlanReturnToPoolOcfData with
+  id
+  date = D.date 2024 D.Jun 30
+  quantity = q
+  reason_text = "Employee termination - unvested options returned to pool"
+  security_id = sec
+  stock_plan_id = plan
+  comments = []
+
+-- | Class SC_COMMON, plan PLAN_1 over it, and stakeholder SH-1.
+planRecords : [OcfRecordData]
+planRecords =
+  [ OcfRecordDataStockClass (stockClass "SC_COMMON")
+  , OcfRecordDataStockPlan (stockPlan "PLAN_1" ["SC_COMMON"])
+  , OcfRecordDataStakeholder (stakeholderData "SH-1")
+  ]
+
+-- =============================================================================
+-- STOCK PLAN
+-- =============================================================================
+
+-- v34 testCreatePlanWithVestingTerms.
+test_stock_plan_create_edit_delete : Script ()
+test_stock_plan_create_edit_delete = do
+  env <- setupEnv
+  let terms = VestingTermsOcfData with
         id = "VT_PLAN"
         name = "Standard 1k at start"
         description = "All at start"
-        allocation_type = OcfAllocationCumulativeRounding
-        vesting_conditions = [vtCond]
-        comments = []]
-      edits = []
-      deletes = []
-  -- Create stock plan
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockPlan StockPlanOcfData with
-        id = "PLAN_2025"
-        plan_name = "2025 Equity Incentive Plan"
-        board_approval_date = None
-        stockholder_approval_date = None
-        initial_shares_reserved = 1_000_000.0
-        default_cancellation_behavior = None
-        stock_class_ids = ["SC_COMMON"]
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+        allocation_type = OcfAllocationTypeCumulativeRounding
+        comments = []
+        vesting_conditions =
+          [ OcfVestingCondition with
+              id = "start"; trigger = OcfVestingStartTrigger; next_condition_ids = []
+              description = Some "All at start"; portion = None; quantity = Some 1000.0
+          ]
+      plan = (stockPlan "PLAN_2025" ["SC_COMMON"]) with plan_name = "2025 Equity Incentive Plan"
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "SC_COMMON"), OcfRecordDataVestingTerms terms]
+  _ <- applyRecords env [OcfRecordDataStockPlan plan]
+  expectRecords env [OcfRecordDataStockPlan plan, OcfRecordDataVestingTerms terms]
+  let edited = plan with initial_shares_reserved = 1500000.0; comments = ["Pool increased"]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockPlan edited)]
+  expectRecord env (OcfRecordDataStockPlan edited)
+  _ <- restateOps env [RestateDelete "PLAN_2025"]
+  expectNoRecord env "PLAN_2025"
 
-testStockPlan_OptionalsSome = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStockClass issuer cap_table
-  _ <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockPlan StockPlanOcfData with
-        id = "PLAN_2027"
+-- v34 testStockPlan_OptionalsSome, with every cancellation behavior.
+test_stock_plan_all_optional_fields : Script ()
+test_stock_plan_all_optional_fields = do
+  env <- bookWith planRecords
+  let ok = accept env validateStockPlanOcfData OcfRecordDataStockPlan
+      full = (stockPlan "PLAN_2027" ["SC_COMMON"]) with
         plan_name = "2027 Equity Incentive Plan"
-        board_approval_date = Some (DT.time (DA.date 2027 Jan 1) 0 0 0)
-        stockholder_approval_date = Some (DT.time (DA.date 2027 Jan 15) 0 0 0)
-        initial_shares_reserved = 600_000.0
-        default_cancellation_behavior = Some OcfPlanCancelReturnToPool
-        stock_class_ids = ["SC_COMMON"]
-        comments = ["Approved"]]
-      edits = []
-      deletes = []
-  pure ()
+        board_approval_date = Some (D.date 2027 D.Jan 1)
+        stockholder_approval_date = Some (D.date 2027 D.Jan 15)
+        initial_shares_reserved = 600000.0
+        default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeReturnToPool
+        comments = ["Approved"]
+  ok full
+  ok full with id = "PLAN_RETIRE"; default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeRetire
+  ok full with id = "PLAN_HOLD"; default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeHoldAsCapitalStock
+  ok full with id = "PLAN_PER_SECURITY"; default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeDefinedPerPlanSecurity
+  ok (stockPlan "PLAN_EMPTY_POOL" ["SC_COMMON"]) with initial_shares_reserved = 0.0
+
+test_stock_plan_validation : Script ()
+test_stock_plan_validation = do
+  env <- bookWith planRecords
+  let no = refuse env validateStockPlanOcfData OcfRecordDataStockPlan
+      base = stockPlan "PLAN_BAD" ["SC_COMMON"]
+  no base with initial_shares_reserved = -1.0
+  no base with plan_name = ""
+  -- OCF minItems 1, and no empty class ID.
+  no base with stock_class_ids = []
+  no base with stock_class_ids = ["SC_COMMON", ""]
+  no base with comments = [""]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockPlan (base with id = "")]
+
+-- The register caps a plan at 16 classes (a policy cap on every write, not OCF validity).
+test_stock_plan_class_cap : Script ()
+test_stock_plan_class_cap = do
+  env <- setupEnv
+  let classes = map (\i -> "SC_" <> show i) [1 .. 17]
+  _ <- applyRecords env (map (OcfRecordDataStockClass . stockClass) classes)
+  let sixteen = stockPlan "PLAN_16" (take 16 classes)
+      seventeen = stockPlan "PLAN_17" classes
+  assertMsg "the validator refused 17 classes" (validateStockPlanOcfData seventeen)
+  applyRecordsFails env "has 17 stock plan classes; at most 16" [OcfRecordDataStockPlan seventeen]
+  _ <- applyRecords env [OcfRecordDataStockPlan sixteen]
+  expectRecord env (OcfRecordDataStockPlan sixteen)
+  -- An edit is capped too.
+  restateOpsFails env "has 17 stock plan classes; at most 16" [RestateEdit (OcfRecordDataStockPlan (seventeen with id = "PLAN_16"))]
+
+-- v34 testStockPlan_MissingStockClassReferenceFails, _StockClassCreatedInSameBatchSucceeds,
+-- _EditMissingStockClassReferenceFails and _EditStockClassCreatedInSameBatchSucceeds.
+test_stock_plan_class_references : Script ()
+test_stock_plan_class_references = do
+  env <- bookWith planRecords
+  applyRecordsFails env "Stock plan PLAN_MISSING_CLASS stock class not found: SC_MISSING"
+    [OcfRecordDataStockPlan (stockPlan "PLAN_MISSING_CLASS" ["SC_MISSING"])]
+  applyRecordsFails env "Stock plan PLAN_SH stock class SH-1 is a OcfObjectTypeStakeholder"
+    [OcfRecordDataStockPlan (stockPlan "PLAN_SH" ["SC_COMMON", "SH-1"])]
+  -- Every class is checked.
+  applyRecordsFails env "Stock plan PLAN_TWO stock class not found: SC_SECOND"
+    [OcfRecordDataStockPlan (stockPlan "PLAN_TWO" ["SC_COMMON", "SC_SECOND"])]
+  -- The class may come later in the same batch.
+  _ <- applyRecords env [OcfRecordDataStockPlan (stockPlan "PLAN_VALID" ["SC_VALID"]), OcfRecordDataStockClass (stockClass "SC_VALID")]
+  expectRecord env (OcfRecordDataStockPlan (stockPlan "PLAN_VALID" ["SC_VALID"]))
+  -- An edit's new class is checked: missing refused; one written since (v34 wrote it in the edit's
+  -- own batch, which v35 splits across CapTable_Apply and CapTable_Restate) accepted.
+  restateOpsFails env "Stock plan PLAN_1 stock class not found: SC_MISSING_ON_EDIT"
+    [RestateEdit (OcfRecordDataStockPlan (stockPlan "PLAN_1" ["SC_MISSING_ON_EDIT"]))]
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "SC_EDIT_BATCH")]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockPlan (stockPlan "PLAN_1" ["SC_COMMON", "SC_EDIT_BATCH"]))]
+  expectRecord env (OcfRecordDataStockPlan (stockPlan "PLAN_1" ["SC_COMMON", "SC_EDIT_BATCH"]))
+
+-- =============================================================================
+-- POOL ADJUSTMENT
+-- =============================================================================
+
+-- v34 testCreateStockPlanPoolAdjustment and testStockPlanPoolAdjustment_OptionalsSome.
+test_stock_plan_pool_adjustment : Script ()
+test_stock_plan_pool_adjustment = do
+  env <- bookWith planRecords
+  let ok = accept env validateStockPlanPoolAdjustmentOcfData OcfRecordDataStockPlanPoolAdjustment
+      plain = poolAdjustment "TX_STOCK_PLAN_POOL_ADJ_1" "PLAN_1" 1500.0
+      full = (poolAdjustment "TX_STOCK_PLAN_POOL_ADJ_2" "PLAN_1" 1750.0) with
+        date = D.date 2024 D.Jan 2
+        board_approval_date = Some (D.date 2024 D.Jan 3)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 4)
+        comments = ["Top up"]
+  ok plain
+  ok full
+  ok (poolAdjustment "TX_STOCK_PLAN_POOL_ADJ_0" "PLAN_1" 0.0)
+  let edited = plain with shares_reserved = 1600.0
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockPlanPoolAdjustment edited), RestateDelete "TX_STOCK_PLAN_POOL_ADJ_2"]
+  expectRecord env (OcfRecordDataStockPlanPoolAdjustment edited)
+  expectNoRecord env "TX_STOCK_PLAN_POOL_ADJ_2"
+
+test_stock_plan_pool_adjustment_validation_and_reference : Script ()
+test_stock_plan_pool_adjustment_validation_and_reference = do
+  env <- bookWith planRecords
+  let no = refuse env validateStockPlanPoolAdjustmentOcfData OcfRecordDataStockPlanPoolAdjustment
+      base = poolAdjustment "TX_POOL_BAD" "PLAN_1" 100.0
+      write = OcfRecordDataStockPlanPoolAdjustment
+  no base with shares_reserved = -1.0
+  no base with stock_plan_id = ""
+  no base with comments = [""]
+  applyRecordsFails env "Stock plan pool adjustment not found: PLAN_NONE" [write (base with stock_plan_id = "PLAN_NONE")]
+  applyRecordsFails env "Stock plan pool adjustment SC_COMMON is a OcfObjectTypeStockClass" [write (base with stock_plan_id = "SC_COMMON")]
+  _ <- applyRecords env [write (base with stock_plan_id = "PLAN_LATER"), OcfRecordDataStockPlan (stockPlan "PLAN_LATER" ["SC_COMMON"])]
+  expectRecord env (write (base with stock_plan_id = "PLAN_LATER"))
+  restateOpsFails env "Stock plan pool adjustment not found: PLAN_NONE" [RestateEdit (write (base with stock_plan_id = "PLAN_NONE"))]
+
+-- =============================================================================
+-- RETURN TO POOL
+-- =============================================================================
+
+-- v34 testCreateAndArchiveStockPlanReturnToPool (termination) and ...Expiration.
+test_stock_plan_return_to_pool : Script ()
+test_stock_plan_return_to_pool = do
+  env <- setupEnv
+  let plan2021 = (stockPlan "PLAN_2021" ["SC_COMMON"]) with
+        board_approval_date = Some (D.date 2021 D.Jan 1)
+        default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeReturnToPool
+      plan2015 = (stockPlan "PLAN_2015" ["SC_COMMON"]) with
+        initial_shares_reserved = 500000.0
+        board_approval_date = Some (D.date 2015 D.Mar 15)
+        stockholder_approval_date = Some (D.date 2015 D.Apr 1)
+        default_cancellation_behavior = Some OcfStockPlanCancellationBehaviorTypeReturnToPool
+      termination = (returnToPool "TX_RETURN_TO_POOL_1" "PLAN_2021" "SEC_OPT_001" 25000.0) with
+        comments = ["Employee B voluntary resignation effective June 30, 2024"]
+      expiration = (returnToPool "TX_RETURN_TO_POOL_2" "PLAN_2015" "SEC_OPT_002" 10000.0) with
+        date = D.date 2025 D.Mar 15
+        reason_text = "Options expired unexercised after 10-year term"
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "SC_COMMON"), OcfRecordDataStockPlan plan2021, OcfRecordDataStockPlan plan2015]
+  -- The security is not a reference v35 checks (v34 did not either): the options need not be in the book.
+  mapA_ (accept env validateStockPlanReturnToPoolOcfData OcfRecordDataStockPlanReturnToPool) [termination, expiration]
+  let edited = termination with quantity = 20000.0
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockPlanReturnToPool edited), RestateDelete "TX_RETURN_TO_POOL_2"]
+  expectRecord env (OcfRecordDataStockPlanReturnToPool edited)
+  expectNoRecord env "TX_RETURN_TO_POOL_2"
+
+test_stock_plan_return_to_pool_validation_and_reference : Script ()
+test_stock_plan_return_to_pool_validation_and_reference = do
+  env <- bookWith planRecords
+  let no = refuse env validateStockPlanReturnToPoolOcfData OcfRecordDataStockPlanReturnToPool
+      base = returnToPool "TX_RTP_BAD" "PLAN_1" "SEC_OPT_001" 10.0
+      write = OcfRecordDataStockPlanReturnToPool
+  no base with quantity = 0.0
+  no base with quantity = -1.0
+  no base with reason_text = ""
+  no base with security_id = ""
+  no base with stock_plan_id = ""
+  no base with comments = [""]
+  applyRecordsFails env "Stock plan return to pool not found: PLAN_NONE" [write (base with stock_plan_id = "PLAN_NONE")]
+  applyRecordsFails env "Stock plan return to pool SH-1 is a OcfObjectTypeStakeholder" [write (base with stock_plan_id = "SH-1")]
+  restateOpsFails env "record TX_RTP_BAD is not in this write" [RestateEdit (write base)]
+  _ <- applyRecords env [write base]
+  restateOpsFails env "Stock plan return to pool not found: PLAN_NONE" [RestateEdit (write (base with stock_plan_id = "PLAN_NONE"))]
+  expectRecord env (write base)

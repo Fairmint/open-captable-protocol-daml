@@ -1,125 +1,151 @@
+-- Convertible transfers through CapTable_Apply and CapTable_Restate: SAFE and note assignments, whole and partial, into convertibles issued in the same batch, their security references, the transfer validator and the shared edit and delete rules.
 module OpenCapTable.TestConvertibleTransfer where
 
-import Fairmint.OpenCapTable.OCF.ConvertibleIssuance
-import Fairmint.OpenCapTable.OCF.ConvertibleTransfer
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Conversion (OcfConvertibleType(..))
-import OpenCapTable.HelpersTriggers (ocfConvTriggerAutomaticOnDate)
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, convertibleSuccessorIssuance)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create a convertible issuance to transfer (follows real workflow)
-createConvertibleIssuance issuer capTableCid securityId amount issuanceDate =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
-        id = "TX_CONVERTIBLE_ISS_" <> securityId
-        date = issuanceDate
-        security_id = securityId
-        custom_id = "SAFE-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = Some "Cash investment"
-        security_law_exemptions = []
-        convertible_type = OcfConvertibleSafe
-        investment_amount = OcfMonetary with amount = amount, currency = "USD"
-        seniority = 1
-        pro_rata = None
-        conversion_triggers = [(ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Dec 31) 0 0 0))]
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Conversion (OcfConvertibleType(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleTransfer (ConvertibleTransferOcfData(..), validateConvertibleTransferOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
 
--- Test: SAFE assignment between investors
--- Based on prod: $100,000 SAFE transferred between investors
-testConvertibleTransfer_SAFEAssignment = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "CSEC-SAFE-001"
-  result <- createConvertibleIssuance issuer capTableCid securityId 100000.0 (DT.time (DA.date 2024 Mar 01) 0 0 0)
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [convertibleSuccessorIssuance "CV-ISS-SAFE-ASSIGNED-001" "CSEC-SAFE-ASSIGNED-001" "SH-1" (DT.time (DA.date 2025 Sep 08) 0 0 0) 100000.0
-        , CT.OcfCreateConvertibleTransfer ConvertibleTransferOcfData with
-        id = "TX_CONVERTIBLE_TRANSFER_1"
-        date = DT.time (DA.date 2025 Sep 08) 0 0 0
-        amount = OcfMonetary with amount = 100000.0, currency = "USD"
-        security_id = securityId
-        resulting_security_ids = ["CSEC-SAFE-ASSIGNED-001"]
+transferDate : Date
+transferDate = D.date 2025 D.Sep 8
+
+transfer : Text -> Text -> Decimal -> [Text] -> ConvertibleTransferOcfData
+transfer id sec amount resulting = ConvertibleTransferOcfData with
+  id
+  amount = usd amount
+  date = transferDate
+  security_id = sec
+  comments = []
+  resulting_security_ids = resulting
+  balance_security_id = None
+  consideration_text = None
+
+ct : ConvertibleTransferOcfData -> OcfRecordData
+ct = OcfRecordDataConvertibleTransfer
+
+-- | A SAFE issued to `sh` on `d` for `amount` USD.
+convertibleOut : Text -> Text -> Date -> Decimal -> OcfRecordData
+convertibleOut sec sh d amount =
+  OcfRecordDataConvertibleIssuance ((convertibleIssuance ("CI-" <> sec) sec sh) with date = d; investment_amount = usd amount)
+
+-- | A SAFE of `amount` USD issued to SH-A on 2024-03-01, converting automatically on 2025-12-31.
+safeSource : Text -> Text -> Decimal -> ConvertibleIssuanceOcfData
+safeSource id sec amount = (convertibleIssuance id sec "SH-A") with
+  date = D.date 2024 D.Mar 1
+  investment_amount = usd amount
+  consideration_text = Some "Cash investment"
+  conversion_triggers = [autoOnDateConvertibleTrigger (D.date 2025 D.Dec 31)]
+
+test_convertible_transfer_safe_assignment : Script ()
+test_convertible_transfer_safe_assignment = do
+  env <- standardBook
+  let src = safeSource "TX_CONVERTIBLE_ISS_CSEC-SAFE-001" "CSEC-SAFE-001" 100000.0
+      out = convertibleOut "CSEC-SAFE-ASSIGNED-001" "SH-B" transferDate 100000.0
+      t = (transfer "TX_CONVERTIBLE_TRANSFER_1" "CSEC-SAFE-001" 100000.0 ["CSEC-SAFE-ASSIGNED-001"]) with
         comments = ["Assignor: ABC Holdings Ltd", "Assignee: New Investor LLC", "Company: Example Corp"]
-        balance_security_id = None
-        consideration_text = Some "Assignment Price: USD 100,000 per Assignment Agreement between ABC Holdings Ltd and New Investor LLC."]
-      edits = []
-      deletes = []
-  pure ()
+        consideration_text = Some "Assignment Price: USD 100,000 per Assignment Agreement between ABC Holdings Ltd and New Investor LLC."
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance src]
+  _ <- applyRecords env [out, ct t]
+  expectRecord env (ct t)
+  expectRecord env out
+  viewSecurityIds env "TX_CONVERTIBLE_TRANSFER_1" >>= (=== ["CSEC-SAFE-001", "CSEC-SAFE-ASSIGNED-001"])
+  -- The transferred convertible's issuance record stays.
+  expectRecord env (OcfRecordDataConvertibleIssuance src)
+  applyRecordsFails env "ID already used: TX_CONVERTIBLE_TRANSFER_1" [OcfRecordDataStakeholder (stakeholderData "TX_CONVERTIBLE_TRANSFER_1")]
 
--- Test: Partial SAFE transfer with balance
-testConvertibleTransfer_PartialSAFE = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "CSEC-SAFE-PARTIAL"
-  result <- createConvertibleIssuance issuer capTableCid securityId 500000.0 (DT.time (DA.date 2024 Mar 01) 0 0 0)
-  balanceResult <- createConvertibleIssuance issuer result.updatedCapTableCid "CSEC-SAFE-RETAINED" 300000.0 (DT.time (DA.date 2025 Oct 15) 0 0 0)
-  _ <- submit issuer do
-    exerciseCmd balanceResult.updatedCapTableCid CT.UpdateCapTable with
-      creates = [convertibleSuccessorIssuance "CV-ISS-SAFE-SPLIT-001" "CSEC-SAFE-SPLIT-001" "SH-1" (DT.time (DA.date 2025 Oct 15) 0 0 0) 200000.0
-        , CT.OcfCreateConvertibleTransfer ConvertibleTransferOcfData with
-        id = "TX_CONVERTIBLE_TRANSFER_PARTIAL"
-        date = DT.time (DA.date 2025 Oct 15) 0 0 0
-        amount = OcfMonetary with amount = 200000.0, currency = "USD"
-        security_id = securityId
-        resulting_security_ids = ["CSEC-SAFE-SPLIT-001"]
+test_convertible_transfer_partial_safe : Script ()
+test_convertible_transfer_partial_safe = do
+  env <- standardBook
+  let d = D.date 2025 D.Oct 15
+      t = (transfer "TX_CONVERTIBLE_TRANSFER_PARTIAL" "CSEC-SAFE-PARTIAL" 200000.0 ["CSEC-SAFE-SPLIT-001"]) with
+        date = d
         comments = ["Partial assignment of SAFE investment", "Original investment: $500,000", "Transferred: $200,000", "Retained: $300,000"]
         balance_security_id = Some "CSEC-SAFE-RETAINED"
-        consideration_text = Some "Partial assignment at face value."]
-      edits = []
-      deletes = []
-  pure ()
+        consideration_text = Some "Partial assignment at face value."
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance (safeSource "TX_CONVERTIBLE_ISS_PARTIAL" "CSEC-SAFE-PARTIAL" 500000.0)]
+  -- The transfer may come before the convertibles it names in the batch.
+  _ <- applyRecords env
+    [ ct t
+    , convertibleOut "CSEC-SAFE-SPLIT-001" "SH-B" d 200000.0
+    , convertibleOut "CSEC-SAFE-RETAINED" "SH-A" d 300000.0
+    ]
+  expectRecord env (ct t)
+  viewSecurityIds env "TX_CONVERTIBLE_TRANSFER_PARTIAL" >>= (=== ["CSEC-SAFE-PARTIAL", "CSEC-SAFE-SPLIT-001", "CSEC-SAFE-RETAINED"])
 
--- Test: Convertible note transfer with full assignment
-testConvertibleTransfer_NoteFullAssignment = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "CSEC-NOTE-001"
-  -- Create a convertible note issuance
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
-        id = "TX_NOTE_ISS_1"
-        date = DT.time (DA.date 2023 Jun 15) 0 0 0
-        security_id = securityId
+test_convertible_transfer_note_full_assignment : Script ()
+test_convertible_transfer_note_full_assignment = do
+  env <- standardBook
+  let d = D.date 2025 D.Dec 1
+      note = (safeSource "TX_NOTE_ISS_1" "CSEC-NOTE-001" 250000.0) with
+        date = D.date 2023 D.Jun 15
         custom_id = "NOTE-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
+        convertible_type = OcfConvertibleTypeNote
         consideration_text = Some "Convertible note investment"
-        security_law_exemptions = []
-        convertible_type = OcfConvertibleNote
-        investment_amount = OcfMonetary with amount = 250000.0, currency = "USD"
-        seniority = 1
-        pro_rata = None
-        conversion_triggers = [(ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Jun 15) 0 0 0))]
-        comments = []]
-      edits = []
-      deletes = []
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [convertibleSuccessorIssuance "CV-ISS-NOTE-ASSIGNED" "CSEC-NOTE-ASSIGNED" "SH-1" (DT.time (DA.date 2025 Dec 01) 0 0 0) 250000.0
-        , CT.OcfCreateConvertibleTransfer ConvertibleTransferOcfData with
-        id = "TX_NOTE_TRANSFER_1"
-        date = DT.time (DA.date 2025 Dec 01) 0 0 0
-        amount = OcfMonetary with amount = 250000.0, currency = "USD"
-        security_id = securityId
-        resulting_security_ids = ["CSEC-NOTE-ASSIGNED"]
+        conversion_triggers = [autoOnDateConvertibleTrigger (D.date 2025 D.Jun 15)]
+      out = OcfRecordDataConvertibleIssuance ((convertibleIssuance "CV-ISS-NOTE-ASSIGNED" "CSEC-NOTE-ASSIGNED" "SH-B") with
+        date = d; convertible_type = OcfConvertibleTypeNote; investment_amount = usd 250000.0)
+      t = (transfer "TX_NOTE_TRANSFER_1" "CSEC-NOTE-001" 250000.0 ["CSEC-NOTE-ASSIGNED"]) with
+        date = d
         comments = ["Full assignment of convertible note"]
-        balance_security_id = None
-        consideration_text = Some "Note assigned at principal amount plus accrued interest."]
-      edits = []
-      deletes = []
-  pure ()
+        consideration_text = Some "Note assigned at principal amount plus accrued interest."
+  _ <- applyRecords env [OcfRecordDataConvertibleIssuance note]
+  _ <- applyRecords env [out, ct t]
+  expectRecord env (ct t)
+  expectRecord env out
+  expectRecord env (OcfRecordDataConvertibleIssuance note)
+
+test_convertible_transfer_security_references : Script ()
+test_convertible_transfer_security_references = do
+  env <- instrumentBook
+  let t = transfer "CT-1" "C-1" 100000.0 ["C-OUT"]
+      out = convertibleOut "C-OUT" "SH-B" transferDate 100000.0
+  applyRecordsFails env "Convertible transfer security not found: C-NONE" [out, ct t with security_id = "C-NONE"]
+  applyRecordsFails env "Convertible transfer security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [out, ct t with security_id = "W-1"]
+  applyRecordsFails env "Convertible transfer security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [out, ct t with security_id = "S-A1"]
+  -- The resulting and balance securities must be convertibles.
+  applyRecordsFails env "Convertible transfer resulting security security not found: C-OUT" [ct t]
+  applyRecordsFails env "Convertible transfer resulting security security W-1 is carried by a OcfObjectTypeTxWarrantIssuance"
+    [ct t with resulting_security_ids = ["W-1"]]
+  applyRecordsFails env "Convertible transfer resulting security security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [out, ct t with resulting_security_ids = ["C-OUT", "S-A1"]]
+  applyRecordsFails env "Convertible transfer balance security not found: C-REST" [out, ct t with balance_security_id = Some "C-REST"]
+  applyRecordsFails env "Convertible transfer balance security S-A2 is carried by a OcfObjectTypeTxStockIssuance"
+    [out, ct t with balance_security_id = Some "S-A2"]
+
+test_convertible_transfer_validator : Script ()
+test_convertible_transfer_validator = do
+  env <- instrumentBook
+  let base = transfer "CT-V" "C-1" 100000.0 ["C-OUT"]
+      rejects : Text -> Text -> ConvertibleTransferOcfData -> Script ()
+      rejects label expected t = do
+        expectInvalid label (validateConvertibleTransferOcfData t)
+        applyRecordsFails env expected [ct t]
+  expectValid "base" (validateConvertibleTransferOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "zero amount" "precondition" base with amount = usd 0.0
+  rejects "negative amount" "precondition" base with amount = usd (-5.0)
+  rejects "four-letter currency" "precondition" base with amount = OcfMonetary with amount = 1.0; currency = "USDX"
+  rejects "no resulting securities" "precondition" base with resulting_security_ids = []
+  rejects "empty resulting security" "precondition" base with resulting_security_ids = ["C-OUT", ""]
+  rejects "empty comment" "precondition" base with comments = [""]
+  rejects "empty balance security" "precondition" base with balance_security_id = Some ""
+  rejects "empty consideration" "precondition" base with consideration_text = Some ""
+
+test_convertible_transfer_edit_and_delete : Script ()
+test_convertible_transfer_edit_and_delete = do
+  env <- instrumentBook
+  let t = transfer "CT-1" "C-1" 100000.0 ["C-OUT"]
+  _ <- applyRecords env [convertibleOut "C-OUT" "SH-B" transferDate 100000.0, ct t]
+  restateOpsFails env "precondition" [RestateEdit (ct t with amount = usd 0.0)]
+  restateOpsFails env "Convertible transfer resulting security security not found: C-OTHER" [RestateEdit (ct t with resulting_security_ids = ["C-OTHER"])]
+  restateOpsFails env "Convertible transfer balance security not found: C-REST" [RestateEdit (ct t with balance_security_id = Some "C-REST")]
+  checkEditAndDelete env (ct t) (ct t with consideration_text = Some "Gift"; comments = ["Corrected"])

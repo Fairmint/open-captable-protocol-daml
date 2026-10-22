@@ -1,0 +1,413 @@
+-- Test harness for OpenCapTable-v35: a cap table set up as in production (factory, TA acceptance, issuer creation), inputs collected from the active contract set, and fixtures.
+module OpenCapTable.Harness where
+
+import DA.Action (unless)
+import qualified DA.Date as D
+import qualified DA.Text as T
+import DA.Time (time)
+import Daml.Script
+
+import Fairmint.OpenCapTableApi.OcfObject (OcfObject, OcfObjectView(..))
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Book (BookInputs(..))
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.IssuerAuthorization
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Numeric (floorMulDiv)
+import Fairmint.OpenCapTable.OcpFactory
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfInitialSharesAuthorized(..), OcfRatio(..), OcfStockClassType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.Issuer (Issuer, IssuerOcfData(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..), OcfStakeholderType(..), Stakeholder, StakeholderOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance, StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockLegendTemplate (StockLegendTemplateOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockPlan (StockPlanOcfData(..))
+
+-- =============================================================================
+-- SETUP
+-- =============================================================================
+
+data Env = Env
+  with
+    system_operator : Party
+    issuer : Party
+    transfer_agent : Party
+    -- A party with no role in the book
+    outsider : Party
+    ctx : Context
+    cap_table : ContractId CapTable
+    issuer_record : ContractId Issuer
+    factory : ContractId OcpFactory
+
+issuerId : Text
+issuerId = "ISSUER-1"
+
+issuerData : IssuerOcfData
+issuerData = IssuerOcfData with
+  id = issuerId
+  country_of_formation = "US"
+  formation_date = D.date 2020 D.Jan 15
+  legal_name = "Test Issuer Inc."
+  comments = []
+  tax_ids = []
+  address = None
+  country_subdivision_name_of_formation = None
+  country_subdivision_of_formation = None
+  dba = None
+  email = None
+  initial_shares_authorized = Some (OcfInitialSharesNumeric 10000000.0)
+  phone = None
+
+-- | A cap table created the production way: the system operator's factory authorizes the issuer
+-- and pins the TA, the TA accepts, and the issuer creates the cap table.
+setupEnv : Script Env
+setupEnv = do
+  sysOp <- allocateParty "SystemOperator"
+  issuer <- allocateParty "Issuer"
+  ta <- allocateParty "TransferAgent"
+  outsider <- allocateParty "Outsider"
+  factory <- submit sysOp do
+    createCmd OcpFactory with system_operator = sysOp; factory_id = "test"; next_cap_table_number = 1
+  newCapTable sysOp issuer ta outsider factory
+
+-- | Another cap table from the same factory and parties.
+newCapTable : Party -> Party -> Party -> Party -> ContractId OcpFactory -> Script Env
+newCapTable sysOp issuer ta outsider factory = do
+  auth <- submit sysOp do
+    exerciseCmd factory OcpFactory_AuthorizeIssuer with issuer; transfer_agent = ta
+  accepted <- submit ta do exerciseCmd auth.authorization IssuerAuthorization_TaAccept
+  created <- submit issuer do
+    exerciseCmd accepted IssuerAuthorization_CreateCapTable with transfer_agent = ta; issuer_data = issuerData
+  pure Env with
+    system_operator = sysOp
+    issuer
+    transfer_agent = ta
+    outsider
+    ctx = Context with cap_table_id = auth.cap_table_id; issuer; system_operator = sysOp; transfer_agent = ta
+    cap_table = created.cap_table
+    issuer_record = created.issuer
+    factory = auth.factory
+
+-- | A second cap table with the same three parties.
+secondCapTable : Env -> Script Env
+secondCapTable env = newCapTable env.system_operator env.issuer env.transfer_agent env.outsider env.factory
+
+-- =============================================================================
+-- ACTIVE CONTRACT SET
+-- =============================================================================
+
+statesOf : Env -> Script [(ContractId StockSecurity, StockSecurity)]
+statesOf env = filter (\(_, s) -> s.context == env.ctx) <$> query @StockSecurity env.transfer_agent
+
+stateOf : Env -> Text -> Script StockSecurity
+stateOf env sec = do
+  ss <- filter (\(_, s) -> s.security_id == sec) <$> statesOf env
+  case ss of
+    [(_, s)] -> pure s
+    [] -> fail ("no active state for " <> sec)
+    _ -> fail ("several active states for " <> sec)
+
+stateCidOf : Env -> Text -> Script (ContractId StockSecurity)
+stateCidOf env sec = do
+  ss <- filter (\(_, s) -> s.security_id == sec) <$> statesOf env
+  case ss of
+    [(cid, _)] -> pure cid
+    _ -> fail ("expected one active state for " <> sec)
+
+hasState : Env -> Text -> Script Bool
+hasState env sec = any (\(_, s) -> s.security_id == sec) <$> statesOf env
+
+epochsOf : Env -> Script [(ContractId StockClassEpoch, StockClassEpoch)]
+epochsOf env = filter (\(_, e) -> e.context == env.ctx) <$> query @StockClassEpoch env.transfer_agent
+
+epochOf : Env -> Text -> Script (ContractId StockClassEpoch, StockClassEpoch)
+epochOf env cls = do
+  es <- filter (\(_, e) -> e.stock_class_id == cls) <$> epochsOf env
+  case es of
+    [e] -> pure e
+    _ -> fail ("expected one active epoch for " <> cls)
+
+shardsOf : Env -> Script [(ContractId OcfIdShard, OcfIdShard)]
+shardsOf env = filter (\(_, s) -> s.context == env.ctx) <$> query @OcfIdShard env.transfer_agent
+
+-- | The book's OCF records, with their views.
+recordsOf : Env -> Script [(OcfRecordCid, OcfObjectView)]
+recordsOf env = do
+  rs <- queryInterface @OcfObject env.transfer_agent
+  pure [ (rcid, v) | (cid, Some v) <- rs, v.cap_table_id == env.ctx.cap_table_id, Some rcid <- [recordCidOfInterface v.object_type cid] ]
+
+recordCidOf : Env -> Text -> Script OcfRecordCid
+recordCidOf env objectId = do
+  rs <- filter (\(_, v) -> v.object_id == objectId) <$> recordsOf env
+  case rs of
+    [(cid, _)] -> pure cid
+    _ -> fail ("expected one active record " <> objectId)
+
+hasRecord : Env -> Text -> Script Bool
+hasRecord env objectId = any (\(_, v) -> v.object_id == objectId) <$> recordsOf env
+
+issuanceCidOf : Env -> Text -> Script (ContractId StockIssuance)
+issuanceCidOf env objectId = do
+  rcid <- recordCidOf env objectId
+  case rcid of
+    OcfRecordCidStockIssuance cid -> pure cid
+    _ -> fail (objectId <> " is not a stock issuance")
+
+-- | Every active contract of the book a write could need: all states, epochs, shards and records.
+allInputs : Env -> Script BookInputs
+allInputs env = do
+  states <- map fst <$> statesOf env
+  epochs <- map fst <$> epochsOf env
+  shards <- map fst <$> shardsOf env
+  records <- map fst <$> recordsOf env
+  pure BookInputs with states; epochs; shards; records
+
+-- =============================================================================
+-- WRITES
+-- =============================================================================
+
+applyOps : Env -> [ApplyOperation] -> Script ApplyResult
+applyOps env ops = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+
+applyWith : Env -> BookInputs -> [ApplyOperation] -> Script ApplyResult
+applyWith env inputs ops =
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+
+applyRecords : Env -> [OcfRecordData] -> Script ApplyResult
+applyRecords env ds = applyOps env (map ApplyRecord ds)
+
+-- | Submits as the TA and requires failure with a message containing `expected`.
+applyOpsFails : Env -> Text -> [ApplyOperation] -> Script ()
+applyOpsFails env expected ops = do
+  inputs <- allInputs env
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops)
+
+applyRecordsFails : Env -> Text -> [OcfRecordData] -> Script ()
+applyRecordsFails env expected ds = applyOpsFails env expected (map ApplyRecord ds)
+
+restateOps : Env -> [RestateOperation] -> Script RestateResult
+restateOps env ops = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Restate with inputs; operations = ops
+
+restateOpsFails : Env -> Text -> [RestateOperation] -> Script ()
+restateOpsFails env expected ops = do
+  inputs <- allInputs env
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Restate with inputs; operations = ops)
+
+-- | Sets the ledger time to noon on a date (ledger-dated choices check the ledger date).
+onDate : Date -> Script ()
+onDate d = setTime (time d 12 0 0)
+
+placeHolds : Env -> OcfHoldType -> Text -> Date -> [PlaceHoldLot] -> Script [PlaceHoldResult]
+placeHolds env holdType reference d lots = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = holdType; reference; date = d; reason_text = "test hold " <> reference; lots
+
+placeHoldsFails : Env -> Text -> OcfHoldType -> Text -> Date -> [PlaceHoldLot] -> Script ()
+placeHoldsFails env expected holdType reference d lots = do
+  inputs <- allInputs env
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_PlaceHolds with
+      inputs; hold_type = holdType; reference; date = d; reason_text = "test hold " <> reference; lots)
+
+-- | A settlement hold lot, with its origin issuance looked up from the state.
+settlementLot : Env -> Text -> Decimal -> Script PlaceHoldLot
+settlementLot env sec q = do
+  s <- stateOf env sec
+  origin <- issuanceCidOf env s.origin_transaction_id
+  pure PlaceHoldLot with security_id = sec; quantity = Some q; origin_issuance = Some origin
+
+stopLot : Text -> PlaceHoldLot
+stopLot sec = PlaceHoldLot with security_id = sec; quantity = None; origin_issuance = None
+
+cancelHolds : Env -> Date -> [CancelHold] -> Script CapTable_CancelHoldsResult
+cancelHolds env d holds = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_CancelHolds with inputs; date = d; holds
+
+cancelHoldsFails : Env -> Text -> Date -> [CancelHold] -> Script ()
+cancelHoldsFails env expected d holds = do
+  inputs <- allInputs env
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_CancelHolds with inputs; date = d; holds)
+
+settle : Env -> Text -> Date -> SettleBuyer -> [SettleLot] -> Script SettleResult
+settle env reference d buyer lots = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Settle with inputs; settlement_id = reference; date = d; buyer; lots
+
+settleFails : Env -> Text -> Text -> Date -> SettleBuyer -> [SettleLot] -> Script ()
+settleFails env expected reference d buyer lots = do
+  inputs <- allInputs env
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Settle with inputs; settlement_id = reference; date = d; buyer; lots)
+
+-- | A draw of `q` at `price` USD a share under the lot's only settlement hold, with the cost bases
+-- the ledger expects.
+drawLot : Env -> Text -> Decimal -> Decimal -> [OcfVesting] -> Script DrawLot
+drawLot env sec q price balanceVestings = do
+  s <- stateOf env sec
+  hold <- case filter (\h -> h.hold_type == OcfHoldTypeRegisterSettlement) s.holds of
+    [h] -> pure h
+    _ -> fail ("expected one settlement hold on " <> sec)
+  originCid <- issuanceCidOf env s.origin_transaction_id
+  origin <- queryContractId env.transfer_agent originCid
+  src <- case origin of
+    Some o -> pure o.ocf_data
+    None -> fail "origin issuance not visible"
+  let remaining = s.quantity - q
+  pure DrawLot with
+    security_id = sec
+    hold_id = hold.hold_id
+    quantity = q
+    custom_id = "BUY-" <> sec
+    share_price = usd price
+    buyer_cost_basis = usd (price * q)
+    balance_cost_basis =
+      if remaining > 0.0
+        then fmap (\cb -> cb with amount = floorMulDiv cb.amount remaining s.quantity) src.cost_basis
+        else None
+    balance_vestings = balanceVestings
+    origin_issuance = originCid
+
+-- | Requires the submission to fail with an error whose text contains `expected`.
+expectSubmitFailure : Text -> Party -> Commands a -> Script ()
+expectSubmitFailure expected party cmds = do
+  r <- trySubmit party cmds
+  case r of
+    Left e -> unless (T.isInfixOf expected (show e))
+      (fail ("expected an error containing \"" <> expected <> "\", got: " <> show e))
+    Right _ -> fail ("expected an error containing \"" <> expected <> "\", but it succeeded")
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+d2024 : Date
+d2024 = D.date 2024 D.Jan 1
+
+usd : Decimal -> OcfMonetary
+usd amount = OcfMonetary with amount; currency = "USD"
+
+stakeholderData : Text -> StakeholderOcfData
+stakeholderData id = StakeholderOcfData with
+  id
+  name = OcfName with legal_name = "Holder " <> id; first_name = None; last_name = None
+  stakeholder_type = OcfStakeholderTypeIndividual
+  addresses = []
+  comments = []
+  current_relationships = []
+  tax_ids = []
+  contact_info = None
+  current_status = None
+  issuer_assigned_id = None
+  primary_contact = None
+
+stockClass : Text -> StockClassOcfData
+stockClass id = StockClassOcfData with
+  id
+  class_type = OcfStockClassTypeCommon
+  default_id_prefix = "CS-"
+  initial_shares_authorized = OcfInitialSharesNumeric 10000000.0
+  name = "Common " <> id
+  seniority = 1.0
+  votes_per_share = 1.0
+  comments = []
+  conversion_rights = []
+  board_approval_date = None
+  liquidation_preference_multiple = None
+  par_value = None
+  participation_cap_multiple = None
+  price_per_share = None
+  stockholder_approval_date = None
+
+legend : Text -> StockLegendTemplateOcfData
+legend id = StockLegendTemplateOcfData with id; name = "Legend " <> id; text = "Restricted."; comments = []
+
+stockPlan : Text -> [Text] -> StockPlanOcfData
+stockPlan id classes = StockPlanOcfData with
+  id
+  initial_shares_reserved = 1000000.0
+  plan_name = "Plan " <> id
+  comments = []
+  stock_class_ids = classes
+  board_approval_date = None
+  default_cancellation_behavior = None
+  stockholder_approval_date = None
+
+-- | A stock issuance of `qty` shares at 1.00 USD, fully vested, with a cost basis of qty USD.
+issuance : Text -> Text -> Text -> Decimal -> Date -> StockIssuanceOcfData
+issuance sec sh cls qty d = StockIssuanceOcfData with
+  id = "ISS-" <> sec
+  custom_id = "C-" <> sec
+  date = d
+  quantity = qty
+  security_id = sec
+  share_price = usd 1.0
+  stakeholder_id = sh
+  stock_class_id = cls
+  comments = []
+  security_law_exemptions = []
+  share_numbers_issued = []
+  stock_legend_ids = []
+  vestings = []
+  board_approval_date = None
+  consideration_text = None
+  cost_basis = Some (usd qty)
+  issuance_type = None
+  stock_plan_id = None
+  stockholder_approval_date = None
+  vesting_terms_id = None
+
+split : Text -> Text -> Decimal -> Decimal -> Date -> StockClassSplitOcfData
+split id cls n d dt = StockClassSplitOcfData with
+  id
+  date = dt
+  split_ratio = OcfRatio with numerator = n; denominator = d
+  stock_class_id = cls
+  comments = []
+
+-- | The standard book: stakeholders SH-A and SH-B, class CLS-A, and Alice's lots S-A1 (600) and
+-- S-A2 (400), issued on 2024-01-01.
+standardBook : Script Env
+standardBook = do
+  env <- setupEnv
+  _ <- applyRecords env
+    [ OcfRecordDataStakeholder (stakeholderData "SH-A")
+    , OcfRecordDataStakeholder (stakeholderData "SH-B")
+    , OcfRecordDataStockClass (stockClass "CLS-A")
+    , OcfRecordDataStockIssuance (issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024)
+    , OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024)
+    ]
+  pure env
+
+-- | The derived ID of an event on a state, as the ledger computes it.
+derived : Env -> Text -> Int -> DerivedRole -> Int -> Text
+derived env = deriveId env.ctx
+
+stakeholderCidOf : Env -> Text -> Script (ContractId Stakeholder)
+stakeholderCidOf env id = do
+  rcid <- recordCidOf env id
+  case rcid of
+    OcfRecordCidStakeholder cid -> pure cid
+    _ -> fail (id <> " is not a stakeholder")

@@ -1,67 +1,68 @@
+-- Convertible acceptances through CapTable_Apply and CapTable_Restate: a record on the convertible's security, its security reference, the acceptance validator and the shared edit and delete rules.
 module OpenCapTable.TestConvertibleAcceptance where
 
-import Fairmint.OpenCapTable.OCF.ConvertibleIssuance
-import Fairmint.OpenCapTable.OCF.ConvertibleAcceptance
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Conversion (OcfConvertibleType(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder)
-import OpenCapTable.HelpersTriggers (ocfConvTriggerAutomaticOnDate)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Helper to create issuance (needs stakeholder first)
-createConvertibleIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleIssuance ConvertibleIssuanceOcfData with
-        id = "TX_CONV_ISS_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-CONV-1"
-        custom_id = "SAFE-001"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = Some "Cash investment"
-        security_law_exemptions = []
-        investment_amount = OcfMonetary with amount = 100000.0, currency = "USD"
-        convertible_type = OcfConvertibleSafe
-        conversion_triggers = [ (ocfConvTriggerAutomaticOnDate with trigger_date = Some (DT.time (DA.date 2025 Jan 01) 0 0 0)) ]
-        pro_rata = None
-        seniority = 1
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.ConvertibleAcceptance (ConvertibleAcceptanceOcfData(..), validateConvertibleAcceptanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
 
-testConvertibleAcceptance_Create = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createConvertibleIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleAcceptance ConvertibleAcceptanceOcfData with
-        id = "TX_CONV_ACCEPT_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-CONV-1"
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+acceptance : Text -> Text -> Date -> ConvertibleAcceptanceOcfData
+acceptance id sec d = ConvertibleAcceptanceOcfData with id; date = d; security_id = sec; comments = []
 
-testConvertibleAcceptance_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createConvertibleIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleAcceptance ConvertibleAcceptanceOcfData with
-        id = "TX_CONV_ACCEPT_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-CONV-1"
-        comments = ["SAFE agreement countersigned", "Wire transfer confirmed"]]
-      edits = []
-      deletes = []
-  pure ()
+ca : ConvertibleAcceptanceOcfData -> OcfRecordData
+ca = OcfRecordDataConvertibleAcceptance
+
+test_convertible_acceptance_create : Script ()
+test_convertible_acceptance_create = do
+  env <- instrumentBook
+  let a = acceptance "TX_CONV_ACCEPT_1" "C-1" (D.date 2024 D.Jan 2)
+  _ <- applyRecords env [ca a]
+  expectRecord env (ca a)
+  viewSecurityIds env "TX_CONV_ACCEPT_1" >>= (=== ["C-1"])
+  hasRecord env "CI-1" >>= (=== True)
+  applyRecordsFails env "ID already used: TX_CONV_ACCEPT_1" [OcfRecordDataStakeholder (stakeholderData "TX_CONV_ACCEPT_1")]
+
+test_convertible_acceptance_with_comments : Script ()
+test_convertible_acceptance_with_comments = do
+  env <- instrumentBook
+  let a = (acceptance "TX_CONV_ACCEPT_2" "C-1" (D.date 2024 D.Jan 3)) with
+        comments = ["SAFE agreement countersigned", "Wire transfer confirmed"]
+  _ <- applyRecords env [ca a]
+  expectRecord env (ca a)
+
+test_convertible_acceptance_security_reference : Script ()
+test_convertible_acceptance_security_reference = do
+  env <- instrumentBook
+  applyRecordsFails env "Convertible acceptance security not found: C-NONE" [ca (acceptance "CA-1" "C-NONE" eventDate)]
+  applyRecordsFails env "Convertible acceptance security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [ca (acceptance "CA-1" "W-1" eventDate)]
+  applyRecordsFails env "Convertible acceptance security S-A1 is carried by a OcfObjectTypeTxStockIssuance" [ca (acceptance "CA-1" "S-A1" eventDate)]
+  -- The convertible may be issued later in the same batch.
+  let a = acceptance "CA-2" "C-2" eventDate
+  _ <- applyRecords env [ca a, OcfRecordDataConvertibleIssuance (convertibleIssuance "CI-2" "C-2" "SH-B")]
+  expectRecord env (ca a)
+
+test_convertible_acceptance_validator : Script ()
+test_convertible_acceptance_validator = do
+  env <- instrumentBook
+  let base = acceptance "CA-V" "C-1" eventDate
+  expectValid "base" (validateConvertibleAcceptanceOcfData base)
+  expectInvalid "empty id" (validateConvertibleAcceptanceOcfData base with id = "")
+  expectInvalid "empty security_id" (validateConvertibleAcceptanceOcfData base with security_id = "")
+  expectInvalid "empty comment" (validateConvertibleAcceptanceOcfData base with comments = [""])
+  applyRecordsFails env "an empty ID cannot be claimed" [ca base with id = ""]
+  applyRecordsFails env "precondition" [ca base with security_id = ""]
+  applyRecordsFails env "precondition" [ca base with comments = [""]]
+
+test_convertible_acceptance_edit_and_delete : Script ()
+test_convertible_acceptance_edit_and_delete = do
+  env <- instrumentBook
+  let a = acceptance "CA-1" "C-1" eventDate
+  _ <- applyRecords env [ca a]
+  restateOpsFails env "precondition" [RestateEdit (ca a with comments = [""])]
+  restateOpsFails env "Convertible acceptance security not found: C-NONE" [RestateEdit (ca a with security_id = "C-NONE")]
+  checkEditAndDelete env (ca a) (ca a with comments = ["Countersigned"])

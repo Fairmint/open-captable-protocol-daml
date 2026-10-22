@@ -1,35 +1,39 @@
 #!/usr/bin/env tsx
 /**
- * Copy the built OpenCapTable DAR to a stable path for npm `exports` (`./opencaptable.dar`).
+ * Copy the built OpenCapTable DARs to stable paths for npm `exports`: OpenCapTable-v35 to `./opencaptable.dar`, and the
+ * reader interfaces it data-depends on to `./opencaptable-api.dar`.
  *
  * Run automatically at the end of `npm run codegen` (after `npm run build` produces
- * `generated/build/<pkg>/.daml/dist`). The copied file is gitignored; publish flows run codegen / package:prep so the
- * tarball includes it.
+ * `generated/build/<pkg>/.daml/dist`). The copied files are gitignored; publish flows run codegen / package:prep so the
+ * tarball includes them.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { getPackage } from './packages';
+import { requirePackageConfig } from './packages';
 
 const ROOT = path.join(__dirname, '..');
 
+/** Package key (scripts/packages.ts) → file name under `published-dars/`, as package.json `exports` lists them. */
+const STAGED_DARS: Array<[string, string]> = [
+  ['ocp', 'OpenCapTable.dar'],
+  ['api', 'OpenCapTableApi.dar'],
+];
+
 function main(): void {
-  const pkg = getPackage('ocp');
-  if (!pkg) {
-    throw new Error('OpenCapTable (ocp) package config not found');
-  }
-
-  const builtDar = path.join(ROOT, pkg.buildDir, '.daml', 'dist', `${pkg.darName}-${pkg.version}.dar`);
   const outDir = path.join(ROOT, 'published-dars');
-  const outFile = path.join(outDir, 'OpenCapTable.dar');
-
-  if (!fs.existsSync(builtDar)) {
-    throw new Error(`Built DAR not found: ${builtDar}\nRun "npm run build" (or full codegen) first.`);
-  }
-
   fs.mkdirSync(outDir, { recursive: true });
-  fs.copyFileSync(builtDar, outFile);
-  console.log(`Staged npm DAR export: ${outFile}`);
+
+  for (const [key, fileName] of STAGED_DARS) {
+    const pkg = requirePackageConfig(key);
+    const builtDar = path.join(ROOT, pkg.buildDir, '.daml', 'dist', `${pkg.darName}-${pkg.version}.dar`);
+    if (!fs.existsSync(builtDar)) {
+      throw new Error(`Built DAR not found: ${builtDar}\nRun "npm run build" (or full codegen) first.`);
+    }
+    const outFile = path.join(outDir, fileName);
+    fs.copyFileSync(builtDar, outFile);
+    console.log(`Staged npm DAR export: ${path.relative(ROOT, outFile)} (${pkg.name} ${pkg.version})`);
+  }
 }
 
 main();

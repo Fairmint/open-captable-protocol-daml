@@ -1,454 +1,246 @@
+-- Stock cancellations through ApplyStockCancellation: a terminal event with an optional balance issuance, its balance rules, one event per state per batch, date order, the units rule for splits on and around the event's date, and the cancellation validator.
 module OpenCapTable.TestStockCancellation where
-import Fairmint.OpenCapTable.OCF.StockIssuance
-import Fairmint.OpenCapTable.OCF.StockCancellation
-import Fairmint.OpenCapTable.OCF.StockClass
-import Fairmint.OpenCapTable.OCF.StockClassSplit
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfStockClassType(..), OcfInitialSharesAuthorized(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites, stockSuccessorIssuance)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..), validateStockCancellationOcfData)
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
-createStockClass issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
-        id = "SC_COMMON"
-        name = "Common"
-        class_type = OcfStockClassTypeCommon
-        default_id_prefix = "CS-"
-        initial_shares_authorized = OcfInitialSharesNumeric 1_000_000.0
-        votes_per_share = 1.0
-        seniority = 1.0
-        board_approval_date = None
-        stockholder_approval_date = None
-        par_value = None
-        price_per_share = None
-        liquidation_preference_multiple = None
-        participation_cap_multiple = None
-        conversion_rights = []
-        comments = []]
-      edits = []
-      deletes = []
+jan : Int -> Date
+jan = D.date 2024 D.Jan
 
-stockIssuanceData = StockIssuanceOcfData with
-  id = "TX_STOCK_ISS_1"
-  date = DT.time (DA.date 2024 Jan 01) 0 0 0
-  security_id = "SEC-1"
-  custom_id = "CERT-1"
-  stakeholder_id = "SH-1"
-  board_approval_date = None
-  stockholder_approval_date = None
-  consideration_text = None
-  security_law_exemptions = []
-  stock_class_id = "SC_COMMON"
-  stock_plan_id = None
-  share_numbers_issued = []
-  share_price = OcfMonetary with amount = 1.0, currency = "USD"
-  quantity = 100.0
-  vesting_terms_id = None
-  vestings = []
-  cost_basis = None
-  stock_legend_ids = []
-  issuance_type = None
-  comments = []
+-- SEC-1: 100 shares of CLS-A held by SH-A, issued 2024-01-01.
+sec1 : StockIssuanceOcfData
+sec1 = issuance "SEC-1" "SH-A" "CLS-A" 100.0 (jan 1)
 
-createStockIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance stockIssuanceData]
-      edits = []
-      deletes = []
+cancellationBook : Script Env
+cancellationBook = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance sec1]
+  pure env
 
-createStockCancellation issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockCancellation StockCancellationOcfData with
-        id = "TX_STOCK_CANCEL_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-1"
-        quantity = 50.0
-        balance_security_id = None
-        reason_text = "Forfeit"
-        comments = []]
-      edits = []
-      deletes = []
+mkCancellation : Text -> Date -> Decimal -> Optional Text -> StockCancellationOcfData
+mkCancellation id d q balance = StockCancellationOcfData with
+  id; date = d; quantity = q; reason_text = "Forfeit"; security_id = "SEC-1"; comments = []
+  balance_security_id = balance
 
-testStockCancellation_CreateAndArchiveByIssuer = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- createStockCancellation issuer result.updatedCapTableCid
+-- A balance issuance of SEC-1, dated on the event.
+balanceOf : Text -> Date -> Decimal -> StockIssuanceOcfData
+balanceOf sec d q = issuance sec "SH-A" "CLS-A" q d
+
+cancel : StockCancellationOcfData -> Optional StockIssuanceOcfData -> ApplyOperation
+cancel c balance = ApplyStockCancellation with cancellation = c; balance
+
+-- =============================================================================
+-- WHOLE AND PARTIAL
+-- =============================================================================
+
+test_stock_cancellation_whole : Script ()
+test_stock_cancellation_whole = do
+  env <- cancellationBook
+  let c = mkCancellation "TX_STOCK_CANCEL_1" (jan 2) 100.0 None
+  _ <- applyOps env [cancel c None]
+  expectRecord env (OcfRecordDataStockCancellation c)
+  hasState env "SEC-1" >>= (=== False)
+  -- The source issuance stays; only its state ends.
+  expectRecord env (OcfRecordDataStockIssuance sec1)
+
+-- Optionals Some and arrays non-empty: a partial cancellation names and writes its balance.
+test_stock_cancellation_partial_with_balance : Script ()
+test_stock_cancellation_partial_with_balance = do
+  env <- cancellationBook
+  let c = (mkCancellation "TX_STOCK_CANCEL_2" (jan 3) 25.0 (Some "SEC-1-BAL2")) with
+        reason_text = "Return to pool"
+        comments = ["Admin correction"]
+      bal = (balanceOf "SEC-1-BAL2" (jan 3) 75.0) with id = "TX_STOCK_ISS_1_BALANCE"
+  _ <- applyOps env [cancel c (Some bal)]
+  expectRecord env (OcfRecordDataStockCancellation c)
+  expectRecord env (OcfRecordDataStockIssuance bal)
+  hasState env "SEC-1" >>= (=== False)
+  b <- stateOf env "SEC-1-BAL2"
+  b.quantity === 75.0
+  b.stakeholder_id === "SH-A"
+  b.origin_transaction_id === "TX_STOCK_ISS_1_BALANCE"
+  b.last_event_date === jan 3
+  b.seq === 0
+
+test_stock_cancellation_balance_rules : Script ()
+test_stock_cancellation_balance_rules = do
+  env <- cancellationBook
+  let partial = mkCancellation "CXL-1" (jan 2) 40.0 (Some "SEC-1-R")
+  applyOpsFails env "event quantity 101.0 exceeds the 100.0 of security SEC-1" [cancel (mkCancellation "CXL-1" (jan 2) 101.0 None) None]
+  applyOpsFails env "needs a balance issuance" [cancel partial None]
+  applyOpsFails env "an event on the whole of security SEC-1 has no balance"
+    [cancel (mkCancellation "CXL-1" (jan 2) 100.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 0.0))]
+  applyOpsFails env "the event must name its balance security SEC-1-R"
+    [cancel (partial with balance_security_id = Some "SEC-1-OTHER") (Some (balanceOf "SEC-1-R" (jan 2) 60.0))]
+  applyOpsFails env "the event must name its balance security SEC-1-R"
+    [cancel (partial with balance_security_id = None) (Some (balanceOf "SEC-1-R" (jan 2) 60.0))]
+  applyOpsFails env "balance SEC-1-R must hold the remaining 60.0"
+    [cancel partial (Some (balanceOf "SEC-1-R" (jan 2) 59.0))]
+  applyOpsFails env "must stay with the source's stakeholder and class"
+    [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with stakeholder_id = "SH-B"))]
+  applyOpsFails env "names a balance security but writes none"
+    [cancel (mkCancellation "CXL-1" (jan 2) 100.0 (Some "SEC-1-R")) None]
+  -- A fully vested source leaves a fully vested balance.
+  applyOpsFails env "the balance of fully vested security SEC-1 must carry no vesting"
+    [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with vestings = [OcfVesting with date = jan 2; amount = 60.0]))]
+  hasState env "SEC-1" >>= (=== True)
+
+-- v34 summed the batch's reductions of one source. In v35 the first event consumes the state, so a
+-- second event on the same security in the batch finds no state.
+test_stock_cancellation_second_event_in_batch_refused : Script ()
+test_stock_cancellation_second_event_in_batch_refused = do
+  env <- cancellationBook
+  applyOpsFails env "no active state for security SEC-1 in this write"
+    [ cancel (mkCancellation "TX_STOCK_CANCEL_OVERDRAW_1" (jan 2) 60.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 40.0))
+    , cancel (mkCancellation "TX_STOCK_CANCEL_OVERDRAW_2" (jan 2) 50.0 None) None
+    ]
+  (.quantity) <$> stateOf env "SEC-1" >>= (=== 100.0)
+
+test_stock_cancellation_before_issuance_refused : Script ()
+test_stock_cancellation_before_issuance_refused = do
+  env <- cancellationBook
+  applyOpsFails env "event dated 2023-12-31 precedes the last event on security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_BEFORE_ISSUANCE" (D.date 2023 D.Dec 31) 10.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (D.date 2023 D.Dec 31) 90.0))]
+
+test_stock_cancellation_refused_while_on_hold : Script ()
+test_stock_cancellation_refused_while_on_hold = do
+  env <- cancellationBook
+  let d = D.date 2025 D.Jun 2
+  onDate d
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" d [stopLot "SEC-1"]
+  applyOpsFails env "security SEC-1 carries an open hold" [cancel (mkCancellation "CXL-1" d 100.0 None) None]
+
+-- v34 refused an issuance edit that renamed the security and orphaned its cancellation; v35 refuses
+-- any edit of a stock issuance's security ID.
+test_stock_cancellation_source_security_id_edit_refused : Script ()
+test_stock_cancellation_source_security_id_edit_refused = do
+  env <- cancellationBook
+  _ <- applyOps env [cancel (mkCancellation "TX_STOCK_CANCEL_1" (jan 2) 50.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 50.0))]
+  restateOpsFails env "cannot change stock issuance ISS-SEC-1's security ID"
+    [RestateEdit (OcfRecordDataStockIssuance (sec1 with security_id = "SEC-RENAMED"; quantity = 25.0))]
+
+-- =============================================================================
+-- SPLITS AND THE UNITS RULE
+-- =============================================================================
+
+-- A split dated after the issuance scales the source at the event.
+test_stock_cancellation_later_split_scales_source : Script ()
+test_stock_cancellation_later_split_scales_source = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_SPLIT_LATER" "CLS-A" 2.0 1.0 (jan 2)
+  applyOpsFails env "exceeds the 200.0 of security SEC-1" [cancel (mkCancellation "CXL-1" (jan 3) 201.0 None) None]
+  let c = mkCancellation "TX_STOCK_CANCEL_AFTER_LATER_SPLIT" (jan 3) 150.0 (Some "SEC-1-R")
+  _ <- applyOps env [cancel c (Some (balanceOf "SEC-1-R" (jan 3) 50.0))]
+  expectRecord env (OcfRecordDataStockCancellation c)
+  b <- stateOf env "SEC-1-R"
+  b.quantity === 50.0
+  b.split_epoch === 1
+
+test_stock_cancellation_later_reverse_split_scales_source : Script ()
+test_stock_cancellation_later_reverse_split_scales_source = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_REVERSE_SPLIT_LATER" "CLS-A" 1.0 2.0 (jan 2)
+  applyOpsFails env "event quantity 60.0 exceeds the 50.0 of security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_AFTER_REVERSE_SPLIT" (jan 3) 60.0 None) None]
+  _ <- applyOps env [cancel (mkCancellation "CXL-OK" (jan 3) 50.0 None) None]
+  hasState env "SEC-1" >>= (=== False)
+
+-- An issuance dated after a split is already in post-split units: the split does not scale it.
+test_stock_cancellation_earlier_split_does_not_scale_source : Script ()
+test_stock_cancellation_earlier_split_does_not_scale_source = do
+  env <- setupEnv
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData "SH-A"), OcfRecordDataStockClass (stockClass "CLS-A")]
+  recordSplit env "TX_STOCK_SPLIT_EARLIER" "CLS-A" 2.0 1.0 (D.date 2023 D.Dec 31)
+  _ <- applyRecords env [OcfRecordDataStockIssuance sec1]
+  (.split_epoch) <$> stateOf env "SEC-1" >>= (=== 1)
+  applyOpsFails env "event quantity 150.0 exceeds the 100.0 of security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_AFTER_EARLIER_SPLIT" (jan 2) 150.0 None) None]
+  _ <- applyOps env [cancel (mkCancellation "CXL-OK" (jan 2) 100.0 None) None]
   pure ()
 
-testStockCancellation_CreateAndArchiveBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- createStockCancellation issuer result.updatedCapTableCid
-  pure ()
+-- v34 refused a reduction on a split's day that fit only if it came after the split. v35's units
+-- rule settles the order: a record dated on the split's day is post-split.
+test_stock_cancellation_on_split_day_is_post_split : Script ()
+test_stock_cancellation_on_split_day_is_post_split = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_SPLIT_WITH_SAME_DAY_REDUCTION" "CLS-A" 2.0 1.0 (jan 2)
+  applyOpsFails env "event quantity 201.0 exceeds the 200.0" [cancel (mkCancellation "CXL-1" (jan 2) 201.0 None) None]
+  -- A balance in pre-split units is refused.
+  applyOpsFails env "balance SEC-1-R must hold the remaining 50.0"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_SAME_DAY_AS_SPLIT" (jan 2) 150.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 25.0))]
+  let c = mkCancellation "TX_STOCK_CANCEL_SAME_DAY_AS_SPLIT" (jan 2) 150.0 (Some "SEC-1-R")
+  _ <- applyOps env [cancel c (Some (balanceOf "SEC-1-R" (jan 2) 50.0))]
+  expectRecord env (OcfRecordDataStockCancellation c)
+  b <- stateOf env "SEC-1-R"
+  b.quantity === 50.0
+  b.split_epoch === 1
 
--- Optionals Some and arrays non-empty
-testStockCancellation_OptionalsSome = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "TX_STOCK_ISS_1_BALANCE" "SEC-1-BAL2" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Jan 03) 0 0 0) 75.0
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-          id = "TX_STOCK_CANCEL_2"
-          date = DT.time (DA.date 2024 Jan 03) 0 0 0
-          security_id = "SEC-1"
-          quantity = 25.0
-          balance_security_id = Some "SEC-1-BAL2"
-          reason_text = "Return to pool"
-          comments = ["Admin correction"]]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_cancellation_on_reverse_split_day_is_post_split : Script ()
+test_stock_cancellation_on_reverse_split_day_is_post_split = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_REVERSE_SPLIT_WITH_SAME_DAY_REDUCTION" "CLS-A" 1.0 2.0 (jan 2)
+  applyOpsFails env "event quantity 60.0 exceeds the 50.0 of security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_SAME_DAY_AS_REVERSE_SPLIT" (jan 2) 60.0 None) None]
+  let c = mkCancellation "TX_STOCK_SAFE_REVERSE_SPLIT_CANCEL" (jan 2) 40.0 (Some "SEC-1-R")
+  _ <- applyOps env [cancel c (Some (balanceOf "SEC-1-R" (jan 2) 10.0))]
+  (.quantity) <$> stateOf env "SEC-1-R" >>= (=== 10.0)
 
--- Multiple individually valid reductions must not overdraw one source security.
-testStockCancellation_CumulativeOverdrawRejected = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_OVERDRAW_1"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-1"
-            quantity = 60.0
-            balance_security_id = None
-            reason_text = "Test reduction"
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_OVERDRAW_2"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-1"
-            quantity = 50.0
-            balance_security_id = None
-            reason_text = "Test reduction"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+-- A split dated on the issuance's own day but recorded after it cannot say whether the issuance's
+-- quantity is pre- or post-split. v34 assumed the lower balance; v35 fails closed: the state's
+-- split epoch is stale, and its next event is refused until a restatement fixes it.
+test_stock_cancellation_split_on_issuance_day_fails_closed : Script ()
+test_stock_cancellation_split_on_issuance_day_fails_closed = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_SPLIT_SAME_DAY" "CLS-A" 2.0 1.0 (jan 1)
+  applyOpsFails env "stale split epoch on security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_AFTER_SAME_DAY_SPLIT" (jan 2) 150.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 50.0))]
+  applyOpsFails env "stale split epoch on security SEC-1" [cancel (mkCancellation "CXL-SMALL" (jan 2) 10.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 90.0))]
 
--- OCF has calendar dates but no intra-day transaction ordering. A split on the
--- issuance date therefore cannot prove that the issuance quantity is pre-split.
-testStockCancellation_SameDaySplitDoesNotMaskOverdraw = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SPLIT_SAME_DAY"
-            date = DT.time (DA.date 2024 Jan 01) 12 34 56
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_SAME_DAY_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-1"
-            quantity = 150.0
-            balance_security_id = None
-            reason_text = "Test ambiguous same-day ordering"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_cancellation_reverse_split_on_issuance_day_fails_closed : Script ()
+test_stock_cancellation_reverse_split_on_issuance_day_fails_closed = do
+  env <- cancellationBook
+  recordSplit env "TX_STOCK_REVERSE_SPLIT_ON_ISSUANCE_DATE" "CLS-A" 1.0 2.0 (jan 1)
+  applyOpsFails env "stale split epoch on security SEC-1"
+    [cancel (mkCancellation "TX_STOCK_CANCEL_AFTER_SAME_DAY_REVERSE_SPLIT" (jan 2) 75.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 25.0))]
 
--- A forward split and reduction on the same date are valid when the reduction
--- fits even if it happened before the split.
-testStockCancellation_SafeSameDayForwardSplit = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SAFE_FORWARD_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 12 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_SAFE_FORWARD_SPLIT_CANCEL"
-            date = DT.time (DA.date 2024 Jan 02) 18 0 0
-            security_id = "SEC-1"
-            quantity = 50.0
-            balance_security_id = None
-            reason_text = "Valid in either same-day ordering"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+-- =============================================================================
+-- VALIDATOR
+-- =============================================================================
 
--- A same-day reverse split may follow the issuance and reduce its balance.
-testStockCancellation_SameDayReverseSplitCanReduceIssuance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_REVERSE_SPLIT_ON_ISSUANCE_DATE"
-            date = DT.time (DA.date 2024 Jan 01) 12 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 1.0, denominator = 2.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_SAME_DAY_REVERSE_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-1"
-            quantity = 75.0
-            balance_security_id = None
-            reason_text = "Reverse split may leave only 50 shares"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_cancellation_ensure_refuses_invalid_data : Script ()
+test_stock_cancellation_ensure_refuses_invalid_data = do
+  env <- cancellationBook
+  let whole = mkCancellation "CXL-1" (jan 2) 100.0 None
+  applyOpsFails env "precondition" [cancel (whole with reason_text = "") None]
+  applyOpsFails env "precondition" [cancel (whole with comments = [""]) None]
+  -- A zero quantity leaves the whole security as the balance, which the record's ensure refuses.
+  applyOpsFails env "precondition" [cancel (mkCancellation "CXL-1" (jan 2) 0.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 100.0))]
+  applyOpsFails env "precondition" [cancel (mkCancellation "CXL-1" (jan 2) 10.0 (Some "")) (Some (balanceOf "" (jan 2) 90.0))]
+  applyOpsFails env "an empty ID cannot be claimed" [cancel (whole with id = "") None]
+  applyOpsFails env "no active state for security  in this write" [cancel (whole with security_id = "") None]
+  hasState env "SEC-1" >>= (=== True)
 
--- Editing an issuance security ID must not orphan existing lifecycle events and
--- thereby bypass their balance reductions.
-testStockCancellation_SecurityIdEditCannotBypassBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  issuanceResult <- createStockIssuance issuer capTableCid
-  cancellationResult <- createStockCancellation issuer issuanceResult.updatedCapTableCid
-  submitMustFail issuer do
-    exerciseCmd cancellationResult.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits =
-        [ CT.OcfEditStockIssuance
-            (stockIssuanceData with
-              security_id = "SEC-RENAMED"
-              quantity = 25.0)
-        ]
-      deletes = []
-  pure ()
-
--- A quantity edit on the same security ID must revalidate reductions already
--- committed by an earlier batch.
-testStockCancellation_QuantityEditRevalidatesPersistedReduction = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  issuanceResult <- createStockIssuance issuer capTableCid
-  cancellationResult <- createStockCancellation issuer issuanceResult.updatedCapTableCid
-  submitMustFail issuer do
-    exerciseCmd cancellationResult.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits =
-        [ CT.OcfEditStockIssuance
-            (stockIssuanceData with quantity = 25.0)
-        ]
-      deletes = []
-  pure ()
-
--- A split on a later date unambiguously scales the source balance.
-testStockCancellation_LaterSplitScalesBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SPLIT_LATER"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_LATER_SPLIT"
-            date = DT.time (DA.date 2024 Jan 03) 0 0 0
-            security_id = "SEC-1"
-            quantity = 150.0
-            balance_security_id = None
-            reason_text = "Test unambiguous later split"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- A reduction on the same OCF date as a split cannot rely on an unknown
--- intra-day order to avoid an overdraw.
-testStockCancellation_SameDayReductionCannotRelyOnSplit = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SPLIT_WITH_SAME_DAY_REDUCTION"
-            date = DT.time (DA.date 2024 Jan 02) 12 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_SAME_DAY_AS_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 18 0 0
-            security_id = "SEC-1"
-            quantity = 150.0
-            balance_security_id = None
-            reason_text = "Same-day ordering is ambiguous"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- Reverse splits are equally ambiguous: a same-day reduction cannot rely on
--- occurring before the reverse split.
-testStockCancellation_SameDayReductionCannotPrecedeReverseSplit = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_REVERSE_SPLIT_WITH_SAME_DAY_REDUCTION"
-            date = DT.time (DA.date 2024 Jan 02) 12 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 1.0, denominator = 2.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_SAME_DAY_AS_REVERSE_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 18 0 0
-            security_id = "SEC-1"
-            quantity = 60.0
-            balance_security_id = None
-            reason_text = "Same-day reverse split ordering is ambiguous"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- A reverse split and reduction on the same date are valid when the reduction
--- fits even if the reverse split happened first.
-testStockCancellation_SafeSameDayReverseSplit = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SAFE_REVERSE_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 12 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 1.0, denominator = 2.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_SAFE_REVERSE_SPLIT_CANCEL"
-            date = DT.time (DA.date 2024 Jan 02) 18 0 0
-            security_id = "SEC-1"
-            quantity = 40.0
-            balance_security_id = None
-            reason_text = "Valid in either same-day ordering"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- A lifecycle event cannot consume a security before that security was issued.
-testStockCancellation_PreIssuanceReductionRejected = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_BEFORE_ISSUANCE"
-            date = DT.time (DA.date 2023 Dec 31) 0 0 0
-            security_id = "SEC-1"
-            quantity = 10.0
-            balance_security_id = None
-            reason_text = "Predates the source issuance"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- A split before the issuance cannot change that issuance's source balance.
-testStockCancellation_EarlierSplitDoesNotScaleBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  splitResult <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_SPLIT_EARLIER"
-            date = DT.time (DA.date 2023 Dec 31) 0 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  issuanceResult <- createStockIssuance issuer splitResult.updatedCapTableCid
-  submitMustFail issuer do
-    exerciseCmd issuanceResult.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_EARLIER_SPLIT"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-1"
-            quantity = 150.0
-            balance_security_id = None
-            reason_text = "Earlier split must not scale later issuance"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
--- A later reverse split reduces the available source balance.
-testStockCancellation_LaterReverseSplitScalesBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-            id = "TX_STOCK_REVERSE_SPLIT_LATER"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            stock_class_id = "SC_COMMON"
-            split_ratio = OcfRatio with numerator = 1.0, denominator = 2.0
-            comments = []
-        , CT.OcfCreateStockCancellation StockCancellationOcfData with
-            id = "TX_STOCK_CANCEL_AFTER_REVERSE_SPLIT"
-            date = DT.time (DA.date 2024 Jan 03) 0 0 0
-            security_id = "SEC-1"
-            quantity = 60.0
-            balance_security_id = None
-            reason_text = "Reverse split leaves only 50 shares"
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_cancellation_validator_branches : Script ()
+test_stock_cancellation_validator_branches = do
+  let c = mkCancellation "CXL-1" (jan 2) 10.0 (Some "SEC-1-R")
+      ok = validateStockCancellationOcfData
+  expectTrue "the fixture" (ok c)
+  expectTrue "no balance" (ok c with balance_security_id = None)
+  expectFalse "empty id" (ok c with id = "")
+  expectFalse "empty security_id" (ok c with security_id = "")
+  expectFalse "zero quantity" (ok c with quantity = 0.0)
+  expectFalse "negative quantity" (ok c with quantity = -1.0)
+  expectFalse "empty reason_text" (ok c with reason_text = "")
+  expectFalse "an empty comment" (ok c with comments = [""])
+  expectFalse "an empty balance_security_id" (ok c with balance_security_id = Some "")

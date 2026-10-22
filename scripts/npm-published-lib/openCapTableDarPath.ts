@@ -2,6 +2,10 @@
  * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` only (uses
  * Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
  *
+ * The package ships two DARs: OpenCapTable-v35 (`OpenCapTable.dar`) and the reader interfaces it data-depends on
+ * (`OpenCapTableApi.dar`, OpenCapTableApi-v01). The OpenCapTable DAR embeds the interfaces;
+ * {@link getOpenCapTableDarPaths} lists both in upload order.
+ *
  * @remarks
  *   User-facing documentation for the packaged DAR and local development lives in the public wiki:
  *   https://github.com/Fairmint/open-captable-protocol-daml/wiki/Development-and-Testing
@@ -19,6 +23,9 @@ export const OPEN_CAP_TABLE_DAR_PATH_ENV = 'OPEN_CAP_TABLE_DAR_PATH' as const;
  * @see package.json `exports["./opencaptable.dar"]`
  */
 export const OPEN_CAP_TABLE_DAR_EXPORT_SUBPATH = './opencaptable.dar' as const;
+
+/** Npm `exports` subpath for the OpenCapTableApi-v01 DAR (the reader interfaces `OcfObject` and `RegisterContract`). */
+export const OPEN_CAP_TABLE_API_DAR_EXPORT_SUBPATH = './opencaptable-api.dar' as const;
 
 /**
  * From a dependent repo root: sibling `open-captable-protocol-daml` staged DAR
@@ -79,20 +86,42 @@ function defaultSiblingDar(siblingSearchFrom: string): string | null {
   return fs.existsSync(dar) ? dar : null;
 }
 
+function packagedDarPath(fileName: string): string {
+  const darPath = path.join(__dirname, '..', 'published-dars', fileName);
+  if (!fs.existsSync(darPath)) {
+    throw new Error(
+      `${fileName.replace(/\.dar$/, '')} DAR not found at ${darPath}. ` +
+        `Expected published-dars/${fileName} (run npm run codegen before pack, or use a published tarball).`
+    );
+  }
+  return darPath;
+}
+
 /**
  * Absolute path to the OpenCapTable DAR inside this npm package (`published-dars/OpenCapTable.dar`).
  *
  * @throws If the file is missing (corrupt install, or git checkout without `npm run codegen` / staging).
  */
 export function getOpenCapTableDarPath(): string {
-  const darPath = path.join(__dirname, '..', 'published-dars', 'OpenCapTable.dar');
-  if (!fs.existsSync(darPath)) {
-    throw new Error(
-      `OpenCapTable DAR not found at ${darPath}. ` +
-        'Expected published-dars/OpenCapTable.dar (run npm run codegen before pack, or use a published tarball).'
-    );
-  }
-  return darPath;
+  return packagedDarPath('OpenCapTable.dar');
+}
+
+/**
+ * Absolute path to the OpenCapTableApi-v01 DAR inside this npm package (`published-dars/OpenCapTableApi.dar`).
+ *
+ * @throws If the file is missing.
+ */
+export function getOpenCapTableApiDarPath(): string {
+  return packagedDarPath('OpenCapTableApi.dar');
+}
+
+/**
+ * The two packaged DARs in upload order: OpenCapTableApi-v01, then OpenCapTable-v35.
+ *
+ * @throws If any file is missing.
+ */
+export function getOpenCapTableDarPaths(): string[] {
+  return [getOpenCapTableApiDarPath(), getOpenCapTableDarPath()];
 }
 
 /**

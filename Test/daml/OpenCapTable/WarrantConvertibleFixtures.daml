@@ -1,0 +1,291 @@
+-- Fixtures and ACS readers for the v35 warrant, convertible, conversion-mechanism and instrument-terms test modules: issuances with their triggers and rights, vesting terms, record payloads by object ID, and the edit and delete rules every record type shares.
+module OpenCapTable.WarrantConvertibleFixtures where
+
+import DA.Action (unless, when)
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Conversion
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleIssuance (ConvertibleIssuanceOcfData(..), OcfConvertibleConversionTrigger(..))
+import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance (EquityCompensationIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfAllocationType(..), OcfVestingCondition(..), OcfVestingConditionPortion(..), OcfVestingTrigger(..), VestingTermsOcfData(..))
+import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- BOOKS AND DATES
+-- =============================================================================
+
+-- | The standard book plus warrant W-1 (100 units, issuance WI-1) and convertible C-1 (100,000 USD,
+-- issuance CI-1), both held by SH-A and issued on 2024-01-01.
+instrumentBook : Script Env
+instrumentBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "WI-1" "W-1" "SH-A")
+    , OcfRecordDataConvertibleIssuance (convertibleIssuance "CI-1" "C-1" "SH-A")
+    ]
+  pure env
+
+-- | The date of the events the modules write on W-1 and C-1.
+eventDate : Date
+eventDate = D.date 2024 D.Mar 1
+
+-- =============================================================================
+-- CONVERSION RIGHTS AND TRIGGERS
+-- =============================================================================
+
+warrantTriggerId : Text
+warrantTriggerId = "WR-AT-WILL"
+
+convertibleTriggerId : Text
+convertibleTriggerId = "CV-AT-WILL"
+
+customMechanism : Text -> OcfCustomConversionMechanism
+customMechanism description = OcfCustomConversionMechanism with custom_conversion_description = description
+
+warrantRight : OcfWarrantConversionMechanism -> Optional Text -> OcfWarrantConversionRight
+warrantRight mechanism target = OcfWarrantConversionRight with
+  conversion_mechanism = mechanism
+  converts_to_future_round = None
+  converts_to_stock_class_id = target
+
+convertibleRight : OcfConvertibleConversionMechanism -> Optional Text -> OcfConvertibleConversionRight
+convertibleRight mechanism target = OcfConvertibleConversionRight with
+  conversion_mechanism = mechanism
+  converts_to_future_round = None
+  converts_to_stock_class_id = target
+
+-- | A one-for-one ratio right at 1.00 USD a share, the only mechanism a stock class right has.
+ratioMechanism : OcfRatioConversionMechanism
+ratioMechanism = OcfRatioConversionMechanism with
+  conversion_price = usd 1.0
+  ratio = OcfRatio with numerator = 1.0; denominator = 1.0
+  rounding_type = OcfRoundingTypeNormal
+
+stockClassRight : Optional Text -> OcfStockClassConversionRight
+stockClassRight target = OcfStockClassConversionRight with
+  conversion_mechanism = ratioMechanism
+  converts_to_future_round = None
+  converts_to_stock_class_id = target
+
+-- | A warrant exercise trigger of the given type with no dates, condition, nickname or description.
+warrantTrigger : Text -> OcfConversionTriggerType -> OcfAnyConversionRight -> OcfConversionTrigger
+warrantTrigger triggerId triggerType right = OcfConversionTrigger with
+  conversion_right = right
+  trigger_id = triggerId
+  type_ = triggerType
+  end_date = None
+  nickname = None
+  start_date = None
+  trigger_condition = None
+  trigger_date = None
+  trigger_description = None
+
+-- | An elective-at-will warrant trigger with a custom warrant right and no conversion target.
+atWillWarrantTrigger : Text -> OcfConversionTrigger
+atWillWarrantTrigger triggerId =
+  warrantTrigger triggerId OcfConversionTriggerTypeElectiveAtWill
+    (OcfRightWarrant (warrantRight (OcfWarrantMechanismCustom (customMechanism "Custom")) None))
+
+-- | A convertible conversion trigger of the given type with no dates, condition, nickname or description.
+convertibleTrigger : Text -> OcfConversionTriggerType -> OcfConvertibleConversionRight -> OcfConvertibleConversionTrigger
+convertibleTrigger triggerId triggerType right = OcfConvertibleConversionTrigger with
+  conversion_right = right
+  trigger_id = triggerId
+  type_ = triggerType
+  end_date = None
+  nickname = None
+  start_date = None
+  trigger_condition = None
+  trigger_date = None
+  trigger_description = None
+
+-- | An elective-at-will convertible trigger with a custom right and no conversion target.
+atWillConvertibleTrigger : Text -> OcfConvertibleConversionTrigger
+atWillConvertibleTrigger triggerId =
+  convertibleTrigger triggerId OcfConversionTriggerTypeElectiveAtWill
+    (convertibleRight (OcfConvMechCustom (customMechanism "Custom")) None)
+
+-- | The automatic-on-date convertible trigger AUTO_DATE, firing on `d`, with a custom right and no
+-- conversion target.
+autoOnDateConvertibleTrigger : Date -> OcfConvertibleConversionTrigger
+autoOnDateConvertibleTrigger d =
+  (convertibleTrigger "AUTO_DATE" OcfConversionTriggerTypeAutomaticOnDate
+    (convertibleRight (OcfConvMechCustom (customMechanism "Custom")) None)) with trigger_date = Some d
+
+-- =============================================================================
+-- ISSUANCES AND DEFINITIONS
+-- =============================================================================
+
+-- | A warrant for 100 units at a 1.00 USD exercise price, bought for nothing, issued on 2024-01-01,
+-- with the elective-at-will trigger WR-AT-WILL and no vesting.
+warrantIssuance : Text -> Text -> Text -> WarrantIssuanceOcfData
+warrantIssuance id sec sh = WarrantIssuanceOcfData with
+  id
+  custom_id = "W-" <> sec
+  date = d2024
+  purchase_price = usd 0.0
+  security_id = sec
+  stakeholder_id = sh
+  comments = []
+  exercise_triggers = [atWillWarrantTrigger warrantTriggerId]
+  security_law_exemptions = []
+  vestings = []
+  board_approval_date = None
+  consideration_text = None
+  exercise_price = Some (usd 1.0)
+  quantity = Some 100.0
+  quantity_source = None
+  stockholder_approval_date = None
+  vesting_terms_id = None
+  warrant_expiration_date = None
+
+-- | A 100,000 USD SAFE issued on 2024-01-01 with the elective-at-will trigger CV-AT-WILL.
+convertibleIssuance : Text -> Text -> Text -> ConvertibleIssuanceOcfData
+convertibleIssuance id sec sh = ConvertibleIssuanceOcfData with
+  id
+  convertible_type = OcfConvertibleTypeSafe
+  custom_id = "CN-" <> sec
+  date = d2024
+  investment_amount = usd 100000.0
+  security_id = sec
+  seniority = 1
+  stakeholder_id = sh
+  comments = []
+  conversion_triggers = [atWillConvertibleTrigger convertibleTriggerId]
+  security_law_exemptions = []
+  board_approval_date = None
+  consideration_text = None
+  pro_rata = None
+  stockholder_approval_date = None
+
+-- | An RSU grant of 100 units issued on 2024-01-01, with no plan, class or vesting.
+equityCompensationIssuance : Text -> Text -> Text -> EquityCompensationIssuanceOcfData
+equityCompensationIssuance id sec sh = EquityCompensationIssuanceOcfData with
+  id
+  compensation_type = OcfCompensationTypeRsu
+  custom_id = "EC-" <> sec
+  date = d2024
+  quantity = 100.0
+  security_id = sec
+  stakeholder_id = sh
+  comments = []
+  security_law_exemptions = []
+  termination_exercise_windows = []
+  vestings = []
+  base_price = None
+  board_approval_date = None
+  consideration_text = None
+  early_exercisable = None
+  exercise_price = None
+  expiration_date = None
+  stock_class_id = None
+  stock_plan_id = None
+  stockholder_approval_date = None
+  vesting_terms_id = None
+
+-- | Vesting terms that vest everything at the vesting start.
+vestingTerms : Text -> VestingTermsOcfData
+vestingTerms id = VestingTermsOcfData with
+  id
+  allocation_type = OcfAllocationTypeCumulativeRounding
+  description = "All at once"
+  name = "Terms " <> id
+  comments = []
+  vesting_conditions =
+    [ OcfVestingCondition with
+        id = "VC-START"
+        trigger = OcfVestingStartTrigger
+        next_condition_ids = []
+        description = None
+        portion = Some OcfVestingConditionPortion with numerator = 1.0; denominator = 1.0; remainder = None
+        quantity = None
+    ]
+
+-- =============================================================================
+-- RECORD PAYLOADS
+-- =============================================================================
+
+-- | The data of the active record with this object ID, read from the ACS (the record types these
+-- modules write).
+recordDataOf : Env -> Text -> Script OcfRecordData
+recordDataOf env objectId = do
+  rcid <- recordCidOf env objectId
+  case rcid of
+    OcfRecordCidConvertibleAcceptance cid -> load OcfRecordDataConvertibleAcceptance cid
+    OcfRecordCidConvertibleCancellation cid -> load OcfRecordDataConvertibleCancellation cid
+    OcfRecordCidConvertibleConversion cid -> load OcfRecordDataConvertibleConversion cid
+    OcfRecordCidConvertibleIssuance cid -> load OcfRecordDataConvertibleIssuance cid
+    OcfRecordCidConvertibleRetraction cid -> load OcfRecordDataConvertibleRetraction cid
+    OcfRecordCidConvertibleTransfer cid -> load OcfRecordDataConvertibleTransfer cid
+    OcfRecordCidEquityCompensationIssuance cid -> load OcfRecordDataEquityCompensationIssuance cid
+    OcfRecordCidStakeholder cid -> load OcfRecordDataStakeholder cid
+    OcfRecordCidStockClass cid -> load OcfRecordDataStockClass cid
+    OcfRecordCidStockIssuance cid -> load OcfRecordDataStockIssuance cid
+    OcfRecordCidStockPlan cid -> load OcfRecordDataStockPlan cid
+    OcfRecordCidVestingTerms cid -> load OcfRecordDataVestingTerms cid
+    OcfRecordCidWarrantAcceptance cid -> load OcfRecordDataWarrantAcceptance cid
+    OcfRecordCidWarrantCancellation cid -> load OcfRecordDataWarrantCancellation cid
+    OcfRecordCidWarrantExercise cid -> load OcfRecordDataWarrantExercise cid
+    OcfRecordCidWarrantIssuance cid -> load OcfRecordDataWarrantIssuance cid
+    OcfRecordCidWarrantRetraction cid -> load OcfRecordDataWarrantRetraction cid
+    OcfRecordCidWarrantTransfer cid -> load OcfRecordDataWarrantTransfer cid
+    _ -> fail ("recordDataOf does not read the type of record " <> objectId)
+  where
+    load : (Template t, HasEnsure t, HasField "ocf_data" t d) => (d -> OcfRecordData) -> ContractId t -> Script OcfRecordData
+    load wrap cid = do
+      r <- queryContractId env.transfer_agent cid
+      case r of
+        Some c -> pure (wrap c.ocf_data)
+        None -> fail ("record " <> objectId <> " is not visible")
+
+objectIdOf : Env -> OcfRecordData -> Text
+objectIdOf env d = (recordView env.ctx d).object_id
+
+-- | The active record with the data's object ID holds exactly that data.
+expectRecord : Env -> OcfRecordData -> Script ()
+expectRecord env d = do
+  got <- recordDataOf env (objectIdOf env d)
+  got === d
+
+-- | Requires a pure validator result, naming the case that failed.
+expectValid : Text -> Bool -> Script ()
+expectValid label ok = unless ok (fail ("expected valid: " <> label))
+
+expectInvalid : Text -> Bool -> Script ()
+expectInvalid label ok = when ok (fail ("expected invalid: " <> label))
+
+-- | The security IDs the active record's interface view lists.
+viewSecurityIds : Env -> Text -> Script [Text]
+viewSecurityIds env objectId = do
+  rs <- filter (\(_, v) -> v.object_id == objectId) <$> recordsOf env
+  case rs of
+    [(_, v)] -> pure v.security_ids
+    _ -> fail ("expected one active record " <> objectId)
+
+-- =============================================================================
+-- SHARED EDIT AND DELETE RULES
+-- =============================================================================
+
+-- | The restatement rules every record keeps: an edit to `edited` (same type and object ID as the
+-- active record `original`) replaces the payload; an edit that changes nothing is refused; a
+-- delete archives the record and releases its object ID, which a new record may then claim.
+checkEditAndDelete : Env -> OcfRecordData -> OcfRecordData -> Script ()
+checkEditAndDelete env original edited = do
+  let objectId = objectIdOf env original
+  objectIdOf env edited === objectId
+  restateOpsFails env "changes nothing" [RestateEdit original]
+  _ <- restateOps env [RestateEdit edited]
+  expectRecord env edited
+  restateOpsFails env "changes nothing" [RestateEdit edited]
+  _ <- restateOps env [RestateDelete objectId]
+  hasRecord env objectId >>= (=== False)
+  restateOpsFails env ("record " <> objectId <> " is not in this write") [RestateDelete objectId]
+  _ <- applyRecords env [OcfRecordDataStakeholder (stakeholderData objectId)]
+  pure ()

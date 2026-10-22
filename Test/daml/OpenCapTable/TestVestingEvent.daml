@@ -1,101 +1,193 @@
+-- Vesting events, ported from v34's TestVestingEvent: milestone events on option grants and warrants, the validator, events on stock (a non-terminal event that consumes the state and may be backdated), restatement and IDs. Vesting condition references are in TestVestingConditionReferences.
 module OpenCapTable.TestVestingEvent where
 
-import Fairmint.OpenCapTable.OCF.EquityCompensationIssuance
-import Fairmint.OpenCapTable.OCF.VestingEvent
-import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder, defaultVestingTermsWithCondition)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create an equity compensation issuance with milestone-based vesting
-createEquityCompensationIssuance issuer capTableCid securityId quantity vestingConditionId =
-  let vestingTermsId = "VT-" <> securityId in
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateVestingTerms (defaultVestingTermsWithCondition vestingTermsId vestingConditionId OcfVestingEventTrigger)
-        , CT.OcfCreateEquityCompensationIssuance EquityCompensationIssuanceOcfData with
-            id = "TX_EC_ISS_MILESTONE"
-            date = DT.time (DA.date 2025 Jan 01) 0 0 0
-            security_id = securityId
-            custom_id = "OPT-MILESTONE-001"
-            stakeholder_id = "SH-1"
-            board_approval_date = None
-            stockholder_approval_date = None
-            consideration_text = None
-            security_law_exemptions = []
-            stock_plan_id = None
-            stock_class_id = None
-            compensation_type = OcfCompensationTypeOptionISO
-            quantity = quantity
-            base_price = None
-            early_exercisable = Some False
-            exercise_price = Some (OcfMonetary with amount = 2.50, currency = "USD")
-            expiration_date = Some (DT.time (DA.date 2035 Jan 01) 0 0 0)
-            termination_exercise_windows = []
-            vestings = []
-            vesting_terms_id = Some vestingTermsId
-            comments = []
-        ]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Ids (DerivedRole(..))
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingEvent
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
+import OpenCapTable.EquityFixtures
+import OpenCapTable.Harness
 
--- Test 1: Basic vesting event (milestone achieved)
-testVestingEvent_MilestoneAchieved = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ECSEC-MILESTONE-001"
-  result <- createEquityCompensationIssuance issuer capTableCid securityId 100000.0 "revenue-milestone-1m"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingEvent VestingEventOcfData with
-        id = "TX_VESTING_EVENT_1"
-        date = DT.time (DA.date 2025 Jun 30) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "revenue-milestone-1m"
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+valid : VestingEventOcfData -> Bool
+valid = validateVestingEventOcfData
 
--- Test 2: Vesting event with comments (product launch milestone)
-testVestingEvent_ProductLaunchMilestone = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ECSEC-MILESTONE-002"
-  result <- createEquityCompensationIssuance issuer capTableCid securityId 50000.0 "product-launch-v2"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingEvent VestingEventOcfData with
-        id = "TX_VESTING_EVENT_2"
-        date = DT.time (DA.date 2025 Sep 15) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "product-launch-v2"
-        comments = ["Product v2.0 launched to production.", "Milestone vesting triggered per grant agreement Section 4."]]
-      edits = []
-      deletes = []
-  pure ()
+-- | An ISO grant `sec` for SH-A over `q` shares at 2.50 USD, granted on 2025-01-01 and expiring on
+-- 2035-01-01, on milestone vesting terms "VT-" <> `sec` with one event condition `cond`.
+milestoneGrant : Text -> Decimal -> Text -> [OcfRecordData]
+milestoneGrant sec q cond =
+  [ termsRecord (termsWith ("VT-" <> sec) cond OcfVestingEventTrigger)
+  , ecRecord ((option sec "SH-A" q) with
+      id = "TX_EC_ISS_" <> sec
+      compensation_type = OcfCompensationTypeOptionIso
+      custom_id = "OPT-" <> sec
+      date = D.date 2025 D.Jan 1
+      exercise_price = Some (usd 2.5)
+      expiration_date = Some (D.date 2035 D.Jan 1)
+      vesting_terms_id = Some ("VT-" <> sec))
+  ]
 
--- Test 3: IPO vesting event
-testVestingEvent_IPOTrigger = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  let securityId = "ECSEC-MILESTONE-003"
-  result <- createEquityCompensationIssuance issuer capTableCid securityId 200000.0 "ipo-trigger"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateVestingEvent VestingEventOcfData with
-        id = "TX_VESTING_EVENT_IPO"
-        date = DT.time (DA.date 2026 Mar 01) 0 0 0
-        security_id = securityId
-        vesting_condition_id = "ipo-trigger"
-        comments = ["IPO condition satisfied - all unvested shares now vested."]]
-      edits = []
-      deletes = []
-  pure ()
+-- | A book with SH-A, SH-B, CLS-A and Alice's grant EC-1 on terms VT-EC-1 (event condition "event").
+grantBook : Script Env
+grantBook = ecBookWith (grantOnTerms "EC-1" "event" OcfVestingEventTrigger)
+
+-- | The standard book plus Alice's 100 shares S-V on terms VT-S (event condition "event").
+stockBook : Script Env
+stockBook = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ termsRecord (termsWith "VT-S" "event" OcfVestingEventTrigger)
+    , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-S")
+    ]
+  pure env
+
+-- =============================================================================
+-- GRANTS AND WARRANTS
+-- =============================================================================
+
+test_vesting_event_milestone_achieved : Script ()
+test_vesting_event_milestone_achieved = do
+  env <- ecBookWith (milestoneGrant "ECSEC-MILESTONE-001" 100000.0 "revenue-milestone-1m")
+  accept env valid eventRecord VestingEventOcfData with
+    id = "TX_VESTING_EVENT_1"
+    date = D.date 2025 D.Jun 30
+    security_id = "ECSEC-MILESTONE-001"
+    vesting_condition_id = "revenue-milestone-1m"
+    comments = []
+  -- An event on a grant touches no stock state.
+  statesOf env >>= assertMsg "no stock state" . null
+
+test_vesting_event_product_launch_milestone : Script ()
+test_vesting_event_product_launch_milestone = do
+  env <- ecBookWith (milestoneGrant "ECSEC-MILESTONE-002" 50000.0 "product-launch-v2")
+  accept env valid eventRecord VestingEventOcfData with
+    id = "TX_VESTING_EVENT_2"
+    date = D.date 2025 D.Sep 15
+    security_id = "ECSEC-MILESTONE-002"
+    vesting_condition_id = "product-launch-v2"
+    comments = ["Product v2.0 launched to production.", "Milestone vesting triggered per grant agreement Section 4."]
+
+test_vesting_event_ipo_trigger : Script ()
+test_vesting_event_ipo_trigger = do
+  env <- ecBookWith (milestoneGrant "ECSEC-MILESTONE-003" 200000.0 "ipo-trigger")
+  accept env valid eventRecord VestingEventOcfData with
+    id = "TX_VESTING_EVENT_IPO"
+    date = D.date 2026 D.Mar 1
+    security_id = "ECSEC-MILESTONE-003"
+    vesting_condition_id = "ipo-trigger"
+    comments = ["IPO condition satisfied - all unvested shares now vested."]
+
+-- v35: a warrant on vesting terms takes vesting records as a grant does.
+test_vesting_event_warrant : Script ()
+test_vesting_event_warrant = do
+  env <- ecBookWith
+    [ termsRecord (termsWith "VT-W" "event" OcfVestingEventTrigger)
+    , OcfRecordDataWarrantIssuance ((warrant "W-1" "SH-A") with vesting_terms_id = Some "VT-W")
+    ]
+  accept env valid eventRecord (vestingEvent "VE-W" "W-1" "event")
+
+-- =============================================================================
+-- VALIDATION
+-- =============================================================================
+
+test_vesting_event_validation : Script ()
+test_vesting_event_validation = do
+  env <- grantBook
+  let e = vestingEvent "VE-V" "EC-1" "event"
+  -- An empty object ID is stopped by its claim, before the record's ensure.
+  refuseWith env "an empty ID cannot be claimed" valid eventRecord (e with id = "")
+  refuse env valid eventRecord (e with security_id = "")
+  refuse env valid eventRecord (e with vesting_condition_id = "")
+  refuse env valid eventRecord (e with comments = [""])
+  refuse env valid eventRecord (e with comments = ["ok", ""])
+  -- An event may be dated before the grant: the register does not order vesting records.
+  accept env valid eventRecord (e with date = D.date 2023 D.Dec 1; comments = ["Recorded late"])
+
+-- =============================================================================
+-- STOCK
+-- =============================================================================
+
+test_vesting_event_on_stock_consumes_state : Script ()
+test_vesting_event_on_stock_consumes_state = do
+  env <- stockBook
+  before <- stateOf env "S-V"
+  beforeCid <- stateCidOf env "S-V"
+  let e = (vestingEvent "VE-1" "S-V" "event") with date = D.date 2024 D.Jun 30; comments = ["Milestone met"]
+  _ <- applyRecords env [eventRecord e]
+  expectRecord env (eventRecord e)
+  after <- stateOf env "S-V"
+  -- The successor differs only in its event count and its last event date.
+  after === (before with seq = 1; last_event_date = D.date 2024 D.Jun 30)
+  afterCid <- stateCidOf env "S-V"
+  assertMsg "the state was consumed and recreated" (afterCid /= beforeCid)
+  applyRecordsFails env "ID already used: VE-1" [OcfRecordDataStakeholder (stakeholderData "VE-1")]
+
+test_vesting_event_on_stock_backdated : Script ()
+test_vesting_event_on_stock_backdated = do
+  env <- stockBook
+  let accepted = D.date 2024 D.Jun 1
+  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = accepted; security_id = "S-V"; comments = []]
+  applyRecordsFails env "precedes the last event on security S-V"
+    [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-2"; date = D.date 2024 D.Mar 1; security_id = "S-V"; comments = []]
+  let e = (vestingEvent "VE-1" "S-V" "event") with date = D.date 2024 D.Mar 1
+  _ <- applyRecords env [eventRecord e]
+  expectRecord env (eventRecord e)
+  st <- stateOf env "S-V"
+  st.last_event_date === accepted
+  st.seq === 2
+
+test_vesting_event_on_stock_derived_id : Script ()
+test_vesting_event_on_stock_derived_id = do
+  env <- stockBook
+  applyRecordsFails env "derived form" [eventRecord (vestingEvent (derived env "S-V" 1 DerivedRoleEvent 0) "S-V" "event")]
+  let did = derived env "S-V" 0 DerivedRoleEvent 0
+      e = vestingEvent did "S-V" "event"
+  _ <- applyRecords env [eventRecord e]
+  expectRecord env (eventRecord e)
+  (.seq) <$> stateOf env "S-V" >>= (=== 1)
+  restateOpsFails env "was written by a register choice and is never restated" [RestateDelete did]
+
+test_vesting_event_on_retired_stock : Script ()
+test_vesting_event_on_retired_stock = do
+  env <- stockBook
+  _ <- applyRecords env [OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Feb 1; reason_text = "Issued in error"; security_id = "S-V"; comments = []]
+  applyRecordsFails env "Vesting record (no stock state in this write) security S-V is carried by a OcfObjectTypeTxStockIssuance"
+    [eventRecord (vestingEvent "VE-1" "S-V" "event")]
+  expectNoRecord env "VE-1"
+
+-- =============================================================================
+-- RESTATEMENT AND IDS
+-- =============================================================================
+
+test_vesting_event_restate : Script ()
+test_vesting_event_restate = do
+  env <- grantBook
+  let e = vestingEvent "VE-1" "EC-1" "event"
+  _ <- applyRecords env [eventRecord e]
+  restateOpsFails env "changes nothing" [RestateEdit (eventRecord e)]
+  let e' = e with date = D.date 2024 D.Mar 31; comments = ["Board confirmed the milestone date"]
+  _ <- restateOps env [RestateEdit (eventRecord e')]
+  expectRecord env (eventRecord e')
+  -- One record is edited or deleted at most once per restatement.
+  restateOpsFails env "edited or deleted more than once"
+    [RestateEdit (eventRecord (e' with comments = ["a"])), RestateDelete "VE-1"]
+  _ <- restateOps env [RestateDelete "VE-1"]
+  expectNoRecord env "VE-1"
+  accept env valid eventRecord e
+
+test_vesting_event_ids_unique : Script ()
+test_vesting_event_ids_unique = do
+  env <- grantBook
+  _ <- applyRecords env [eventRecord (vestingEvent "VE-1" "EC-1" "event")]
+  applyRecordsFails env "ID already used: VE-1" [eventRecord ((vestingEvent "VE-1" "EC-1" "event") with date = D.date 2024 D.Mar 1)]
+  applyRecordsFails env "ID already used: ECI-EC-1" [eventRecord (vestingEvent "ECI-EC-1" "EC-1" "event")]
+  -- A start and an event share the object namespace.
+  applyRecordsFails env "ID already used: VE-1" [startRecord (vestingStart "VE-1" "EC-1" "event")]
+  applyRecordsFails env "derived form" [eventRecord (vestingEvent (env.ctx.cap_table_id <> ":x") "EC-1" "event")]

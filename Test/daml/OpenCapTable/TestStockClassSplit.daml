@@ -1,86 +1,94 @@
+-- Stock class splits through CapTable_Apply: forward and reverse splits recorded on the class's frozen epoch, applied to each state at its next event, and the split validator.
 module OpenCapTable.TestStockClassSplit where
 
-import Fairmint.OpenCapTable.OCF.StockClass
-import Fairmint.OpenCapTable.OCF.StockClassSplit
-import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..), OcfStockClassType(..), OcfInitialSharesAuthorized(..))
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Create a stock class to split
-createStockClass issuer capTableCid stockClassId =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClass StockClassOcfData with
-        id = stockClassId
-        name = "Common Stock"
-        class_type = OcfStockClassTypeCommon
-        default_id_prefix = "CS"
-        initial_shares_authorized = OcfInitialSharesNumeric 10000000.0
-        board_approval_date = None
-        stockholder_approval_date = None
-        votes_per_share = 1.0
-        par_value = None
-        price_per_share = None
-        seniority = 1.0
-        conversion_rights = []
-        liquidation_preference_multiple = None
-        participation_cap_multiple = None
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassSplit (StockClassSplitOcfData(..), validateStockClassSplitOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
--- Test 1: Standard 2-for-1 stock split
-testStockClassSplit_TwoForOne = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockClass issuer capTableCid "COMMON"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-        id = "TX_STOCK_CLASS_SPLIT_1"
-        date = DT.time (DA.date 2025 Jul 01) 0 0 0
-        stock_class_id = "SC_COMMON"
-        split_ratio = OcfRatio with numerator = 2.0, denominator = 1.0
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+-- Records a split under the class freeze and checks the record and the epoch.
+recordAndCheck : Env -> StockClassSplitOcfData -> Script ()
+recordAndCheck env sp = do
+  freezeClass env sp.stock_class_id
+  _ <- applyRecords env [OcfRecordDataStockClassSplit sp]
+  (_, frozen) <- epochOf env sp.stock_class_id
+  frozen.frozen === True
+  unfreezeClass env sp.stock_class_id
+  expectRecord env (OcfRecordDataStockClassSplit sp)
+  (_, e) <- epochOf env sp.stock_class_id
+  e.frozen === False
+  e.splits === [RecordedSplit with split_id = sp.id; date = sp.date; ratio = sp.split_ratio]
 
--- Test 2: 10-for-1 stock split with comments
-testStockClassSplit_TenForOne = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockClass issuer capTableCid "COMMON"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-        id = "TX_STOCK_CLASS_SPLIT_2"
-        date = DT.time (DA.date 2025 Dec 15) 0 0 0
-        stock_class_id = "SC_COMMON"
-        split_ratio = OcfRatio with numerator = 10.0, denominator = 1.0
-        comments = ["Pre-IPO stock split to reduce per-share price.", "Board resolution dated 2025-12-01."]]
-      edits = []
-      deletes = []
-  pure ()
+-- Brings S-A1 (600 shares) to a date with an acceptance and returns its quantity.
+quantityOfA1On : Env -> Date -> Script Decimal
+quantityOfA1On env d = do
+  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-" <> show d; date = d; security_id = "S-A1"; comments = []]
+  (.quantity) <$> stateOf env "S-A1"
 
--- Test 3: Reverse stock split (1-for-10)
-testStockClassSplit_ReverseOneForTen = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockClass issuer capTableCid "COMMON"
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockClassSplit StockClassSplitOcfData with
-        id = "TX_STOCK_CLASS_SPLIT_REVERSE"
-        date = DT.time (DA.date 2025 Sep 01) 0 0 0
-        stock_class_id = "SC_COMMON"
-        split_ratio = OcfRatio with numerator = 1.0, denominator = 10.0
-        comments = ["Reverse split to maintain NASDAQ minimum share price requirement."]]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_class_split_two_for_one : Script ()
+test_stock_class_split_two_for_one = do
+  env <- standardBook
+  let d = D.date 2025 D.Jul 1
+  recordAndCheck env (split "TX_STOCK_CLASS_SPLIT_1" "CLS-A" 2.0 1.0 d)
+  -- The split touches no state until its next event on or after the split's date.
+  (.quantity) <$> stateOf env "S-A1" >>= (=== 600.0)
+  quantityOfA1On env d >>= (=== 1200.0)
+  (.split_epoch) <$> stateOf env "S-A1" >>= (=== 1)
+
+test_stock_class_split_ten_for_one_with_comments : Script ()
+test_stock_class_split_ten_for_one_with_comments = do
+  env <- standardBook
+  let d = D.date 2025 D.Dec 15
+  recordAndCheck env (split "TX_STOCK_CLASS_SPLIT_2" "CLS-A" 10.0 1.0 d) with
+    comments = ["Pre-IPO stock split to reduce per-share price.", "Board resolution dated 2025-12-01."]
+  quantityOfA1On env (D.addDays d 1) >>= (=== 6000.0)
+
+test_stock_class_split_reverse_one_for_ten : Script ()
+test_stock_class_split_reverse_one_for_ten = do
+  env <- standardBook
+  let d = D.date 2025 D.Sep 1
+  recordAndCheck env (split "TX_STOCK_CLASS_SPLIT_REVERSE" "CLS-A" 1.0 10.0 d) with
+    comments = ["Reverse split to maintain NASDAQ minimum share price requirement."]
+  quantityOfA1On env d >>= (=== 60.0)
+  -- Another class is untouched.
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B")]
+  (_, e) <- epochOf env "CLS-B"
+  e.splits === []
+
+test_stock_class_split_needs_its_class : Script ()
+test_stock_class_split_needs_its_class = do
+  env <- standardBook
+  let d = D.date 2025 D.Jul 1
+  applyRecordsFails env "no active epoch for stock class CLS-NONE in this write" [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-NONE" 2.0 1.0 d)]
+  applyRecordsFails env "no active epoch for stock class  in this write" [OcfRecordDataStockClassSplit (split "SPLIT-1" "" 2.0 1.0 d)]
+  applyRecordsFails env "stock class CLS-A must be frozen to record a split" [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 d)]
+
+test_stock_class_split_validator : Script ()
+test_stock_class_split_validator = do
+  env <- standardBook
+  let d = D.date 2025 D.Jul 1
+      sp = split "SPLIT-1" "CLS-A" 2.0 1.0 d
+  freezeClass env "CLS-A"
+  applyRecordsFails env "precondition" [OcfRecordDataStockClassSplit (sp with split_ratio = OcfRatio with numerator = 0.0; denominator = 1.0)]
+  applyRecordsFails env "precondition" [OcfRecordDataStockClassSplit (sp with split_ratio = OcfRatio with numerator = 2.0; denominator = 0.0)]
+  applyRecordsFails env "precondition" [OcfRecordDataStockClassSplit (sp with split_ratio = OcfRatio with numerator = -1.0; denominator = 1.0)]
+  applyRecordsFails env "precondition" [OcfRecordDataStockClassSplit (sp with comments = [""])]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockClassSplit (sp with id = "")]
+  (_, e) <- epochOf env "CLS-A"
+  e.splits === []
+  let ok = validateStockClassSplitOcfData
+  expectTrue "the fixture" (ok sp)
+  expectTrue "a reverse split" (ok sp with split_ratio = OcfRatio with numerator = 1.0; denominator = 10.0)
+  expectFalse "empty id" (ok sp with id = "")
+  expectFalse "empty stock_class_id" (ok sp with stock_class_id = "")
+  expectFalse "zero numerator" (ok sp with split_ratio = OcfRatio with numerator = 0.0; denominator = 1.0)
+  expectFalse "zero denominator" (ok sp with split_ratio = OcfRatio with numerator = 1.0; denominator = 0.0)
+  expectFalse "negative denominator" (ok sp with split_ratio = OcfRatio with numerator = 1.0; denominator = -2.0)
+  expectFalse "an empty comment" (ok sp with comments = [""])

@@ -1,109 +1,74 @@
+-- Warrant retractions through CapTable_Apply and CapTable_Restate: a record on the warrant's security, its security reference, the retraction validator and the shared edit and delete rules.
 module OpenCapTable.TestWarrantRetraction where
 
-import Fairmint.OpenCapTable.OCF.WarrantIssuance
-import Fairmint.OpenCapTable.OCF.WarrantRetraction
-import Fairmint.OpenCapTable.OCF.WarrantCancellation
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import Fairmint.OpenCapTable.Types.Stock (OcfQuantitySourceType(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addDefaultStakeholder)
-import OpenCapTable.HelpersTriggers (ocfTriggerElectiveAtWill)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
-createWarrantIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
-        id = "TX_WARRANT_ISS_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-WARRANT-1"
-        custom_id = "W-001"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = Some "Issued as part of debt financing"
-        security_law_exemptions = []
-        quantity = Some 10000.0
-        quantity_source = Some OcfQuantityUnspecified
-        exercise_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
-        purchase_price = OcfMonetary with amount = 0.01, currency = "USD"
-        exercise_triggers = [ ocfTriggerElectiveAtWill ]
-        warrant_expiration_date = None
-        vesting_terms_id = None
-        vestings = []
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.WarrantRetraction (WarrantRetractionOcfData(..), validateWarrantRetractionOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.WarrantConvertibleFixtures
 
-createWarrantRetraction issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantRetraction WarrantRetractionOcfData with
-        id = "TX_WARRANT_RETRACT_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-WARRANT-1"
-        reason_text = "Administrative error - incorrect warrant quantity"
-        comments = []]
-      edits = []
-      deletes = []
+retraction : Text -> Text -> WarrantRetractionOcfData
+retraction id sec = WarrantRetractionOcfData with
+  id
+  date = D.date 2024 D.Jan 2
+  reason_text = "Administrative error - incorrect warrant quantity"
+  security_id = sec
+  comments = []
 
-testWarrantRetraction_CreateAndArchiveByIssuer = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- createWarrantRetraction issuer result.updatedCapTableCid
-  pure ()
+wr : WarrantRetractionOcfData -> OcfRecordData
+wr = OcfRecordDataWarrantRetraction
 
-testWarrantRetraction_CreateAndArchiveBuiltIn = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- createWarrantRetraction issuer result.updatedCapTableCid
-  pure ()
+test_warrant_retraction_create : Script ()
+test_warrant_retraction_create = do
+  env <- instrumentBook
+  let r = retraction "TX_WARRANT_RETRACT_1" "W-1"
+  _ <- applyRecords env [wr r]
+  expectRecord env (wr r)
+  viewSecurityIds env "TX_WARRANT_RETRACT_1" >>= (=== ["W-1"])
+  -- The retracted warrant's issuance record stays; correcting it is a restatement.
+  hasRecord env "WI-1" >>= (=== True)
+  applyRecordsFails env "ID already used: TX_WARRANT_RETRACT_1" [OcfRecordDataStakeholder (stakeholderData "TX_WARRANT_RETRACT_1")]
 
--- Test with comments (non-empty array)
-testWarrantRetraction_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantRetraction WarrantRetractionOcfData with
-        id = "TX_WARRANT_RETRACT_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-WARRANT-1"
+test_warrant_retraction_with_comments : Script ()
+test_warrant_retraction_with_comments = do
+  env <- instrumentBook
+  let r = (retraction "TX_WARRANT_RETRACT_2" "W-1") with
+        date = D.date 2024 D.Jan 3
         reason_text = "Warrant void ab initio - debt financing fell through"
-        comments = ["Board resolution 2024-005", "Holder acknowledged"]]
-      edits = []
-      deletes = []
-  pure ()
+        comments = ["Board resolution 2024-005", "Holder acknowledged"]
+  _ <- applyRecords env [wr r]
+  expectRecord env (wr r)
 
-testWarrantRetraction_RetiresSourceBalance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  result <- createWarrantIssuance issuer capTableCid
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateWarrantRetraction WarrantRetractionOcfData with
-            id = "TX_WARRANT_RETRACT_BALANCE"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-WARRANT-1"
-            reason_text = "Void the warrant"
-            comments = []
-        , CT.OcfCreateWarrantCancellation WarrantCancellationOcfData with
-            id = "TX_WARRANT_CANCEL_AFTER_RETRACTION"
-            date = DT.time (DA.date 2024 Jan 02) 0 0 0
-            security_id = "SEC-WARRANT-1"
-            quantity = 1.0
-            reason_text = "Cannot reduce a retracted warrant"
-            balance_security_id = None
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_warrant_retraction_security_reference : Script ()
+test_warrant_retraction_security_reference = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant retraction security not found: W-NONE" [wr (retraction "WR-1" "W-NONE")]
+  applyRecordsFails env "Warrant retraction security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance" [wr (retraction "WR-1" "C-1")]
+  applyRecordsFails env "Warrant retraction security S-A2 is carried by a OcfObjectTypeTxStockIssuance" [wr (retraction "WR-1" "S-A2")]
+
+test_warrant_retraction_validator : Script ()
+test_warrant_retraction_validator = do
+  env <- instrumentBook
+  let base = retraction "WR-V" "W-1"
+      rejects : Text -> Text -> WarrantRetractionOcfData -> Script ()
+      rejects label expected r = do
+        expectInvalid label (validateWarrantRetractionOcfData r)
+        applyRecordsFails env expected [wr r]
+  expectValid "base" (validateWarrantRetractionOcfData base)
+  rejects "empty id" "an empty ID cannot be claimed" base with id = ""
+  rejects "empty security_id" "precondition" base with security_id = ""
+  rejects "empty reason" "precondition" base with reason_text = ""
+  rejects "empty comment" "precondition" base with comments = [""]
+
+test_warrant_retraction_edit_and_delete : Script ()
+test_warrant_retraction_edit_and_delete = do
+  env <- instrumentBook
+  let r = retraction "WR-1" "W-1"
+  _ <- applyRecords env [wr r]
+  restateOpsFails env "precondition" [RestateEdit (wr r with reason_text = "")]
+  restateOpsFails env "Warrant retraction security not found: W-NONE" [RestateEdit (wr r with security_id = "W-NONE")]
+  checkEditAndDelete env (wr r) (wr r with reason_text = "Issued to the wrong holder")

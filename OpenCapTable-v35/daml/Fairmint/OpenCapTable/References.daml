@@ -1,0 +1,341 @@
+-- References an OCF record makes to other records, checked when the record is written against the records its write fetched or created.
+module Fairmint.OpenCapTable.References
+  ( Requirement(..)
+  , Lookups(..)
+  , requirementsOf
+  , polymorphicReferenceCount
+  , polymorphicRequirementsOf
+  , checkRequirement
+  , issuanceSecurityId
+  , recordTranches
+  , issuanceObjectTypes
+  , checkRecordCaps
+  , maxStoredPolymorphicReferences
+  , maxClassesPerStockPlan
+  ) where
+
+import DA.List (dedup)
+import DA.Optional (optionalToList)
+import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.Document (OcfObjectReference(..))
+import Fairmint.OpenCapTable.OCF.VestingTerms (OcfVestingTrigger(..))
+import Fairmint.OpenCapTable.State (RecordedSplit(..), maxTranchesPerSecurity)
+import Fairmint.OpenCapTable.Types.Conversion (OcfAnyConversionRight(..), OcfCapitalizationDefinition(..))
+
+-- | A reference a record makes, checked after the write's last operation against the final
+-- working set, so a batch may reference a record it creates later. Definitions edited or deleted
+-- later are not re-checked on the ledger: the SDK refuses an edit or delete that would orphan a
+-- live reference.
+data Requirement
+  = -- | A record with this object ID and one of these types exists.
+    RequireObject with label : Text; object_id : Text; object_types : [OcfObjectType]
+  | -- | An issuance of one of these types carries this security ID.
+    RequireSecurity with label : Text; security_id : Text; object_types : [OcfObjectType]
+  | -- | The stock plan exists and includes the stock class.
+    RequirePlanIncludesClass with label : Text; stock_plan_id : Text; stock_class_id : Text
+  | -- | The stock class exists and has a ratio conversion right.
+    RequireRatioConversionRight with label : Text; stock_class_id : Text
+  | -- | The security's vesting terms have this condition, with a start trigger (`start`) or an
+    -- event trigger.
+    RequireVestingCondition with label : Text; security_id : Text; vesting_condition_id : Text; start : Bool
+  | -- | The warrant or convertible issuance carrying the security has this trigger.
+    RequireTrigger with label : Text; security_id : Text; trigger_id : Text
+  | -- | The split exists, is of the class, is recorded on the class's epoch and is dated on or
+    -- before the reissuance.
+    RequireSplitOfClass with label : Text; split_id : Text; stock_class_id : Text; on_or_before : Date
+  deriving (Eq, Ord, Show)
+
+-- | How requirements see the working set.
+data Lookups = Lookups
+  with
+    record : Text -> Optional OcfRecordData
+    security : Text -> Optional OcfRecordData
+    epoch_splits : Text -> Optional [RecordedSplit]
+
+issuanceObjectTypes : [OcfObjectType]
+issuanceObjectTypes =
+  [ OcfObjectTypeTxConvertibleIssuance
+  , OcfObjectTypeTxEquityCompensationIssuance
+  , OcfObjectTypeTxStockIssuance
+  , OcfObjectTypeTxWarrantIssuance
+  ]
+
+-- | The security ID an issuance record carries; other records carry none.
+issuanceSecurityId : OcfRecordData -> Optional Text
+issuanceSecurityId d = case d of
+  OcfRecordDataStockIssuance x -> Some x.security_id
+  OcfRecordDataWarrantIssuance x -> Some x.security_id
+  OcfRecordDataConvertibleIssuance x -> Some x.security_id
+  OcfRecordDataEquityCompensationIssuance x -> Some x.security_id
+  _ -> None
+
+-- | Vesting tranches a record carries, for the per-transaction tranche cap: every issuance's.
+recordTranches : OcfRecordData -> Int
+recordTranches d = case d of
+  OcfRecordDataStockIssuance x -> length x.vestings
+  OcfRecordDataWarrantIssuance x -> length x.vestings
+  OcfRecordDataEquityCompensationIssuance x -> length x.vestings
+  _ -> 0
+
+-- | Polymorphic references one record stores. A larger financing or document is created and then
+-- extended by restatements that check only the references they add.
+maxStoredPolymorphicReferences : Int
+maxStoredPolymorphicReferences = 1000
+
+maxClassesPerStockPlan : Int
+maxClassesPerStockPlan = 16
+
+-- | The register's size caps on one record, checked on every write (they bound a transaction's
+-- view; they are not OCF validity, so they are not in the records' `ensure`).
+checkRecordCaps : OcfRecordData -> Either Text ()
+checkRecordCaps d = case d of
+  OcfRecordDataDocument x -> cap "document related objects" (length x.related_objects) maxStoredPolymorphicReferences
+  OcfRecordDataFinancing x -> cap "financing issuance IDs" (length x.issuance_ids) maxStoredPolymorphicReferences
+  OcfRecordDataConvertibleConversion x ->
+    cap "capitalization definition references" (optional 0 capitalizationReferenceCount x.capitalization_definition) maxStoredPolymorphicReferences
+  OcfRecordDataStockPlan x -> cap "stock plan classes" (length x.stock_class_ids) maxClassesPerStockPlan
+  OcfRecordDataStockIssuance x -> cap "vesting tranches" (length x.vestings) maxTranchesPerSecurity
+  OcfRecordDataWarrantIssuance x -> cap "vesting tranches" (length x.vestings) maxTranchesPerSecurity
+  OcfRecordDataEquityCompensationIssuance x -> cap "vesting tranches" (length x.vestings) maxTranchesPerSecurity
+  _ -> pure ()
+  where
+    cap what n limit =
+      if n <= limit then pure ()
+      else Left (show (recordObjectType d) <> " has " <> show n <> " " <> what <> "; at most " <> show limit)
+
+capitalizationReferenceCount : OcfCapitalizationDefinition -> Int
+capitalizationReferenceCount c =
+  length c.include_security_ids + length c.exclude_security_ids
+    + length c.include_stock_class_ids + length c.include_stock_plans_ids
+
+-- | Polymorphic references a record makes; a transaction checks at most 100.
+polymorphicReferenceCount : OcfRecordData -> Int
+polymorphicReferenceCount d = case d of
+  OcfRecordDataDocument x -> length x.related_objects
+  OcfRecordDataFinancing x -> length x.issuance_ids
+  OcfRecordDataConvertibleConversion x -> optional 0 capitalizationReferenceCount x.capitalization_definition
+  _ -> 0
+
+-- | The requirements of a record's polymorphic references, the ones the per-transaction cap counts:
+-- an edit is charged for those the old record did not make.
+polymorphicRequirementsOf : OcfRecordData -> [Requirement]
+polymorphicRequirementsOf d = dedup $ case d of
+  OcfRecordDataDocument x -> documentRefs x.related_objects
+  OcfRecordDataFinancing x -> financingRefs x.issuance_ids
+  OcfRecordDataConvertibleConversion x -> conversionCapitalizationRefs x.capitalization_definition
+  _ -> []
+
+documentRefs : [OcfObjectReference] -> [Requirement]
+documentRefs = map (\r -> RequireObject with label = "Document related object"; object_id = r.object_id; object_types = [r.object_type])
+
+financingRefs : [Text] -> [Requirement]
+financingRefs = map (\i -> RequireObject with label = "Financing issuance"; object_id = i; object_types = issuanceObjectTypes)
+
+conversionCapitalizationRefs : Optional OcfCapitalizationDefinition -> [Requirement]
+conversionCapitalizationRefs = optional [] (capitalizationRefs "Convertible conversion capitalization definition")
+
+stakeholderRef : Text -> Text -> Requirement
+stakeholderRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeStakeholder]
+
+stockClassRef : Text -> Text -> Requirement
+stockClassRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeStockClass]
+
+stockPlanRef : Text -> Text -> Requirement
+stockPlanRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeStockPlan]
+
+vestingTermsRef : Text -> Text -> Requirement
+vestingTermsRef label id = RequireObject with label; object_id = id; object_types = [OcfObjectTypeVestingTerms]
+
+securityRef : Text -> OcfObjectType -> Text -> Requirement
+securityRef label t sec = RequireSecurity with label; security_id = sec; object_types = [t]
+
+conversionRightTargets : Text -> OcfAnyConversionRight -> [Requirement]
+conversionRightTargets label r = map (stockClassRef (label <> " conversion target")) $ case r of
+  OcfRightConvertible x -> optionalToList x.converts_to_stock_class_id
+  OcfRightWarrant x -> optionalToList x.converts_to_stock_class_id
+  OcfRightStockClass x -> optionalToList x.converts_to_stock_class_id
+
+capitalizationRefs : Text -> OcfCapitalizationDefinition -> [Requirement]
+capitalizationRefs label c =
+  map (\s -> RequireSecurity with label = label <> " included security"; security_id = s; object_types = issuanceObjectTypes) c.include_security_ids
+  <> map (\s -> RequireSecurity with label = label <> " excluded security"; security_id = s; object_types = issuanceObjectTypes) c.exclude_security_ids
+  <> map (stockClassRef (label <> " stock class")) c.include_stock_class_ids
+  <> map (stockPlanRef (label <> " stock plan")) c.include_stock_plans_ids
+
+-- | Every reference a record makes, as requirements on the working set. Stock events on a state
+-- need none for their source and outputs: the state proves the source, and the outputs are
+-- written in the same operation with their own requirements.
+requirementsOf : OcfRecordData -> [Requirement]
+requirementsOf d = dedup $ case d of
+  OcfRecordDataConvertibleAcceptance x -> [securityRef "Convertible acceptance" OcfObjectTypeTxConvertibleIssuance x.security_id]
+  OcfRecordDataConvertibleCancellation x ->
+    securityRef "Convertible cancellation" OcfObjectTypeTxConvertibleIssuance x.security_id
+      :: map (securityRef "Convertible cancellation balance" OcfObjectTypeTxConvertibleIssuance) (optionalToList x.balance_security_id)
+  OcfRecordDataConvertibleConversion x ->
+    [ securityRef "Convertible conversion" OcfObjectTypeTxConvertibleIssuance x.security_id
+    , RequireTrigger with label = "Convertible conversion"; security_id = x.security_id; trigger_id = x.trigger_id
+    ]
+      <> map (securityRef "Convertible conversion resulting security" OcfObjectTypeTxStockIssuance) x.resulting_security_ids
+      <> map (securityRef "Convertible conversion balance" OcfObjectTypeTxConvertibleIssuance) (optionalToList x.balance_security_id)
+      <> conversionCapitalizationRefs x.capitalization_definition
+  OcfRecordDataConvertibleIssuance x ->
+    stakeholderRef "Convertible issuance stakeholder" x.stakeholder_id
+      :: concatMap (\t -> conversionRightTargets "Convertible conversion trigger" (OcfRightConvertible t.conversion_right)) x.conversion_triggers
+  OcfRecordDataConvertibleRetraction x -> [securityRef "Convertible retraction" OcfObjectTypeTxConvertibleIssuance x.security_id]
+  OcfRecordDataConvertibleTransfer x ->
+    securityRef "Convertible transfer" OcfObjectTypeTxConvertibleIssuance x.security_id
+      :: map (securityRef "Convertible transfer resulting security" OcfObjectTypeTxConvertibleIssuance) x.resulting_security_ids
+      <> map (securityRef "Convertible transfer balance" OcfObjectTypeTxConvertibleIssuance) (optionalToList x.balance_security_id)
+  OcfRecordDataDocument x -> documentRefs x.related_objects
+  OcfRecordDataEquityCompensationAcceptance x -> [securityRef "Equity compensation acceptance" OcfObjectTypeTxEquityCompensationIssuance x.security_id]
+  OcfRecordDataEquityCompensationCancellation x ->
+    securityRef "Equity compensation cancellation" OcfObjectTypeTxEquityCompensationIssuance x.security_id
+      :: map (securityRef "Equity compensation cancellation balance" OcfObjectTypeTxEquityCompensationIssuance) (optionalToList x.balance_security_id)
+  OcfRecordDataEquityCompensationExercise x ->
+    securityRef "Equity compensation exercise" OcfObjectTypeTxEquityCompensationIssuance x.security_id
+      :: map (securityRef "Equity compensation exercise resulting security" OcfObjectTypeTxStockIssuance) x.resulting_security_ids
+  OcfRecordDataEquityCompensationIssuance x ->
+    [stakeholderRef "Equity compensation stakeholder" x.stakeholder_id]
+      <> map (stockClassRef "Equity compensation stock class") (optionalToList x.stock_class_id)
+      <> map (vestingTermsRef "Equity compensation vesting terms") (optionalToList x.vesting_terms_id)
+      <> case (x.stock_plan_id, x.stock_class_id) of
+           (Some p, Some c) -> [RequirePlanIncludesClass with label = "Equity compensation stock plan"; stock_plan_id = p; stock_class_id = c]
+           (Some p, None) -> [stockPlanRef "Equity compensation stock plan" p]
+           _ -> []
+  OcfRecordDataEquityCompensationRelease x ->
+    securityRef "Equity compensation release" OcfObjectTypeTxEquityCompensationIssuance x.security_id
+      :: map (securityRef "Equity compensation release resulting security" OcfObjectTypeTxStockIssuance) x.resulting_security_ids
+  OcfRecordDataEquityCompensationRepricing x -> [securityRef "Equity compensation repricing" OcfObjectTypeTxEquityCompensationIssuance x.security_id]
+  OcfRecordDataEquityCompensationRetraction x -> [securityRef "Equity compensation retraction" OcfObjectTypeTxEquityCompensationIssuance x.security_id]
+  OcfRecordDataEquityCompensationTransfer x ->
+    securityRef "Equity compensation transfer" OcfObjectTypeTxEquityCompensationIssuance x.security_id
+      :: map (securityRef "Equity compensation transfer resulting security" OcfObjectTypeTxEquityCompensationIssuance) x.resulting_security_ids
+      <> map (securityRef "Equity compensation transfer balance" OcfObjectTypeTxEquityCompensationIssuance) (optionalToList x.balance_security_id)
+  OcfRecordDataFinancing x -> financingRefs x.issuance_ids
+  OcfRecordDataIssuer _ -> []
+  OcfRecordDataIssuerAuthorizedSharesAdjustment x ->
+    [RequireObject with label = "Issuer authorized shares adjustment issuer"; object_id = x.issuer_id; object_types = [OcfObjectTypeIssuer]]
+  OcfRecordDataStakeholder _ -> []
+  OcfRecordDataStakeholderRelationshipChangeEvent x -> [stakeholderRef "Stakeholder relationship change event stakeholder" x.stakeholder_id]
+  OcfRecordDataStakeholderStatusChangeEvent x -> [stakeholderRef "Stakeholder status change event stakeholder" x.stakeholder_id]
+  OcfRecordDataStockAcceptance _ -> []
+  OcfRecordDataStockCancellation _ -> []
+  OcfRecordDataStockClass x ->
+    concatMap (\r -> conversionRightTargets ("Stock class " <> x.id) (OcfRightStockClass r)) x.conversion_rights
+  OcfRecordDataStockClassAuthorizedSharesAdjustment x -> [stockClassRef "Stock class authorized shares adjustment" x.stock_class_id]
+  OcfRecordDataStockClassConversionRatioAdjustment x ->
+    [RequireRatioConversionRight with label = "Stock class conversion ratio adjustment " <> x.id; stock_class_id = x.stock_class_id]
+  OcfRecordDataStockClassSplit x -> [stockClassRef "Stock class split" x.stock_class_id]
+  OcfRecordDataStockConsolidation _ -> []
+  OcfRecordDataStockConversion _ -> []
+  OcfRecordDataStockHold _ -> []
+  OcfRecordDataStockHoldCancellation _ -> []
+  OcfRecordDataStockIssuance x ->
+    [ stakeholderRef "Stock issuance stakeholder" x.stakeholder_id
+    , stockClassRef "Stock issuance stock class" x.stock_class_id
+    ]
+      <> map (\l -> RequireObject with label = "Stock issuance stock legend"; object_id = l; object_types = [OcfObjectTypeStockLegendTemplate]) x.stock_legend_ids
+      <> map (\p -> RequirePlanIncludesClass with label = "Stock issuance stock plan"; stock_plan_id = p; stock_class_id = x.stock_class_id) (optionalToList x.stock_plan_id)
+      <> map (vestingTermsRef "Stock issuance vesting terms") (optionalToList x.vesting_terms_id)
+  OcfRecordDataStockLegendTemplate _ -> []
+  OcfRecordDataStockPlan x -> map (stockClassRef ("Stock plan " <> x.id <> " stock class")) x.stock_class_ids
+  OcfRecordDataStockPlanPoolAdjustment x -> [stockPlanRef "Stock plan pool adjustment" x.stock_plan_id]
+  OcfRecordDataStockPlanReturnToPool x -> [stockPlanRef "Stock plan return to pool" x.stock_plan_id]
+  OcfRecordDataStockReissuance _ -> []
+  OcfRecordDataStockRepurchase _ -> []
+  OcfRecordDataStockRetraction _ -> []
+  OcfRecordDataStockTransfer _ -> []
+  OcfRecordDataValuation x -> [stockClassRef "Valuation stock class" x.stock_class_id]
+  OcfRecordDataVestingAcceleration _ -> []
+  OcfRecordDataVestingEvent x ->
+    [RequireVestingCondition with label = "Vesting event " <> x.id; security_id = x.security_id; vesting_condition_id = x.vesting_condition_id; start = False]
+  OcfRecordDataVestingStart x ->
+    [RequireVestingCondition with label = "Vesting start " <> x.id; security_id = x.security_id; vesting_condition_id = x.vesting_condition_id; start = True]
+  OcfRecordDataVestingTerms _ -> []
+  OcfRecordDataWarrantAcceptance x -> [securityRef "Warrant acceptance" OcfObjectTypeTxWarrantIssuance x.security_id]
+  OcfRecordDataWarrantCancellation x ->
+    securityRef "Warrant cancellation" OcfObjectTypeTxWarrantIssuance x.security_id
+      :: map (securityRef "Warrant cancellation balance" OcfObjectTypeTxWarrantIssuance) (optionalToList x.balance_security_id)
+  OcfRecordDataWarrantExercise x ->
+    [ securityRef "Warrant exercise" OcfObjectTypeTxWarrantIssuance x.security_id
+    , RequireTrigger with label = "Warrant exercise"; security_id = x.security_id; trigger_id = x.trigger_id
+    ]
+      <> map (securityRef "Warrant exercise resulting security" OcfObjectTypeTxStockIssuance) x.resulting_security_ids
+  OcfRecordDataWarrantIssuance x ->
+    stakeholderRef "Warrant issuance stakeholder" x.stakeholder_id
+      :: map (vestingTermsRef "Warrant vesting terms") (optionalToList x.vesting_terms_id)
+      <> concatMap (\t -> conversionRightTargets "Warrant exercise trigger" t.conversion_right) x.exercise_triggers
+  OcfRecordDataWarrantRetraction x -> [securityRef "Warrant retraction" OcfObjectTypeTxWarrantIssuance x.security_id]
+  OcfRecordDataWarrantTransfer x ->
+    securityRef "Warrant transfer" OcfObjectTypeTxWarrantIssuance x.security_id
+      :: map (securityRef "Warrant transfer resulting security" OcfObjectTypeTxWarrantIssuance) x.resulting_security_ids
+      <> map (securityRef "Warrant transfer balance" OcfObjectTypeTxWarrantIssuance) (optionalToList x.balance_security_id)
+
+-- | Checks one requirement against the working set.
+checkRequirement : Lookups -> Requirement -> Either Text ()
+checkRequirement l r = case r of
+  RequireObject with label; object_id; object_types ->
+    case l.record object_id of
+      Some d | recordObjectType d `elem` object_types -> pure ()
+      Some d -> Left (label <> " " <> object_id <> " is a " <> show (recordObjectType d) <> ", not one of " <> show object_types)
+      None -> Left (label <> " not found: " <> object_id)
+  RequireSecurity with label; security_id; object_types ->
+    case l.security security_id of
+      Some d | recordObjectType d `elem` object_types -> pure ()
+      Some d -> Left (label <> " security " <> security_id <> " is carried by a " <> show (recordObjectType d))
+      None -> Left (label <> " security not found: " <> security_id)
+  RequirePlanIncludesClass with label; stock_plan_id; stock_class_id ->
+    case l.record stock_plan_id of
+      Some (OcfRecordDataStockPlan p) ->
+        if stock_class_id `elem` p.stock_class_ids then pure ()
+        else Left (label <> " " <> stock_plan_id <> " does not include stock class " <> stock_class_id)
+      _ -> Left (label <> " not found: " <> stock_plan_id)
+  RequireRatioConversionRight with label; stock_class_id ->
+    case l.record stock_class_id of
+      Some (OcfRecordDataStockClass c) ->
+        if not (null c.conversion_rights) then pure ()
+        else Left (label <> " targets a stock class without a ratio conversion right: " <> stock_class_id)
+      _ -> Left (label <> " target not found: " <> stock_class_id)
+  RequireVestingCondition with label; security_id; vesting_condition_id; start -> do
+    termsId <- case l.security security_id of
+      Some (OcfRecordDataStockIssuance x) -> pure x.vesting_terms_id
+      Some (OcfRecordDataWarrantIssuance x) -> pure x.vesting_terms_id
+      Some (OcfRecordDataEquityCompensationIssuance x) -> pure x.vesting_terms_id
+      Some _ -> Left (label <> ": security " <> security_id <> " cannot vest")
+      None -> Left (label <> ": security not found: " <> security_id)
+    terms <- case termsId of
+      None -> Left (label <> ": security " <> security_id <> " has no vesting terms")
+      Some t -> case l.record t of
+        Some (OcfRecordDataVestingTerms vt) -> pure vt
+        _ -> Left (label <> ": vesting terms not found: " <> t)
+    case filter (\c -> c.id == vesting_condition_id) terms.vesting_conditions of
+      c :: _ | triggerMatches start c.trigger -> pure ()
+      _ :: _ -> Left (label <> " references vesting condition " <> vesting_condition_id <> " with the wrong trigger type")
+      [] -> Left (label <> " references missing vesting condition " <> vesting_condition_id <> " for security " <> security_id)
+  RequireTrigger with label; security_id; trigger_id ->
+    case l.security security_id of
+      Some (OcfRecordDataWarrantIssuance w) ->
+        if trigger_id `elem` map (.trigger_id) w.exercise_triggers then pure ()
+        else Left (label <> " trigger not found: " <> trigger_id)
+      Some (OcfRecordDataConvertibleIssuance c) ->
+        if trigger_id `elem` map (.trigger_id) c.conversion_triggers then pure ()
+        else Left (label <> " trigger not found: " <> trigger_id)
+      _ -> Left (label <> " security not found: " <> security_id)
+  RequireSplitOfClass with label; split_id; stock_class_id; on_or_before ->
+    case l.record split_id of
+      Some (OcfRecordDataStockClassSplit s) -> do
+        if s.stock_class_id == stock_class_id then pure ()
+        else Left (label <> " split " <> split_id <> " is of stock class " <> s.stock_class_id <> ", not " <> stock_class_id)
+        if s.date <= on_or_before then pure ()
+        else Left (label <> " split " <> split_id <> " is dated after the reissuance")
+        case l.epoch_splits stock_class_id of
+          Some splits | split_id `elem` map (.split_id) splits -> pure ()
+          _ -> Left (label <> " split " <> split_id <> " is not recorded on its class's epoch")
+      _ -> Left (label <> " split transaction not found: " <> split_id)
+
+triggerMatches : Bool -> OcfVestingTrigger -> Bool
+triggerMatches start t = case t of
+  OcfVestingStartTrigger -> start
+  OcfVestingEventTrigger -> not start
+  _ -> False

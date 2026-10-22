@@ -1,160 +1,167 @@
+-- Documents, ported from v34's TestDocument: writes, edits and deletes, every validator branch, the related-object references (any record type, checked by object ID and type), and the per-transaction and stored reference caps.
 module OpenCapTable.TestDocument where
-import Fairmint.OpenCapTable.OCF.Document
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers
+
+import DA.Assert ((===))
+import qualified DA.Map as Map
+import qualified DA.Text as T
 import Daml.Script
 
+import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.References (checkRecordCaps)
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.Document
+import Fairmint.OpenCapTable.OCF.Financing (FinancingOcfData(..))
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+sampleMd5 : Text
+sampleMd5 = "0123456789abcdef0123456789abcdef"
+
 documentData : Text -> [OcfObjectReference] -> DocumentOcfData
-documentData documentId relatedObjects = DocumentOcfData with
-  id = documentId
-  path = Some ("/docs/" <> documentId <> ".pdf")
-  uri = None
-  md5 = "0123456789abcdef0123456789abcdef"
-  related_objects = relatedObjects
+documentData id related = DocumentOcfData with
+  id
+  md5 = sampleMd5
   comments = []
+  related_objects = related
+  path = Some ("/docs/" <> id <> ".pdf")
+  uri = None
 
-testCreateDocument = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add document to CapTable via batch
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument DocumentOcfData with
-        id = "DOC_1"
-        path = Some "/docs/acme/charter.pdf"
-        uri = None
-        md5 = "0123456789abcdef0123456789abcdef"
-        related_objects = []
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+ref : OcfObjectType -> Text -> OcfObjectReference
+ref t id = OcfObjectReference with object_type = t; object_id = id
 
-testCreateAndDeleteDocument = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add document to CapTable via batch
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument DocumentOcfData with
-        id = "DOC_1"
-        path = Some "/docs/acme/charter.pdf"
-        uri = None
-        md5 = "0123456789abcdef0123456789abcdef"
-        related_objects = []
-        comments = []]
-      edits = []
-      deletes = []
-  -- Delete document via batch
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits = []
-      deletes = [CT.OcfDeleteDocument "DOC_1"]
-  pure ()
+issuerRef : OcfObjectReference
+issuerRef = ref OcfObjectTypeIssuer issuerId
 
-testCreateDocumentWithOptionalsSome = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add document with optional fields populated via batch
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument DocumentOcfData with
-        id = "DOC_2"
-        path = None
-        uri = Some "https://cdn.example.com/docs/acme/charter.pdf"
-        md5 = "0123456789abcdef0123456789abcdef"
-        related_objects = [ OcfObjectReference with object_type = OcfObjIssuer, object_id = "ISSUER_1" ]
-        comments = ["External link"]]
-      edits = []
-      deletes = []
-  pure ()
+documentRecords : [OcfRecordData]
+documentRecords =
+  [ OcfRecordDataStakeholder (stakeholderData "SH-1")
+  , OcfRecordDataStockClass (stockClass "SC_COMMON")
+  ]
 
-testEditDocument = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add document via batch
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument DocumentOcfData with
-        id = "DOC_EDIT"
-        path = Some "/docs/original.pdf"
-        uri = None
-        md5 = "0123456789abcdef0123456789abcdef"
-        related_objects = []
-        comments = []]
-      edits = []
-      deletes = []
-  -- Edit document via batch
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits = [CT.OcfEditDocument DocumentOcfData with
-          id = "DOC_EDIT"
-          path = Some "/docs/updated.pdf"
-          uri = None
-          md5 = "fedcba9876543210fedcba9876543210"
-          related_objects = []
-          comments = ["Updated version"]]
-      deletes = []
-  pure ()
+-- =============================================================================
+-- TESTS
+-- =============================================================================
 
-testDocumentRelatedIssuerReferenceMustExist = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
+-- v34 testCreateDocument, testCreateAndDeleteDocument and testEditDocument.
+test_document_create_edit_delete : Script ()
+test_document_create_edit_delete = do
+  env <- setupEnv
+  let charter = (documentData "DOC_1" []) with path = Some "/docs/acme/charter.pdf"
+  r <- applyRecords env [OcfRecordDataDocument charter]
+  Map.keys r.records === ["DOC_1"]
+  expectRecord env (OcfRecordDataDocument charter)
+  let updated = charter with path = Some "/docs/updated.pdf"; md5 = "fedcba9876543210fedcba9876543210"; comments = ["Updated version"]
+  _ <- restateOps env [RestateEdit (OcfRecordDataDocument updated)]
+  expectRecord env (OcfRecordDataDocument updated)
+  _ <- restateOps env [RestateDelete "DOC_1"]
+  expectNoRecord env "DOC_1"
 
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument (documentData "DOC_BAD_ISSUER_REF" [OcfObjectReference with object_type = OcfObjIssuer, object_id = "ISSUER_MISSING"])]
-      edits = []
-      deletes = []
+-- v34 testCreateDocumentWithOptionalsSome.
+test_document_all_optional_fields : Script ()
+test_document_all_optional_fields = do
+  env <- setupEnv
+  accept env validateDocumentOcfData OcfRecordDataDocument DocumentOcfData with
+    id = "DOC_2"
+    md5 = "0123456789ABCDEF0123456789abcdef"
+    comments = ["External link"]
+    related_objects = [issuerRef]
+    path = None
+    uri = Some "https://cdn.example.com/docs/acme/charter.pdf"
 
-testDocumentRelatedObjectCreatedInSameBatchSucceeds = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
+test_document_validation : Script ()
+test_document_validation = do
+  env <- setupEnv
+  let no = refuse env validateDocumentOcfData OcfRecordDataDocument
+      base = documentData "DOC_BAD" [issuerRef]
+  -- An MD5 of 32 hex characters
+  no base with md5 = T.take 31 sampleMd5
+  no base with md5 = sampleMd5 <> "0"
+  no base with md5 = "0123456789abcdef0123456789abcdeg"
+  no base with md5 = ""
+  -- OCF oneOf: exactly one of path and uri, each non-empty
+  no base with uri = Some "https://example.com/doc.pdf"
+  no base with path = None
+  no base with path = Some ""
+  no base with path = None; uri = Some ""
+  no base with comments = [""]
+  no base with related_objects = [issuerRef, ref OcfObjectTypeStakeholder ""]
 
-  _ <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateDocument (documentData "DOC_STOCK_CLASS_REF" [OcfObjectReference with object_type = OcfObjStockClass, object_id = "SC_DOC_REF"])
-        , CT.OcfCreateStockClass (defaultStockClass "SC_DOC_REF")
+-- v34 testDocumentRelatedIssuerReferenceMustExist, testDocumentRelatedObjectCreatedInSameBatchSucceeds
+-- and testDocumentEditMissingRelatedObjectFails.
+test_document_related_object_references : Script ()
+test_document_related_object_references = do
+  env <- bookWith documentRecords
+  let doc id related = OcfRecordDataDocument (documentData id related)
+  applyRecordsFails env "Document related object not found: ISSUER_MISSING" [doc "DOC_BAD_ISSUER_REF" [ref OcfObjectTypeIssuer "ISSUER_MISSING"]]
+  -- The reference names the type, and the record must have it.
+  applyRecordsFails env "Document related object SH-1 is a OcfObjectTypeStakeholder" [doc "DOC_WRONG_TYPE" [ref OcfObjectTypeStockClass "SH-1"]]
+  -- Every reference is checked.
+  applyRecordsFails env "Document related object not found: SC_SECOND" [doc "DOC_TWO" [issuerRef, ref OcfObjectTypeStockClass "SC_SECOND"]]
+  -- The object may come later in the same batch.
+  _ <- applyRecords env [doc "DOC_STOCK_CLASS_REF" [ref OcfObjectTypeStockClass "SC_DOC_REF"], OcfRecordDataStockClass (stockClass "SC_DOC_REF")]
+  expectRecord env (doc "DOC_STOCK_CLASS_REF" [ref OcfObjectTypeStockClass "SC_DOC_REF"])
+  -- An edit's added reference is checked.
+  _ <- applyRecords env [doc "DOC_EDIT_REF" []]
+  restateOpsFails env "Document related object not found: SC_MISSING_FOR_DOC" [RestateEdit (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_MISSING_FOR_DOC"])]
+  _ <- restateOps env [RestateEdit (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_COMMON", ref OcfObjectTypeStakeholder "SH-1"])]
+  expectRecord env (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_COMMON", ref OcfObjectTypeStakeholder "SH-1"])
+
+-- v34 testDocumentPlanSecurityAliasReferencesEquityCompensationIssuance and
+-- testDocumentUnsupportedRelatedObjectTypeFails. v35 has no TX_PLAN_SECURITY_* aliases (writers
+-- normalize them to TX_EQUITY_COMPENSATION_*), and a document may relate to a record of any type,
+-- including a financing, which v34 refused.
+test_document_relates_to_any_record_type : Script ()
+test_document_relates_to_any_record_type = do
+  env <- bookWith documentRecords
+  let financing = FinancingOcfData with
+        id = "FINANCING_1"; date = d2024; name = "Seed"; comments = []; issuance_ids = ["EC_DOC_PLAN_SECURITY"]
+      related =
+        [ ref OcfObjectTypeTxEquityCompensationIssuance "EC_DOC_PLAN_SECURITY"
+        , ref OcfObjectTypeFinancing "FINANCING_1"
+        , ref OcfObjectTypeTxStockIssuance "ISS-S-1"
+        , ref OcfObjectTypeStakeholder "SH-1"
+        , issuerRef
         ]
-      edits = []
-      deletes = []
-  pure ()
+  _ <- applyRecords env
+    [ OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "EC_DOC_PLAN_SECURITY" "SEC_DOC_PLAN_SECURITY" "SH-1")
+    , OcfRecordDataStockIssuance (issuance "S-1" "SH-1" "SC_COMMON" 10.0 d2024)
+    , OcfRecordDataFinancing financing
+    ]
+  accept env validateDocumentOcfData OcfRecordDataDocument (documentData "DOC_ANY" related)
+  applyRecordsFails env "Document related object not found: FINANCING_MISSING" [OcfRecordDataDocument (documentData "DOC_FIN" [ref OcfObjectTypeFinancing "FINANCING_MISSING"])]
+  -- References are by object ID, never by security ID.
+  applyRecordsFails env "Document related object not found: SEC_DOC_PLAN_SECURITY"
+    [OcfRecordDataDocument (documentData "DOC_SEC" [ref OcfObjectTypeTxEquityCompensationIssuance "SEC_DOC_PLAN_SECURITY"])]
 
-testDocumentPlanSecurityAliasReferencesEquityCompensationIssuance = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  (capTableWithStakeholder, stakeholderId) <- setupStakeholderWithId issuer cap_table "SH_DOC_PLAN_SECURITY" "Plan Security Holder"
-  capTableWithStockClass <- addDefaultStockClass issuer capTableWithStakeholder
-  capTableWithIssuance <- addEquityCompensationIssuance issuer capTableWithStockClass "EC_DOC_PLAN_SECURITY" "SEC_DOC_PLAN_SECURITY" stakeholderId
+-- A transaction checks at most 100 polymorphic references, over the whole batch; an edit counts
+-- only the references it adds.
+test_document_references_per_transaction_cap : Script ()
+test_document_references_per_transaction_cap = do
+  env <- setupEnv
+  let doc id n = OcfRecordDataDocument (documentData id (replicate n issuerRef))
+  applyRecordsFails env "more than 100 polymorphic references" [doc "DOC_101" 101]
+  applyRecordsFails env "more than 100 polymorphic references" [doc "DOC_60" 60, doc "DOC_41" 41]
+  _ <- applyRecords env [doc "DOC_BIG" 100]
+  expectRecord env (doc "DOC_BIG" 100)
+  restateOpsFails env "more than 100 polymorphic references" [RestateEdit (doc "DOC_BIG" 201)]
+  _ <- restateOps env [RestateEdit (doc "DOC_BIG" 200)]
+  expectRecord env (doc "DOC_BIG" 200)
+  -- Shrinking checks nothing new.
+  _ <- restateOps env [RestateEdit (doc "DOC_BIG" 1)]
+  expectRecord env (doc "DOC_BIG" 1)
 
-  _ <- submit issuer do
-    exerciseCmd capTableWithIssuance CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateDocument
-            (documentData
-              "DOC_PLAN_SECURITY_REF"
-              [OcfObjectReference with object_type = OcfObjTxPlanSecurityIssuance, object_id = "EC_DOC_PLAN_SECURITY"])
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
-testDocumentEditMissingRelatedObjectFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument (documentData "DOC_EDIT_REF" [])]
-      edits = []
-      deletes = []
-
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits = [CT.OcfEditDocument (documentData "DOC_EDIT_REF" [OcfObjectReference with object_type = OcfObjStockClass, object_id = "SC_MISSING_FOR_DOC"])]
-      deletes = []
-
-testDocumentUnsupportedRelatedObjectTypeFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateDocument (documentData "DOC_UNSUPPORTED_REF" [OcfObjectReference with object_type = OcfObjFinancing, object_id = "FINANCING_1"])]
-      edits = []
-      deletes = []
+-- A document stores at most 1000 references, so a larger one is created and then extended by
+-- restatements of at most 100 new references each. The register checks the cap on every record
+-- it writes (TestFinancing.test_financing_reference_caps drives that path to the cap on the
+-- ledger); a 1000-reference document trace is too large for the script service, so the document
+-- branch is checked directly.
+test_document_references_stored_cap : Script ()
+test_document_references_stored_cap = do
+  let doc n = OcfRecordDataDocument (documentData "DOC_BIG" (replicate n issuerRef))
+  checkRecordCaps (doc 1000) === Right ()
+  checkRecordCaps (doc 1001) === Left "OcfObjectTypeDocument has 1001 document related objects; at most 1000"

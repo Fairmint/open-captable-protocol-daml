@@ -1,268 +1,149 @@
+-- Security IDs on events: a stock event needs the security's stock state; a warrant, convertible or equity-compensation event needs an issuance of its own instrument carrying the ID; and security IDs are unique across instruments.
 module OpenCapTable.TestSecurityIdValidation where
 
--- =============================================================================
--- Security ID Validation Tests
--- =============================================================================
--- Tests for security_id validation in tier 4 transactions.
--- These tests verify:
--- 1. Transactions fail with clear error when security_id doesn't exist
--- 2. Cross-type validation works (can't use stock security_id in warrant transaction)
--- =============================================================================
-
-import qualified Fairmint.OpenCapTable.OCF.StockTransfer as ST
-import qualified Fairmint.OpenCapTable.OCF.WarrantTransfer as WT
-import qualified Fairmint.OpenCapTable.OCF.ConvertibleTransfer as CVT
-import qualified Fairmint.OpenCapTable.OCF.EquityCompensationTransfer as ECT
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers
-  ( addPrerequisites
-  , addDefaultStockIssuance
-  , addDefaultWarrantIssuance
-  , addDefaultConvertibleIssuance
-  , addDefaultEquityCompensationIssuance
-  , stockSuccessorIssuance
-  , warrantSuccessorIssuance
-  )
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+transferOn : Text -> Decimal -> [Text] -> StockTransferOcfData
+transferOn sec q resulting = StockTransferOcfData with
+  id = "TX_TRANSFER_1"; date = D.date 2024 D.Jan 1; security_id = sec; quantity = q; comments = []
+  resulting_security_ids = resulting; balance_security_id = None; consideration_text = None
+
+stockTransferOp : StockTransferOcfData -> [StockIssuanceOcfData] -> ApplyOperation
+stockTransferOp t rs = ApplyStockTransfer with transfer = t; resulting = rs; balance = None
+
+newSec : Text -> Decimal -> StockIssuanceOcfData
+newSec sec q = (issuance sec "SH-B" "CLS-A" q (D.date 2024 D.Jan 1)) with id = "ISS-" <> sec
 
 -- =============================================================================
--- Test: Non-existent security_id fails with clear error
+-- NON-EXISTENT SECURITY IDS
 -- =============================================================================
 
--- Test: StockTransfer fails when security_id doesn't exist
-testStockTransfer_NonExistentSecurityIdFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites (stakeholder and stock class) but NO stock issuance
-  cap_table <- addPrerequisites issuer cap_table
-  -- Attempt to create a stock transfer without an existing stock issuance
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-        id = "TX_TRANSFER_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "NONEXISTENT-STOCK-SEC"  -- This security_id doesn't exist
-        quantity = 50.0
-        comments = []
-        resulting_security_ids = ["NEW-SEC-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_stock_transfer_nonexistent_fails : Script ()
+test_security_ids_stock_transfer_nonexistent_fails = do
+  env <- standardBook
+  applyOpsFails env "no active state for security NONEXISTENT-STOCK-SEC in this write"
+    [stockTransferOp (transferOn "NONEXISTENT-STOCK-SEC" 50.0 ["NEW-SEC-1"]) [newSec "NEW-SEC-1" 50.0]]
 
--- Test: WarrantTransfer fails when security_id doesn't exist
-testWarrantTransfer_NonExistentSecurityIdFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add only stakeholder (required for validation) but NO warrant issuance
-  cap_table <- addPrerequisites issuer cap_table
-  -- Attempt to create a warrant transfer without an existing warrant issuance
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
-        id = "TX_WARRANT_TRANSFER_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "NONEXISTENT-WARRANT-SEC"  -- This security_id doesn't exist
-        quantity = 25.0
-        comments = []
-        resulting_security_ids = ["NEW-WARRANT-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_warrant_transfer_nonexistent_fails : Script ()
+test_security_ids_warrant_transfer_nonexistent_fails = do
+  env <- standardBook
+  applyRecordsFails env "Warrant transfer security not found: NONEXISTENT-WARRANT-SEC"
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "NEW-WARRANT-1" "SH-B")
+    , OcfRecordDataWarrantTransfer (warrantTransfer "TX_WARRANT_TRANSFER_1" "NONEXISTENT-WARRANT-SEC" ["NEW-WARRANT-1"] None)
+    ]
 
--- Test: ConvertibleTransfer fails when security_id doesn't exist
-testConvertibleTransfer_NonExistentSecurityIdFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add only stakeholder but NO convertible issuance
-  cap_table <- addPrerequisites issuer cap_table
-  -- Attempt to create a convertible transfer without an existing convertible issuance
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleTransfer CVT.ConvertibleTransferOcfData with
-        id = "TX_CONV_TRANSFER_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "NONEXISTENT-CONV-SEC"  -- This security_id doesn't exist
-        amount = OcfMonetary with amount = 1000.0; currency = "USD"
-        comments = []
-        resulting_security_ids = ["NEW-CONV-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_convertible_transfer_nonexistent_fails : Script ()
+test_security_ids_convertible_transfer_nonexistent_fails = do
+  env <- standardBook
+  applyRecordsFails env "Convertible transfer security not found: NONEXISTENT-CONV-SEC"
+    [ OcfRecordDataConvertibleIssuance (convertibleIssuance "NEW-CONV-1" "SH-B")
+    , OcfRecordDataConvertibleTransfer (convertibleTransfer "TX_CONV_TRANSFER_1" "NONEXISTENT-CONV-SEC" ["NEW-CONV-1"] None)
+    ]
 
--- Test: EquityCompensationTransfer fails when security_id doesn't exist
-testEquityCompensationTransfer_NonExistentSecurityIdFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add only stakeholder but NO equity compensation issuance
-  cap_table <- addPrerequisites issuer cap_table
-  -- Attempt to create an equity compensation transfer without an existing issuance
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationTransfer ECT.EquityCompensationTransferOcfData with
-        id = "TX_EC_TRANSFER_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "NONEXISTENT-EC-SEC"  -- This security_id doesn't exist
-        quantity = 100.0
-        comments = []
-        resulting_security_ids = ["NEW-EC-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
-
+test_security_ids_equity_compensation_transfer_nonexistent_fails : Script ()
+test_security_ids_equity_compensation_transfer_nonexistent_fails = do
+  env <- standardBook
+  applyRecordsFails env "Equity compensation transfer security not found: NONEXISTENT-EC-SEC"
+    [ OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "NEW-EC-1" "SH-B")
+    , OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX_EC_TRANSFER_1" "NONEXISTENT-EC-SEC" ["NEW-EC-1"] None)
+    ]
 
 -- =============================================================================
--- Test: Cross-type validation (type-safe security references)
+-- WRONG INSTRUMENT
 -- =============================================================================
 
--- Test: StockTransfer fails when using warrant security_id (wrong type)
-testStockTransfer_WrongSecurityTypeFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and a WARRANT issuance (not stock)
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultWarrantIssuance issuer cap_table
-  -- Attempt to create a stock transfer using the warrant's security_id
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-        id = "TX_TRANSFER_WRONG_TYPE"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-WR-1"  -- This is a warrant security_id, not stock
-        quantity = 50.0
-        comments = []
-        resulting_security_ids = ["NEW-SEC-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_stock_transfer_of_warrant_fails : Script ()
+test_security_ids_stock_transfer_of_warrant_fails = do
+  env <- instrumentBook
+  applyOpsFails env "no active state for security W-1 in this write"
+    [stockTransferOp ((transferOn "W-1" 50.0 ["NEW-SEC-1"]) with id = "TX_TRANSFER_WRONG_TYPE") [newSec "NEW-SEC-1" 50.0]]
 
--- Test: WarrantTransfer fails when using stock security_id (wrong type)
-testWarrantTransfer_WrongSecurityTypeFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and a STOCK issuance (not warrant)
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultStockIssuance issuer cap_table
-  -- Attempt to create a warrant transfer using the stock's security_id
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
-        id = "TX_WARRANT_TRANSFER_WRONG_TYPE"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-STOCK-1"  -- This is a stock security_id, not warrant
-        quantity = 25.0
-        comments = []
-        resulting_security_ids = ["NEW-WARRANT-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_warrant_transfer_of_stock_fails : Script ()
+test_security_ids_warrant_transfer_of_stock_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant transfer security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "NEW-WARRANT-1" "SH-B")
+    , OcfRecordDataWarrantTransfer (warrantTransfer "TX_WARRANT_TRANSFER_WRONG_TYPE" "S-A1" ["NEW-WARRANT-1"] None)
+    ]
 
--- Test: ConvertibleTransfer fails when using equity compensation security_id (wrong type)
-testConvertibleTransfer_WrongSecurityTypeFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and an EQUITY COMPENSATION issuance (not convertible)
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultEquityCompensationIssuance issuer cap_table
-  -- Attempt to create a convertible transfer using the EC's security_id
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleTransfer CVT.ConvertibleTransferOcfData with
-        id = "TX_CONV_TRANSFER_WRONG_TYPE"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-EC-1"  -- This is an equity compensation security_id, not convertible
-        amount = OcfMonetary with amount = 1000.0; currency = "USD"
-        comments = []
-        resulting_security_ids = ["NEW-CONV-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_convertible_transfer_of_equity_compensation_fails : Script ()
+test_security_ids_convertible_transfer_of_equity_compensation_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Convertible transfer security EC-1 is carried by a OcfObjectTypeTxEquityCompensationIssuance"
+    [ OcfRecordDataConvertibleIssuance (convertibleIssuance "NEW-CONV-1" "SH-B")
+    , OcfRecordDataConvertibleTransfer (convertibleTransfer "TX_CONV_TRANSFER_WRONG_TYPE" "EC-1" ["NEW-CONV-1"] None)
+    ]
 
--- Test: EquityCompensationTransfer fails when using convertible security_id (wrong type)
-testEquityCompensationTransfer_WrongSecurityTypeFails = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and a CONVERTIBLE issuance (not equity compensation)
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultConvertibleIssuance issuer cap_table
-  -- Attempt to create an equity compensation transfer using the convertible's security_id
-  submitMustFail issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationTransfer ECT.EquityCompensationTransferOcfData with
-        id = "TX_EC_TRANSFER_WRONG_TYPE"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-CV-1"  -- This is a convertible security_id, not equity compensation
-        quantity = 100.0
-        comments = []
-        resulting_security_ids = ["NEW-EC-1"]
-        balance_security_id = None
-        consideration_text = None]
-      edits = []
-      deletes = []
-  pure ()
-
+test_security_ids_equity_compensation_transfer_of_convertible_fails : Script ()
+test_security_ids_equity_compensation_transfer_of_convertible_fails = do
+  env <- instrumentBook
+  applyRecordsFails env "Equity compensation transfer security CV-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [ OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "NEW-EC-1" "SH-B")
+    , OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX_EC_TRANSFER_WRONG_TYPE" "CV-1" ["NEW-EC-1"] None)
+    ]
 
 -- =============================================================================
--- Test: Valid security_id succeeds
+-- VALID SECURITY IDS
 -- =============================================================================
 
--- Test: StockTransfer succeeds when using correct stock security_id
-testStockTransfer_CorrectSecurityIdSucceeds = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and stock issuance
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultStockIssuance issuer cap_table
-  -- Create a stock transfer using the correct stock security_id
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateStockTransfer ST.StockTransferOcfData with
-            id = "TX_TRANSFER_VALID"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-STOCK-1"  -- Correct stock security_id
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["NEW-SEC-1"]
-            balance_security_id = None
-            consideration_text = None
-        , stockSuccessorIssuance "TX_TRANSFER_VALID_RESULT" "NEW-SEC-1" "SH-1" "SC_COMMON" (DT.time (DA.date 2024 Jan 01) 0 0 0) 100.0
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_stock_transfer_correct_id_succeeds : Script ()
+test_security_ids_stock_transfer_correct_id_succeeds = do
+  env <- standardBook
+  let t = (transferOn "S-A2" 400.0 ["NEW-SEC-1"]) with id = "TX_TRANSFER_VALID"
+      r = (newSec "NEW-SEC-1" 400.0) with id = "TX_TRANSFER_VALID_RESULT"
+  _ <- applyOps env [stockTransferOp t [r]]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  expectRecord env (OcfRecordDataStockIssuance r)
+  hasState env "S-A2" >>= (=== False)
+  (.quantity) <$> stateOf env "NEW-SEC-1" >>= (=== 400.0)
 
--- Test: WarrantTransfer succeeds when using correct warrant security_id
-testWarrantTransfer_CorrectSecurityIdSucceeds = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- Add prerequisites and warrant issuance
-  cap_table <- addPrerequisites issuer cap_table
-  cap_table <- addDefaultWarrantIssuance issuer cap_table
-  -- Create a warrant transfer using the correct warrant security_id
-  result <- submit issuer do
-    exerciseCmd cap_table CT.UpdateCapTable with
-      creates =
-        [ CT.OcfCreateWarrantTransfer WT.WarrantTransferOcfData with
-            id = "TX_WARRANT_TRANSFER_VALID"
-            date = DT.time (DA.date 2024 Jan 01) 0 0 0
-            security_id = "SEC-WR-1"  -- Correct warrant security_id
-            quantity = 100.0
-            comments = []
-            resulting_security_ids = ["NEW-WARRANT-1"]
-            balance_security_id = None
-            consideration_text = None
-        , warrantSuccessorIssuance "TX_WARRANT_TRANSFER_VALID_RESULT" "NEW-WARRANT-1" "SH-1" (DT.time (DA.date 2024 Jan 01) 0 0 0) 100.0
-        ]
-      edits = []
-      deletes = []
-  pure ()
+test_security_ids_warrant_transfer_correct_id_succeeds : Script ()
+test_security_ids_warrant_transfer_correct_id_succeeds = do
+  env <- instrumentBook
+  let t = warrantTransfer "TX_WARRANT_TRANSFER_VALID" "W-1" ["NEW-WARRANT-1"] None
+      w = (warrantIssuance "NEW-WARRANT-1" "SH-B") with id = "TX_WARRANT_TRANSFER_VALID_RESULT"
+  _ <- applyRecords env [OcfRecordDataWarrantTransfer t, OcfRecordDataWarrantIssuance w]
+  expectRecord env (OcfRecordDataWarrantTransfer t)
+  expectRecord env (OcfRecordDataWarrantIssuance w)
+
+-- =============================================================================
+-- UNIQUENESS ACROSS INSTRUMENTS
+-- =============================================================================
+
+test_security_ids_unique_across_instruments : Script ()
+test_security_ids_unique_across_instruments = do
+  env <- instrumentBook
+  applyRecordsFails env "security ID already used: S-A1"
+    [OcfRecordDataWarrantIssuance ((warrantIssuance "S-A1" "SH-B") with id = "ISS-W-DUP")]
+  applyRecordsFails env "security ID already used: W-1"
+    [OcfRecordDataStockIssuance ((newSec "W-1" 1.0) with id = "ISS-S-DUP")]
+  applyRecordsFails env "security ID already used: CV-1"
+    [OcfRecordDataEquityCompensationIssuance ((equityCompensationIssuance "CV-1" "SH-B") with id = "ISS-EC-DUP")]
+  applyRecordsFails env "security ID already used: EC-1"
+    [OcfRecordDataConvertibleIssuance ((convertibleIssuance "EC-1" "SH-B") with id = "ISS-CV-DUP")]
+  -- Two instruments with one new security ID in the same batch.
+  applyRecordsFails env "security ID already used: SEC-NEW"
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "SEC-NEW" "SH-B")
+    , OcfRecordDataStockIssuance ((newSec "SEC-NEW" 1.0) with id = "ISS-SEC-NEW-2")
+    ]
+
+-- Security IDs and object IDs are claimed in separate namespaces.
+test_security_ids_separate_from_object_ids : Script ()
+test_security_ids_separate_from_object_ids = do
+  env <- standardBook
+  let iss = (newSec "SH-B" 5.0) with id = "ISS-NAMED-LIKE-A-STAKEHOLDER"
+  _ <- applyRecords env [OcfRecordDataStockIssuance iss]
+  expectRecord env (OcfRecordDataStockIssuance iss)
+  (.quantity) <$> stateOf env "SH-B" >>= (=== 5.0)
+  -- The issuance's object ID is claimed against every type.
+  applyRecordsFails env "ID already used: ISS-NAMED-LIKE-A-STAKEHOLDER"
+    [OcfRecordDataStakeholder (stakeholderData "ISS-NAMED-LIKE-A-STAKEHOLDER")]

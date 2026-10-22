@@ -13,7 +13,7 @@ import { isContractNetwork, type ContractNetwork } from './types';
 // =============================================================================
 
 export interface PackageConfig {
-  /** Display name (e.g., 'OpenCapTable-v34') */
+  /** Display name (e.g., 'OpenCapTable-v35') */
   name: string;
   /** DAR file name without extension (usually same as name) */
   darName: string;
@@ -25,6 +25,13 @@ export interface PackageConfig {
   buildDir: string;
   /** Generated JS package metadata, if this package produces a generated package. */
   generated?: GeneratedPackageMetadata;
+  /**
+   * Keys of this repository's packages that this package data-depends on, in upload order. Their DARs are uploaded (and
+   * their deployments tagged) before this package's.
+   */
+  dependencies: string[];
+  /** Whether a `<name>-v<version>` release tag can name this package (dependencies release with their dependent). */
+  releasable: boolean;
 }
 
 export interface GeneratedPackageMetadata {
@@ -60,13 +67,25 @@ function readMetadataFromDamlYaml(sourceDir: string): DamlPackageMetadata {
 interface PackageDef {
   sourceDir: string;
   generated?: GeneratedPackageMetadata;
+  dependencies?: readonly string[];
+  releasable?: boolean;
 }
 
-/** Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands. */
+/**
+ * Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands.
+ *
+ * OpenCapTable-v35 data-depends on the reader interfaces (OpenCapTableApi-v01), which are bundled into the npm `lib/`
+ * and released with it.
+ */
 const PACKAGE_DEFS = {
+  api: {
+    sourceDir: 'OpenCapTableApi-v01',
+  },
   ocp: {
-    sourceDir: 'OpenCapTable-v34',
+    sourceDir: 'OpenCapTable-v35',
     generated: { createIndex: true, publishNameSuffix: null },
+    dependencies: ['api'],
+    releasable: true,
   },
 } as const satisfies Record<string, PackageDef>;
 
@@ -82,6 +101,8 @@ function buildPackageConfig(def: PackageDef): PackageConfig {
     sourceDir: def.sourceDir,
     buildDir: path.join('generated', 'build', metadata.name),
     generated: def.generated ? { ...def.generated } : undefined,
+    dependencies: [...(def.dependencies ?? [])],
+    releasable: def.releasable ?? false,
   };
 }
 
@@ -111,7 +132,7 @@ function resolvePackageKey(key: string): PackageDefKey | undefined {
 }
 
 /**
- * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v34'). Key lookup is
+ * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35'). Key lookup is
  * case-insensitive.
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {
@@ -142,6 +163,28 @@ export function requirePackageConfig(packageKey: string): PackageConfig {
 /** Get all package keys. */
 export function getPackageKeys(): PackageKey[] {
   return [...(Object.keys(PACKAGE_DEFS) as PackageDefKey[])];
+}
+
+/**
+ * The packages to upload for `keyOrName`, dependencies first (each once), ending with the package itself. A participant
+ * must hold a package's dependencies before it can vet the package.
+ */
+export function getUploadOrder(keyOrName: string): PackageConfig[] {
+  const order: PackageConfig[] = [];
+  const visit = (key: string, chain: string[]): void => {
+    const pkg = requirePackageConfig(key);
+    if (chain.includes(pkg.name)) {
+      throw new Error(`Package dependency cycle: ${[...chain, pkg.name].join(' -> ')}`);
+    }
+    for (const dependency of pkg.dependencies) {
+      visit(dependency, [...chain, pkg.name]);
+    }
+    if (!order.some((existing) => existing.name === pkg.name)) {
+      order.push(pkg);
+    }
+  };
+  visit(keyOrName, []);
+  return order;
 }
 
 export interface GeneratedPackageConfig {
@@ -287,7 +330,7 @@ export function printPackageUsage(scriptName: string, errorMessage?: string): vo
  * This ensures we always use the correct package version from daml.yaml (single source of truth), avoiding hardcoded
  * version references that become stale after upgrades.
  *
- * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v34')
+ * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35')
  * @param module - Full module path (e.g., 'Fairmint.OpenCapTable.OcpFactory')
  * @param template - Template name (e.g., 'OcpFactory')
  */

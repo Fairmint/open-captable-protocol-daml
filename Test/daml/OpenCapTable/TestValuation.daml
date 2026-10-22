@@ -1,0 +1,73 @@
+-- Valuations, ported from v34's TestValuationReferences: writes, edits and deletes, every validator branch, and the stock class reference.
+module OpenCapTable.TestValuation where
+
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.OCF.Valuation
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+
+valuationFor : Text -> Text -> ValuationOcfData
+valuationFor id cls = ValuationOcfData with
+  id
+  effective_date = D.date 2024 D.Jan 1
+  price_per_share = usd 1.0
+  stock_class_id = cls
+  valuation_type = OcfValuationType409a
+  comments = []
+  board_approval_date = None
+  provider = None
+  stockholder_approval_date = None
+
+valuationRecords : [OcfRecordData]
+valuationRecords = [OcfRecordDataStockClass (stockClass "SC_COMMON"), OcfRecordDataStakeholder (stakeholderData "SH-1")]
+
+test_valuation_create_edit_delete : Script ()
+test_valuation_create_edit_delete = do
+  env <- bookWith valuationRecords
+  let full = (valuationFor "VAL_409A" "SC_COMMON") with
+        price_per_share = usd 0.42
+        board_approval_date = Some (D.date 2024 D.Jan 10)
+        stockholder_approval_date = Some (D.date 2024 D.Jan 20)
+        provider = Some "Carta Valuations"
+        comments = ["Annual 409A"]
+  accept env validateValuationOcfData OcfRecordDataValuation full
+  accept env validateValuationOcfData OcfRecordDataValuation ((valuationFor "VAL_FREE" "SC_COMMON") with price_per_share = usd 0.0)
+  let edited = full with effective_date = D.date 2024 D.Feb 1; price_per_share = usd 0.45
+  _ <- restateOps env [RestateEdit (OcfRecordDataValuation edited), RestateDelete "VAL_FREE"]
+  expectRecord env (OcfRecordDataValuation edited)
+  expectNoRecord env "VAL_FREE"
+
+test_valuation_validation : Script ()
+test_valuation_validation = do
+  env <- bookWith valuationRecords
+  let no = refuse env validateValuationOcfData OcfRecordDataValuation
+      base = valuationFor "VAL_BAD" "SC_COMMON"
+  no base with stock_class_id = ""
+  no base with price_per_share = (OcfMonetary with amount = -1.0; currency = "USD")
+  no base with price_per_share = (OcfMonetary with amount = 1.0; currency = "USDX")
+  no base with provider = Some ""
+  no base with comments = [""]
+
+-- v34 testValuationStockClassCreatedInSameBatchSucceeds, testValuationMissingStockClassFails,
+-- testValuationEditMissingStockClassFails and testValuationEditStockClassCreatedInSameBatchSucceeds.
+test_valuation_stock_class_reference : Script ()
+test_valuation_stock_class_reference = do
+  env <- bookWith valuationRecords
+  let write id cls = OcfRecordDataValuation (valuationFor id cls)
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "SC_VALUATION_TARGET"), write "VAL_TARGET_REF" "SC_VALUATION_TARGET"]
+  expectRecord env (write "VAL_TARGET_REF" "SC_VALUATION_TARGET")
+  -- The class may also come after the valuation in the batch.
+  _ <- applyRecords env [write "VAL_BEFORE_CLASS" "SC_AFTER", OcfRecordDataStockClass (stockClass "SC_AFTER")]
+  expectRecord env (write "VAL_BEFORE_CLASS" "SC_AFTER")
+  applyRecordsFails env "Valuation stock class not found: SC_MISSING_VALUATION_TARGET" [write "VAL_MISSING_TARGET" "SC_MISSING_VALUATION_TARGET"]
+  applyRecordsFails env "Valuation stock class SH-1 is a OcfObjectTypeStakeholder" [write "VAL_SH" "SH-1"]
+  restateOpsFails env "Valuation stock class not found: SC_MISSING_VALUATION_EDIT_TARGET" [RestateEdit (write "VAL_TARGET_REF" "SC_MISSING_VALUATION_EDIT_TARGET")]
+  -- v34 wrote the new class in the edit's own batch; v35 writes it first, then restates.
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "SC_VALUATION_EDIT_BATCH_TARGET")]
+  _ <- restateOps env [RestateEdit (write "VAL_TARGET_REF" "SC_VALUATION_EDIT_BATCH_TARGET")]
+  expectRecord env (write "VAL_TARGET_REF" "SC_VALUATION_EDIT_BATCH_TARGET")

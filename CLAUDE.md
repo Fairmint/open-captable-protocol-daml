@@ -10,21 +10,35 @@ Read the public wiki before changing contracts or automation:
 
 Keep repository guidance synchronized with the code:
 
-- Treat `multi-package.yaml`, the active `OpenCapTable-v*/daml.yaml`, `package.json`,
-  `daml-js-bundle.json`, and the remaining OCP-specific implementation in `scripts/` as the current
-  source of truth. Shared DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions
-  or dependency lists into prose.
+- The packages are `OpenCapTable-v35` (the register,
+  [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md)),
+  `OpenCapTableApi-v01` (reader interfaces, never upgraded, so their views hold only builtin types),
+  which v35 data-depends on and embeds, plus `Test`. v35 targets DevNet only; keep MainNet steps
+  gated off.
+- Treat `multi-package.yaml`, each package's `daml.yaml`, `package.json`, `daml-js-bundle.json`, and
+  the remaining OCP-specific implementation in `scripts/` as the current source of truth. Shared
+  DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions or dependency lists into
+  prose.
 - Run `npm run build` and `npm test` for contract changes. Also run `npm run lint:daml`,
   `npm run check-upgrade-compat`, `npm run codegen`, and `npm run verify-package` when DAML source,
   upgrade compatibility, generated bindings, or the npm surface may change.
 - For DAR backup or release metadata changes, run the applicable policy checks from `package.json`,
   including `npm run check:dar-version-policy` and `npm run verify-dars`.
-- `Fairmint/OpenCapTable/CapTable.daml` is generated and gitignored. Change
-  `scripts/codegen/generate-captable.ts`, its configuration, or its templates instead, then
-  regenerate through the repository scripts (`npm run generate-captable` / `npm run build`).
+- `Fairmint/OpenCapTable/OcfRecords.daml` is generated and gitignored; `CapTable.daml` (the anchor)
+  is hand-written. Change `scripts/codegen/generate-captable.ts` or its template instead, then
+  regenerate through the repository scripts (`npm run generate-captable` / `npm run build`). Its
+  constructors follow `scripts/codegen/record-order.json`: append a new OCF template at its end and
+  never reorder or remove an entry, or the generated variants stop being upgrade-compatible.
 - Builds run from `generated/build/` via `canton-dev-tools prepare-build`. Keep source
   `Test/daml.yaml` sibling-relative paths; prepare-build rewrites them for the generated tree.
 - `npm run codegen` uses CDT `codegen-js` → `bundle-dependencies` → `create-root-index` →
-  `fix-splice-refs`, then OCP-only DAR staging (`stage-npm-opencaptable-dar`) and npm-runtime lib.
+  `scripts/bundle-local-packages.ts` (bundles the sibling package into `lib/`) → `fix-splice-refs`,
+  then DAR staging (`stage-npm-opencaptable-dar`, both DARs) and npm-runtime lib. The root entry
+  points are `OCP_TEMPLATES` and `OCP_INTERFACES` (`daml-js-bundle.json`).
 - Validate protocol behavior against the official OCF schema, `scripts/schema-gap-checker/`, and
-  `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity.
+  `Test/daml/OpenCapTable/`. Do not add Fairmint-specific requirements to OCF data validity. The one
+  Fairmint OCF extension, the hold pair, lives in `ocf-extension/` and the checker's registry.
+- `test-vectors/v35.json` (derived IDs, claim hashes, floor function) is shared with the SDK and
+  apiv2. `Test/daml/OpenCapTable/TestVectors.daml` is generated from it: edit the JSON, then run
+  `npm run generate:test-vectors`. `npm run test:vectors` recomputes every vector in TypeScript and
+  fails if the Daml file is out of step.

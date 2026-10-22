@@ -1,0 +1,603 @@
+-- Batch semantics of CapTable_Apply and CapTable_Restate, ported from v34's TestUpdateCapTable, TestNoOpUpdates and TestFinalReferenceValidation: what a batch returns, references deferred to the end of the batch (a record may reference one written later), cyclic class conversions, references to deleted records, the edit-must-change rule across a restatement, empty batches, the polymorphic-reference, stock plan, operation and restatement caps, and mixed creates and stock events in one batch.
+module OpenCapTable.TestBatch where
+
+import DA.Action ((>=>))
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Foldable (mapA_)
+import DA.List (init, sort)
+import qualified DA.Map as Map
+import qualified DA.Set as Set
+import qualified DA.Text as T
+import Daml.Script
+
+import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Contact (OcfAddress(..), OcfAddressType(..))
+import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..), OcfStockClassConversionRight(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfRatio(..))
+import Fairmint.OpenCapTable.OCF.Document (DocumentOcfData(..), OcfObjectReference(..))
+import Fairmint.OpenCapTable.OCF.Financing (FinancingOcfData(..))
+import Fairmint.OpenCapTable.OCF.Stakeholder (OcfStakeholderStatusType(..))
+import Fairmint.OpenCapTable.OCF.StakeholderStatusChangeEvent (StakeholderStatusChangeEventOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockClassConversionRatioAdjustment (StockClassConversionRatioAdjustmentOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.OCF.Valuation (OcfValuationType(..), ValuationOcfData(..))
+import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
+import OpenCapTable.DefinitionFixtures
+import OpenCapTable.Harness
+import qualified OpenCapTable.StockHelpers as Stock
+
+-- =============================================================================
+-- FIXTURES
+-- =============================================================================
+
+sh : Text -> OcfRecordData
+sh = OcfRecordDataStakeholder . stakeholderData
+
+cls : StockClassOcfData -> OcfRecordData
+cls = OcfRecordDataStockClass
+
+stockIss : StockIssuanceOcfData -> OcfRecordData
+stockIss = OcfRecordDataStockIssuance
+
+-- | A common class with a 1:1 ratio conversion right into each target.
+convertingInto : Text -> [Text] -> StockClassOcfData
+convertingInto id targets = (stockClass id) with
+  conversion_rights = map (\t -> OcfStockClassConversionRight with
+      conversion_mechanism = OcfRatioConversionMechanism with
+        conversion_price = usd 1.0
+        ratio = OcfRatio with numerator = 1.0; denominator = 1.0
+        rounding_type = OcfRoundingTypeNormal
+      converts_to_future_round = None
+      converts_to_stock_class_id = Some t) targets
+
+ratioAdjustment : Text -> Text -> StockClassConversionRatioAdjustmentOcfData
+ratioAdjustment id klass = StockClassConversionRatioAdjustmentOcfData with
+  id
+  date = D.date 2024 D.Mar 15
+  new_ratio_conversion_mechanism = OcfRatioConversionMechanism with
+    conversion_price = usd 0.5
+    ratio = OcfRatio with numerator = 2.0; denominator = 1.0
+    rounding_type = OcfRoundingTypeFloor
+  stock_class_id = klass
+  comments = []
+
+ref : OcfObjectType -> Text -> OcfObjectReference
+ref t id = OcfObjectReference with object_type = t; object_id = id
+
+document : Text -> [OcfObjectReference] -> DocumentOcfData
+document id related = DocumentOcfData with
+  id
+  md5 = "0123456789abcdef0123456789abcdef"
+  comments = []
+  related_objects = related
+  path = Some ("/docs/" <> id <> ".pdf")
+  uri = None
+
+financing : Text -> [Text] -> FinancingOcfData
+financing id issuances = FinancingOcfData with
+  id; date = d2024; name = "Financing " <> id; comments = []; issuance_ids = issuances
+
+statusChange : Text -> Text -> StakeholderStatusChangeEventOcfData
+statusChange id stakeholder = StakeholderStatusChangeEventOcfData with
+  id; date = D.date 2024 D.Feb 1; new_status = OcfStakeholderStatusTypeActive; stakeholder_id = stakeholder; comments = []
+
+valuation : Text -> Text -> ValuationOcfData
+valuation id klass = ValuationOcfData with
+  id
+  effective_date = D.date 2024 D.Jun 30
+  price_per_share = usd 0.5
+  stock_class_id = klass
+  valuation_type = OcfValuationType409a
+  comments = []
+  board_approval_date = None
+  provider = Some "Valuer LLC"
+  stockholder_approval_date = None
+
+acceptanceOf : Text -> Text -> Date -> StockAcceptanceOcfData
+acceptanceOf id sec d = StockAcceptanceOcfData with id; date = d; security_id = sec; comments = []
+
+legalAddress : OcfAddress
+legalAddress = OcfAddress with
+  address_type = OcfAddressTypeLegal
+  street_suite = Some "2 Main St"
+  city = Some "SF"
+  country_subdivision = Some "CA"
+  country = "US"
+  postal_code = Some "94105"
+
+isRecordCidOfType : OcfObjectType -> OcfRecordCid -> Bool
+isRecordCidOfType t rcid = case (t, rcid) of
+  (OcfObjectTypeStakeholder, OcfRecordCidStakeholder _) -> True
+  (OcfObjectTypeStockClass, OcfRecordCidStockClass _) -> True
+  (OcfObjectTypeTxStockIssuance, OcfRecordCidStockIssuance _) -> True
+  _ -> False
+
+-- =============================================================================
+-- WHAT A BATCH RETURNS
+-- =============================================================================
+
+-- v34 testUpdateCapTableWithCreates: the result names every contract the batch created, by OCF ID
+-- (records), security ID (states), class ID (epochs) and prefix (shards).
+test_batch_result_names_created_contracts : Script ()
+test_batch_result_names_created_contracts = do
+  env <- setupEnv
+  r <- applyRecords env [sh "BATCH_SH_1"]
+  Map.keys r.records === ["BATCH_SH_1"]
+  rcid <- recordCidOf env "BATCH_SH_1"
+  Map.lookup "BATCH_SH_1" r.records === Some rcid
+  assertMsg "the created record is a stakeholder" (isRecordCidOfType OcfObjectTypeStakeholder rcid)
+  expectRecord env (sh "BATCH_SH_1")
+  r.states === Map.empty
+  r.epochs === Map.empty
+  -- The claim rewrote exactly the shard that covers the ID, and that shard holds the claim.
+  let hash = claimHash IdNamespaceObject "BATCH_SH_1"
+  [(prefix, shardCid)] <- pure (Map.toList r.shards)
+  prefix === T.take 8 (hashBits hash)
+  Some shard <- queryContractId env.transfer_agent shardCid
+  assertMsg "the rewritten shard holds the claim" (Set.member hash shard.claimed)
+  -- A class adds its epoch, a stock issuance its state.
+  r2 <- applyRecords env [cls (stockClass "CLS-1"), stockIss (issuance "S-1" "BATCH_SH_1" "CLS-1" 10.0 d2024)]
+  sort (Map.keys r2.records) === ["CLS-1", "ISS-S-1"]
+  issCid <- recordCidOf env "ISS-S-1"
+  assertMsg "the issuance record is a stock issuance" (isRecordCidOfType OcfObjectTypeTxStockIssuance issCid)
+  (epochCid, epoch) <- epochOf env "CLS-1"
+  r2.epochs === Map.fromList [("CLS-1", epochCid)]
+  epoch.frozen === False
+  stateCid <- stateCidOf env "S-1"
+  r2.states === Map.fromList [("S-1", stateCid)]
+  s <- stateOf env "S-1"
+  (s.quantity, s.stakeholder_id, s.origin_transaction_id) === (10.0, "BATCH_SH_1", "ISS-S-1")
+
+-- =============================================================================
+-- DEFERRED REFERENCES
+-- =============================================================================
+
+-- References are checked after the batch's last operation, against everything the batch wrote:
+-- a whole book can be written with every referencing record ahead of what it references. A batch
+-- that leaves one reference unresolved fails as a whole and writes nothing.
+test_batch_references_resolved_at_end_of_batch : Script ()
+test_batch_references_resolved_at_end_of_batch = do
+  env <- setupEnv
+  let stock = (issuance "S-LATE" "SH-LATE" "CLS-LATE" 1000.0 d2024) with
+        stock_legend_ids = ["LEG-LATE"]
+        stock_plan_id = Some "PLAN-LATE"
+        vesting_terms_id = Some "VT-LATE"
+      option = (equityCompensationIssuance "EC-LATE" "SEC-EC-LATE" "SH-LATE") with
+        stock_plan_id = Some "PLAN-LATE"
+        stock_class_id = Some "CLS-LATE"
+        vesting_terms_id = Some "VT-LATE"
+      batch =
+        [ OcfRecordDataDocument (document "DOC-LATE"
+            [ ref OcfObjectTypeStakeholder "SH-LATE"
+            , ref OcfObjectTypeStockClass "CLS-LATE"
+            , ref OcfObjectTypeStockPlan "PLAN-LATE"
+            , ref OcfObjectTypeTxStockIssuance "ISS-S-LATE"
+            , ref OcfObjectTypeFinancing "FIN-LATE"
+            , ref OcfObjectTypeValuation "VAL-LATE"
+            , ref OcfObjectTypeVestingTerms "VT-LATE"
+            ])
+        , OcfRecordDataFinancing (financing "FIN-LATE" ["ISS-S-LATE", "EC-LATE", "W-LATE"])
+        , OcfRecordDataValuation (valuation "VAL-LATE" "CLS-LATE")
+        , OcfRecordDataStakeholderStatusChangeEvent (statusChange "STATUS-LATE" "SH-LATE")
+        , OcfRecordDataEquityCompensationIssuance option
+        , OcfRecordDataWarrantIssuance (warrantIssuance "W-LATE" "SEC-W-LATE" "SH-LATE")
+        , OcfRecordDataStockPlan (stockPlan "PLAN-LATE" ["CLS-LATE"])
+        , cls (convertingInto "CLS-LATE" ["CLS-LATER"])
+        -- A stock issuance needs its class's epoch when it is applied, so it follows its class
+        -- (test_batch_epochs_and_states_are_needed_in_order); its references may still come later.
+        , stockIss stock
+        , OcfRecordDataStockLegendTemplate (legend "LEG-LATE")
+        , OcfRecordDataVestingTerms (Stock.vestingTerms "VT-LATE")
+        , cls (stockClass "CLS-LATER")
+        , sh "SH-LATE"
+        ]
+  -- Without the stakeholder at the end, the first reference to it fails the batch.
+  applyRecordsFails env "Document related object not found: SH-LATE" (init batch)
+  mapA_ (\d -> expectNoRecord env (objectIdOf env d)) batch
+  statesOf env >>= (=== 0) . length
+  -- With it, every reference resolves.
+  r <- applyRecords env batch
+  sort (Map.keys r.records) === sort (map (objectIdOf env) batch)
+  expectRecords env batch
+  sort (Map.keys r.epochs) === ["CLS-LATE", "CLS-LATER"]
+  Map.keys r.states === ["S-LATE"]
+  s <- stateOf env "S-LATE"
+  s.vesting === StockVestingOnTerms "VT-LATE"
+  (s.stakeholder_id, s.stock_class_id, s.quantity) === ("SH-LATE", "CLS-LATE", 1000.0)
+
+-- References wait for the end of the batch; the contracts an operation acts on do not. A stock
+-- issuance needs its class's epoch, and a stock event its security's state, when it is applied; a
+-- vesting record on a warrant or equity compensation has no state and is checked at the end.
+test_batch_epochs_and_states_are_needed_in_order : Script ()
+test_batch_epochs_and_states_are_needed_in_order = do
+  env <- standardBook
+  let late = issuance "S-C" "SH-D" "CLS-C" 10.0 d2024
+      accept' = OcfRecordDataStockAcceptance (acceptanceOf "ACC-C" "S-C" (D.date 2024 D.Feb 1))
+  applyRecordsFails env "no active epoch for stock class CLS-C" [stockIss late, cls (stockClass "CLS-C"), sh "SH-D"]
+  applyRecordsFails env "no active state for security S-C in this write" [cls (stockClass "CLS-C"), accept', stockIss late, sh "SH-D"]
+  -- In order, the same records are written, and the stakeholder may still come last.
+  r <- applyRecords env [cls (stockClass "CLS-C"), stockIss late, accept', sh "SH-D"]
+  sort (Map.keys r.records) === ["ACC-C", "CLS-C", "ISS-S-C", "SH-D"]
+  expectRecords env [stockIss late, accept', sh "SH-D"]
+  s <- stateOf env "S-C"
+  (s.stakeholder_id, s.seq, s.last_event_date) === ("SH-D", 1, D.date 2024 D.Feb 1)
+  -- A vesting start on a warrant written later in the batch, on terms written after it.
+  let warrant = (warrantIssuance "W-V" "SEC-W-V" "SH-A") with vesting_terms_id = Some "VT-W"
+      start = VestingStartOcfData with
+        id = "VS-W"; date = D.date 2024 D.Mar 1; security_id = "SEC-W-V"; vesting_condition_id = "VC-START"; comments = []
+  applyRecordsFails env "Vesting start VS-W: security not found: SEC-W-V"
+    [OcfRecordDataVestingStart start, OcfRecordDataVestingTerms (Stock.vestingTerms "VT-W")]
+  _ <- applyRecords env
+    [OcfRecordDataVestingStart start, OcfRecordDataWarrantIssuance warrant, OcfRecordDataVestingTerms (Stock.vestingTerms "VT-W")]
+  expectRecords env [OcfRecordDataVestingStart start, OcfRecordDataWarrantIssuance warrant]
+
+-- =============================================================================
+-- MIXED CREATES
+-- =============================================================================
+
+-- One batch writes definitions, a stock issuance, an acceptance and a transfer of that new
+-- security, and instrument issuances. A security issued and consumed inside the batch leaves no
+-- state; its outputs do.
+test_batch_mixed_creates_and_events_in_one_batch : Script ()
+test_batch_mixed_creates_and_events_in_one_batch = do
+  env <- standardBook
+  let accepted = D.date 2024 D.Feb 1
+      moved = D.date 2024 D.Mar 1
+      primary = issuance "S-NEW" "SH-C" "CLS-B" 300.0 d2024
+      acceptance = acceptanceOf "ACC-NEW" "S-NEW" accepted
+      transfer = StockTransferOcfData with
+        id = "TR-NEW"; date = moved; quantity = 100.0; security_id = "S-NEW"; comments = []
+        resulting_security_ids = ["S-NEW-B"]; balance_security_id = Some "S-NEW-R"; consideration_text = None
+      out sec holder q = issuance sec holder "CLS-B" q moved
+      warrant = warrantIssuance "W-NEW" "SEC-W-NEW" "SH-C"
+      option = equityCompensationIssuance "EC-NEW" "SEC-EC-NEW" "SH-C"
+  r <- applyOps env
+    [ ApplyRecord (sh "SH-C")
+    , ApplyRecord (cls (stockClass "CLS-B"))
+    , ApplyRecord (stockIss primary)
+    , ApplyRecord (OcfRecordDataStockAcceptance acceptance)
+    , ApplyStockTransfer with transfer; resulting = [out "S-NEW-B" "SH-B" 100.0]; balance = Some (out "S-NEW-R" "SH-C" 200.0)
+    , ApplyRecord (OcfRecordDataWarrantIssuance warrant)
+    , ApplyRecord (OcfRecordDataEquityCompensationIssuance option)
+    , ApplyRecord (OcfRecordDataStockLegendTemplate (legend "LEG-NEW"))
+    ]
+  sort (Map.keys r.records) === sort
+    ["SH-C", "CLS-B", "ISS-S-NEW", "ACC-NEW", "TR-NEW", "ISS-S-NEW-B", "ISS-S-NEW-R", "W-NEW", "EC-NEW", "LEG-NEW"]
+  Map.keys r.states === ["S-NEW-B", "S-NEW-R"]
+  Map.keys r.epochs === ["CLS-B"]
+  hasState env "S-NEW" >>= (=== False)
+  b <- stateOf env "S-NEW-B"
+  (b.stakeholder_id, b.stock_class_id, b.quantity, b.seq, b.last_event_date) === ("SH-B", "CLS-B", 100.0, 0, moved)
+  rest <- stateOf env "S-NEW-R"
+  (rest.stakeholder_id, rest.quantity, rest.origin_transaction_id) === ("SH-C", 200.0, "ISS-S-NEW-R")
+  expectRecords env
+    [ stockIss primary
+    , OcfRecordDataStockAcceptance acceptance
+    , OcfRecordDataStockTransfer transfer
+    , stockIss (out "S-NEW-B" "SH-B" 100.0)
+    , OcfRecordDataWarrantIssuance warrant
+    , OcfRecordDataEquityCompensationIssuance option
+    ]
+  -- The standard book's lots were not touched.
+  (.quantity) <$> stateOf env "S-A1" >>= (=== 600.0)
+  (.seq) <$> stateOf env "S-A1" >>= (=== 0)
+
+-- =============================================================================
+-- CYCLIC CLASS CONVERSIONS
+-- =============================================================================
+
+-- A conversion right names its target class by ID and the check waits for the end of the batch,
+-- so classes may convert into each other, into themselves, or around a ring.
+test_batch_cyclic_class_conversions : Script ()
+test_batch_cyclic_class_conversions = do
+  env <- setupEnv
+  let pair = [cls (convertingInto "CLS-X" ["CLS-Y"]), cls (convertingInto "CLS-Y" ["CLS-X"])]
+  r <- applyRecords env pair
+  sort (Map.keys r.epochs) === ["CLS-X", "CLS-Y"]
+  expectRecords env pair
+  let self = cls (convertingInto "CLS-SELF" ["CLS-SELF"])
+  _ <- applyRecords env [self]
+  expectRecord env self
+  let ring =
+        [ cls (convertingInto "CLS-R1" ["CLS-R2"])
+        , cls (convertingInto "CLS-R2" ["CLS-R3"])
+        , cls (convertingInto "CLS-R3" ["CLS-R1", "CLS-R2"])
+        ]
+  _ <- applyRecords env ring
+  expectRecords env ring
+  -- A cycle with a missing member is refused, and none of it is written.
+  applyRecordsFails env "Stock class CLS-Q conversion target not found: CLS-MISSING"
+    [cls (convertingInto "CLS-P" ["CLS-Q"]), cls (convertingInto "CLS-Q" ["CLS-MISSING", "CLS-P"])]
+  expectNoRecord env "CLS-P"
+  expectNoRecord env "CLS-Q"
+  -- An edit closes a cycle.
+  _ <- applyRecords env [cls (stockClass "CLS-M"), cls (convertingInto "CLS-N" ["CLS-M"])]
+  _ <- restateOps env [RestateEdit (cls (convertingInto "CLS-M" ["CLS-N"]))]
+  expectRecords env [cls (convertingInto "CLS-M" ["CLS-N"]), cls (convertingInto "CLS-N" ["CLS-M"])]
+  -- A ratio adjustment's check (its class has a ratio right) waits too: it may precede the pair of
+  -- classes it adjusts one of.
+  let adj = OcfRecordDataStockClassConversionRatioAdjustment (ratioAdjustment "ADJ-U" "CLS-U")
+      mutual = [cls (convertingInto "CLS-U" ["CLS-V"]), cls (convertingInto "CLS-V" ["CLS-U"])]
+  _ <- applyRecords env (adj :: mutual)
+  expectRecords env (adj :: mutual)
+  -- Each class keeps its own epoch.
+  epochs <- map ((.stock_class_id) . snd) <$> epochsOf env
+  sort epochs === sort ["CLS-X", "CLS-Y", "CLS-SELF", "CLS-R1", "CLS-R2", "CLS-R3", "CLS-M", "CLS-N", "CLS-U", "CLS-V"]
+
+-- =============================================================================
+-- DELETED RECORDS
+-- =============================================================================
+
+-- A deleted record is gone from every later write's inputs, so a reference to it fails until the
+-- ID is written again. Within one restatement, a delete and an edit that adds a reference to the
+-- deleted record fail in either order: the references are checked against the restatement's end.
+test_batch_reference_to_deleted_record_fails : Script ()
+test_batch_reference_to_deleted_record_fails = do
+  env <- standardBook
+  _ <- applyRecords env [sh "SH-C", OcfRecordDataStockLegendTemplate (legend "LEG-1")]
+  _ <- restateOps env [RestateDelete "SH-C"]
+  expectNoRecord env "SH-C"
+  let toC = issuance "S-C1" "SH-C" "CLS-A" 10.0 d2024
+  applyRecordsFails env "Stock issuance stakeholder not found: SH-C" [stockIss toC]
+  applyRecordsFails env "Stakeholder status change event stakeholder not found: SH-C"
+    [OcfRecordDataStakeholderStatusChangeEvent (statusChange "STATUS-C" "SH-C")]
+  applyRecordsFails env "Document related object not found: SH-C"
+    [OcfRecordDataDocument (document "DOC-C" [ref OcfObjectTypeStakeholder "SH-C"])]
+  let original = issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024
+      withLegend = original with stock_legend_ids = ["LEG-1"]
+  restateOpsFails env "Stock issuance stock legend not found: LEG-1"
+    [RestateDelete "LEG-1", RestateEdit (stockIss withLegend)]
+  restateOpsFails env "Stock issuance stock legend not found: LEG-1"
+    [RestateEdit (stockIss withLegend), RestateDelete "LEG-1"]
+  expectRecords env [OcfRecordDataStockLegendTemplate (legend "LEG-1"), stockIss original]
+  -- Written again, the ID resolves again (here later in the same batch).
+  _ <- applyRecords env [stockIss toC, sh "SH-C"]
+  expectRecords env [stockIss toC, sh "SH-C"]
+  (.stakeholder_id) <$> stateOf env "S-C1" >>= (=== "SH-C")
+
+-- v34 refused deleting a record that another record still referenced
+-- (testFinalReferenceValidation_DeleteStakeholderReferencedByStockIssuanceFails,
+-- _DeleteReferencedStockIssuanceFails and _DeleteReferencedStakeholderFromStatusEventFails). v35
+-- checks a reference when it is written; a later delete is not re-checked on the ledger (the SDK
+-- refuses one that would orphan a live reference), and the referencing records stay as written.
+test_batch_deletes_are_not_rechecked_on_the_ledger : Script ()
+test_batch_deletes_are_not_rechecked_on_the_ledger = do
+  env <- standardBook
+  let status = OcfRecordDataStakeholderStatusChangeEvent (statusChange "STATUS-B" "SH-B")
+      doc = OcfRecordDataDocument (document "DOC-A2" [ref OcfObjectTypeTxStockIssuance "ISS-S-A2"])
+  _ <- applyRecords env [status, doc]
+  _ <- restateOps env [RestateDelete "SH-B"]
+  expectNoRecord env "SH-B"
+  expectRecord env status
+  _ <- restateOps env [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
+  expectNoRecord env "ISS-S-A2"
+  hasState env "S-A2" >>= (=== False)
+  expectRecord env doc
+  _ <- restateOps env [RestateDelete "SH-A"]
+  expectNoRecord env "SH-A"
+  (.stakeholder_id) <$> stateOf env "S-A1" >>= (=== "SH-A")
+  expectRecord env (stockIss (issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024))
+
+-- v34 testFinalReferenceValidation_DeleteStockIssuanceThenStakeholderSucceeds and
+-- _DeleteStakeholderThenStockIssuanceSucceeds: one restatement removes a stakeholder and its
+-- issuance, with the issuance's state, in either order.
+test_batch_delete_issuance_and_stakeholder_in_either_order : Script ()
+test_batch_delete_issuance_and_stakeholder_in_either_order = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ sh "SH-C", stockIss (issuance "S-C1" "SH-C" "CLS-A" 10.0 d2024)
+    , sh "SH-D", stockIss (issuance "S-D1" "SH-D" "CLS-A" 10.0 d2024)
+    ]
+  _ <- restateOps env [RestateDelete "ISS-S-C1", RestateEndState "S-C1", RestateDelete "SH-C"]
+  _ <- restateOps env [RestateDelete "SH-D", RestateEndState "S-D1", RestateDelete "ISS-S-D1"]
+  mapA_ (expectNoRecord env) ["SH-C", "ISS-S-C1", "SH-D", "ISS-S-D1"]
+  mapA_ (hasState env >=> (=== False)) ["S-C1", "S-D1"]
+  -- Their object and security IDs are free again.
+  _ <- applyRecords env [sh "SH-C", stockIss (issuance "S-C1" "SH-C" "CLS-A" 5.0 d2024)]
+  (.quantity) <$> stateOf env "S-C1" >>= (=== 5.0)
+  -- The rest of the book is as it was.
+  (.quantity) <$> stateOf env "S-A1" >>= (=== 600.0)
+
+-- =============================================================================
+-- EDITS MUST CHANGE
+-- =============================================================================
+
+-- v34 TestNoOpUpdates: an identical replacement is refused whatever the type, and one identical
+-- edit aborts the whole restatement; real changes go through together. (The issuer's no-op edit
+-- is TestIssuer.test_issuer_edit's.)
+test_batch_edit_must_change : Script ()
+test_batch_edit_must_change = do
+  let addressed = (stakeholderData "SH-ADDR") with addresses = [legalAddress]
+      doc = document "DOC-EDIT" []
+      klass = stockClass "SC-EDIT"
+  env <- bookWith [OcfRecordDataStakeholder addressed, OcfRecordDataDocument doc, cls klass]
+  restateOpsFails env "edit of record SH-ADDR changes nothing" [RestateEdit (OcfRecordDataStakeholder addressed)]
+  restateOpsFails env "edit of record DOC-EDIT changes nothing" [RestateEdit (OcfRecordDataDocument doc)]
+  restateOpsFails env "edit of record SC-EDIT changes nothing" [RestateEdit (cls klass)]
+  let moved = addressed with addresses = [legalAddress with street_suite = Some "3 Market St"]
+      renamed = klass with name = "Updated Common Stock"
+      repathed = doc with path = Some "/docs/updated.pdf"
+  restateOpsFails env "edit of record SC-EDIT changes nothing" [RestateEdit (OcfRecordDataStakeholder moved), RestateEdit (cls klass)]
+  restateOpsFails env "edit of record SH-ADDR changes nothing" [RestateEdit (cls renamed), RestateEdit (OcfRecordDataStakeholder addressed)]
+  expectRecords env [OcfRecordDataStakeholder addressed, cls klass]
+  r <- restateOps env [RestateEdit (OcfRecordDataStakeholder moved), RestateEdit (cls renamed), RestateEdit (OcfRecordDataDocument repathed)]
+  sort (Map.keys r.records) === ["DOC-EDIT", "SC-EDIT", "SH-ADDR"]
+  expectRecords env [OcfRecordDataStakeholder moved, cls renamed, OcfRecordDataDocument repathed]
+  -- Back to an earlier payload is a change.
+  _ <- restateOps env [RestateEdit (cls klass)]
+  expectRecord env (cls klass)
+  -- A record is edited or deleted at most once per restatement.
+  restateOpsFails env "record SH-ADDR is edited or deleted more than once"
+    [RestateEdit (OcfRecordDataStakeholder addressed), RestateDelete "SH-ADDR"]
+  expectRecord env (OcfRecordDataStakeholder moved)
+
+-- =============================================================================
+-- EMPTY BATCHES
+-- =============================================================================
+
+-- v34 testUpdateCapTableEmpty: an empty UpdateCapTable only rotated the cap table's contract ID and
+-- was refused. v35 refuses an empty write, and no write rotates the anchor: every write exercises
+-- the one anchor without consuming it.
+test_batch_empty_batches_refused_and_anchor_kept : Script ()
+test_batch_empty_batches_refused_and_anchor_kept = do
+  env <- standardBook
+  applyOpsFails env "CapTable_Apply needs at least one operation" []
+  restateOpsFails env "CapTable_Restate needs at least one operation" []
+  _ <- applyRecords env [sh "SH-C"]
+  _ <- restateOps env [RestateEdit (OcfRecordDataStakeholder ((stakeholderData "SH-C") with issuer_assigned_id = Some "7"))]
+  _ <- restateOps env [RestateDelete "SH-C"]
+  anchors <- filter (\(_, a) -> a.context == env.ctx) <$> query @CapTable env.transfer_agent
+  map fst anchors === [env.cap_table]
+  map ((.status) . snd) anchors === [CapTableStatusActive]
+
+-- =============================================================================
+-- POLYMORPHIC REFERENCE CAPS
+-- =============================================================================
+
+-- A transaction checks at most 100 polymorphic references (a document's related objects, a
+-- financing's issuances, a capitalization definition's targets), summed over every record and type
+-- in the batch. Typed references (a plan's classes, an issuance's stakeholder, class and legends)
+-- do not count. A restatement counts what each edit adds; shrinking one record frees no budget for
+-- another.
+test_batch_polymorphic_references_counted_across_records_and_types : Script ()
+test_batch_polymorphic_references_counted_across_records_and_types = do
+  env <- standardBook
+  let doc id n = OcfRecordDataDocument (document id (replicate n (ref OcfObjectTypeStakeholder "SH-A")))
+      fin id n = OcfRecordDataFinancing (financing id (replicate n "ISS-S-A1"))
+  applyRecordsFails env "more than 100 polymorphic references checked in one transaction" [doc "DOC-1" 50, fin "FIN-1" 51]
+  applyRecordsFails env "more than 100 polymorphic references checked in one transaction" [doc "DOC-1" 34, fin "FIN-1" 33, doc "DOC-2" 34]
+  _ <- applyRecords env [doc "DOC-1" 50, fin "FIN-1" 50]
+  expectRecords env [doc "DOC-1" 50, fin "FIN-1" 50]
+  let classes = map (\i -> "CLS-P" <> show i) [1 .. 16]
+      legends = map (\i -> "LEG-" <> show i) [1 .. 20]
+      planned = (issuance "S-P" "SH-A" "CLS-P16" 10.0 d2024) with stock_plan_id = Some "PLAN-16"; stock_legend_ids = legends
+      plan = OcfRecordDataStockPlan (stockPlan "PLAN-16" classes)
+  _ <- applyRecords env
+    (map (cls . stockClass) classes <> map (OcfRecordDataStockLegendTemplate . legend) legends <> [plan, stockIss planned, doc "DOC-2" 100])
+  expectRecords env [plan, stockIss planned, doc "DOC-2" 100]
+  -- Restatements: +51 and +50 is over; +50 and +50 is the limit.
+  restateOpsFails env "more than 100 polymorphic references checked in one transaction"
+    [RestateEdit (doc "DOC-1" 101), RestateEdit (fin "FIN-1" 100)]
+  _ <- restateOps env [RestateEdit (doc "DOC-1" 100), RestateEdit (fin "FIN-1" 100)]
+  expectRecords env [doc "DOC-1" 100, fin "FIN-1" 100]
+  restateOpsFails env "more than 100 polymorphic references checked in one transaction"
+    [RestateEdit (doc "DOC-2" 0), RestateEdit (fin "FIN-1" 201)]
+  _ <- restateOps env [RestateEdit (doc "DOC-2" 0), RestateEdit (fin "FIN-1" 200)]
+  expectRecords env [doc "DOC-2" 0, fin "FIN-1" 200]
+  -- A delete counts nothing.
+  _ <- restateOps env [RestateDelete "DOC-1", RestateDelete "FIN-1"]
+  mapA_ (expectNoRecord env) ["DOC-1", "FIN-1"]
+
+-- A record stores at most 1000 polymorphic references, so a larger one is created and extended by
+-- restatements, each adding at most the transaction's 100 over all the records it edits. Two
+-- financings grow together to the per-record cap, 50 references each per restatement; the cap then
+-- refuses one more on either, alone or beside an edit that shrinks the other.
+test_batch_stored_polymorphic_cap_per_record : Script ()
+test_batch_stored_polymorphic_cap_per_record = do
+  env <- standardBook
+  let fin id n = OcfRecordDataFinancing (financing id (replicate n "ISS-S-A1"))
+  _ <- applyRecords env [fin "FIN-A" 50, fin "FIN-B" 50]
+  mapA_ (\n -> restateOps env [RestateEdit (fin "FIN-A" n), RestateEdit (fin "FIN-B" n)]) [100, 150 .. 1000]
+  expectRecords env [fin "FIN-A" 1000, fin "FIN-B" 1000]
+  restateOpsFails env "OcfObjectTypeFinancing has 1001 financing issuance IDs; at most 1000" [RestateEdit (fin "FIN-B" 1001)]
+  restateOpsFails env "OcfObjectTypeFinancing has 1001 financing issuance IDs; at most 1000"
+    [RestateEdit (fin "FIN-A" 999), RestateEdit (fin "FIN-B" 1001)]
+  -- Shrinking keeps it writable.
+  _ <- restateOps env [RestateEdit (fin "FIN-A" 999)]
+  expectRecord env (fin "FIN-A" 999)
+
+-- An edit is charged for the references it adds, not for how its list grows: replacing a
+-- document's 100 related objects with 101 others checks, and counts, 101 new references.
+test_batch_replaced_references_are_counted : Script ()
+test_batch_replaced_references_are_counted = do
+  env <- setupEnv
+  let holders = map (\i -> "SH-" <> show i) [1 .. 201]
+      doc ids = OcfRecordDataDocument (document "DOC-R" (map (ref OcfObjectTypeStakeholder) ids))
+  _ <- applyRecords env (map sh holders)
+  _ <- applyRecords env [doc (take 100 holders)]
+  restateOpsFails env "more than 100 polymorphic references checked in one transaction" [RestateEdit (doc holders)]
+  restateOpsFails env "more than 100 polymorphic references checked in one transaction" [RestateEdit (doc (drop 100 holders))]
+
+-- =============================================================================
+-- STOCK PLAN CLASS CAP
+-- =============================================================================
+
+-- A plan names at most 16 classes. A plan over 16 classes written after it in the same batch, and
+-- issuances under the plan in its last class, are written together; 17 classes are refused even
+-- when every class exists.
+test_batch_stock_plan_classes_in_one_batch : Script ()
+test_batch_stock_plan_classes_in_one_batch = do
+  env <- standardBook
+  let classes = map (\i -> "CLS-" <> show i) [1 .. 17]
+      plan16 = stockPlan "PLAN-16" (take 16 classes)
+      option = (equityCompensationIssuance "EC-16" "SEC-EC-16" "SH-A") with
+        stock_plan_id = Some "PLAN-16"; stock_class_id = Some "CLS-16"
+      planned = (issuance "S-16" "SH-B" "CLS-16" 25.0 d2024) with stock_plan_id = Some "PLAN-16"
+  r <- applyRecords env
+    (OcfRecordDataStockPlan plan16 :: OcfRecordDataEquityCompensationIssuance option :: map (cls . stockClass) (take 16 classes) <> [stockIss planned])
+  Map.size r.records === 19
+  Map.size r.epochs === 16
+  expectRecords env [OcfRecordDataStockPlan plan16, OcfRecordDataEquityCompensationIssuance option, stockIss planned]
+  (.stock_class_id) <$> stateOf env "S-16" >>= (=== "CLS-16")
+  -- The 17th class exists, and the plan does not include it.
+  _ <- applyRecords env [cls (stockClass "CLS-17")]
+  applyRecordsFails env "Equity compensation stock plan PLAN-16 does not include stock class CLS-17"
+    [OcfRecordDataEquityCompensationIssuance (option with id = "EC-17"; security_id = "SEC-EC-17"; stock_class_id = Some "CLS-17")]
+  applyRecordsFails env "Stock issuance stock plan PLAN-16 does not include stock class CLS-17"
+    [stockIss ((issuance "S-17" "SH-B" "CLS-17" 25.0 d2024) with stock_plan_id = Some "PLAN-16")]
+  applyRecordsFails env "OcfObjectTypeStockPlan has 17 stock plan classes; at most 16"
+    [OcfRecordDataStockPlan (stockPlan "PLAN-17" classes)]
+  restateOpsFails env "OcfObjectTypeStockPlan has 17 stock plan classes; at most 16"
+    [RestateEdit (OcfRecordDataStockPlan (stockPlan "PLAN-16" classes))]
+  -- Swapping a class within the cap is an edit like any other.
+  let swapped = stockPlan "PLAN-16" (drop 1 classes)
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockPlan swapped)]
+  expectRecord env (OcfRecordDataStockPlan swapped)
+
+-- =============================================================================
+-- OPERATION AND RESTATEMENT CAPS
+-- =============================================================================
+
+-- A CapTable_Apply takes at most 500 operations: exactly 500 are written (here also exactly the
+-- 500 IDs a transaction may claim). CapTable_Restate touches at most 500 contracts: an edit
+-- archives and recreates its record, so 250 edits are the limit and 251 are refused.
+test_batch_operation_and_restatement_caps : Script ()
+test_batch_operation_and_restatement_caps = do
+  env <- setupEnv
+  let ids = map (\i -> "SH-" <> show i) [1 .. maxOperationsPerApply]
+  maxOperationsPerApply === 500
+  maxContractsPerRestatement === 500
+  r <- applyRecords env (map sh ids)
+  Map.size r.records === 500
+  sort (Map.keys r.records) === sort ids
+  expectRecords env [sh "SH-1", sh "SH-250", sh "SH-500"]
+  length <$> recordsOf env >>= (=== 501)
+  applyRecordsFails env "ID already used: SH-500" [sh "SH-500"]
+  let renamed i = OcfRecordDataStakeholder ((stakeholderData ("SH-" <> show i)) with issuer_assigned_id = Some ("E-" <> show i))
+  restateOpsFails env "CapTable_Restate touches at most 500 contracts" (map (RestateEdit . renamed) [1 .. 251])
+  expectRecord env (sh "SH-1")
+  r2 <- restateOps env (map (RestateEdit . renamed) [1 .. 250])
+  Map.size r2.records === 250
+  expectRecords env [renamed 1, renamed 250, sh "SH-251"]
+
+-- CapTable_Restate counts the ID shards it archives toward its 500 contracts, as well as the records,
+-- states and epochs: 300 deletes over K shards touch 300 + 2K contracts, more than 500.
+test_batch_restatement_counts_archived_shards : Script ()
+test_batch_restatement_counts_archived_shards = do
+  env <- setupEnv
+  let ids = map (\i -> "SH-" <> show i) [1 .. 300]
+      k = Set.size (Set.fromList (map (\i -> T.take 8 (hashBits (claimHash IdNamespaceObject i))) ids))
+  _ <- applyRecords env (map sh ids)
+  assertMsg "counted as at most 500" (300 + k <= 500)
+  assertMsg "touches more than 500" (300 + 2 * k > 500)
+  restateOpsFails env "CapTable_Restate touches at most 500 contracts" (map RestateDelete ids)

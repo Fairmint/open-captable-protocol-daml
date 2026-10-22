@@ -1,0 +1,514 @@
+-- The hold pair and settlement: CapTable_PlaceHolds, CapTable_CancelHolds and CapTable_Settle, each a bounded write that derives every ID it writes.
+module Fairmint.OpenCapTable.Holds
+  ( PlaceHoldLot(..)
+  , CanceledSettlementHold(..)
+  , PlaceHoldResult(..)
+  , CancelHold(..)
+  , CancelHoldResult(..)
+  , SettleBuyer(..)
+  , DrawLot(..)
+  , SettleLot(..)
+  , SettleLotResult(..)
+  , SettleResult(..)
+  , maxHoldCancellationsPerTransaction
+  , placeHolds
+  , cancelHolds
+  , settle
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.List (dedup, head)
+import qualified DA.Map as Map
+import DA.Optional (fromSomeNote, isSome)
+import Fairmint.OpenCapTable.Apply (maxLotsPerOperation)
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.Numeric (floorMulDiv, mulHalfEven)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.Stakeholder (Stakeholder(..), StakeholderOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockHold (StockHoldOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockHoldCancellation (StockHoldCancellationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuance(..), StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfSecurityExemption)
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting)
+import Fairmint.OpenCapTable.VestingState (drawTranches, vestedBy)
+
+-- | Hold cancellations per `CapTable_CancelHolds`: a trade keeps at most 50 live holds.
+maxHoldCancellationsPerTransaction : Int
+maxHoldCancellationsPerTransaction = 50
+
+-- =============================================================================
+-- PLACING HOLDS
+-- =============================================================================
+
+data PlaceHoldLot = PlaceHoldLot
+  with
+    security_id : Text
+    -- Some (> 0, at most vested) for REGISTER_SETTLEMENT; None for STOP_TRANSFER
+    quantity : Optional Decimal
+    -- REGISTER_SETTLEMENT: the security's origin TX_STOCK_ISSUANCE, whose legends and exemptions
+    -- the result returns for the desk's restriction-bucket check
+    origin_issuance : Optional (ContractId StockIssuance)
+  deriving (Eq, Show)
+
+-- | The settlement hold a stop canceled.
+data CanceledSettlementHold = CanceledSettlementHold
+  with
+    hold_id : Text
+    reference : Text
+    hold_cancellation_id : Text
+  deriving (Eq, Show)
+
+data PlaceHoldResult = PlaceHoldResult
+  with
+    hold_id : Text
+    security_id : Text
+    stakeholder_id : Text
+    stock_class_id : Text
+    -- The class's splits dated on or before the hold's date
+    split_epoch : Int
+    -- REGISTER_SETTLEMENT: the origin issuance's legends and exemptions
+    stock_legend_ids : [Text]
+    security_law_exemptions : [OcfSecurityExemption]
+    -- STOP_TRANSFER: the settlement hold it canceled, if any
+    canceled_settlement_hold : Optional CanceledSettlementHold
+    -- The security's new state
+    state : ContractId StockSecurity
+  deriving (Eq, Show)
+
+-- | Places one hold per lot under one reference, each a non-terminal event on the lot's state.
+-- Settlement holds go on up to 50 lots of one stakeholder in one class, on vested shares of lots
+-- that carry no other settlement hold and no stop. A stop holds a whole security, vested or not,
+-- and cancels its settlement hold, which it lists in its result so the TA releases that trade.
+placeHolds : Context -> BookInputs -> OcfHoldType -> Text -> Date -> Text -> [PlaceHoldLot] -> Update [PlaceHoldResult]
+placeHolds ctx inputs holdType reference date reasonText lots = do
+  assertLedgerDate date
+  when (null lots) (abort "CapTable_PlaceHolds needs at least one lot")
+  when (length lots > maxLotsPerOperation)
+    (abort ("CapTable_PlaceHolds takes at most " <> show maxLotsPerOperation <> " lots"))
+  unless (dedup (map (.security_id) lots) == map (.security_id) lots) (abort "each lot appears once")
+  when (reference == "") (abort "a hold needs a reference")
+  b0 <- loadBook ctx inputs
+  when (holdType == OcfHoldTypeRegisterSettlement) do
+    states <- mapA (\l -> requireState l.security_id b0) lots
+    let first = head states
+    unless (all (\s -> s.stakeholder_id == first.stakeholder_id && s.stock_class_id == first.stock_class_id) states)
+      (abort "settlement holds go on lots of one stakeholder in one class")
+  (b1, pending) <- foldlA (placeOne holdType reference date reasonText) (b0, []) lots
+  (_, result) <- flushBook b1
+  pure (map (\(sec, mk) -> mk (fromSomeNote ("no new state for " <> sec) (Map.lookup sec result.states))) (reverse pending))
+
+placeOne : OcfHoldType -> Text -> Date -> Text -> (Book, [(Text, ContractId StockSecurity -> PlaceHoldResult)]) -> PlaceHoldLot -> Update (Book, [(Text, ContractId StockSecurity -> PlaceHoldResult)])
+placeOne holdType reference date reasonText (b0, acc) lot = do
+  (s, _) <- beginEvent b0 lot.security_id date False
+  when (any (\h -> h.reference == reference) s.holds)
+    (abort ("reference " <> reference <> " is already open on security " <> s.security_id))
+  let holdId = deriveId b0.context s.security_id s.seq DerivedRoleHold 0
+  (s1, b1, legends, exemptions, canceled) <- case holdType of
+    OcfHoldTypeRegisterSettlement -> do
+      when (isStopped s) (abort ("security " <> s.security_id <> " is stopped"))
+      unless (null (settlementHolds s))
+        (abort ("security " <> s.security_id <> " already carries a settlement hold"))
+      unless (fullyCovered s)
+        (abort ("security " <> s.security_id <> " has tranches covering less than its quantity"))
+      q <- case lot.quantity of
+        Some q -> pure q
+        None -> abort "a settlement hold needs a quantity"
+      let vested = vestedAt s date
+      unless (q > 0.0 && q <= vested)
+        (abort ("settlement hold of " <> show q <> " on security " <> s.security_id
+          <> " must be positive and at most its vested " <> show vested))
+      originCid <- case lot.origin_issuance of
+        Some cid -> pure cid
+        None -> abort "a settlement hold needs the security's origin issuance"
+      origin <- fetchChecked b0.context "an origin issuance" originCid
+      unless (origin.ocf_data.id == s.origin_transaction_id)
+        (abort ("issuance " <> origin.ocf_data.id <> " is not the origin of security " <> s.security_id))
+      checkOriginAgrees s origin.ocf_data
+      -- The origin issuance is read, so its tranches count toward the transaction's cap.
+      b' <- countTranches (length origin.ocf_data.vestings) b0
+      pure (s, b', origin.ocf_data.stock_legend_ids, origin.ocf_data.security_law_exemptions, None)
+    OcfHoldTypeStopTransfer -> do
+      when (isSome lot.quantity) (abort "a stop holds the whole security and takes no quantity")
+      case settlementHolds s of
+        [h] -> do
+          let cancellationId = deriveId b0.context s.security_id s.seq DerivedRoleHoldCancellation 0
+          (b', _) <- addRecord (OcfRecordDataStockHoldCancellation StockHoldCancellationOcfData with
+            id = cancellationId
+            date
+            hold_id = h.hold_id
+            reason_text = "Canceled by stop " <> reference <> ": " <> reasonText
+            security_id = s.security_id
+            comments = []) b0
+          let withoutHold = s with holds = filter (\x -> x.hold_id /= h.hold_id) s.holds
+              canceledHold = CanceledSettlementHold with hold_id = h.hold_id; reference = h.reference; hold_cancellation_id = cancellationId
+          pure (withoutHold, b', [], [], Some canceledHold)
+        _ -> pure (s, b0, [], [], None)
+  (b2, _) <- addRecord (OcfRecordDataStockHold StockHoldOcfData with
+    id = holdId
+    date
+    hold_type = holdType
+    reason_text = reasonText
+    reference
+    security_id = s.security_id
+    comments = []
+    quantity = lot.quantity) b1
+  let hold = OpenHold with
+        hold_id = holdId
+        hold_type = holdType
+        reference
+        split_epoch = s1.split_epoch
+        quantity = lot.quantity
+  when (length s1.holds >= maxHoldsPerSecurity)
+    (abort ("security " <> s.security_id <> " already carries " <> show maxHoldsPerSecurity <> " holds"))
+  b3 <- replaceState ((successor s1) with holds = s1.holds <> [hold]; derived_ids = True) b2
+  let r stateCid = PlaceHoldResult with
+        hold_id = holdId
+        security_id = s.security_id
+        stakeholder_id = s.stakeholder_id
+        stock_class_id = s.stock_class_id
+        split_epoch = s1.split_epoch
+        stock_legend_ids = legends
+        security_law_exemptions = exemptions
+        canceled_settlement_hold = canceled
+        state = stateCid
+  pure (b3, (s.security_id, r) :: acc)
+
+-- =============================================================================
+-- CANCELING HOLDS
+-- =============================================================================
+
+data CancelHold = CancelHold
+  with
+    security_id : Text
+    hold_id : Text
+    reason_text : Text
+  deriving (Eq, Show)
+
+data CancelHoldResult = CancelHoldResult
+  with
+    security_id : Text
+    hold_id : Text
+    hold_cancellation_id : Text
+  deriving (Eq, Show)
+
+-- | Cancels whole holds, current or voided, settlement or stop: each a non-terminal event on the
+-- lot's state that writes a TX_STOCK_HOLD_CANCELLATION.
+cancelHolds : Context -> BookInputs -> Date -> [CancelHold] -> Update ([CancelHoldResult], Map.Map Text (ContractId StockSecurity))
+cancelHolds ctx inputs date holds = do
+  when (null holds) (abort "CapTable_CancelHolds needs at least one hold")
+  when (length holds > maxHoldCancellationsPerTransaction)
+    (abort ("CapTable_CancelHolds takes at most " <> show maxHoldCancellationsPerTransaction <> " holds"))
+  b0 <- loadBook ctx inputs
+  (b1, results) <- foldlA (\(b, acc) c -> do
+      (b', r) <- cancelOne None date c b
+      pure (b', r :: acc)) (b0, []) holds
+  (_, result) <- flushBook b1
+  pure (reverse results, result.states)
+
+-- Cancels one hold; under a settlement, it must be a settlement hold of that trade.
+cancelOne : Optional Text -> Date -> CancelHold -> Book -> Update (Book, CancelHoldResult)
+cancelOne underReference date c b0 = do
+  when (c.reason_text == "") (abort "a hold cancellation needs a reason")
+  (s, _) <- beginEvent b0 c.security_id date False
+  h <- case findHold c.hold_id s of
+    Some h -> pure h
+    None -> abort ("hold " <> c.hold_id <> " is not open on security " <> c.security_id)
+  case underReference of
+    Some r -> unless (h.hold_type == OcfHoldTypeRegisterSettlement && h.reference == r)
+      (abort ("hold " <> c.hold_id <> " is not a settlement hold under " <> r))
+    None -> pure ()
+  let cancellationId = deriveId b0.context s.security_id s.seq DerivedRoleHoldCancellation 0
+  (b1, _) <- addRecord (OcfRecordDataStockHoldCancellation StockHoldCancellationOcfData with
+    id = cancellationId
+    date
+    hold_id = c.hold_id
+    reason_text = c.reason_text
+    security_id = s.security_id
+    comments = []) b0
+  b2 <- replaceState ((successor s) with holds = filter (\x -> x.hold_id /= c.hold_id) s.holds; derived_ids = True) b1
+  pure (b2, CancelHoldResult with security_id = s.security_id; hold_id = c.hold_id; hold_cancellation_id = cancellationId)
+
+-- =============================================================================
+-- SETTLEMENT
+-- =============================================================================
+
+-- | The buyer's stakeholder: an existing record, or a new one created, its ID claimed, by the settlement.
+data SettleBuyer
+  = SettleBuyerExisting (ContractId Stakeholder)
+  | SettleBuyerNew StakeholderOcfData
+  deriving (Eq, Show)
+
+data DrawLot = DrawLot
+  with
+    security_id : Text
+    -- The lot's REGISTER_SETTLEMENT hold under this settlement
+    hold_id : Text
+    -- Shares drawn: positive, at most the hold's quantity
+    quantity : Decimal
+    -- The buyer's issuance's custom ID
+    custom_id : Text
+    -- Price per share, in the trade's currency
+    share_price : OcfMonetary
+    -- The TA's buyer cost basis: share_price × quantity, half-even at scale 10
+    buyer_cost_basis : OcfMonetary
+    -- The TA's balance cost basis: the source's × remaining / quantity, floored; None if the source
+    -- has none or nothing remains
+    balance_cost_basis : Optional OcfMonetary
+    -- A lot on vesting terms: the balance's remaining vesting as explicit tranches; otherwise []
+    balance_vestings : [OcfVesting]
+    -- The lot's origin TX_STOCK_ISSUANCE
+    origin_issuance : ContractId StockIssuance
+  deriving (Eq, Show)
+
+data SettleLot
+  = SettleDraw DrawLot
+  | SettleCancel CancelHold
+  deriving (Eq, Show)
+
+data SettleLotResult
+  = SettleDrawResult with
+      security_id : Text
+      hold_id : Text
+      quantity : Decimal
+      share_price : OcfMonetary
+      transfer_id : Text
+      buyer_issuance_id : Text
+      buyer_security_id : Text
+      buyer_state : ContractId StockSecurity
+      balance_issuance_id : Optional Text
+      balance_security_id : Optional Text
+      balance_state : Optional (ContractId StockSecurity)
+      stock_legend_ids : [Text]
+      security_law_exemptions : [OcfSecurityExemption]
+  | SettleCancelResult with
+      security_id : Text
+      hold_id : Text
+      hold_cancellation_id : Text
+      state : ContractId StockSecurity
+  deriving (Eq, Show)
+
+data SettleResult = SettleResult
+  with
+    context : Context
+    settlement_id : Text
+    seller_stakeholder_id : Text
+    buyer_stakeholder_id : Text
+    stock_class_id : Text
+    lots : [SettleLotResult]
+    -- Total quantity delivered
+    quantity : Decimal
+  deriving (Eq, Show)
+
+-- One draw's outputs before the flush gives them contract IDs.
+data PendingDraw = PendingDraw
+  with
+    lot : DrawLot
+    transfer_id : Text
+    buyer_issuance_id : Text
+    buyer_security_id : Text
+    balance_issuance_id : Optional Text
+    balance_security_id : Optional Text
+    legends : [Text]
+    exemptions : [OcfSecurityExemption]
+
+-- | Draws or cancels the holds of one trade, in one transaction with its cash leg. Every draw is a
+-- terminal event on a lot of one stakeholder in one class: it writes the TX_STOCK_TRANSFER, the
+-- buyer's TX_STOCK_ISSUANCE and state (carrying the delivery record), and the seller's balance
+-- issuance and state when shares remain. The result carries the delivered terms, which the desk
+-- checks against the accepted terms before it pays.
+settle : Context -> BookInputs -> Text -> Date -> SettleBuyer -> [SettleLot] -> Update SettleResult
+settle ctx inputs settlementId date buyer lots = do
+  assertLedgerDate date
+  when (settlementId == "") (abort "a settlement needs its reference")
+  when (null lots) (abort "CapTable_Settle needs at least one lot")
+  when (length lots > maxLotsPerOperation)
+    (abort ("CapTable_Settle takes at most " <> show maxLotsPerOperation <> " lots"))
+  let lotSecurity l = case l of
+        SettleDraw d -> d.security_id
+        SettleCancel c -> c.security_id
+      draws = concatMap (\l -> case l of
+        SettleDraw d -> [d]
+        SettleCancel _ -> []) lots
+  unless (dedup (map lotSecurity lots) == map lotSecurity lots) (abort "each lot appears once")
+  when (null draws) (abort "a settlement draws at least one lot; release a trade with CapTable_CancelHolds")
+  b0 <- loadBook ctx inputs
+  drawStates <- mapA (\d -> requireState d.security_id b0) draws
+  let first = head drawStates
+      seller = first.stakeholder_id
+      stockClass = first.stock_class_id
+  unless (all (\s -> s.stakeholder_id == seller && s.stock_class_id == stockClass) drawStates)
+    (abort "a settlement draws lots of one stakeholder in one class")
+  (b1, buyerId) <- case buyer of
+    SettleBuyerExisting cid -> do
+      sh <- fetchChecked ctx "the buyer's stakeholder" cid
+      pure (b0, sh.ocf_data.id)
+    SettleBuyerNew sh -> do
+      b' <- claimId IdNamespaceObject sh.id b0
+      (b'', _) <- addRecord (OcfRecordDataStakeholder sh) b'
+      pure (b'', sh.id)
+  when (buyerId == seller) (abort "the buyer and the seller are the same stakeholder")
+  (b2, pending) <- foldlA (\(b, acc) l -> case l of
+      SettleDraw d -> do
+        (b', p) <- drawOne settlementId date buyerId d b
+        pure (b', Left p :: acc)
+      SettleCancel c -> do
+        (b', r) <- cancelOne (Some settlementId) date c b
+        pure (b', Right r :: acc)) (b1, []) lots
+  let total = sum (map (.quantity) draws)
+  (_, result) <- flushBook b2
+  let stateOf sec = fromSomeNote ("no new state for " <> sec) (Map.lookup sec result.states)
+      toResult p = case p of
+        Left d -> SettleDrawResult with
+          security_id = d.lot.security_id
+          hold_id = d.lot.hold_id
+          quantity = d.lot.quantity
+          share_price = d.lot.share_price
+          transfer_id = d.transfer_id
+          buyer_issuance_id = d.buyer_issuance_id
+          buyer_security_id = d.buyer_security_id
+          buyer_state = stateOf d.buyer_security_id
+          balance_issuance_id = d.balance_issuance_id
+          balance_security_id = d.balance_security_id
+          balance_state = stateOf <$> d.balance_security_id
+          stock_legend_ids = d.legends
+          security_law_exemptions = d.exemptions
+        Right c -> SettleCancelResult with
+          security_id = c.security_id
+          hold_id = c.hold_id
+          hold_cancellation_id = c.hold_cancellation_id
+          state = stateOf c.security_id
+  pure SettleResult with
+    context = ctx
+    settlement_id = settlementId
+    seller_stakeholder_id = seller
+    buyer_stakeholder_id = buyerId
+    stock_class_id = stockClass
+    lots = map toResult (reverse pending)
+    quantity = total
+
+drawOne : Text -> Date -> Text -> DrawLot -> Book -> Update (Book, PendingDraw)
+drawOne settlementId date buyerId d b0 = do
+  (s, e) <- beginEvent b0 d.security_id date False
+  when (isStopped s) (abort ("security " <> s.security_id <> " is stopped"))
+  h <- case findHold d.hold_id s of
+    Some h -> pure h
+    None -> abort ("hold " <> d.hold_id <> " is not open on security " <> s.security_id)
+  unless (h.hold_type == OcfHoldTypeRegisterSettlement && h.reference == settlementId)
+    (abort ("hold " <> d.hold_id <> " is not a settlement hold under " <> settlementId))
+  unless (h.split_epoch == splitsOnOrBefore e.splits date)
+    (abort ("a split of the class voided hold " <> d.hold_id))
+  unless (fullyCovered s)
+    (abort ("security " <> s.security_id <> " has tranches covering less than its quantity"))
+  let q = d.quantity
+  unless (q > 0.0 && Some q <= h.quantity && q <= s.quantity)
+    (abort ("draw of " <> show q <> " must be positive and at most hold " <> d.hold_id <> "'s quantity"))
+  origin <- fetchChecked b0.context "an origin issuance" d.origin_issuance
+  let src = origin.ocf_data
+  unless (src.id == s.origin_transaction_id)
+    (abort ("issuance " <> src.id <> " is not the origin of security " <> s.security_id))
+  -- The buyer's and the balance's issuances copy the origin, so it must still agree with the lot.
+  checkOriginAgrees s src
+  -- The origin issuance is read, so its tranches count toward the transaction's cap.
+  bRead <- countTranches (length src.vestings) b0
+  let ctx = b0.context
+      derive role = deriveId ctx s.security_id s.seq role 0
+      transferId = derive DerivedRoleEvent
+      buyerIssuanceId = derive DerivedRoleResultingIssuance
+      buyerSecurityId = derive DerivedRoleResultingSecurity
+      remaining = s.quantity - q
+      hasBalance = remaining > 0.0
+      balanceIssuanceId = if hasBalance then Some (derive DerivedRoleBalanceIssuance) else None
+      balanceSecurityId = if hasBalance then Some (derive DerivedRoleBalanceSecurity) else None
+  -- Cost bases: the buyer's records the price paid; a balance keeps the source's pro rata.
+  let expectedBuyerBasis = OcfMonetary with amount = mulHalfEven d.share_price.amount q; currency = d.share_price.currency
+      expectedBalanceBasis =
+        if hasBalance
+          then fmap (\cb -> cb with amount = floorMulDiv cb.amount remaining s.quantity) src.cost_basis
+          else None
+  unless (d.buyer_cost_basis == expectedBuyerBasis)
+    (abort ("buyer cost basis must be " <> show expectedBuyerBasis))
+  unless (d.balance_cost_basis == expectedBalanceBasis)
+    (abort ("balance cost basis must be " <> show expectedBalanceBasis))
+  -- Only vested shares trade: the draw takes the earliest vested tranches.
+  balanceVestings <- case s.vesting of
+    StockVestingNone -> do
+      unless (null d.balance_vestings) (abort "a fully vested lot's balance carries no vesting")
+      pure []
+    StockVestingTranches ts -> do
+      unless (null d.balance_vestings) (abort "a tranche lot's balance vesting is the ledger's to compute")
+      pure (if hasBalance then drawTranches q ts else [])
+    StockVestingOnTerms _ -> do
+      let keptVested = vestedAt s date - q
+      when hasBalance do
+        unless (trancheTotal d.balance_vestings == remaining)
+          (abort ("the balance's vestings must sum to its quantity " <> show remaining))
+        unless (vestedBy date d.balance_vestings == keptVested)
+          (abort ("the balance's vestings dated on or before the draw must equal the vested " <> show keptVested <> " it keeps"))
+      unless (hasBalance || null d.balance_vestings) (abort "a full draw has no balance vestings")
+      pure d.balance_vestings
+  -- The transfer, the buyer's issuance and state, and the balance.
+  (b1, _) <- addRecord (OcfRecordDataStockTransfer StockTransferOcfData with
+    id = transferId
+    date
+    quantity = q
+    security_id = s.security_id
+    comments = []
+    resulting_security_ids = [buyerSecurityId]
+    balance_security_id = balanceSecurityId
+    consideration_text = None) bRead
+  let buyerIssuance = src with
+        id = buyerIssuanceId
+        custom_id = d.custom_id
+        date
+        quantity = q
+        security_id = buyerSecurityId
+        share_price = d.share_price
+        stakeholder_id = buyerId
+        comments = []
+        share_numbers_issued = []
+        vestings = []
+        consideration_text = None
+        cost_basis = Some d.buyer_cost_basis
+        vesting_terms_id = None
+  (b2, _) <- addRecord (OcfRecordDataStockIssuance buyerIssuance) b1
+  b3 <- endState s.security_id b2
+  b4 <- addState ((stateForIssuance b3 e date buyerIssuance) with
+    delivery = Some Delivery with reference = settlementId; seller_stakeholder_id = s.stakeholder_id; transfer_id = transferId) b3
+  b5 <- case (balanceIssuanceId, balanceSecurityId) of
+    (Some bi, Some bs) -> do
+      let balance = src with
+            id = bi
+            custom_id = bs
+            date
+            quantity = remaining
+            security_id = bs
+            comments = []
+            share_numbers_issued = []
+            vestings = balanceVestings
+            cost_basis = expectedBalanceBasis
+            vesting_terms_id = None
+      (b', _) <- addRecord (OcfRecordDataStockIssuance balance) b4
+      addState (stateForIssuance b' e date balance) b'
+    _ -> pure b4
+  pure (b5, PendingDraw with
+    lot = d
+    transfer_id = transferId
+    buyer_issuance_id = buyerIssuanceId
+    buyer_security_id = buyerSecurityId
+    balance_issuance_id = balanceIssuanceId
+    balance_security_id = balanceSecurityId
+    legends = src.stock_legend_ids
+    exemptions = src.security_law_exemptions)
+
+-- A restatement can edit a lot's origin issuance without its state, so a hold or draw that copies
+-- the origin first checks it still names the lot's security, stakeholder and class.
+checkOriginAgrees : StockSecurity -> StockIssuanceOcfData -> Update ()
+checkOriginAgrees s iss =
+  unless (iss.security_id == s.security_id && iss.stakeholder_id == s.stakeholder_id && iss.stock_class_id == s.stock_class_id)
+    (abort ("origin issuance " <> iss.id <> " disagrees with security " <> s.security_id <> "'s stakeholder or class"))

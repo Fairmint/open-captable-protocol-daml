@@ -1,71 +1,89 @@
+-- Stock acceptances through CapTable_Apply: a non-terminal event on the security's state, with claimed or derived IDs, date order and the acceptance validator.
 module OpenCapTable.TestStockAcceptance where
 
-import Fairmint.OpenCapTable.OCF.StockIssuance
-import Fairmint.OpenCapTable.OCF.StockAcceptance
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers (addPrerequisites)
-import qualified DA.Date as DA
-import DA.Date (Month(..))
-import qualified DA.Time as DT
+import DA.Assert ((===))
+import qualified DA.Date as D
 import Daml.Script
 
--- Helper to create stock issuance (needs stakeholder + stock class)
-createStockIssuance issuer capTableCid =
-  submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockIssuance StockIssuanceOcfData with
-        id = "TX_STOCK_ISS_1"
-        date = DT.time (DA.date 2024 Jan 01) 0 0 0
-        security_id = "SEC-STOCK-1"
-        custom_id = "CERT-1"
-        stakeholder_id = "SH-1"
-        board_approval_date = None
-        stockholder_approval_date = None
-        consideration_text = None
-        security_law_exemptions = []
-        stock_class_id = "SC_COMMON"
-        stock_plan_id = None
-        share_numbers_issued = []
-        share_price = OcfMonetary with amount = 1.0, currency = "USD"
-        quantity = 100.0
-        vesting_terms_id = None
-        vestings = []
-        cost_basis = None
-        stock_legend_ids = []
-        issuance_type = None
-        comments = []]
-      edits = []
-      deletes = []
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..), validateStockAcceptanceOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
-testStockAcceptance_Create = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  -- addPrerequisites adds stakeholder "SH-1" and stock class "SC_COMMON"
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockAcceptance StockAcceptanceOcfData with
-        id = "TX_STOCK_ACCEPT_1"
-        date = DT.time (DA.date 2024 Jan 02) 0 0 0
-        security_id = "SEC-STOCK-1"
-        comments = []]
-      edits = []
-      deletes = []
-  pure ()
+acceptance : Text -> Text -> Date -> StockAcceptanceOcfData
+acceptance id sec d = StockAcceptanceOcfData with id; date = d; security_id = sec; comments = []
 
-testStockAcceptance_WithComments = script do
-  TestOcp{system_operator, issuer, ctx, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  result <- createStockIssuance issuer capTableCid
-  _ <- submit issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockAcceptance StockAcceptanceOcfData with
-        id = "TX_STOCK_ACCEPT_2"
-        date = DT.time (DA.date 2024 Jan 03) 0 0 0
-        security_id = "SEC-STOCK-1"
-        comments = ["Stakeholder accepted via DocuSign", "Certificate mailed"]]
-      edits = []
-      deletes = []
-  pure ()
+test_stock_acceptance_create : Script ()
+test_stock_acceptance_create = do
+  env <- standardBook
+  let a = acceptance "TX_STOCK_ACCEPT_1" "S-A1" (D.date 2024 D.Jan 2)
+  _ <- applyRecords env [OcfRecordDataStockAcceptance a]
+  expectRecord env (OcfRecordDataStockAcceptance a)
+  -- The acceptance consumes the state and leaves a successor with one more event.
+  s <- stateOf env "S-A1"
+  s.seq === 1
+  s.quantity === 600.0
+  s.last_event_date === D.date 2024 D.Jan 2
+  s.stakeholder_id === "SH-A"
+  s.origin_transaction_id === "ISS-S-A1"
+  -- Its ID is claimed.
+  applyRecordsFails env "ID already used: TX_STOCK_ACCEPT_1" [OcfRecordDataStakeholder (stakeholderData "TX_STOCK_ACCEPT_1")]
+
+test_stock_acceptance_with_comments : Script ()
+test_stock_acceptance_with_comments = do
+  env <- standardBook
+  let a = (acceptance "TX_STOCK_ACCEPT_2" "S-A1" (D.date 2024 D.Jan 3)) with
+        comments = ["Stakeholder accepted via DocuSign", "Certificate mailed"]
+  _ <- applyRecords env [OcfRecordDataStockAcceptance a]
+  expectRecord env (OcfRecordDataStockAcceptance a)
+  (.seq) <$> stateOf env "S-A1" >>= (=== 1)
+
+-- An acceptance may carry the ledger's derived event ID for the state's seq; it claims nothing.
+test_stock_acceptance_derived_id : Script ()
+test_stock_acceptance_derived_id = do
+  env <- standardBook
+  let first = acceptance (derived env "S-A2" 0 DerivedRoleEvent 0) "S-A2" (D.date 2024 D.Jan 2)
+      second = acceptance (derived env "S-A2" 1 DerivedRoleEvent 0) "S-A2" (D.date 2024 D.Jan 3)
+  _ <- applyRecords env [OcfRecordDataStockAcceptance first]
+  -- The seq-0 ID is no longer the state's own.
+  applyRecordsFails env "derived form" [OcfRecordDataStockAcceptance (first with date = D.date 2024 D.Jan 3)]
+  _ <- applyRecords env [OcfRecordDataStockAcceptance second]
+  expectRecord env (OcfRecordDataStockAcceptance first)
+  expectRecord env (OcfRecordDataStockAcceptance second)
+  (.seq) <$> stateOf env "S-A2" >>= (=== 2)
+
+test_stock_acceptance_needs_a_stock_state : Script ()
+test_stock_acceptance_needs_a_stock_state = do
+  env <- instrumentBook
+  applyRecordsFails env "no active state for security S-NONE" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-NONE" eventDate)]
+  -- A warrant's security has no stock state.
+  applyRecordsFails env "no active state for security W-1" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "W-1" eventDate)]
+  applyRecordsFails env "no active state for security  in this write" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "" eventDate)]
+  -- Two acceptances of one security in a batch: the second runs on the first's successor.
+  _ <- applyRecords env
+    [ OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" eventDate)
+    , OcfRecordDataStockAcceptance (acceptance "ACC-2" "S-A1" eventDate)
+    ]
+  (.seq) <$> stateOf env "S-A1" >>= (=== 2)
+
+test_stock_acceptance_date_order : Script ()
+test_stock_acceptance_date_order = do
+  env <- standardBook
+  applyRecordsFails env "precedes the last event on security S-A1" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" (D.date 2023 D.Dec 31))]
+  -- An acceptance on the issuance date is in order.
+  _ <- applyRecords env [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" d2024)]
+  (.last_event_date) <$> stateOf env "S-A1" >>= (=== d2024)
+
+test_stock_acceptance_validator : Script ()
+test_stock_acceptance_validator = do
+  env <- standardBook
+  let a = acceptance "ACC-1" "S-A1" eventDate
+  applyRecordsFails env "precondition" [OcfRecordDataStockAcceptance (a with comments = [""])]
+  applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockAcceptance (a with id = "")]
+  (.seq) <$> stateOf env "S-A1" >>= (=== 0)
+  expectTrue "the fixture" (validateStockAcceptanceOcfData a)
+  expectTrue "comments" (validateStockAcceptanceOcfData a with comments = ["Signed"])
+  expectFalse "empty id" (validateStockAcceptanceOcfData a with id = "")
+  expectFalse "empty security_id" (validateStockAcceptanceOcfData a with security_id = "")
+  expectFalse "an empty comment" (validateStockAcceptanceOcfData a with comments = ["Signed", ""])

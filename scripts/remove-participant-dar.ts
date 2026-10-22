@@ -31,11 +31,20 @@
  *
  * Custom main package id (64-char hex, no prefix): npx tsx scripts/remove-participant-dar.ts --main-package-id
  * aca762f1ca25b960f4016d00c2eef4263a860e7663e3bb76f4ecf56375508a6a
+ *
+ * A package of this repository and the packages it depends on, dependents first (the reverse of upload order), with
+ * main package ids read from the backed-up DARs: npx tsx scripts/remove-participant-dar.ts --package ocp. For
+ * OpenCapTable-v35 that removes OpenCapTable-v35, then OpenCapTableApi-v01.
+ *
+ * The admin protos come from `npm run sync-splice-dars` (run by `npm run remove-participant-dar`).
  */
 
+import { requireBackedUpDar } from '@fairmint/canton-dev-tools/daml';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
+import { inspectDarPackageId } from './detect-factory-need';
+import { getUploadOrder } from './packages';
 
 const ROOT = path.join(__dirname, '..');
 const ADMIN_PROTO_ROOT = path.join(ROOT, 'libs/splice/canton/community/admin-api/src/main/protobuf');
@@ -48,7 +57,19 @@ const MAINNET_LEDGER_JSON_HINT = [
   '5n mainnet ledger JSON (NOT admin gRPC):       https://ledger-api.validator.transfer-agent.xyz',
 ].join('\n');
 
-/** Main-Dalf package id (64 hex) from backed-up DARs — CantonPayments only. */
+/** Main package ids of a package and its dependencies, dependents first, from their backed-up DARs. */
+function packageRemovalIds(packageKey: string): string[] {
+  return getUploadOrder(packageKey)
+    .reverse()
+    .map((pkg) => {
+      const darPath = requireBackedUpDar(ROOT, pkg.name, pkg.version, pkg.darName);
+      const id = inspectDarPackageId(darPath, pkg.name, pkg.version);
+      console.log(`# ${pkg.name} ${pkg.version}: ${id}`);
+      return id;
+    });
+}
+
+/** Main-Dalf package id (64 hex) from backed-up DARs — CantonPayments only (legacy presets). */
 const PRESETS: Record<string, readonly string[]> = {
   // dars.lock: 0.0.39 + 0.0.40 recorded mainnet upload 2026-04-23 (splice / airdrop debugging).
   'mainnet-canton-payments-2026-04-23': [
@@ -70,9 +91,8 @@ function grpcImportArgs(): string[] {
   if (!fs.existsSync(protoPath)) {
     throw new Error(
       `Admin proto not found at ${protoPath}. ` +
-        `sync-splice-dars only materializes DAR artifacts under libs/splice/; ` +
-        `this ops script needs a full Splice checkout (with canton admin-api protos) at libs/splice, ` +
-        `or run the equivalent tooling from a repo that still vendors that tree.`
+        'Run `npm run sync-splice-dars` (it fetches the Canton participant admin protos into libs/splice/), ' +
+        'or use `npm run remove-participant-dar`, which runs it first.'
     );
   }
   return ['-import-path', ADMIN_PROTO_ROOT, '-proto', ADMIN_PROTO_REL];
@@ -149,23 +169,28 @@ function main(): void {
   const execute = argv.includes('--execute') || argv.includes('--execute-mainnet-both');
   const include038 = argv.includes('--include-0-0-38');
   let preset: string | undefined;
+  let packageKey: string | undefined;
   const manual: string[] = [];
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--preset' && argv[i + 1]) {
       preset = argv[++i];
+    } else if (argv[i] === '--package' && argv[i + 1]) {
+      packageKey = argv[++i];
     } else if (argv[i] === '--main-package-id' && argv[i + 1]) {
       manual.push(argv[++i]);
     }
   }
 
   if (argv.includes('--help') || argv.includes('-h')) {
-    console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(0, 42).join('\n'));
+    console.log(fs.readFileSync(__filename, 'utf8').split('\n').slice(0, 40).join('\n'));
     process.exit(0);
   }
 
   let ids: string[] = [];
   if (manual.length > 0) {
     ids = [...manual];
+  } else if (packageKey) {
+    ids = packageRemovalIds(packageKey);
   } else if (preset) {
     const list = PRESETS[preset];
     if (!list) {
@@ -175,8 +200,9 @@ function main(): void {
     ids = [...list];
   } else {
     console.error(
-      'Usage: tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 [--mainnet-both] [--include-0-0-38] [--execute|--execute-mainnet-both]\n' +
-        '   or: tsx scripts/remove-participant-dar.ts --main-package-id <64-hex> [--execute]'
+      'Usage: tsx scripts/remove-participant-dar.ts --package <key> [--execute]\n' +
+        '   or: tsx scripts/remove-participant-dar.ts --main-package-id <64-hex> [--execute]\n' +
+        '   or: tsx scripts/remove-participant-dar.ts --preset mainnet-canton-payments-2026-04-23 [--mainnet-both] [--include-0-0-38] [--execute|--execute-mainnet-both]'
     );
     process.exit(1);
   }
@@ -203,7 +229,7 @@ function main(): void {
 
   console.log(
     '\nParticipant admin RemoveDar — Canton participant only. Does not unvet topology.\n' +
-      'Order: newer CantonPayments builds first (preset default), then 0.0.38 only with --include-0-0-38.\n'
+      'Order: dependents before their dependencies (--package); newer CantonPayments builds first (preset), then 0.0.38 only with --include-0-0-38.\n'
   );
   console.log(`${MAINNET_LEDGER_JSON_HINT}\n`);
 

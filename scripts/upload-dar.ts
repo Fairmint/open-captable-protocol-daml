@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 /**
- * Upload a DAR file to devnet or mainnet.
+ * Upload a package's DAR to devnet or mainnet, after the DARs of the packages it data-depends on.
  *
- * Requires a fresh build whose bytes exactly match the committed backup.
+ * Requires fresh builds whose bytes exactly match the committed backups.
+ *
+ * **Dependencies first:** `--package ocp` (OpenCapTable-v35) uploads OpenCapTableApi-v01, then OpenCapTable-v35
+ * (`dependencies` in `scripts/packages.ts`). Pass `--no-dependencies` to upload only the named package. A provider that
+ * fails on one DAR is not sent the DARs after it.
+ *
+ * **Networks:** OpenCapTable-v35 targets DevNet only (ADR-040: MainNet is out of scope); `--network mainnet` stays for
+ * the release machinery but no workflow runs it for v35.
  *
  * **Backed-up DARs:** Upload uses the version recorded under `dars/` + `dars.lock`. Older versions remain in `dars/` on
  * purpose—see https://github.com/Fairmint/open-captable-protocol-daml/wiki/DAR-Backup
  *
- * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet]
+ * Usage: tsx scripts/upload-dar.ts --package <package> --network <network> [--no-vet] [--no-dependencies]
  *
  * **`--no-vet`:** pass `vetAllPackages=false` to `POST /v2/packages` so the DAR is stored without immediately vetting
  * packages. That **skips** the upgrade-compatibility step that rejects `NOT_VALID_UPGRADE_PACKAGE` for incompatible
@@ -19,6 +26,7 @@ import { computeSha256, getFreshDarPath, requireBackedUpDar } from '@fairmint/ca
 import * as fs from 'fs';
 import * as path from 'path';
 import {
+  getUploadOrder,
   type PackageConfig,
   parseNetworkArg,
   parsePackageArg,
@@ -54,7 +62,7 @@ function requireMatchingBuild(pkg: PackageConfig): string {
     console.error(`❌ Fresh build does not match the committed backup.`);
     console.error(`   Fresh:  ${freshHash}`);
     console.error(`   Backup: ${backedUpHash}`);
-    console.error(`   Run: npm run backup-dar -- --package ${pkg.sourceDir} --version ${pkg.version}`);
+    console.error(`   Run: npm run backup-dar -- --package ${pkg.name} --version ${pkg.version}`);
     process.exit(1);
   }
 
@@ -70,13 +78,15 @@ async function main() {
 
   const pkg = requirePackage('upload-dar.ts');
   const network = requireNetwork('upload-dar.ts');
+  const packages = process.argv.includes('--no-dependencies') ? [pkg] : getUploadOrder(pkg.name);
 
-  console.log(`\n📦 Uploading ${pkg.name} v${pkg.version} to ${network}\n`);
+  console.log(`\n📦 Uploading ${packages.map((p) => `${p.name} v${p.version}`).join(', then ')} to ${network}\n`);
 
-  const darPath = requireMatchingBuild(pkg);
+  // Check every DAR before the first upload, so a stale backup stops the run before any side effect.
+  const dars = packages.map((p) => ({ pkg: p, darPath: requireMatchingBuild(p) }));
 
   // Upload to each provider independently so one unhealthy participant (e.g. devnet Intellect with no synchronizer)
-  // does not block the other.
+  // does not block the other. Within a provider, a failed DAR stops the DARs that depend on it.
   const failures: Array<{ provider: string; message: string }> = [];
   const noVet = process.argv.includes('--no-vet');
   if (noVet) {
@@ -89,18 +99,20 @@ async function main() {
     console.log(`  → ${provider}...`);
     try {
       const client = createLedgerJsonApiClient(network, provider);
-      if (noVet) {
-        // Published @fairmint/canton-node-sdk may not yet parse `vetAllPackages` on uploadDar (Zod strips unknown
-        // keys). POST the octet-stream body ourselves with the query flag Canton documents for JSON API uploads.
-        const url = `${client.getApiUrl()}/v2/packages?vetAllPackages=false`;
-        await client.makePostRequest(url, fs.readFileSync(darPath), {
-          contentType: 'application/octet-stream',
-          includeBearerToken: true,
-        });
-      } else {
-        await client.uploadDar({ darFile: fs.readFileSync(darPath) });
+      for (const { pkg: uploaded, darPath } of dars) {
+        if (noVet) {
+          // Published @fairmint/canton-node-sdk may not yet parse `vetAllPackages` on uploadDar (Zod strips unknown
+          // keys). POST the octet-stream body ourselves with the query flag Canton documents for JSON API uploads.
+          const url = `${client.getApiUrl()}/v2/packages?vetAllPackages=false`;
+          await client.makePostRequest(url, fs.readFileSync(darPath), {
+            contentType: 'application/octet-stream',
+            includeBearerToken: true,
+          });
+        } else {
+          await client.uploadDar({ darFile: fs.readFileSync(darPath) });
+        }
+        console.log(`    ✅ ${uploaded.name} v${uploaded.version}`);
       }
-      console.log(`    ✅ Done`);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       console.error(`    ⚠️  Failed: ${message}`);

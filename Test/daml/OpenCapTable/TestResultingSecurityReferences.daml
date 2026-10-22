@@ -1,360 +1,190 @@
+-- Resulting securities: a stock event writes its resulting issuances in its own operation, in the order it names them; warrant, convertible and equity-compensation events reference resulting issuances of the right instrument, checked at the end of the batch and when a restatement adds them.
 module OpenCapTable.TestResultingSecurityReferences where
 
-import qualified Fairmint.OpenCapTable.CapTable as CT
-import Fairmint.OpenCapTable.OCF.ConvertibleConversion (ConvertibleConversionOcfData(..))
-import Fairmint.OpenCapTable.OCF.ConvertibleTransfer (ConvertibleTransferOcfData(..))
-import Fairmint.OpenCapTable.OCF.EquityCompensationExercise (EquityCompensationExerciseOcfData(..))
-import Fairmint.OpenCapTable.OCF.EquityCompensationRelease (EquityCompensationReleaseOcfData(..))
-import Fairmint.OpenCapTable.OCF.EquityCompensationTransfer (EquityCompensationTransferOcfData(..))
-import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
-import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
-import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
-import Fairmint.OpenCapTable.OCF.WarrantExercise (WarrantExerciseOcfData(..))
-import Fairmint.OpenCapTable.OCF.WarrantIssuance (WarrantIssuanceOcfData(..))
-import Fairmint.OpenCapTable.OCF.WarrantTransfer (WarrantTransferOcfData(..))
-import Fairmint.OpenCapTable.Types.Conversion
-import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
-import OpenCapTable.Setup
-import OpenCapTable.TestHelpers
-  ( addDefaultConvertibleIssuance
-  , addDefaultEquityCompensationIssuance
-  , addDefaultStakeholder
-  , addDefaultStockIssuance
-  , addDefaultWarrantIssuance
-  , addPrerequisites
-  , addStockIssuance
-  , defaultTestDate
-  , stockSuccessorIssuance
-  )
+import DA.Assert ((===))
 import Daml.Script
 
-warrantExerciseSourceIssuance : CT.OcfCreateData
-warrantExerciseSourceIssuance =
-  CT.OcfCreateWarrantIssuance WarrantIssuanceOcfData with
-    id = "WR-ISS-EXERCISE-SOURCE"
-    custom_id = "WR-EXERCISE-SOURCE"
-    date = defaultTestDate
-    purchase_price = OcfMonetary with amount = 1.0, currency = "USD"
-    security_id = "SEC-WR-EXERCISE-SOURCE"
-    stakeholder_id = "SH-1"
-    comments = []
-    exercise_triggers = [OcfConversionTrigger with
-      conversion_right = OcfRightWarrant (OcfWarrantConversionRight with
-        conversion_mechanism = OcfWarrantMechanismFixedAmount with converts_to_quantity = 100.0
-        converts_to_future_round = None
-        converts_to_stock_class_id = Some "SC_COMMON"
-        type_ = "WARRANT_CONVERSION_RIGHT")
-      end_date = None
-      nickname = None
-      start_date = None
-      trigger_condition = None
-      trigger_date = None
-      trigger_description = None
-      trigger_id = "WR-EXERCISE-TRIGGER"
-      type_ = OcfTriggerTypeTypeElectiveAtWill]
-    security_law_exemptions = []
-    vestings = []
-    board_approval_date = None
-    consideration_text = None
-    exercise_price = Some (OcfMonetary with amount = 1.0, currency = "USD")
-    quantity = Some 100.0
-    quantity_source = None
-    stockholder_approval_date = None
-    vesting_terms_id = None
-    warrant_expiration_date = None
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.OCF.StockConsolidation (StockConsolidationOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
 
-testResultingSecurityReferences_MissingStockTransferResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
+stockTransfer : Text -> [Text] -> StockTransferOcfData
+stockTransfer id resulting = StockTransferOcfData with
+  id; date = eventDate; quantity = 400.0; security_id = "S-A2"; resulting_security_ids = resulting
+  balance_security_id = None; consideration_text = None; comments = []
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockTransfer StockTransferOcfData with
-        id = "TX-STOCK-MISSING-RESULT"
-        date = defaultTestDate
-        quantity = 100.0
-        security_id = "SEC-STOCK-1"
-        resulting_security_ids = ["SEC-STOCK-MISSING-RESULT"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
+stockOut : Text -> Decimal -> StockIssuanceOcfData
+stockOut sec q = (issuance sec "SH-B" "CLS-A" q eventDate) with id = "ISS-" <> sec
 
-testResultingSecurityReferences_MissingWarrantTransferResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  capTableCid <- addDefaultWarrantIssuance issuer capTableCid
+-- =============================================================================
+-- STOCK EVENTS: OUTPUTS WRITTEN IN THE OPERATION
+-- =============================================================================
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantTransfer WarrantTransferOcfData with
-        id = "TX-WARRANT-MISSING-RESULT"
-        date = defaultTestDate
-        quantity = 100.0
-        security_id = "SEC-WR-1"
-        resulting_security_ids = ["SEC-WARRANT-MISSING-RESULT"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
+test_resulting_refs_missing_stock_transfer_result_fails : Script ()
+test_resulting_refs_missing_stock_transfer_result_fails = do
+  env <- standardBook
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-MISSING-RESULT" ["SEC-STOCK-MISSING-RESULT"]; resulting = []; balance = None]
+  hasState env "S-A2" >>= (=== True)
 
-testResultingSecurityReferences_MissingConvertibleTransferResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addDefaultStakeholder issuer cap_table
-  capTableCid <- addDefaultConvertibleIssuance issuer capTableCid
+-- A stock transfer's results are new stock issuances: no other instrument's security can stand in.
+test_resulting_refs_stock_transfer_result_must_be_new_stock : Script ()
+test_resulting_refs_stock_transfer_result_must_be_new_stock = do
+  env <- instrumentBook
+  applyOpsFails env "security ID already used: W-1"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-WRONG-RESULT-TYPE" ["W-1"]; resulting = [(stockOut "W-1" 400.0) with id = "ISS-STOCK-RESULT"]; balance = None]
+  applyOpsFails env "security ID already used: S-A1"
+    [ApplyStockTransfer with transfer = stockTransfer "TX-STOCK-WRONG-RESULT-TYPE" ["S-A1"]; resulting = [(stockOut "S-A1" 400.0) with id = "ISS-STOCK-RESULT"]; balance = None]
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleTransfer ConvertibleTransferOcfData with
-        id = "TX-CONVERTIBLE-MISSING-RESULT"
-        date = defaultTestDate
-        amount = OcfMonetary with amount = 10000.0, currency = "USD"
-        security_id = "SEC-CV-1"
-        resulting_security_ids = ["SEC-CONVERTIBLE-MISSING-RESULT"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
+test_resulting_refs_missing_consolidation_result_fails : Script ()
+test_resulting_refs_missing_consolidation_result_fails = do
+  env <- standardBook
+  let c = StockConsolidationOcfData with
+        id = "TX-STOCK-MISSING-CONSOLIDATION-RESULT"; date = eventDate; security_ids = ["S-A1", "S-A2"]
+        resulting_security_id = "SEC-STOCK-MISSING-CONSOLIDATION-RESULT"; reason_text = None; comments = []
+  applyOpsFails env "must write its resulting security SEC-STOCK-MISSING-CONSOLIDATION-RESULT"
+    [ApplyStockConsolidation with consolidation = c; resulting_issuance = (stockOut "SEC-OTHER" 1000.0) with stakeholder_id = "SH-A"]
 
-testResultingSecurityReferences_MissingEquityCompensationTransferResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultEquityCompensationIssuance issuer capTableCid
+test_resulting_refs_missing_stock_reissuance_result_fails : Script ()
+test_resulting_refs_missing_stock_reissuance_result_fails = do
+  env <- standardBook
+  let r = StockReissuanceOcfData with
+        id = "TX-STOCK-MISSING-REISSUANCE-RESULT"; date = eventDate; security_id = "S-A2"
+        resulting_security_ids = ["SEC-STOCK-MISSING-REISSUANCE-RESULT"]; comments = []; reason_text = None; split_transaction_id = None
+  applyOpsFails env "the resulting issuances must be the event's resulting securities, in order"
+    [ApplyStockReissuance with reissuance = r; resulting = []]
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationTransfer EquityCompensationTransferOcfData with
-        id = "TX-EC-MISSING-RESULT"
-        date = defaultTestDate
-        quantity = 100.0
-        security_id = "SEC-EC-1"
-        resulting_security_ids = ["SEC-EC-MISSING-RESULT"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
+test_resulting_refs_stock_result_in_same_operation : Script ()
+test_resulting_refs_stock_result_in_same_operation = do
+  env <- standardBook
+  let t = stockTransfer "TX-STOCK-SAME-BATCH-TRANSFER" ["SEC-STOCK-SAME-BATCH-RESULT"]
+      r = stockOut "SEC-STOCK-SAME-BATCH-RESULT" 400.0
+  _ <- applyOps env [ApplyStockTransfer with transfer = t; resulting = [r]; balance = None]
+  expectRecord env (OcfRecordDataStockTransfer t)
+  expectRecord env (OcfRecordDataStockIssuance r)
+  (.stakeholder_id) <$> stateOf env "SEC-STOCK-SAME-BATCH-RESULT" >>= (=== "SH-B")
 
-testResultingSecurityReferences_StockTransferResultMustBeStock = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-  capTableCid <- addDefaultWarrantIssuance issuer capTableCid
+-- =============================================================================
+-- WARRANT, CONVERTIBLE AND EQUITY-COMPENSATION EVENTS: REFERENCES
+-- =============================================================================
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockTransfer StockTransferOcfData with
-        id = "TX-STOCK-WRONG-RESULT-TYPE"
-        date = defaultTestDate
-        quantity = 100.0
-        security_id = "SEC-STOCK-1"
-        resulting_security_ids = ["SEC-WR-1"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
+test_resulting_refs_missing_instrument_transfer_results_fail : Script ()
+test_resulting_refs_missing_instrument_transfer_results_fail = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant transfer resulting security security not found: SEC-WARRANT-MISSING-RESULT"
+    [OcfRecordDataWarrantTransfer (warrantTransfer "TX-WARRANT-MISSING-RESULT" "W-1" ["SEC-WARRANT-MISSING-RESULT"] None)]
+  applyRecordsFails env "Convertible transfer resulting security security not found: SEC-CONVERTIBLE-MISSING-RESULT"
+    [OcfRecordDataConvertibleTransfer (convertibleTransfer "TX-CONVERTIBLE-MISSING-RESULT" "CV-1" ["SEC-CONVERTIBLE-MISSING-RESULT"] None)]
+  applyRecordsFails env "Equity compensation transfer resulting security security not found: SEC-EC-MISSING-RESULT"
+    [OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX-EC-MISSING-RESULT" "EC-1" ["SEC-EC-MISSING-RESULT"] None)]
+  -- The balance of a transfer is checked the same way.
+  applyRecordsFails env "Warrant transfer balance security not found: W-1-BAL"
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "W-2" "SH-B")
+    , OcfRecordDataWarrantTransfer (warrantTransfer "TX-WARRANT-BALANCE" "W-1" ["W-2"] (Some "W-1-BAL"))
+    ]
 
-testResultingSecurityReferences_MissingConsolidationResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addStockIssuance issuer capTableCid "TX-STOCK-CONSOLIDATE-A" "SEC-STOCK-CONSOLIDATE-A" "SH-1" "SC_COMMON"
-  capTableCid <- addStockIssuance issuer capTableCid "TX-STOCK-CONSOLIDATE-B" "SEC-STOCK-CONSOLIDATE-B" "SH-1" "SC_COMMON"
+test_resulting_refs_instrument_transfer_results_keep_their_instrument : Script ()
+test_resulting_refs_instrument_transfer_results_keep_their_instrument = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant transfer resulting security security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
+    [OcfRecordDataWarrantTransfer (warrantTransfer "TX-W" "W-1" ["S-A1"] None)]
+  applyRecordsFails env "Convertible transfer resulting security security EC-1 is carried by a OcfObjectTypeTxEquityCompensationIssuance"
+    [OcfRecordDataConvertibleTransfer (convertibleTransfer "TX-CV" "CV-1" ["EC-1"] None)]
+  applyRecordsFails env "Equity compensation transfer resulting security security W-1 is carried by a OcfObjectTypeTxWarrantIssuance"
+    [OcfRecordDataEquityCompensationTransfer (equityCompensationTransfer "TX-EC" "EC-1" ["W-1"] None)]
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockConsolidation StockConsolidationOcfData with
-        id = "TX-STOCK-MISSING-CONSOLIDATION-RESULT"
-        date = defaultTestDate
-        security_ids = ["SEC-STOCK-CONSOLIDATE-A", "SEC-STOCK-CONSOLIDATE-B"]
-        resulting_security_id = "SEC-STOCK-MISSING-CONSOLIDATION-RESULT"
-        reason_text = None
-        comments = []]
-      edits = []
-      deletes = []
+-- Exercises, conversions and releases result in stock.
+test_resulting_refs_missing_stock_results_of_instruments_fail : Script ()
+test_resulting_refs_missing_stock_results_of_instruments_fail = do
+  env <- instrumentBook
+  applyRecordsFails env "Warrant exercise resulting security security not found: SEC-STOCK-MISSING-WARRANT-EXERCISE-RESULT"
+    [OcfRecordDataWarrantExercise (warrantExercise "TX-WARRANT-MISSING-EXERCISE-RESULT" "W-1" ["SEC-STOCK-MISSING-WARRANT-EXERCISE-RESULT"])]
+  applyRecordsFails env "Convertible conversion resulting security security not found: SEC-STOCK-MISSING-CONVERTIBLE-CONVERSION-RESULT"
+    [OcfRecordDataConvertibleConversion (convertibleConversion "TX-CONVERTIBLE-MISSING-CONVERSION-RESULT" "CV-1" ["SEC-STOCK-MISSING-CONVERTIBLE-CONVERSION-RESULT"])]
+  applyRecordsFails env "Equity compensation exercise resulting security security not found: SEC-STOCK-MISSING-EC-EXERCISE-RESULT"
+    [OcfRecordDataEquityCompensationExercise (equityCompensationExercise "TX-EC-MISSING-EXERCISE-RESULT" "EC-1" ["SEC-STOCK-MISSING-EC-EXERCISE-RESULT"])]
+  applyRecordsFails env "Equity compensation release resulting security security not found: SEC-STOCK-MISSING-EC-RELEASE-RESULT"
+    [OcfRecordDataEquityCompensationRelease (equityCompensationRelease "TX-EC-MISSING-RELEASE-RESULT" "EC-1" ["SEC-STOCK-MISSING-EC-RELEASE-RESULT"])]
+  -- A warrant cannot be what an exercise results in.
+  applyRecordsFails env "Warrant exercise resulting security security CV-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
+    [OcfRecordDataWarrantExercise (warrantExercise "TX-W-EX" "W-1" ["CV-1"])]
+  -- The exercise names a trigger of its warrant.
+  applyRecordsFails env "Warrant exercise trigger not found: NO-TRIGGER"
+    [OcfRecordDataWarrantExercise ((warrantExercise "TX-W-EX" "W-1" ["S-A1"]) with trigger_id = "NO-TRIGGER")]
 
-testResultingSecurityReferences_MissingStockReissuanceResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
+-- Each stock result may be written later in the same batch. The v35 warrant exercise carries no
+-- quantity: the resulting issuance holds it.
+test_resulting_refs_stock_results_created_in_same_batch : Script ()
+test_resulting_refs_stock_results_created_in_same_batch = do
+  env <- instrumentBook
+  let we = warrantExercise "TX-W-EX" "W-1" ["S-W-EX"]
+      cc = convertibleConversion "TX-CV-CONV" "CV-1" ["S-CV-CONV"]
+      ex = equityCompensationExercise "TX-EC-EX" "EC-1" ["S-EC-EX"]
+      rel = equityCompensationRelease "TX-EC-REL" "EC-1" ["S-EC-REL"]
+      out sec = (issuance sec "SH-A" "CLS-A" 100.0 eventDate) with id = "ISS-" <> sec
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantExercise we
+    , OcfRecordDataConvertibleConversion cc
+    , OcfRecordDataEquityCompensationExercise ex
+    , OcfRecordDataEquityCompensationRelease rel
+    , OcfRecordDataStockIssuance (out "S-W-EX")
+    , OcfRecordDataStockIssuance (out "S-CV-CONV")
+    , OcfRecordDataStockIssuance (out "S-EC-EX")
+    , OcfRecordDataStockIssuance (out "S-EC-REL")
+    ]
+  expectRecord env (OcfRecordDataWarrantExercise we)
+  expectRecord env (OcfRecordDataConvertibleConversion cc)
+  expectRecord env (OcfRecordDataEquityCompensationExercise ex)
+  expectRecord env (OcfRecordDataEquityCompensationRelease rel)
+  -- Each result is a primary stock issuance with its own state.
+  (.quantity) <$> stateOf env "S-W-EX" >>= (=== 100.0)
+  (.quantity) <$> stateOf env "S-EC-REL" >>= (=== 100.0)
 
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateStockReissuance StockReissuanceOcfData with
-        id = "TX-STOCK-MISSING-REISSUANCE-RESULT"
-        date = defaultTestDate
-        security_id = "SEC-STOCK-1"
-        resulting_security_ids = ["SEC-STOCK-MISSING-REISSUANCE-RESULT"]
-        comments = []
-        reason_text = None
-        split_transaction_id = None]
-      edits = []
-      deletes = []
+test_resulting_refs_instrument_transfer_result_created_in_same_batch : Script ()
+test_resulting_refs_instrument_transfer_result_created_in_same_batch = do
+  env <- instrumentBook
+  let wt = warrantTransfer "TX-W-TR" "W-1" ["W-2"] None
+      ct = convertibleTransfer "TX-CV-TR" "CV-1" ["CV-2"] None
+      et = equityCompensationTransfer "TX-EC-TR" "EC-1" ["EC-2"] None
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantTransfer wt
+    , OcfRecordDataConvertibleTransfer ct
+    , OcfRecordDataEquityCompensationTransfer et
+    , OcfRecordDataWarrantIssuance (warrantIssuance "W-2" "SH-B")
+    , OcfRecordDataConvertibleIssuance (convertibleIssuance "CV-2" "SH-B")
+    , OcfRecordDataEquityCompensationIssuance (equityCompensationIssuance "EC-2" "SH-B")
+    ]
+  expectRecord env (OcfRecordDataWarrantTransfer wt)
+  expectRecord env (OcfRecordDataConvertibleTransfer ct)
+  expectRecord env (OcfRecordDataEquityCompensationTransfer et)
 
-testResultingSecurityReferences_MissingWarrantExerciseResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  source <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [warrantExerciseSourceIssuance]
-      edits = []
-      deletes = []
+-- =============================================================================
+-- RESTATEMENTS
+-- =============================================================================
 
-  submitMustFail issuer do
-    exerciseCmd source.updatedCapTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateWarrantExercise WarrantExerciseOcfData with
-        id = "TX-WARRANT-MISSING-EXERCISE-RESULT"
-        date = defaultTestDate
-        security_id = "SEC-WR-EXERCISE-SOURCE"
-        trigger_id = "WR-EXERCISE-TRIGGER"
-        quantity = Some 100.0
-        resulting_security_ids = ["SEC-STOCK-MISSING-WARRANT-EXERCISE-RESULT"]
-        comments = []
-        consideration_text = None]
-      edits = []
-      deletes = []
-
-testResultingSecurityReferences_MissingConvertibleConversionResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultConvertibleIssuance issuer capTableCid
-
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateConvertibleConversion ConvertibleConversionOcfData with
-        id = "TX-CONVERTIBLE-MISSING-CONVERSION-RESULT"
-        date = defaultTestDate
-        security_id = "SEC-CV-1"
-        trigger_id = "TRIGGER-1"
-        reason_text = "Conversion test"
-        resulting_security_ids = ["SEC-STOCK-MISSING-CONVERTIBLE-CONVERSION-RESULT"]
-        comments = []
-        balance_security_id = None
-        capitalization_definition = None
-        quantity_converted = Some 100.0]
-      edits = []
-      deletes = []
-
-testResultingSecurityReferences_MissingEquityCompensationExerciseResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultEquityCompensationIssuance issuer capTableCid
-
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationExercise EquityCompensationExerciseOcfData with
-        id = "TX-EC-MISSING-EXERCISE-RESULT"
-        date = defaultTestDate
-        security_id = "SEC-EC-1"
-        quantity = 100.0
-        consideration_text = None
-        resulting_security_ids = ["SEC-STOCK-MISSING-EC-EXERCISE-RESULT"]
-        comments = []]
-      edits = []
-      deletes = []
-
-testResultingSecurityReferences_MissingEquityCompensationReleaseResultFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultEquityCompensationIssuance issuer capTableCid
-
-  submitMustFail issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates = [CT.OcfCreateEquityCompensationRelease EquityCompensationReleaseOcfData with
-        id = "TX-EC-MISSING-RELEASE-RESULT"
-        date = defaultTestDate
-        security_id = "SEC-EC-1"
-        settlement_date = defaultTestDate
-        release_price = OcfMonetary with amount = 1.0, currency = "USD"
-        quantity = 100.0
-        resulting_security_ids = ["SEC-STOCK-MISSING-EC-RELEASE-RESULT"]
-        consideration_text = None
-        comments = []]
-      edits = []
-      deletes = []
-
-testResultingSecurityReferences_StockResultCreatedInSameBatchSucceeds = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-
-  _ <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ stockSuccessorIssuance "TX-STOCK-SAME-BATCH-RESULT" "SEC-STOCK-SAME-BATCH-RESULT" "SH-1" "SC_COMMON" defaultTestDate 100.0
-        , CT.OcfCreateStockTransfer StockTransferOcfData with
-            id = "TX-STOCK-SAME-BATCH-TRANSFER"
-            date = defaultTestDate
-            quantity = 100.0
-            security_id = "SEC-STOCK-1"
-            resulting_security_ids = ["SEC-STOCK-SAME-BATCH-RESULT"]
-            balance_security_id = None
-            consideration_text = None
-            comments = []
-        ]
-      edits = []
-      deletes = []
-  pure ()
-
-testResultingSecurityReferences_ResultDeletionFails = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-
-  result <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ stockSuccessorIssuance "TX-STOCK-RESULT-TO-DELETE" "SEC-STOCK-RESULT-TO-DELETE" "SH-1" "SC_COMMON" defaultTestDate 100.0
-        , CT.OcfCreateStockTransfer StockTransferOcfData with
-            id = "TX-STOCK-RESULT-DELETE-TRANSFER"
-            date = defaultTestDate
-            quantity = 100.0
-            security_id = "SEC-STOCK-1"
-            resulting_security_ids = ["SEC-STOCK-RESULT-TO-DELETE"]
-            balance_security_id = None
-            consideration_text = None
-            comments = []
-        ]
-      edits = []
-      deletes = []
-
-  submitMustFail issuer do
-    exerciseCmd result.updatedCapTableCid CT.UpdateCapTable with
-      creates = []
-      edits = []
-      deletes = [CT.OcfDeleteStockIssuance "TX-STOCK-RESULT-TO-DELETE"]
-  pure ()
-
-testResultingSecurityReferences_EditCanReplaceResultInSameBatch = script do
-  TestOcp{issuer, cap_table} <- setupTestOcp
-  capTableCid <- addPrerequisites issuer cap_table
-  capTableCid <- addDefaultStockIssuance issuer capTableCid
-  let originalTransfer = StockTransferOcfData with
-        id = "TX-STOCK-EDIT-RESULT"
-        date = defaultTestDate
-        quantity = 100.0
-        security_id = "SEC-STOCK-1"
-        resulting_security_ids = ["SEC-STOCK-EDIT-RESULT-OLD"]
-        balance_security_id = None
-        consideration_text = None
-        comments = []
-
-  created <- submit issuer do
-    exerciseCmd capTableCid CT.UpdateCapTable with
-      creates =
-        [ stockSuccessorIssuance "TX-STOCK-EDIT-RESULT-OLD" "SEC-STOCK-EDIT-RESULT-OLD" "SH-1" "SC_COMMON" defaultTestDate 100.0
-        , CT.OcfCreateStockTransfer originalTransfer
-        ]
-      edits = []
-      deletes = []
-
-  _ <- submit issuer do
-    exerciseCmd created.updatedCapTableCid CT.UpdateCapTable with
-      creates = [stockSuccessorIssuance "TX-STOCK-EDIT-RESULT-NEW" "SEC-STOCK-EDIT-RESULT-NEW" "SH-1" "SC_COMMON" defaultTestDate 100.0]
-      edits = [CT.OcfEditStockTransfer (originalTransfer with resulting_security_ids = ["SEC-STOCK-EDIT-RESULT-NEW"])]
-      deletes = [CT.OcfDeleteStockIssuance "TX-STOCK-EDIT-RESULT-OLD"]
-  pure ()
+-- An edit may point a transfer at a new result and delete the old one in the same restatement; the
+-- result it adds is checked, the one it drops is not re-checked.
+test_resulting_refs_edit_can_replace_result : Script ()
+test_resulting_refs_edit_can_replace_result = do
+  env <- instrumentBook
+  let original = warrantTransfer "TX-W-EDIT-RESULT" "W-1" ["W-EDIT-RESULT-OLD"] None
+  _ <- applyRecords env
+    [ OcfRecordDataWarrantIssuance (warrantIssuance "W-EDIT-RESULT-OLD" "SH-B")
+    , OcfRecordDataWarrantTransfer original
+    ]
+  restateOpsFails env "Warrant transfer resulting security security not found: W-EDIT-RESULT-NEW"
+    [RestateEdit (OcfRecordDataWarrantTransfer (original with resulting_security_ids = ["W-EDIT-RESULT-NEW"]))]
+  _ <- applyRecords env [OcfRecordDataWarrantIssuance (warrantIssuance "W-EDIT-RESULT-NEW" "SH-B")]
+  let edited = original with resulting_security_ids = ["W-EDIT-RESULT-NEW"]
+  _ <- restateOps env
+    [ RestateEdit (OcfRecordDataWarrantTransfer edited)
+    , RestateDelete "ISS-W-EDIT-RESULT-OLD"
+    ]
+  expectRecord env (OcfRecordDataWarrantTransfer edited)
+  hasRecord env "ISS-W-EDIT-RESULT-OLD" >>= (=== False)
