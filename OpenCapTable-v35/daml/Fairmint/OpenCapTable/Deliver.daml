@@ -1,0 +1,231 @@
+-- CapTable_Deliver: transfers fully vested lots to stakeholders named by ID, on the ledger date, reading nothing but the lots and their class's epoch.
+module Fairmint.OpenCapTable.Deliver
+  ( DeliveryTerms(..)
+  , DeliverTo(..)
+  , DeliverLot(..)
+  , DeliveredSecurity(..)
+  , DeliverLotResult(..)
+  , DeliverResult(..)
+  , maxRecipientsPerLot
+  , deliver
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import DA.Foldable (forA_)
+import DA.List (dedup, head, sort)
+import qualified DA.Map as Map
+import DA.Optional (fromSomeNote, optionalToList)
+import Fairmint.OpenCapTable.Apply (maxLotsPerOperation)
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary)
+import Fairmint.OpenCapTable.Types.Stock (OcfSecurityExemption)
+
+-- | Recipients per lot: a lot can pay out to every co-owner of a line in one transfer.
+maxRecipientsPerLot : Int
+maxRecipientsPerLot = 50
+
+-- | The terms of every issuance a delivery writes, the recipients' and the balances' alike. They
+-- are the caller's: a delivery reads no origin issuance, so it copies none of its price, cost
+-- basis, legends, exemptions, approvals, plan or consideration.
+data DeliveryTerms = DeliveryTerms
+  with
+    -- Price per share; 0 when the caller does not learn the price
+    share_price : OcfMonetary
+    stock_legend_ids : [Text]
+    security_law_exemptions : [OcfSecurityExemption]
+  deriving (Eq, Show)
+
+-- | One recipient of a lot's shares. The caller vouches for the stakeholder ID: the delivery reads
+-- no stakeholder record.
+data DeliverTo = DeliverTo
+  with
+    stakeholder_id : Text
+    -- > 0
+    quantity : Decimal
+    -- The recipient's issuance's custom ID
+    custom_id : Text
+  deriving (Eq, Show)
+
+-- | A lot and the recipients it pays, in the order of the transfer's resulting securities. Shares
+-- the recipients do not take stay with the lot's stakeholder on a balance security.
+data DeliverLot = DeliverLot
+  with
+    security_id : Text
+    recipients : [DeliverTo]
+  deriving (Eq, Show)
+
+-- | A security a delivery created, a recipient's or a balance.
+data DeliveredSecurity = DeliveredSecurity
+  with
+    stakeholder_id : Text
+    quantity : Decimal
+    issuance_id : Text
+    security_id : Text
+    state : ContractId StockSecurity
+  deriving (Eq, Show)
+
+data DeliverLotResult = DeliverLotResult
+  with
+    security_id : Text
+    -- The lot's stakeholder
+    stakeholder_id : Text
+    transfer_id : Text
+    -- In the order of the lot's recipients
+    recipients : [DeliveredSecurity]
+    balance : Optional DeliveredSecurity
+  deriving (Eq, Show)
+
+data DeliverResult = DeliverResult
+  with
+    stock_class_id : Text
+    -- In the order of the lots
+    lots : [DeliverLotResult]
+  deriving (Eq, Show)
+
+-- An output's IDs before the flush gives it a contract ID.
+data PendingOutput = PendingOutput
+  with
+    stakeholder_id : Text
+    quantity : Decimal
+    issuance_id : Text
+    security_id : Text
+
+data PendingLot = PendingLot
+  with
+    security_id : Text
+    stakeholder_id : Text
+    transfer_id : Text
+    recipients : [PendingOutput]
+    balance : Optional PendingOutput
+
+-- | Transfers up to 50 lots of one class. Every lot is a terminal event: it writes a
+-- TX_STOCK_TRANSFER, a TX_STOCK_ISSUANCE and state per recipient, and the balance's when shares
+-- remain, each ID derived from the lot. The write's only inputs are the lots and their class's
+-- epoch, and it fetches nothing else, so a delivery inside another party's transaction shows that
+-- party those contracts, the anchor, the arguments and the records it writes, and nothing more of
+-- the book. Lots must be fully vested and carry no hold: a stop fails the delivery.
+deliver : Context -> [ContractId StockSecurity] -> ContractId StockClassEpoch -> Date -> DeliveryTerms -> [DeliverLot] -> Update DeliverResult
+deliver ctx states epoch date terms lots = do
+  assertLedgerDate date
+  when (null lots) (abort "CapTable_Deliver needs at least one lot")
+  when (length lots > maxLotsPerOperation)
+    (abort ("CapTable_Deliver takes at most " <> show maxLotsPerOperation <> " lots"))
+  let securityIds = map (.security_id) lots
+  unless (dedup securityIds == securityIds) (abort "each lot appears once")
+  b0 <- loadBook ctx (emptyInputs with states; epochs = [epoch])
+  -- Every state the write fetched is one it delivers.
+  unless (Map.keys b0.states == sort securityIds)
+    (abort "a delivery's states are exactly its lots' states")
+  lotStates <- mapA (\l -> requireState l.security_id b0) lots
+  let stockClass = (head lotStates).stock_class_id
+  unless (all (\s -> s.stock_class_id == stockClass) lotStates)
+    (abort "a delivery's lots share one class")
+  (b1, pending) <- foldlA (deliverOne date terms) (b0, []) lots
+  (_, result) <- flushBook b1
+  let stateOf sec = fromSomeNote ("no new state for " <> sec) (Map.lookup sec result.states)
+      delivered o = DeliveredSecurity with
+        stakeholder_id = o.stakeholder_id
+        quantity = o.quantity
+        issuance_id = o.issuance_id
+        security_id = o.security_id
+        state = stateOf o.security_id
+      toResult p = DeliverLotResult with
+        security_id = p.security_id
+        stakeholder_id = p.stakeholder_id
+        transfer_id = p.transfer_id
+        recipients = map delivered p.recipients
+        balance = delivered <$> p.balance
+  pure DeliverResult with
+    stock_class_id = stockClass
+    lots = map toResult (reverse pending)
+
+deliverOne : Date -> DeliveryTerms -> (Book, [PendingLot]) -> DeliverLot -> Update (Book, [PendingLot])
+deliverOne date terms (b0, acc) l = do
+  (s, e) <- beginEvent b0 l.security_id date False
+  requireNoHolds s
+  unless (s.vesting == StockVestingNone)
+    (abort ("security " <> s.security_id <> " vests; a delivery takes only fully vested lots"))
+  when (null l.recipients) (abort ("lot " <> s.security_id <> " has no recipient"))
+  when (length l.recipients > maxRecipientsPerLot)
+    (abort ("lot " <> s.security_id <> " pays at most " <> show maxRecipientsPerLot <> " recipients"))
+  let ctx = b0.context
+      recipientIds = map (.stakeholder_id) l.recipients
+  unless (dedup recipientIds == recipientIds)
+    (abort ("each recipient of lot " <> s.security_id <> " appears once"))
+  forA_ l.recipients \r -> do
+    when (r.stakeholder_id == "" || isDerivedForm ctx r.stakeholder_id)
+      (abort ("recipient " <> r.stakeholder_id <> " is not a stakeholder ID"))
+    when (r.stakeholder_id == s.stakeholder_id)
+      (abort ("lot " <> s.security_id <> " cannot be delivered to its own stakeholder"))
+    unless (r.quantity > 0.0)
+      (abort ("a delivery to " <> r.stakeholder_id <> " must be positive"))
+  let q = sum (map (.quantity) l.recipients)
+      remaining = s.quantity - q
+  when (remaining < 0.0)
+    (abort ("delivery of " <> show q <> " exceeds the " <> show s.quantity <> " of security " <> s.security_id))
+  let derive role i = deriveId ctx s.security_id s.seq role i
+      transferId = derive DerivedRoleEvent 0
+      outputs = zipWith (\i r -> PendingOutput with
+        stakeholder_id = r.stakeholder_id
+        quantity = r.quantity
+        issuance_id = derive DerivedRoleResultingIssuance i
+        security_id = derive DerivedRoleResultingSecurity i) [0 .. length l.recipients - 1] l.recipients
+      balance =
+        if remaining > 0.0
+          then Some PendingOutput with
+            stakeholder_id = s.stakeholder_id
+            quantity = remaining
+            issuance_id = derive DerivedRoleBalanceIssuance 0
+            security_id = derive DerivedRoleBalanceSecurity 0
+          else None
+      issuanceOf o customId = StockIssuanceOcfData with
+        id = o.issuance_id
+        custom_id = customId
+        date
+        quantity = o.quantity
+        security_id = o.security_id
+        share_price = terms.share_price
+        stakeholder_id = o.stakeholder_id
+        stock_class_id = s.stock_class_id
+        comments = []
+        security_law_exemptions = terms.security_law_exemptions
+        share_numbers_issued = []
+        stock_legend_ids = terms.stock_legend_ids
+        vestings = []
+        board_approval_date = None
+        consideration_text = None
+        cost_basis = None
+        issuance_type = None
+        stock_plan_id = None
+        stockholder_approval_date = None
+        vesting_terms_id = None
+      writeOutput b (o, customId) = do
+        let iss = issuanceOf o customId
+        (b', _) <- addRecord (OcfRecordDataStockIssuance iss) b
+        addState (stateForIssuance b' e date iss) b'
+  (b1, _) <- addRecord (OcfRecordDataStockTransfer StockTransferOcfData with
+    id = transferId
+    date
+    quantity = q
+    security_id = s.security_id
+    comments = []
+    resulting_security_ids = map (.security_id) outputs
+    balance_security_id = (.security_id) <$> balance
+    consideration_text = None) b0
+  b2 <- endState s.security_id b1
+  b3 <- foldlA writeOutput b2 (zip outputs (map (.custom_id) l.recipients))
+  b4 <- foldlA writeOutput b3 (map (\o -> (o, o.security_id)) (optionalToList balance))
+  let p = PendingLot with
+        security_id = s.security_id
+        stakeholder_id = s.stakeholder_id
+        transfer_id = transferId
+        recipients = outputs
+        balance
+  pure (b4, p :: acc)

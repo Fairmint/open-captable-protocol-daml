@@ -1,0 +1,376 @@
+-- CapTable_Deliver: transfers to stakeholders named by ID, their records and IDs, the checks, and a delivery submitted by a party that sees only the contracts it is given.
+module OpenCapTable.TestDelivery where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import DA.Action (unless)
+import DA.Foldable (forA_)
+import qualified DA.Text as T
+import DA.List (head)
+import Daml.Script
+
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Deliver
+import Fairmint.OpenCapTable.Ids
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate (RestateOperation(..))
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfSecurityExemption(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers (freezeClass, recordSplit)
+
+tradeDay : Date
+tradeDay = D.date 2025 D.Jun 2
+
+-- The line's terms: no price, one legend and one exemption.
+lineTerms : DeliveryTerms
+lineTerms = DeliveryTerms with
+  share_price = usd 0.0
+  stock_legend_ids = ["LEG-LINE"]
+  security_law_exemptions = [OcfSecurityExemption with description = "Regulation S"; jurisdiction = "US"]
+
+to : Text -> Decimal -> DeliverTo
+to sh q = DeliverTo with stakeholder_id = sh; quantity = q; custom_id = "D-" <> sh
+
+lot : Text -> [DeliverTo] -> DeliverLot
+lot sec recipients = DeliverLot with security_id = sec; recipients
+
+-- The states of the named securities and their class's epoch.
+deliveryInputs : Env -> [Text] -> Text -> Script ([ContractId StockSecurity], ContractId StockClassEpoch)
+deliveryInputs env secs cls = do
+  states <- mapA (stateCidOf env) secs
+  (epoch, _) <- epochOf env cls
+  pure (states, epoch)
+
+deliverAs : Env -> Date -> [DeliverLot] -> Script DeliverResult
+deliverAs env d lots = do
+  (states, epoch) <- deliveryInputs env (map (.security_id) lots) "CLS-A"
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Deliver with states; epoch; date = d; terms = lineTerms; lots
+
+deliverFails : Env -> Text -> Date -> [DeliverLot] -> Script ()
+deliverFails env expected d lots = do
+  (states, epoch) <- deliveryInputs env (dedupSecs (map (.security_id) lots)) "CLS-A"
+  expectSubmitFailure expected env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with states; epoch; date = d; terms = lineTerms; lots)
+  where
+    dedupSecs = foldr (\s acc -> if s `elem` acc then acc else s :: acc) []
+
+issuanceData : Env -> Text -> Script StockIssuanceOcfData
+issuanceData env id = do
+  cid <- issuanceCidOf env id
+  Some iss <- queryContractId env.transfer_agent cid
+  pure iss.ocf_data
+
+-- =============================================================================
+-- RECORDS AND IDS
+-- =============================================================================
+
+test_delivery_partial_lot : Script ()
+test_delivery_partial_lot = do
+  env <- standardBook
+  onDate tradeDay
+  r <- deliverAs env tradeDay [lot "S-A1" [to "SH-B" 60.0]]
+  r.stock_class_id === "CLS-A"
+  [l] <- pure r.lots
+  l.stakeholder_id === "SH-A"
+  -- IDs derive from the lot's security ID and seq.
+  l.transfer_id === derived env "S-A1" 0 DerivedRoleEvent 0
+  [b] <- pure l.recipients
+  b.security_id === derived env "S-A1" 0 DerivedRoleResultingSecurity 0
+  b.issuance_id === derived env "S-A1" 0 DerivedRoleResultingIssuance 0
+  Some bal <- pure l.balance
+  bal.security_id === derived env "S-A1" 0 DerivedRoleBalanceSecurity 0
+  bal.stakeholder_id === "SH-A"
+  bal.quantity === 540.0
+  hasState env "S-A1" >>= (=== False)
+  bought <- stateOf env b.security_id
+  bought.stakeholder_id === "SH-B"
+  bought.quantity === 60.0
+  bought.issue_date === tradeDay
+  bought.delivery === None
+  rest <- stateOf env bal.security_id
+  rest.stakeholder_id === "SH-A"
+  rest.quantity === 540.0
+  -- The transfer names the lot, the recipient's security and the balance.
+  Some (OcfRecordCidStockTransfer tcid) <- Some <$> recordCidOf env l.transfer_id
+  Some t <- queryContractId env.transfer_agent tcid
+  t.ocf_data.quantity === 60.0
+  t.ocf_data.resulting_security_ids === [b.security_id]
+  t.ocf_data.balance_security_id === Some bal.security_id
+  t.ocf_data.consideration_text === None
+  -- Both issuances carry the caller's terms and nothing from the origin: S-A1's origin has a price
+  -- of 1.00 and a cost basis of 600.
+  forA_ [b.issuance_id, bal.issuance_id] \id -> do
+    iss <- issuanceData env id
+    iss.share_price === usd 0.0
+    iss.cost_basis === None
+    iss.stock_legend_ids === lineTerms.stock_legend_ids
+    iss.security_law_exemptions === lineTerms.security_law_exemptions
+    iss.date === tradeDay
+  recipient <- issuanceData env b.issuance_id
+  recipient.custom_id === "D-SH-B"
+  balance <- issuanceData env bal.issuance_id
+  balance.custom_id === bal.security_id
+
+-- A whole lot pays several co-owners in one transfer, and leaves no balance.
+test_delivery_whole_lot_to_co_owners : Script ()
+test_delivery_whole_lot_to_co_owners = do
+  env <- standardBook
+  onDate tradeDay
+  r <- deliverAs env tradeDay [lot "S-A2" [to "LP-1" 250.0, to "LP-2" 150.0]]
+  [l] <- pure r.lots
+  l.balance === None
+  map (\o -> (o.stakeholder_id, o.quantity)) l.recipients === [("LP-1", 250.0), ("LP-2", 150.0)]
+  map (.security_id) l.recipients ===
+    [derived env "S-A2" 0 DerivedRoleResultingSecurity 0, derived env "S-A2" 0 DerivedRoleResultingSecurity 1]
+  Some (OcfRecordCidStockTransfer tcid) <- Some <$> recordCidOf env l.transfer_id
+  Some t <- queryContractId env.transfer_agent tcid
+  t.ocf_data.resulting_security_ids === map (.security_id) l.recipients
+  t.ocf_data.balance_security_id === None
+
+-- Lots of several stakeholders in one class deliver in one write.
+test_delivery_lots_of_several_stakeholders : Script ()
+test_delivery_lots_of_several_stakeholders = do
+  env <- standardBook
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-B1" "SH-B" "CLS-A" 80.0 d2024)]
+  onDate tradeDay
+  r <- deliverAs env tradeDay [lot "S-A1" [to "BUYER" 10.0], lot "S-B1" [to "BUYER" 80.0]]
+  map (.stakeholder_id) r.lots === ["SH-A", "SH-B"]
+  map (\l -> map (.quantity) l.recipients) r.lots === [[10.0], [80.0]]
+  map (\l -> (.quantity) <$> l.balance) r.lots === [Some 590.0, None]
+
+-- A delivery's state starts a new lot: a later event derives from it, and a split recorded after
+-- the lot's issue applies first.
+test_delivery_applies_splits : Script ()
+test_delivery_applies_splits = do
+  env <- standardBook
+  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 (D.date 2025 D.Mar 1)
+  onDate tradeDay
+  r <- deliverAs env tradeDay [lot "S-A2" [to "SH-B" 100.0]]
+  [l] <- pure r.lots
+  fmap (.quantity) l.balance === Some 700.0
+  bought <- stateOf env (head l.recipients).security_id
+  bought.split_epoch === 1
+
+-- =============================================================================
+-- CHECKS
+-- =============================================================================
+
+test_delivery_checks : Script ()
+test_delivery_checks = do
+  env <- standardBook
+  onDate tradeDay
+  deliverFails env "is not the ledger date" (D.addDays tradeDay 1) [lot "S-A1" [to "SH-B" 1.0]]
+  deliverFails env "needs at least one lot" tradeDay []
+  deliverFails env "each lot appears once" tradeDay [lot "S-A1" [to "SH-B" 1.0], lot "S-A1" [to "SH-B" 2.0]]
+  deliverFails env "has no recipient" tradeDay [lot "S-A1" []]
+  deliverFails env "appears once" tradeDay [lot "S-A1" [to "SH-B" 1.0, to "SH-B" 2.0]]
+  deliverFails env "its own stakeholder" tradeDay [lot "S-A1" [to "SH-A" 1.0]]
+  deliverFails env "must be positive" tradeDay [lot "S-A1" [to "SH-B" 0.0]]
+  deliverFails env "exceeds the 600.0" tradeDay [lot "S-A1" [to "SH-B" 400.0, to "SH-C" 200.5]]
+  deliverFails env "is not a stakeholder ID" tradeDay [lot "S-A1" [to "" 1.0]]
+  deliverFails env "is not a stakeholder ID" tradeDay [lot "S-A1" [to (env.ctx.cap_table_id <> ":x") 1.0]]
+  deliverFails env "pays at most 50 recipients" tradeDay
+    [lot "S-A1" (map (\i -> to ("SH-" <> show i) 1.0) [1 .. 51 : Int])]
+
+-- The write's states are exactly its lots' states.
+test_delivery_reads_only_its_lots : Script ()
+test_delivery_reads_only_its_lots = do
+  env <- standardBook
+  onDate tradeDay
+  (states, epoch) <- deliveryInputs env ["S-A1", "S-A2"] "CLS-A"
+  expectSubmitFailure "exactly its lots' states" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states; epoch; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-B" 1.0]])
+  (one, _) <- deliveryInputs env ["S-A1"] "CLS-A"
+  expectSubmitFailure "exactly its lots' states" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states = one; epoch; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-B" 1.0], lot "S-A2" [to "SH-B" 1.0]])
+
+test_delivery_one_class : Script ()
+test_delivery_one_class = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockIssuance (issuance "S-B1" "SH-B" "CLS-B" 10.0 d2024) ]
+  onDate tradeDay
+  states <- mapA (stateCidOf env) ["S-A1", "S-B1"]
+  (epochA, _) <- epochOf env "CLS-A"
+  (epochB, _) <- epochOf env "CLS-B"
+  expectSubmitFailure "a delivery's lots share one class" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states; epoch = epochA; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-C" 1.0], lot "S-B1" [to "SH-C" 1.0]])
+  -- The epoch must be the lots' class's.
+  expectSubmitFailure "no active epoch for stock class CLS-A" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states = [head states]; epoch = epochB; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-C" 1.0]])
+
+-- A stopped lot, a lot with a settlement hold and a vesting lot do not deliver, nor does a lot of
+-- a class frozen for a split.
+test_delivery_refuses_held_vesting_and_frozen_lots : Script ()
+test_delivery_refuses_held_vesting_and_frozen_lots = do
+  env <- standardBook
+  _ <- applyRecords env
+    [ OcfRecordDataStockIssuance ((issuance "S-V1" "SH-A" "CLS-A" 100.0 d2024) with
+        vestings = [OcfVesting with date = D.date 2026 D.Jan 1; amount = 100.0]) ]
+  onDate tradeDay
+  _ <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" tradeDay [stopLot "S-A1"]
+  deliverFails env "carries an open hold" tradeDay [lot "S-A1" [to "SH-B" 1.0]]
+  held <- settlementLot env "S-A2" 10.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" tradeDay [held]
+  deliverFails env "carries an open hold" tradeDay [lot "S-A2" [to "SH-B" 1.0]]
+  deliverFails env "vests; a delivery takes only fully vested lots" tradeDay [lot "S-V1" [to "SH-B" 1.0]]
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-A3" "SH-A" "CLS-A" 10.0 d2024)]
+  freezeClass env "CLS-A"
+  deliverFails env "is frozen for a split" tradeDay [lot "S-A3" [to "SH-B" 1.0]]
+
+-- Only the TA controls the choice, and a lot of another cap table is refused.
+test_delivery_authority_and_book : Script ()
+test_delivery_authority_and_book = do
+  env <- standardBook
+  other <- secondCapTable env
+  _ <- applyRecords other
+    [ OcfRecordDataStakeholder (stakeholderData "SH-A")
+    , OcfRecordDataStockClass (stockClass "CLS-A")
+    , OcfRecordDataStockIssuance (issuance "S-X1" "SH-A" "CLS-A" 10.0 d2024) ]
+  onDate tradeDay
+  (states, epoch) <- deliveryInputs env ["S-A1"] "CLS-A"
+  expectSubmitFailure "" env.issuer (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states; epoch; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-B" 1.0]])
+  (foreign, foreignEpoch) <- deliveryInputs other ["S-X1"] "CLS-A"
+  expectSubmitFailure "belongs to another cap table" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states = foreign; epoch; date = tradeDay; terms = lineTerms; lots = [lot "S-X1" [to "SH-B" 1.0]])
+  expectSubmitFailure "belongs to another cap table" env.transfer_agent (
+    exerciseCmd env.cap_table CapTable_Deliver with
+      states; epoch = foreignEpoch; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-B" 1.0]])
+
+-- Records a delivery writes have derived IDs, so they are never restated.
+test_delivery_records_are_protected : Script ()
+test_delivery_records_are_protected = do
+  env <- standardBook
+  onDate tradeDay
+  r <- deliverAs env tradeDay [lot "S-A1" [to "SH-B" 60.0]]
+  [l] <- pure r.lots
+  iss <- issuanceData env (head l.recipients).issuance_id
+  restateOpsFails env "is never restated" [RestateEdit (OcfRecordDataStockIssuance iss with custom_id = "EDITED")]
+
+-- =============================================================================
+-- A DELIVERY INSIDE ANOTHER PARTY'S TRANSACTION
+-- =============================================================================
+
+-- | Stands in for a package that holds the TA's authority and that a venue calls inside its own
+-- transaction, as a token adapter would.
+template TestVenueAdapter
+  with
+    transfer_agent : Party
+    venue : Party
+    cap_table : ContractId CapTable
+  where
+    signatory transfer_agent
+    observer venue
+
+    nonconsuming choice TestVenue_Deliver : DeliverResult
+      with
+        states : [ContractId StockSecurity]
+        epoch : ContractId StockClassEpoch
+        date : Date
+        terms : DeliveryTerms
+        lots : [DeliverLot]
+      controller venue
+      do exercise cap_table CapTable_Deliver with states; epoch; date; terms; lots
+
+    -- | A sale into a pool and a purchase out of it, in one transaction: the seller's lot pays the
+    -- pool's co-owners pro rata, and each co-owner's new lot then pays the buyer `fraction` of it.
+    nonconsuming choice TestVenue_SellThenBuy : (DeliverResult, DeliverResult)
+      with
+        seller_state : ContractId StockSecurity
+        epoch : ContractId StockClassEpoch
+        date : Date
+        terms : DeliveryTerms
+        sale : DeliverLot
+        buyer : Text
+        fraction : Decimal
+      controller venue
+      do
+        sold <- exercise cap_table CapTable_Deliver with
+          states = [seller_state]; epoch; date; terms; lots = [sale]
+        let pooled = (head sold.lots).recipients
+        bought <- exercise cap_table CapTable_Deliver with
+          states = map (.state) pooled
+          epoch
+          date
+          terms
+          lots = map (\o -> DeliverLot with
+            security_id = o.security_id
+            recipients = [DeliverTo with stakeholder_id = buyer; quantity = o.quantity * fraction; custom_id = "BUY-" <> o.stakeholder_id]) pooled
+        pure (sold, bought)
+
+disclosed : Template t => Env -> ContractId t -> Script Disclosure
+disclosed env cid = do
+  Some d <- queryDisclosure env.transfer_agent cid
+  pure d
+
+-- The venue sees nothing of the book. Given only the anchor, the lots and their class's epoch, it
+-- can run a delivery through the adapter: the delivery fetches no stakeholder record, origin
+-- issuance, shard or other record. Without the epoch, the same submission fails.
+test_delivery_by_a_venue_sees_only_its_inputs : Script ()
+test_delivery_by_a_venue_sees_only_its_inputs = do
+  env <- standardBook
+  let venue = env.outsider
+  adapter <- submit env.transfer_agent do
+    createCmd TestVenueAdapter with transfer_agent = env.transfer_agent; venue; cap_table = env.cap_table
+  onDate tradeDay
+  (states, epoch) <- deliveryInputs env ["S-A1"] "CLS-A"
+  anchor <- disclosed env env.cap_table
+  lotDs <- mapA (disclosed env) states
+  epochD <- disclosed env epoch
+  let args = TestVenue_Deliver with
+        states; epoch; date = tradeDay; terms = lineTerms; lots = [lot "S-A1" [to "SH-B" 60.0]]
+  expectSubmitFailure "NotVisible" venue (exerciseCmd adapter args)
+  r <- trySubmit (actAs venue <> discloseMany (anchor :: lotDs)) (exerciseCmd adapter args)
+  case r of
+    Left e -> unless (T.isInfixOf "NotVisible" (show e)) (fail ("expected NotVisible, got: " <> show e))
+    Right _ -> fail "a delivery without its epoch disclosed succeeded"
+  result <- submit (actAs venue <> discloseMany (anchor :: epochD :: lotDs)) (exerciseCmd adapter args)
+  [l] <- pure result.lots
+  map (.stakeholder_id) l.recipients === ["SH-B"]
+  bought <- stateOf env (head l.recipients).security_id
+  bought.quantity === 60.0
+
+-- A sale into a pool with two co-owners and a purchase from it commit together, the second
+-- delivery drawing on the lots the first created, in one venue transaction.
+test_delivery_legs_chain_in_one_transaction : Script ()
+test_delivery_legs_chain_in_one_transaction = do
+  env <- standardBook
+  let venue = env.outsider
+  adapter <- submit env.transfer_agent do
+    createCmd TestVenueAdapter with transfer_agent = env.transfer_agent; venue; cap_table = env.cap_table
+  onDate tradeDay
+  (states, epoch) <- deliveryInputs env ["S-A2"] "CLS-A"
+  anchor <- disclosed env env.cap_table
+  lotDs <- mapA (disclosed env) states
+  epochD <- disclosed env epoch
+  (sold, bought) <- submit (actAs venue <> discloseMany (anchor :: epochD :: lotDs)) do
+    exerciseCmd adapter TestVenue_SellThenBuy with
+      seller_state = head states
+      epoch
+      date = tradeDay
+      terms = lineTerms
+      sale = lot "S-A2" [to "LP-1" 6.0, to "LP-2" 4.0]
+      buyer = "SH-B"
+      fraction = 0.5
+  map (.quantity) (head sold.lots).recipients === [6.0, 4.0]
+  map (\l -> map (.quantity) l.recipients) bought.lots === [[3.0], [2.0]]
+  map (\l -> (.quantity) <$> l.balance) bought.lots === [Some 3.0, Some 2.0]
+  -- The pool's co-owners keep their balances; the buyer holds two lots; the seller keeps 390.
+  holdings <- statesOf env
+  let held sh = sum [ s.quantity | (_, s) <- holdings, s.stakeholder_id == sh ]
+  held "LP-1" === 3.0
+  held "LP-2" === 2.0
+  held "SH-B" === 5.0
+  held "SH-A" === 990.0
