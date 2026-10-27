@@ -17,7 +17,7 @@ import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
 import Fairmint.OpenCapTable.OcfRecords
-import Fairmint.OpenCapTable.Restate (RestateOperation(..))
+import Fairmint.OpenCapTable.Restate (RestateOperation(..), StateRestatement(..))
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Contact (OcfAddress(..), OcfAddressType(..))
 import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..), OcfStockClassConversionRight(..))
@@ -30,6 +30,7 @@ import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClass (StockClassOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockClassConversionRatioAdjustment (StockClassConversionRatioAdjustmentOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
+import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
 import Fairmint.OpenCapTable.OCF.Valuation (OcfValuationType(..), ValuationOcfData(..))
 import Fairmint.OpenCapTable.OCF.VestingStart (VestingStartOcfData(..))
@@ -609,6 +610,41 @@ test_batch_reissue_and_recreate_in_one_update = do
   expectRecord env (cls (stockClass "CLS-B"))
   (_, e) <- epochOf env "CLS-B"
   e.splits === []
+
+-- Each run of corrections is checked on its own deletes: a later run cannot end a reissued lot on
+-- the strength of the issuance an earlier run deleted, nor delete the origin of a lot an earlier run
+-- recreated.
+test_batch_correction_runs_checked_on_their_own_deletes : Script ()
+test_batch_correction_runs_checked_on_their_own_deletes = do
+  env <- standardBook
+  let reissued = issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024
+  updateOpsFails env "only with the deletion of its origin issuance ISS-S-A2"
+    [ UpdateCorrect (RestateDelete "ISS-S-A2")
+    , UpdateCorrect (RestateEndState "S-A2")
+    , UpdateCreate (ApplyRecord (stockIss reissued))
+    , UpdateCorrect (RestateEndState "S-A2")
+    ]
+  let ret = StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Mar 1; reason_text = "x"; security_id = "S-A2"; comments = []
+      restored = StateRestatement with
+        security_id = "S-A2"
+        issue_date = d2024
+        last_event_date = d2024
+        origin_transaction_id = "ISS-S-A2"
+        quantity = 400.0
+        stakeholder_id = "SH-A"
+        stock_class_id = "CLS-A"
+        vesting = StockVestingNone
+        snapshot = None
+        accelerated_since_snapshot = None
+        seq = Some 5
+  _ <- applyRecords env [OcfRecordDataStockRetraction ret]
+  updateOpsFails env "only with the end of security S-A2's state"
+    [ UpdateCorrect (RestateDelete "RET-1")
+    , UpdateCorrect (RestateSetState restored)
+    , UpdateCreate (ApplyRecord (sh "SH-X"))
+    , UpdateCorrect (RestateDelete "ISS-S-A2")
+    ]
+  expectRecord env (stockIss reissued)
 
 -- A record created in an update is never edited or deleted in it: the create carries its final data.
 test_batch_created_record_not_corrected_in_same_update : Script ()
