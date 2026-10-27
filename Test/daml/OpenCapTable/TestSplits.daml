@@ -5,8 +5,8 @@ import DA.Assert ((===))
 import qualified DA.Date as D
 import Daml.Script
 
-import Fairmint.OpenCapTable.Apply hiding (apply)
-import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Apply hiding (applyOperation)
+import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.State
@@ -23,22 +23,23 @@ splitDay = D.date 2025 D.Jan 10
 
 freeze : Env -> Text -> Script ()
 freeze env cls = do
-  (cid, _) <- epochOf env cls
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid
+  _ <- updateOps env [UpdateFreezeClass cls]
   pure ()
 
 unfreeze : Env -> Text -> Script ()
 unfreeze env cls = do
-  (cid, _) <- epochOf env cls
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = cid
+  _ <- updateOps env [UpdateUnfreezeClass cls]
   pure ()
 
--- Records a split by the procedure: freeze, record, unfreeze.
+-- Records a split in one update: freeze, record, unfreeze.
 recordSplit : Env -> Text -> Text -> Decimal -> Decimal -> Date -> Script ()
 recordSplit env id cls n d dt = do
-  freeze env cls
-  _ <- applyRecords env [OcfRecordDataStockClassSplit (split id cls n d dt)]
-  unfreeze env cls
+  _ <- updateOps env
+    [ UpdateFreezeClass cls
+    , UpdateCreate (ApplyRecord (OcfRecordDataStockClassSplit (split id cls n d dt)))
+    , UpdateUnfreezeClass cls
+    ]
+  pure ()
 
 acceptance : Text -> Text -> Date -> OcfRecordData
 acceptance id sec d = OcfRecordDataStockAcceptance StockAcceptanceOcfData with id; date = d; security_id = sec; comments = []
@@ -51,15 +52,13 @@ test_splits_need_a_frozen_epoch = do
   -- While frozen, no write that creates or changes a stock state in the class commits.
   applyRecordsFails env "is frozen" [OcfRecordDataStockIssuance (issuance "S-NEW" "SH-A" "CLS-A" 1.0 splitDay)]
   applyRecordsFails env "is frozen" [acceptance "ACC-1" "S-A1" splitDay]
-  (cid, _) <- epochOf env "CLS-A"
-  expectSubmitFailure "already frozen" env.transfer_agent (exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid)
+  updateOpsFails env "already frozen" [UpdateFreezeClass "CLS-A"]
   _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 splitDay)]
   (_, e) <- epochOf env "CLS-A"
   e.frozen === True
   map (.split_id) e.splits === ["SPLIT-1"]
   unfreeze env "CLS-A"
-  (cid', _) <- epochOf env "CLS-A"
-  expectSubmitFailure "is not frozen" env.transfer_agent (exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = cid')
+  updateOpsFails env "is not frozen" [UpdateUnfreezeClass "CLS-A"]
 
 test_splits_dates_strictly_increase : Script ()
 test_splits_dates_strictly_increase = do

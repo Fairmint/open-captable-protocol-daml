@@ -1,4 +1,4 @@
--- CapTable_Restate: mirrored edits and deletes, and the stock states they affect, within the restatement limits.
+-- Corrections through CapTable_Update: mirrored edits and deletes, and the stock states they affect.
 module OpenCapTable.TestRestate where
 
 import DA.Assert ((===))
@@ -6,10 +6,12 @@ import qualified DA.Date as D
 import Daml.Script
 
 import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Apply (ApplyOperation(..))
+import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.Holds (CancelHold(..))
 import Fairmint.OpenCapTable.Ids (DerivedRole(..))
 import Fairmint.OpenCapTable.OcfRecords
-import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Restate (RestateOperation(..), StateRestatement(..))
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..))
@@ -77,11 +79,11 @@ test_restate_refuses_derived_records = do
 test_restate_refuses_splits : Script ()
 test_restate_refuses_splits = do
   env <- standardBook
-  (cid, _) <- epochOf env "CLS-A"
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid
-  _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 (D.date 2025 D.Jan 10))]
-  (cid', _) <- epochOf env "CLS-A"
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = cid'
+  _ <- updateOps env
+    [ UpdateFreezeClass "CLS-A"
+    , UpdateCreate (ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 (D.date 2025 D.Jan 10))))
+    , UpdateUnfreezeClass "CLS-A"
+    ]
   restateOpsFails env "never restated" [RestateDelete "SPLIT-1"]
   restateOpsFails env "never restated" [RestateEdit (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 3.0 1.0 (D.date 2025 D.Jan 10)))]
   -- The class with recorded splits is never deleted either.
@@ -218,9 +220,9 @@ test_restate_issuance_delete_after_its_consumer = do
   inputs <- allInputs env
   retCid <- recordCidOf env "RET-1"
   expectSubmitFailure "only with the end of security S-A2's state" env.transfer_agent
-    (exerciseCmd env.cap_table CapTable_Restate with
+    (exerciseCmd env.cap_table CapTable_Update with
       inputs = inputs with records = filter (/= retCid) inputs.records
-      operations = [RestateDelete "ISS-S-A2"])
+      operations = [UpdateCorrect (RestateDelete "ISS-S-A2")])
   _ <- restateOps env [RestateDelete "ISS-S-A2"]
   hasRecord env "ISS-S-A2" >>= (=== False)
   applyRecordsFails env "security ID already used: S-A2" [OcfRecordDataStockIssuance (issuance "S-A2" "SH-A" "CLS-A" 400.0 d2024)]
@@ -236,18 +238,15 @@ test_restate_edit_keeps_consumed_securities = do
   _ <- restateOps env [RestateEdit (OcfRecordDataStockRetraction ret with reason_text = "corrected")]
   hasState env "S-A1" >>= (=== True)
 
--- Every contract a restatement archives counts toward its 500, the shards a release rewrites
--- included. 250 deletes over 160 shards touch 250 + 160 + 160 = 570 contracts; 200 deletes over
--- 143 shards touch 486.
-test_restate_counts_rewritten_shards : Script ()
-test_restate_counts_rewritten_shards = do
+-- One update deletes as many records as it names, rewriting every shard the releases touch.
+test_restate_deletes_not_capped_per_update : Script ()
+test_restate_deletes_not_capped_per_update = do
   env <- setupEnv
-  let ids = map (\i -> "SH-" <> show i) [1 .. 250]
+  let ids = map (\i -> "SH-" <> show i) [1 .. 300]
   _ <- applyRecords env (map (OcfRecordDataStakeholder . stakeholderData) ids)
-  restateOpsFails env "touches at most 500 contracts" (map RestateDelete ids)
-  _ <- restateOps env (map RestateDelete (take 200 ids))
-  hasRecord env "SH-200" >>= (=== False)
-  hasRecord env "SH-201" >>= (=== True)
+  _ <- restateOps env (map RestateDelete (take 250 ids))
+  hasRecord env "SH-250" >>= (=== False)
+  hasRecord env "SH-251" >>= (=== True)
 
 -- While a class is frozen for a split, a restatement neither ends one of its states nor moves one
 -- out of it, as no other write changes a state in the class.
@@ -255,13 +254,11 @@ test_restate_respects_a_frozen_class : Script ()
 test_restate_respects_a_frozen_class = do
   env <- standardBook
   _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B")]
-  (cid, _) <- epochOf env "CLS-A"
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = cid
+  _ <- updateOps env [UpdateFreezeClass "CLS-A"]
   restateOpsFails env "CLS-A is frozen" [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
   s <- stateOf env "S-A1"
   restateOpsFails env "CLS-A is frozen" [RestateSetState (restatementOf s) with stock_class_id = "CLS-B"]
-  (frozen, _) <- epochOf env "CLS-A"
-  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = frozen
+  _ <- updateOps env [UpdateUnfreezeClass "CLS-A"]
   _ <- restateOps env [RestateDelete "ISS-S-A2", RestateEndState "S-A2"]
   hasState env "S-A2" >>= (=== False)
 

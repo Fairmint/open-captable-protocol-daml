@@ -1,0 +1,56 @@
+-- CapTable_Update: one register write of creates, edits and deletes, in the order given, in one transaction.
+module Fairmint.OpenCapTable.Update
+  ( UpdateOperation(..)
+  , update
+  ) where
+
+import DA.Action (foldlA, unless, when)
+import Fairmint.OpenCapTable.Apply (ApplyOperation, applyOperation)
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events (checkRequirements)
+import Fairmint.OpenCapTable.Restate (Progress(..), RestateOperation, resolvePending, restateOne, startProgress)
+import Fairmint.OpenCapTable.Types.Core (Context)
+
+-- | One operation of a `CapTable_Update`. The operations run in order on one working set, so a
+-- later one sees what earlier ones wrote; references are checked after the last, so a record may
+-- name one written later in the same update.
+data UpdateOperation
+  = -- | Writes a new record, or a stock event with the records it bundles.
+    UpdateCreate ApplyOperation
+  | -- | Edits or deletes a record, or restates a stock state a correction changes.
+    UpdateCorrect RestateOperation
+  | -- | Freezes a stock class ahead of recording a split, so no state in it changes until it
+    -- unfreezes.
+    UpdateFreezeClass Text
+  | -- | Unfreezes a stock class after its split is recorded.
+    UpdateUnfreezeClass Text
+  deriving (Eq, Show)
+
+-- | Runs every operation on the book the inputs load, checks the references and the whole-write
+-- rules after the last, then creates every changed contract once. Nothing is written unless all
+-- of it is: the update is one transaction.
+update : Context -> BookInputs -> [UpdateOperation] -> Update BookResult
+update ctx inputs operations = do
+  when (null operations) (abort "CapTable_Update needs at least one operation")
+  b0 <- loadBook ctx inputs
+  p <- foldlA updateOne (startProgress b0) operations
+  book <- foldlA (resolvePending p) p.book p.pending
+  checkRequirements book
+  flushBook book
+
+updateOne : Progress -> UpdateOperation -> Update Progress
+updateOne p op = case op of
+  UpdateCreate o -> do
+    b <- applyOperation p.book o
+    pure p with book = b
+  UpdateCorrect o -> restateOne p o
+  UpdateFreezeClass cls -> do
+    e <- requireEpoch cls p.book
+    when e.frozen (abort ("stock class " <> cls <> " is already frozen"))
+    b <- replaceEpoch (e with frozen = True) p.book
+    pure p with book = b
+  UpdateUnfreezeClass cls -> do
+    e <- requireEpoch cls p.book
+    unless e.frozen (abort ("stock class " <> cls <> " is not frozen"))
+    b <- replaceEpoch (e with frozen = False) p.book
+    pure p with book = b

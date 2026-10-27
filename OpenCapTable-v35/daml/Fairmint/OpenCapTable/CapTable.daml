@@ -3,14 +3,15 @@ module Fairmint.OpenCapTable.CapTable
   ( CapTable(..)
   , CapTableStatus(..)
   , PurgeTarget(..)
+  , CapTable_Update(..)
   , CapTable_Apply(..)
+  , CapTable_Restate(..)
+  , CapTable_FreezeClass(..)
+  , CapTable_UnfreezeClass(..)
   , CapTable_PlaceHolds(..)
   , CapTable_CancelHolds(..)
   , CapTable_CancelHoldsResult(..)
   , CapTable_Settle(..)
-  , CapTable_FreezeClass(..)
-  , CapTable_UnfreezeClass(..)
-  , CapTable_Restate(..)
   , CapTable_BeginTeardown(..)
   , CapTable_Purge(..)
   , CapTable_Close(..)
@@ -21,14 +22,15 @@ import DA.Action (unless, when)
 import DA.Foldable (forA_)
 import DA.Map (Map)
 import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..))
-import Fairmint.OpenCapTable.Apply (ApplyOperation, ApplyResult, apply)
-import Fairmint.OpenCapTable.Book (BookInputs, fetchChecked)
+import Fairmint.OpenCapTable.Apply (ApplyOperation, ApplyResult)
+import Fairmint.OpenCapTable.Book (BookInputs, BookResult, fetchChecked)
 import Fairmint.OpenCapTable.Holds
 import Fairmint.OpenCapTable.OcfRecords (OcfRecordCid, archiveRecord, fetchRecord)
-import Fairmint.OpenCapTable.Restate (RestateOperation, RestateResult, restate)
+import Fairmint.OpenCapTable.Restate (RestateOperation, RestateResult)
 import Fairmint.OpenCapTable.State (OcfIdShard, StockClassEpoch(..), StockSecurity)
 import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType)
+import Fairmint.OpenCapTable.Update (UpdateOperation, update)
 
 data CapTableStatus
   = CapTableStatusActive
@@ -66,16 +68,51 @@ template CapTable
         kind = "CAP_TABLE"
         key = context.cap_table_id
 
-    -- | A non-empty batch of at most 500 operations: OCF creates, stock security events, splits,
-    -- vesting snapshots and shard pre-splits. Edits and deletes go through `CapTable_Restate`.
+    -- | Writes a non-empty batch of creates, edits and deletes, in order, as one transaction.
+    nonconsuming choice CapTable_Update : BookResult
+      with
+        inputs : BookInputs
+        operations : [UpdateOperation]
+      controller context.transfer_agent
+      do
+        requireStatus CapTableStatusActive status
+        update context inputs operations
+
+    -- | Refused: every write goes through `CapTable_Update`. A package upgrade keeps every choice,
+    -- so this one stays, and refuses.
     nonconsuming choice CapTable_Apply : ApplyResult
       with
         inputs : BookInputs
         operations : [ApplyOperation]
       controller context.transfer_agent
       do
-        requireStatus CapTableStatusActive status
-        apply context inputs operations
+        abort "write with CapTable_Update"
+
+    -- | Refused: every write goes through `CapTable_Update`.
+    nonconsuming choice CapTable_Restate : RestateResult
+      with
+        inputs : BookInputs
+        operations : [RestateOperation]
+      controller context.transfer_agent
+      do
+        abort "write with CapTable_Update"
+
+    -- | Refused: a split is recorded inside one `CapTable_Update`, between `UpdateFreezeClass` and
+    -- `UpdateUnfreezeClass`.
+    nonconsuming choice CapTable_FreezeClass : ContractId StockClassEpoch
+      with
+        epoch : ContractId StockClassEpoch
+      controller context.transfer_agent
+      do
+        abort "freeze a class inside a CapTable_Update"
+
+    -- | Refused: a split is recorded inside one `CapTable_Update`.
+    nonconsuming choice CapTable_UnfreezeClass : ContractId StockClassEpoch
+      with
+        epoch : ContractId StockClassEpoch
+      controller context.transfer_agent
+      do
+        abort "unfreeze a class inside a CapTable_Update"
 
     -- | Places one hold per lot, on at most 50 lots, under one reference, dated on the ledger date.
     nonconsuming choice CapTable_PlaceHolds : [PlaceHoldResult]
@@ -115,42 +152,6 @@ template CapTable
       do
         requireStatus CapTableStatusActive status
         settle context inputs settlement_id date buyer lots
-
-    -- | Starts recording a split: consumes the class's epoch and recreates it frozen, so writes in
-    -- flight that fetched it fail, and no write that creates or changes a stock state in the class
-    -- commits until it unfreezes.
-    nonconsuming choice CapTable_FreezeClass : ContractId StockClassEpoch
-      with
-        epoch : ContractId StockClassEpoch
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        e <- fetchChecked context "the stock class epoch" epoch
-        when e.frozen (abort ("stock class " <> e.stock_class_id <> " is already frozen"))
-        archive epoch
-        create e with frozen = True
-
-    -- | Ends recording a split.
-    nonconsuming choice CapTable_UnfreezeClass : ContractId StockClassEpoch
-      with
-        epoch : ContractId StockClassEpoch
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        e <- fetchChecked context "the stock class epoch" epoch
-        unless e.frozen (abort ("stock class " <> e.stock_class_id <> " is not frozen"))
-        archive epoch
-        create e with frozen = False
-
-    -- | Mirrors edits and deletes, within fixed limits.
-    nonconsuming choice CapTable_Restate : RestateResult
-      with
-        inputs : BookInputs
-        operations : [RestateOperation]
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        restate context inputs operations
 
     -- | Ends every write to a book being rebuilt: writes sequenced after it fail, because they
     -- exercise the anchor it consumes.
