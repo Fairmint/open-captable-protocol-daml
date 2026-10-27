@@ -13,7 +13,8 @@ import Fairmint.OpenCapTable.Types.Core (Context)
 
 -- | One operation of a `CapTable_Update`. The operations run in order on one working set, so a
 -- later one sees what earlier ones wrote; references are checked after the last, so a record may
--- name one written later in the same update.
+-- name one written later in the same update. The checks that need a whole run of corrections run
+-- when the run ends, so a create after it may reuse a security ID the run released.
 data UpdateOperation
   = -- | Writes a new record, or a stock event with the records it bundles.
     UpdateCreate ApplyOperation
@@ -34,23 +35,29 @@ update ctx inputs operations = do
   when (null operations) (abort "CapTable_Update needs at least one operation")
   b0 <- loadBook ctx inputs
   p <- foldlA updateOne (startProgress b0) operations
-  book <- foldlA (resolvePending p) p.book p.pending
+  book <- endCorrections p
   checkRequirements book
   flushBook book
 
+-- Runs the checks of the corrections since the last other operation, and releases the security
+-- IDs they may.
+endCorrections : Progress -> Update Book
+endCorrections p = foldlA (resolvePending p) p.book p.pending
+
 updateOne : Progress -> UpdateOperation -> Update Progress
 updateOne p op = case op of
-  UpdateCreate o -> do
-    b <- applyOperation p.book o
-    pure p with book = b
   UpdateCorrect o -> restateOne p o
-  UpdateFreezeClass cls -> do
-    e <- requireEpoch cls p.book
-    when e.frozen (abort ("stock class " <> cls <> " is already frozen"))
-    b <- replaceEpoch (e with frozen = True) p.book
-    pure p with book = b
-  UpdateUnfreezeClass cls -> do
-    e <- requireEpoch cls p.book
-    unless e.frozen (abort ("stock class " <> cls <> " is not frozen"))
-    b <- replaceEpoch (e with frozen = False) p.book
-    pure p with book = b
+  _ -> do
+    b0 <- endCorrections p
+    b <- case op of
+      UpdateCreate o -> applyOperation b0 o
+      UpdateFreezeClass cls -> do
+        e <- requireEpoch cls b0
+        when e.frozen (abort ("stock class " <> cls <> " is already frozen"))
+        replaceEpoch (e with frozen = True) b0
+      UpdateUnfreezeClass cls -> do
+        e <- requireEpoch cls b0
+        unless e.frozen (abort ("stock class " <> cls <> " is not frozen"))
+        replaceEpoch (e with frozen = False) b0
+      UpdateCorrect _ -> pure b0
+    pure p with book = b; pending = []
