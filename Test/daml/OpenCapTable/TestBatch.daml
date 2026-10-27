@@ -1,4 +1,4 @@
--- Batch semantics of CapTable_Apply and CapTable_Restate, ported from v34's TestUpdateCapTable, TestNoOpUpdates and TestFinalReferenceValidation: what a batch returns, references deferred to the end of the batch (a record may reference one written later), cyclic class conversions, references to deleted records, the edit-must-change rule across a restatement, empty batches, the polymorphic-reference, stock plan, operation and restatement caps, and mixed creates and stock events in one batch.
+-- Batch semantics of CapTable_Update, ported from v34's TestUpdateCapTable, TestNoOpUpdates and TestFinalReferenceValidation: what a batch returns, references deferred to the end of the batch (a record may reference one written later), cyclic class conversions, references to deleted records, the edit-must-change rule, empty batches, the per-record caps, creates, edits and deletes in one update with no per-transaction count cap, and the refused CapTable_Apply and CapTable_Restate.
 module OpenCapTable.TestBatch where
 
 import DA.Action ((>=>))
@@ -12,11 +12,12 @@ import qualified DA.Text as T
 import Daml.Script
 
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
-import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Apply hiding (applyOperation)
 import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
 import Fairmint.OpenCapTable.OcfRecords
-import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Restate (RestateOperation(..))
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Contact (OcfAddress(..), OcfAddressType(..))
 import Fairmint.OpenCapTable.Types.Conversion (OcfRatioConversionMechanism(..), OcfRoundingType(..), OcfStockClassConversionRight(..))
@@ -446,13 +447,12 @@ test_batch_edit_must_change = do
 -- =============================================================================
 
 -- v34 testUpdateCapTableEmpty: an empty UpdateCapTable only rotated the cap table's contract ID and
--- was refused. v35 refuses an empty write, and no write rotates the anchor: every write exercises
+-- was refused. v35 refuses an empty update, and no write rotates the anchor: every write exercises
 -- the one anchor without consuming it.
 test_batch_empty_batches_refused_and_anchor_kept : Script ()
 test_batch_empty_batches_refused_and_anchor_kept = do
   env <- standardBook
-  applyOpsFails env "CapTable_Apply needs at least one operation" []
-  restateOpsFails env "CapTable_Restate needs at least one operation" []
+  updateOpsFails env "CapTable_Update needs at least one operation" []
   _ <- applyRecords env [sh "SH-C"]
   _ <- restateOps env [RestateEdit (OcfRecordDataStakeholder ((stakeholderData "SH-C") with issuer_assigned_id = Some "7"))]
   _ <- restateOps env [RestateDelete "SH-C"]
@@ -461,72 +461,47 @@ test_batch_empty_batches_refused_and_anchor_kept = do
   map ((.status) . snd) anchors === [CapTableStatusActive]
 
 -- =============================================================================
--- POLYMORPHIC REFERENCE CAPS
+-- POLYMORPHIC REFERENCES
 -- =============================================================================
 
--- A transaction checks at most 100 polymorphic references (a document's related objects, a
--- financing's issuances, a capitalization definition's targets), summed over every record and type
--- in the batch. Typed references (a plan's classes, an issuance's stakeholder, class and legends)
--- do not count. A restatement counts what each edit adds; shrinking one record frees no budget for
--- another.
-test_batch_polymorphic_references_counted_across_records_and_types : Script ()
-test_batch_polymorphic_references_counted_across_records_and_types = do
+-- References are checked, not counted: one update checks as many polymorphic references (a
+-- document's related objects, a financing's issuances, a capitalization definition's targets) as
+-- its records make, and an edit that replaces every reference checks every new one.
+test_batch_polymorphic_references_not_counted_per_update : Script ()
+test_batch_polymorphic_references_not_counted_per_update = do
   env <- standardBook
   let doc id n = OcfRecordDataDocument (document id (replicate n (ref OcfObjectTypeStakeholder "SH-A")))
       fin id n = OcfRecordDataFinancing (financing id (replicate n "ISS-S-A1"))
-  applyRecordsFails env "more than 100 polymorphic references checked in one transaction" [doc "DOC-1" 50, fin "FIN-1" 51]
-  applyRecordsFails env "more than 100 polymorphic references checked in one transaction" [doc "DOC-1" 34, fin "FIN-1" 33, doc "DOC-2" 34]
-  _ <- applyRecords env [doc "DOC-1" 50, fin "FIN-1" 50]
-  expectRecords env [doc "DOC-1" 50, fin "FIN-1" 50]
-  let classes = map (\i -> "CLS-P" <> show i) [1 .. 16]
-      legends = map (\i -> "LEG-" <> show i) [1 .. 20]
-      planned = (issuance "S-P" "SH-A" "CLS-P16" 10.0 d2024) with stock_plan_id = Some "PLAN-16"; stock_legend_ids = legends
-      plan = OcfRecordDataStockPlan (stockPlan "PLAN-16" classes)
-  _ <- applyRecords env
-    (map (cls . stockClass) classes <> map (OcfRecordDataStockLegendTemplate . legend) legends <> [plan, stockIss planned, doc "DOC-2" 100])
-  expectRecords env [plan, stockIss planned, doc "DOC-2" 100]
-  -- Restatements: +51 and +50 is over; +50 and +50 is the limit.
-  restateOpsFails env "more than 100 polymorphic references checked in one transaction"
-    [RestateEdit (doc "DOC-1" 101), RestateEdit (fin "FIN-1" 100)]
-  _ <- restateOps env [RestateEdit (doc "DOC-1" 100), RestateEdit (fin "FIN-1" 100)]
-  expectRecords env [doc "DOC-1" 100, fin "FIN-1" 100]
-  restateOpsFails env "more than 100 polymorphic references checked in one transaction"
-    [RestateEdit (doc "DOC-2" 0), RestateEdit (fin "FIN-1" 201)]
-  _ <- restateOps env [RestateEdit (doc "DOC-2" 0), RestateEdit (fin "FIN-1" 200)]
-  expectRecords env [doc "DOC-2" 0, fin "FIN-1" 200]
-  -- A delete counts nothing.
-  _ <- restateOps env [RestateDelete "DOC-1", RestateDelete "FIN-1"]
-  mapA_ (expectNoRecord env) ["DOC-1", "FIN-1"]
+  _ <- applyRecords env [doc "DOC-1" 500, fin "FIN-1" 500, doc "DOC-2" 500]
+  expectRecords env [doc "DOC-1" 500, fin "FIN-1" 500, doc "DOC-2" 500]
+  _ <- restateOps env [RestateEdit (doc "DOC-1" 1000), RestateEdit (fin "FIN-1" 1000), RestateDelete "DOC-2"]
+  expectRecords env [doc "DOC-1" 1000, fin "FIN-1" 1000]
+  expectNoRecord env "DOC-2"
+  let holders = map (\i -> "SH-" <> show i) [1 .. 201]
+      docR ids = OcfRecordDataDocument (document "DOC-R" (map (ref OcfObjectTypeStakeholder) ids))
+  _ <- applyRecords env (map sh holders)
+  _ <- applyRecords env [docR (take 100 holders)]
+  _ <- restateOps env [RestateEdit (docR (drop 100 holders))]
+  expectRecord env (docR (drop 100 holders))
+  -- Every new reference is still checked.
+  restateOpsFails env "Document related object not found: SH-MISSING"
+    [RestateEdit (docR (drop 101 holders <> ["SH-MISSING"]))]
 
--- A record stores at most 1000 polymorphic references, so a larger one is created and extended by
--- restatements, each adding at most the transaction's 100 over all the records it edits. Two
--- financings grow together to the per-record cap, 50 references each per restatement; the cap then
--- refuses one more on either, alone or beside an edit that shrinks the other.
+-- A record stores at most 1000 polymorphic references: the cap refuses one more, alone or beside an
+-- edit that shrinks another record.
 test_batch_stored_polymorphic_cap_per_record : Script ()
 test_batch_stored_polymorphic_cap_per_record = do
   env <- standardBook
   let fin id n = OcfRecordDataFinancing (financing id (replicate n "ISS-S-A1"))
-  _ <- applyRecords env [fin "FIN-A" 50, fin "FIN-B" 50]
-  mapA_ (\n -> restateOps env [RestateEdit (fin "FIN-A" n), RestateEdit (fin "FIN-B" n)]) [100, 150 .. 1000]
+  _ <- applyRecords env [fin "FIN-A" 1000, fin "FIN-B" 1000]
   expectRecords env [fin "FIN-A" 1000, fin "FIN-B" 1000]
+  applyRecordsFails env "OcfObjectTypeFinancing has 1001 financing issuance IDs; at most 1000" [fin "FIN-C" 1001]
   restateOpsFails env "OcfObjectTypeFinancing has 1001 financing issuance IDs; at most 1000" [RestateEdit (fin "FIN-B" 1001)]
   restateOpsFails env "OcfObjectTypeFinancing has 1001 financing issuance IDs; at most 1000"
     [RestateEdit (fin "FIN-A" 999), RestateEdit (fin "FIN-B" 1001)]
   -- Shrinking keeps it writable.
   _ <- restateOps env [RestateEdit (fin "FIN-A" 999)]
   expectRecord env (fin "FIN-A" 999)
-
--- An edit is charged for the references it adds, not for how its list grows: replacing a
--- document's 100 related objects with 101 others checks, and counts, 101 new references.
-test_batch_replaced_references_are_counted : Script ()
-test_batch_replaced_references_are_counted = do
-  env <- setupEnv
-  let holders = map (\i -> "SH-" <> show i) [1 .. 201]
-      doc ids = OcfRecordDataDocument (document "DOC-R" (map (ref OcfObjectTypeStakeholder) ids))
-  _ <- applyRecords env (map sh holders)
-  _ <- applyRecords env [doc (take 100 holders)]
-  restateOpsFails env "more than 100 polymorphic references checked in one transaction" [RestateEdit (doc holders)]
-  restateOpsFails env "more than 100 polymorphic references checked in one transaction" [RestateEdit (doc (drop 100 holders))]
 
 -- =============================================================================
 -- STOCK PLAN CLASS CAP
@@ -565,39 +540,64 @@ test_batch_stock_plan_classes_in_one_batch = do
   expectRecord env (OcfRecordDataStockPlan swapped)
 
 -- =============================================================================
--- OPERATION AND RESTATEMENT CAPS
+-- CREATES, EDITS AND DELETES IN ONE UPDATE
 -- =============================================================================
 
--- A CapTable_Apply takes at most 500 operations: exactly 500 are written (here also exactly the
--- 500 IDs a transaction may claim). CapTable_Restate touches at most 500 contracts: an edit
--- archives and recreates its record, so 250 edits are the limit and 251 are refused.
-test_batch_operation_and_restatement_caps : Script ()
-test_batch_operation_and_restatement_caps = do
+-- One update writes any mix of creates, edits and deletes, in the order given, as one transaction,
+-- with no count cap: 150 edits, 150 deletes and 150 new stakeholders archive and create well over
+-- 500 contracts. An ID a delete releases is claimed again by a later create in the same update, and
+-- a record may reference one a later create writes.
+test_batch_creates_edits_and_deletes_in_one_update : Script ()
+test_batch_creates_edits_and_deletes_in_one_update = do
   env <- setupEnv
-  let ids = map (\i -> "SH-" <> show i) [1 .. maxOperationsPerApply]
-  maxOperationsPerApply === 500
-  maxContractsPerRestatement === 500
-  r <- applyRecords env (map sh ids)
-  Map.size r.records === 500
-  sort (Map.keys r.records) === sort ids
-  expectRecords env [sh "SH-1", sh "SH-250", sh "SH-500"]
-  length <$> recordsOf env >>= (=== 501)
-  applyRecordsFails env "ID already used: SH-500" [sh "SH-500"]
+  let ids from to = map (\i -> "SH-" <> show i) [from .. to]
+  _ <- applyRecords env (map sh (ids 1 300))
   let renamed i = OcfRecordDataStakeholder ((stakeholderData ("SH-" <> show i)) with issuer_assigned_id = Some ("E-" <> show i))
-  restateOpsFails env "CapTable_Restate touches at most 500 contracts" (map (RestateEdit . renamed) [1 .. 251])
-  expectRecord env (sh "SH-1")
-  r2 <- restateOps env (map (RestateEdit . renamed) [1 .. 250])
-  Map.size r2.records === 250
-  expectRecords env [renamed 1, renamed 250, sh "SH-251"]
+      newRecords = map sh (ids 301 450)
+      ops = map (UpdateCorrect . RestateEdit . renamed) [1 .. 150]
+        <> map (UpdateCorrect . RestateDelete) (ids 151 300)
+        <> map (UpdateCreate . ApplyRecord) newRecords
+  r <- updateOps env ops
+  Map.size r.records === 300
+  expectRecords env ([renamed 1, renamed 150] <> newRecords)
+  mapA_ (expectNoRecord env) ["SH-151", "SH-300"]
+  length <$> recordsOf env >>= (=== 301)
+  -- A deleted ID is free again in the same update, and an edit may name a record created after it.
+  let doc = OcfRecordDataDocument (document "DOC-1" [ref OcfObjectTypeStakeholder "SH-NEW"])
+  _ <- applyRecords env [OcfRecordDataDocument (document "DOC-1" [ref OcfObjectTypeStakeholder "SH-1"])]
+  _ <- updateOps env
+    [ UpdateCorrect (RestateDelete "SH-2")
+    , UpdateCorrect (RestateEdit doc)
+    , UpdateCreate (ApplyRecord (sh "SH-2"))
+    , UpdateCreate (ApplyRecord (sh "SH-NEW"))
+    ]
+  expectRecords env [sh "SH-2", sh "SH-NEW", doc]
 
--- CapTable_Restate counts the ID shards it archives toward its 500 contracts, as well as the records,
--- states and epochs: 300 deletes over K shards touch 300 + 2K contracts, more than 500.
-test_batch_restatement_counts_archived_shards : Script ()
-test_batch_restatement_counts_archived_shards = do
+-- Nothing of an update is written unless all of it is: one bad operation refuses the whole update.
+test_batch_update_is_atomic : Script ()
+test_batch_update_is_atomic = do
   env <- setupEnv
-  let ids = map (\i -> "SH-" <> show i) [1 .. 300]
-      k = Set.size (Set.fromList (map (\i -> T.take 8 (hashBits (claimHash IdNamespaceObject i))) ids))
-  _ <- applyRecords env (map sh ids)
-  assertMsg "counted as at most 500" (300 + k <= 500)
-  assertMsg "touches more than 500" (300 + 2 * k > 500)
-  restateOpsFails env "CapTable_Restate touches at most 500 contracts" (map RestateDelete ids)
+  _ <- applyRecords env [sh "SH-1", sh "SH-2"]
+  updateOpsFails env "ID already used: SH-1"
+    [ UpdateCorrect (RestateDelete "SH-2")
+    , UpdateCreate (ApplyRecord (sh "SH-3"))
+    , UpdateCreate (ApplyRecord (sh "SH-1"))
+    ]
+  expectRecords env [sh "SH-1", sh "SH-2"]
+  expectNoRecord env "SH-3"
+
+-- CapTable_Apply, CapTable_Restate, CapTable_FreezeClass and CapTable_UnfreezeClass refuse every
+-- call: every write goes through CapTable_Update.
+test_batch_other_write_choices_refused : Script ()
+test_batch_other_write_choices_refused = do
+  env <- standardBook
+  inputs <- allInputs env
+  (epoch, _) <- epochOf env "CLS-A"
+  expectSubmitFailure "write with CapTable_Update" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_Apply with inputs; operations = [ApplyRecord (sh "SH-X")])
+  expectSubmitFailure "write with CapTable_Update" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_Restate with inputs; operations = [RestateDelete "SH-A"])
+  expectSubmitFailure "freeze a class inside a CapTable_Update" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_FreezeClass with epoch)
+  expectSubmitFailure "unfreeze a class inside a CapTable_Update" env.transfer_agent
+    (exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch)
