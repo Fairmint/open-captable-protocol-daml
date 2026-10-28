@@ -11,23 +11,24 @@ contracts for Canton. It also publishes generated JavaScript bindings and the bu
 
 | Package               | What it holds                                                                                                                                                             |
 | --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `OpenCapTable-v35`    | The register: `OcpFactory`, `IssuerAuthorization`, the `CapTable` anchor, one contract per OCF record, and the `StockSecurity`, `StockClassEpoch` and `OcfIdShard` states |
+| `OpenCapTable-v36`    | The register: `OcpFactory`, `IssuerAuthorization`, the `CapTable` anchor, one contract per OCF record, and the `StockSecurity`, `StockClassEpoch` and `OcfIdShard` states |
 | `OpenCapTableApi-v01` | The reader interfaces `OcfObject` and `RegisterContract`, whose views hold only builtin types (OCF `object_type` strings), since an interface package is never upgraded   |
 | `Test`                | Daml Script tests (not released)                                                                                                                                          |
 
-OpenCapTable-v35 data-depends on `OpenCapTableApi-v01`, embeds it in its DAR and has no Splice
+OpenCapTable-v36 data-depends on `OpenCapTableApi-v01`, embeds it in its DAR and has no Splice
 dependency. Its design is
 [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md).
-v35 deploys to DevNet only; MainNet is out of scope. Older majors stay in [`dars/`](dars) and in git
+v36 deploys to DevNet only; MainNet is out of scope. Older majors stay in [`dars/`](dars) and in git
 history.
 
-Two more directories belong to v35:
+Two more directories belong to v36:
 
 - [`ocf-extension/`](ocf-extension) holds the JSON schemas of the one Fairmint OCF extension, the
   hold pair `TX_STOCK_HOLD` / `TX_STOCK_HOLD_CANCELLATION`.
 - [`test-vectors/v35.json`](test-vectors/v35.json) holds the derived-ID, claim-hash and
-  floor-function vectors that the Daml tests, the SDK and apiv2 must all reproduce.
-  `npm run test:vectors` recomputes them and checks the generated `TestVectors.daml`.
+  floor-function vectors that the Daml tests, the SDK and apiv2 must all reproduce. v36 keeps the ID
+  scheme v35 introduced, so the shared file keeps its name. `npm run test:vectors` recomputes them
+  and checks the generated `TestVectors.daml`.
 
 ## Install and use the package
 
@@ -56,12 +57,12 @@ import {
 } from '@fairmint/open-captable-protocol-daml-js/openCapTableDarPath';
 ```
 
-The v35 `OcpFactory` is consumed by each authorization, so `ocp-factory-contract-id.json` records
+The v36 `OcpFactory` is consumed by each authorization, so `ocp-factory-contract-id.json` records
 each network's factory identity (`templateId`, `system_operator`, `factory_id`), not a contract ID.
 Find the live factory with an active-contracts query for that template, filtered on both fields. A
 network is absent until its factory is created.
 
-The DARs are exported at `./opencaptable.dar` (OpenCapTable-v35) and `./opencaptable-api.dar`;
+The DARs are exported at `./opencaptable.dar` (OpenCapTable-v36) and `./opencaptable-api.dar`;
 `getOpenCapTableDarPaths()` lists both in upload order. Check [`package.json`](package.json) for the
 complete export map and [`scripts/test-imports.ts`](scripts/test-imports.ts) for the executable
 package-surface contract. `resolveOpenCapTableDarPath` checks `OPEN_CAP_TABLE_DAR_PATH`, then the
@@ -109,7 +110,7 @@ npm run build
 npm test
 ```
 
-`npm run build` generates `OpenCapTable-v35/daml/Fairmint/OpenCapTable/OcfRecords.daml` (the OCF
+`npm run build` generates `OpenCapTable-v36/daml/Fairmint/OpenCapTable/OcfRecords.daml` (the OCF
 record dispatch, from `scripts/codegen/`), runs `prepare-build` into `generated/build/`, then builds
 every package with `dpm`.
 
@@ -125,7 +126,7 @@ npm run verify-package
 extension in `ocf-extension/`.
 
 The LocalNet OCF replay and cross-participant traffic scripts drove the ledger through
-`ocp-canton-sdk`, which does not support v35 yet. They were removed and return with SDK support; the
+`ocp-canton-sdk`, which does not support v36 yet. They were removed and return with SDK support; the
 last versions are in git history, the scripts before `0a15f5c` and the `replay-ocf-database`
 workflow, with its `sdk_ref` input, at `7d693fa`.
 

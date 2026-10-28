@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * Copy the built OpenCapTable DARs to stable paths for npm `exports`: OpenCapTable-v35 to `./opencaptable.dar`, and the
+ * Copy the built OpenCapTable DARs to stable paths for npm `exports`: OpenCapTable-v36 to `./opencaptable.dar`, and the
  * reader interfaces it data-depends on to `./opencaptable-api.dar`.
  *
  * Run automatically at the end of `npm run codegen` (after `npm run build` produces

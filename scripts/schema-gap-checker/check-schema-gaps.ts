@@ -17,7 +17,7 @@
  * exactly the declared additions, the amended Object primitive is upstream's with that enum, and sample hold records
  * validate against the complete schemas, OCF's included.
  *
- * Usage: npx tsx scripts/schema-gap-checker/check-schema-gaps.ts [--package OpenCapTable-v35] [--api-package
+ * Usage: npx tsx scripts/schema-gap-checker/check-schema-gaps.ts [--package OpenCapTable-v36] [--api-package
  * OpenCapTableApi-v01] [--ocf-schema-dir /path/to/schema] [--extension-schema-dir /path/to/ocf-extension/schema]
  */
 

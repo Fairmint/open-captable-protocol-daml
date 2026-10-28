@@ -4,9 +4,9 @@
  *
  * Usage: npm run upgrade-package -- --package <name> --type <major|minor>
  *
- * Examples: `npm run upgrade-package -- --package OpenCapTable --type minor` (OpenCapTable-v35 0.0.1 → 0.0.2) and `npm
+ * Examples: `npm run upgrade-package -- --package OpenCapTable --type minor` (OpenCapTable-v36 0.0.1 → 0.0.2) and `npm
  * run upgrade-package -- --package OpenCapTableApi --type minor`. A minor upgrade of OpenCapTableApi-v01 also rewrites
- * the data-dependency paths in OpenCapTable-v35/daml.yaml and Test/daml.yaml, and changes OpenCapTable-v35's DAR, which
+ * the data-dependency paths in OpenCapTable-v36/daml.yaml and Test/daml.yaml, and changes OpenCapTable-v36's DAR, which
  * embeds it; back up every changed package.
  */
 
@@ -66,7 +66,7 @@ function findPackageFolder(packageName: string): string {
 
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      // Match patterns like "OpenCapTable-v35", "OpenCapTableApi-v01", etc.
+      // Match patterns like "OpenCapTable-v36", "OpenCapTableApi-v01", etc.
       const match = entry.name.match(new RegExp(`^${packageName}-(v(\\d+))$`, 'i'));
       if (match) {
         const version = parseInt(match[2], 10);

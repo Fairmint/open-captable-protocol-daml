@@ -3,7 +3,7 @@
  * Bundle this repository's sibling Daml packages into the merged `lib/`.
  *
  * `canton-dev-tools create-root-index` builds `lib/` from one codegen package (`rootIndex.sourcePackage` in
- * `daml-js-bundle.json`, OpenCapTable-v35). That package's generated JS imports its data-dependencies from this
+ * `daml-js-bundle.json`, OpenCapTable-v36). That package's generated JS imports its data-dependencies from this
  * repository (OpenCapTableApi-v01) as `daml.js/<name>-<version>`, which no canton-dev-tools preset bundles. This step,
  * run between `create-root-index` and `fix-splice-refs --target lib`:
  *

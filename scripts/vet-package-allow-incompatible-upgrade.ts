@@ -13,7 +13,7 @@
  * --network devnet --provider intellect --synchronizer-id 'global-domain::1220...'\
  * --package-id 6b6a969fa6a621479a29fcf7fb2d9596317545eabc088ed4c62c43c0c0ac2173
  *
- * `--network` is required. OpenCapTable-v35 deploys to DevNet only (ADR-040), which needs `--synchronizer-id`; MainNet
+ * `--network` is required. OpenCapTable-v36 deploys to DevNet only (ADR-040), which needs `--synchronizer-id`; MainNet
  * defaults to the Catalyst / TA global-domain (the legacy CantonPayments case).
  *
  * Dry run (validate request without applying): ... --dry-run

@@ -12,7 +12,7 @@ import * as yaml from 'yaml';
 // =============================================================================
 
 export interface PackageConfig {
-  /** Display name (e.g., 'OpenCapTable-v35') */
+  /** Display name (e.g., 'OpenCapTable-v36') */
   name: string;
   /** DAR file name without extension (usually same as name) */
   darName: string;
@@ -70,7 +70,7 @@ interface PackageDef {
 /**
  * Package definitions - versions are loaded lazily from daml.yaml. Keys are short aliases used in CLI commands.
  *
- * OpenCapTable-v35 data-depends on the reader interfaces (OpenCapTableApi-v01), which are bundled into the npm `lib/`
+ * OpenCapTable-v36 data-depends on the reader interfaces (OpenCapTableApi-v01), which are bundled into the npm `lib/`
  * and released with it.
  */
 const PACKAGE_DEFS = {
@@ -78,7 +78,7 @@ const PACKAGE_DEFS = {
     sourceDir: 'OpenCapTableApi-v01',
   },
   ocp: {
-    sourceDir: 'OpenCapTable-v35',
+    sourceDir: 'OpenCapTable-v36',
     generated: { createIndex: true, publishNameSuffix: null },
     dependencies: ['api'],
   },
@@ -124,7 +124,7 @@ function resolvePackageKey(key: string): PackageDefKey | undefined {
 }
 
 /**
- * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35'). Key lookup is
+ * Get package config by short key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v36'). Key lookup is
  * case-insensitive.
  */
 export function getPackage(keyOrName: string): PackageConfig | undefined {

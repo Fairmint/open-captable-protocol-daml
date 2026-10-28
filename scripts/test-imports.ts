@@ -38,7 +38,7 @@ try {
     typeof rootPkg?.Fairmint?.OpenCapTableDeliveryProof !== 'undefined' ||
     typeof rootPkg.OCP_DELIVERY_PROOF_TEMPLATES !== 'undefined'
   ) {
-    throw new Error('This package must not export a delivery proof; OpenCapTable-v35 has none');
+    throw new Error('This package must not export a delivery proof; OpenCapTable-v36 has none');
   }
   for (const [constant, keys] of Object.entries(ENTRY_POINTS)) {
     const missing = keys.filter((key) => typeof rootPkg[constant]?.[key] !== 'string');
@@ -47,7 +47,7 @@ try {
     }
   }
 
-  // The v35 factory is consumed per authorization, so the JSON records identities, never a contract ID. A network is
+  // The v36 factory is consumed per authorization, so the JSON records identities, never a contract ID. A network is
   // absent until its factory exists; any entry present must belong to the current package (no v34 leftovers).
   const ocp = require(`${rootPackage.name}/ocp-factory-contract-id.json`);
   if (ocp === null || typeof ocp !== 'object' || Array.isArray(ocp)) {
@@ -62,7 +62,7 @@ try {
       }
     }
     if ('ocpFactoryContractId' in (entry ?? {})) {
-      throw new Error(`OCP Factory JSON ${network} entry records a contract ID; the v35 factory is consumed per use`);
+      throw new Error(`OCP Factory JSON ${network} entry records a contract ID; the v36 factory is consumed per use`);
     }
     if (entry?.packageName !== ocpPackage.name) {
       throw new Error(`OCP Factory JSON ${network} entry is for ${String(entry?.packageName)}, not ${ocpPackage.name}`);
