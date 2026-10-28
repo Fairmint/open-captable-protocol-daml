@@ -64,6 +64,13 @@ test_batch_blocks_every_other_write = do
   onDate batchDay
   lot <- settlementLot env "S-A2" 10.0
   [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" batchDay [lot]
+  draw <- drawLot env "S-A2" 10.0 1.0 []
+  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+  -- A class frozen by the split procedure before the batch.
+  _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-F")]
+  (frozen, _) <- epochOf env "CLS-F"
+  _ <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = frozen
+  (frozen', _) <- epochOf env "CLS-F"
   envB <- beginBatch env "B-1"
   -- The anchor the writes were prepared against is gone.
   inputs <- allInputs env
@@ -75,6 +82,9 @@ test_batch_blocks_every_other_write = do
   lot2 <- settlementLot envB "S-A1" 10.0
   placeHoldsFails envB "CapTableStatusBatching" OcfHoldTypeRegisterSettlement "T-2" batchDay [lot2]
   cancelHoldsFails envB "CapTableStatusBatching" batchDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
+  settleFails envB "CapTableStatusBatching" "T-1" batchDay buyer [SettleDraw draw]
+  expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
+    (exerciseCmd envB.cap_table CapTable_UnfreezeClass with epoch = frozen')
   (epoch, _) <- epochOf envB "CLS-A"
   expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
     (exerciseCmd envB.cap_table CapTable_FreezeClass with epoch)
@@ -94,9 +104,10 @@ test_batch_blocks_every_other_write = do
   inputsB <- allInputs envB
   submitMustFail env.issuer do
     exerciseCmd envB.cap_table CapTable_Write with batch_id = Some "B-1"; inputs = inputsB; steps = [creates [sh "SH-X"]]
-  -- After it ends, the hold is canceled as usual.
+  -- After it ends, the trade settles and the class unfreezes as usual.
   envE <- endBatch envB "B-1"
-  _ <- cancelHolds envE batchDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
+  _ <- settle envE "T-1" batchDay buyer [SettleDraw draw]
+  _ <- submit env.transfer_agent do exerciseCmd envE.cap_table CapTable_UnfreezeClass with epoch = frozen'
   pure ()
 
 -- In a batch, a split is recorded without freezing its class: the batch keeps every class still.
