@@ -1,4 +1,4 @@
--- Test harness for OpenCapTable-v35: a cap table set up as in production (factory, TA acceptance, issuer creation), inputs collected from the active contract set, and fixtures.
+-- Test harness for OpenCapTable-v36: a cap table set up as in production (factory, TA acceptance, issuer creation), inputs collected from the active contract set, and fixtures.
 module OpenCapTable.Harness where
 
 import DA.Action (unless)
@@ -8,8 +8,8 @@ import DA.Time (time)
 import Daml.Script
 
 import Fairmint.OpenCapTableApi.OcfObject (OcfObject, OcfObjectView(..))
-import Fairmint.OpenCapTable.Apply hiding (apply)
-import Fairmint.OpenCapTable.Book (BookInputs(..))
+import Fairmint.OpenCapTable.Apply hiding (applyOperation)
+import Fairmint.OpenCapTable.Book (BookInputs(..), BookResult(..))
 import Fairmint.OpenCapTable.CapTable
 import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
 import Fairmint.OpenCapTable.Ids
@@ -17,7 +17,8 @@ import Fairmint.OpenCapTable.IssuerAuthorization
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Numeric (floorMulDiv)
 import Fairmint.OpenCapTable.OcpFactory
-import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Restate (RestateOperation(..))
+import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Core (Context(..))
 import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
@@ -174,41 +175,69 @@ allInputs env = do
 -- WRITES
 -- =============================================================================
 
-applyOps : Env -> [ApplyOperation] -> Script ApplyResult
-applyOps env ops = do
+-- | Submits one `CapTable_Update` as the TA, with every active contract of the book as inputs.
+updateOps : Env -> [UpdateOperation] -> Script BookResult
+updateOps env ops = do
   inputs <- allInputs env
-  submit env.transfer_agent do
-    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
+  updateWith env inputs ops
 
-applyWith : Env -> BookInputs -> [ApplyOperation] -> Script ApplyResult
-applyWith env inputs ops =
+updateWith : Env -> BookInputs -> [UpdateOperation] -> Script BookResult
+updateWith env inputs ops =
   submit env.transfer_agent do
-    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops
-
-applyRecords : Env -> [OcfRecordData] -> Script ApplyResult
-applyRecords env ds = applyOps env (map ApplyRecord ds)
+    exerciseCmd env.cap_table CapTable_Update with batch_id = None; inputs; operations = ops
 
 -- | Submits as the TA and requires failure with a message containing `expected`.
-applyOpsFails : Env -> Text -> [ApplyOperation] -> Script ()
-applyOpsFails env expected ops = do
+updateOpsFails : Env -> Text -> [UpdateOperation] -> Script ()
+updateOpsFails env expected ops = do
   inputs <- allInputs env
   expectSubmitFailure expected env.transfer_agent (
-    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops)
+    exerciseCmd env.cap_table CapTable_Update with batch_id = None; inputs; operations = ops)
+
+applyOps : Env -> [ApplyOperation] -> Script BookResult
+applyOps env ops = updateOps env (map UpdateCreate ops)
+
+applyWith : Env -> BookInputs -> [ApplyOperation] -> Script BookResult
+applyWith env inputs ops = updateWith env inputs (map UpdateCreate ops)
+
+applyRecords : Env -> [OcfRecordData] -> Script BookResult
+applyRecords env ds = applyOps env (map ApplyRecord ds)
+
+applyOpsFails : Env -> Text -> [ApplyOperation] -> Script ()
+applyOpsFails env expected ops = updateOpsFails env expected (map UpdateCreate ops)
 
 applyRecordsFails : Env -> Text -> [OcfRecordData] -> Script ()
 applyRecordsFails env expected ds = applyOpsFails env expected (map ApplyRecord ds)
 
-restateOps : Env -> [RestateOperation] -> Script RestateResult
-restateOps env ops = do
-  inputs <- allInputs env
-  submit env.transfer_agent do
-    exerciseCmd env.cap_table CapTable_Restate with inputs; operations = ops
+restateOps : Env -> [RestateOperation] -> Script BookResult
+restateOps env ops = updateOps env (map UpdateCorrect ops)
 
 restateOpsFails : Env -> Text -> [RestateOperation] -> Script ()
-restateOpsFails env expected ops = do
+restateOpsFails env expected ops = updateOpsFails env expected (map UpdateCorrect ops)
+
+-- | A `CapTable_Update` in the named batch, as the TA, with every active contract as inputs.
+batchUpdate : Env -> Text -> [UpdateOperation] -> Script BookResult
+batchUpdate env batch ops = do
+  inputs <- allInputs env
+  submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Update with batch_id = Some batch; inputs; operations = ops
+
+batchUpdateFails : Env -> Text -> Text -> [UpdateOperation] -> Script ()
+batchUpdateFails env expected batch ops = do
   inputs <- allInputs env
   expectSubmitFailure expected env.transfer_agent (
-    exerciseCmd env.cap_table CapTable_Restate with inputs; operations = ops)
+    exerciseCmd env.cap_table CapTable_Update with batch_id = Some batch; inputs; operations = ops)
+
+-- | Opens a batch as the TA. The environment it returns names the recreated anchor.
+beginBatch : Env -> Text -> Script Env
+beginBatch env batch = do
+  anchor <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_BeginBatch with batch_id = batch
+  pure env with cap_table = anchor
+
+-- | Ends the open batch as the TA. The environment it returns names the recreated anchor.
+endBatch : Env -> Text -> Script Env
+endBatch env batch = do
+  anchor <- submit env.transfer_agent do exerciseCmd env.cap_table CapTable_EndBatch with batch_id = batch
+  pure env with cap_table = anchor
 
 -- | Sets the ledger time to noon on a date (ledger-dated choices check the ledger date).
 onDate : Date -> Script ()

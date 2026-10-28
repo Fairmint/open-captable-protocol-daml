@@ -1,16 +1,15 @@
--- The cap table anchor: its identity and status, and the entry point for every register write. It indexes nothing, and every write exercises it without consuming it.
+-- The cap table anchor: its identity and status, and the entry point for every register write. It indexes nothing, and every write exercises it without consuming it; only a change of status (a batch, a teardown, the tombstone) consumes it.
 module Fairmint.OpenCapTable.CapTable
   ( CapTable(..)
   , CapTableStatus(..)
   , PurgeTarget(..)
-  , CapTable_Apply(..)
+  , CapTable_Update(..)
+  , CapTable_BeginBatch(..)
+  , CapTable_EndBatch(..)
   , CapTable_PlaceHolds(..)
   , CapTable_CancelHolds(..)
   , CapTable_CancelHoldsResult(..)
   , CapTable_Settle(..)
-  , CapTable_FreezeClass(..)
-  , CapTable_UnfreezeClass(..)
-  , CapTable_Restate(..)
   , CapTable_BeginTeardown(..)
   , CapTable_Purge(..)
   , CapTable_Close(..)
@@ -21,17 +20,19 @@ import DA.Action (unless, when)
 import DA.Foldable (forA_)
 import DA.Map (Map)
 import Fairmint.OpenCapTableApi.RegisterContract (RegisterContract, RegisterContractView(..))
-import Fairmint.OpenCapTable.Apply (ApplyOperation, ApplyResult, apply)
-import Fairmint.OpenCapTable.Book (BookInputs, fetchChecked)
+import Fairmint.OpenCapTable.Book (BookInputs, BookResult, fetchChecked)
 import Fairmint.OpenCapTable.Holds
 import Fairmint.OpenCapTable.OcfRecords (OcfRecordCid, archiveRecord, fetchRecord)
-import Fairmint.OpenCapTable.Restate (RestateOperation, RestateResult, restate)
 import Fairmint.OpenCapTable.State (OcfIdShard, StockClassEpoch(..), StockSecurity)
 import Fairmint.OpenCapTable.Types.Core (Context(..), validateContext)
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType)
+import Fairmint.OpenCapTable.Update (UpdateOperation, update)
 
 data CapTableStatus
   = CapTableStatusActive
+  | -- | A batch is open: until `CapTable_EndBatch`, the only write is a `CapTable_Update` that
+    -- names it
+    CapTableStatusBatching with batch_id : Text
   | CapTableStatusTearingDown
   | CapTableStatusClosed
   deriving (Eq, Show)
@@ -51,6 +52,14 @@ maxContractsPerPurge = 500
 -- The transfer agent (TA) controls every write; the issuer acts only at setup; the system operator
 -- only purges and closes a book the TA has begun to tear down. Each choice body holds the issuer's,
 -- the system operator's and the TA's authority, which every register contract needs.
+--
+-- A batch writes a change too large for one transaction as one update. `CapTable_BeginBatch`
+-- consumes the anchor, so writes in flight fail, and recreates it batching. Until
+-- `CapTable_EndBatch`, the only write is a `CapTable_Update` that names the batch: holds,
+-- settlements and unnamed updates are refused. Readers read the book as of the batching anchor's
+-- creation, so the batch's updates become visible together when it ends. A batch is abandoned by
+-- restoring the book in more of its updates and ending it, or, when it cannot be restored, by
+-- tearing the book down from the batching anchor.
 template CapTable
   with
     context : Context
@@ -58,7 +67,7 @@ template CapTable
   where
     signatory context.issuer, context.system_operator, context.transfer_agent
 
-    ensure validateContext context
+    ensure validateContext context && validStatus status
 
     interface instance RegisterContract for CapTable where
       view = RegisterContractView with
@@ -66,16 +75,38 @@ template CapTable
         kind = "CAP_TABLE"
         key = context.cap_table_id
 
-    -- | A non-empty batch of at most 500 operations: OCF creates, stock security events, splits,
-    -- vesting snapshots and shard pre-splits. Edits and deletes go through `CapTable_Restate`.
-    nonconsuming choice CapTable_Apply : ApplyResult
+    -- | Writes a non-empty batch of creates, edits and deletes, in order, as one transaction.
+    -- Outside a batch it needs an active cap table and no batch ID; in a batch it names the open
+    -- batch.
+    nonconsuming choice CapTable_Update : BookResult
       with
+        batch_id : Optional Text
         inputs : BookInputs
-        operations : [ApplyOperation]
+        operations : [UpdateOperation]
+      controller context.transfer_agent
+      do
+        requireWritable status batch_id
+        update context inputs operations
+
+    -- | Opens a batch: consumes the anchor, so writes in flight fail, and recreates it batching.
+    choice CapTable_BeginBatch : ContractId CapTable
+      with
+        batch_id : Text
       controller context.transfer_agent
       do
         requireStatus CapTableStatusActive status
-        apply context inputs operations
+        when (batch_id == "") (abort "a batch needs a non-empty ID")
+        create this with status = CapTableStatusBatching with batch_id
+
+    -- | Ends the open batch, written in full or restored: its updates become visible together, and
+    -- the cap table takes every write again.
+    choice CapTable_EndBatch : ContractId CapTable
+      with
+        batch_id : Text
+      controller context.transfer_agent
+      do
+        requireWritable status (Some batch_id)
+        create this with status = CapTableStatusActive
 
     -- | Places one hold per lot, on at most 50 lots, under one reference, dated on the ledger date.
     nonconsuming choice CapTable_PlaceHolds : [PlaceHoldResult]
@@ -116,48 +147,15 @@ template CapTable
         requireStatus CapTableStatusActive status
         settle context inputs settlement_id date buyer lots
 
-    -- | Starts recording a split: consumes the class's epoch and recreates it frozen, so writes in
-    -- flight that fetched it fail, and no write that creates or changes a stock state in the class
-    -- commits until it unfreezes.
-    nonconsuming choice CapTable_FreezeClass : ContractId StockClassEpoch
-      with
-        epoch : ContractId StockClassEpoch
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        e <- fetchChecked context "the stock class epoch" epoch
-        when e.frozen (abort ("stock class " <> e.stock_class_id <> " is already frozen"))
-        archive epoch
-        create e with frozen = True
-
-    -- | Ends recording a split.
-    nonconsuming choice CapTable_UnfreezeClass : ContractId StockClassEpoch
-      with
-        epoch : ContractId StockClassEpoch
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        e <- fetchChecked context "the stock class epoch" epoch
-        unless e.frozen (abort ("stock class " <> e.stock_class_id <> " is not frozen"))
-        archive epoch
-        create e with frozen = False
-
-    -- | Mirrors edits and deletes, within fixed limits.
-    nonconsuming choice CapTable_Restate : RestateResult
-      with
-        inputs : BookInputs
-        operations : [RestateOperation]
-      controller context.transfer_agent
-      do
-        requireStatus CapTableStatusActive status
-        restate context inputs operations
-
     -- | Ends every write to a book being rebuilt: writes sequenced after it fail, because they
-    -- exercise the anchor it consumes.
+    -- exercise the anchor it consumes. A batching book may be torn down too, so a batch that cannot
+    -- be restored (it recorded a split) is abandoned without its updates ever becoming visible.
     choice CapTable_BeginTeardown : ContractId CapTable
       controller context.transfer_agent
       do
-        requireStatus CapTableStatusActive status
+        case status of
+          CapTableStatusBatching {} -> pure ()
+          _ -> requireStatus CapTableStatusActive status
         create this with status = CapTableStatusTearingDown
 
     -- | Archives up to 500 of a torn-down book's contracts.
@@ -190,6 +188,23 @@ requireStatus : CapTableStatus -> CapTableStatus -> Update ()
 requireStatus expected actual =
   unless (actual == expected)
     (abort ("the cap table is " <> show actual <> ", not " <> show expected))
+
+-- | A write outside a batch needs an active cap table and names no batch; a write in a batch
+-- names the open one.
+requireWritable : CapTableStatus -> Optional Text -> Update ()
+requireWritable status batch = case status of
+  CapTableStatusActive -> forA_ batch \named ->
+    abort ("the cap table has no open batch; batch " <> named <> " was never begun or has ended")
+  CapTableStatusBatching with batch_id -> case batch of
+    Some named -> unless (named == batch_id) (abort ("batch " <> named <> " is not the cap table's open batch " <> batch_id))
+    None -> abort ("the cap table has an open batch " <> batch_id <> "; only an update that names it runs")
+  _ -> requireStatus CapTableStatusActive status
+
+-- | A batching cap table names its batch.
+validStatus : CapTableStatus -> Bool
+validStatus status = case status of
+  CapTableStatusBatching with batch_id -> batch_id /= ""
+  _ -> True
 
 purgeOne : Context -> PurgeTarget -> Update ()
 purgeOne ctx target = case target of

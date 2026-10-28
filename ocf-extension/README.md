@@ -1,6 +1,6 @@
 # Fairmint OCF extension: the hold pair
 
-OpenCapTable-v35 extends the Open Cap Format (OCF) with one pair of transactions, `TX_STOCK_HOLD`
+OpenCapTable-v36 extends the Open Cap Format (OCF) with one pair of transactions, `TX_STOCK_HOLD`
 and `TX_STOCK_HOLD_CANCELLATION`, following OCF's primitive pattern (as `Cancellation` is shared by
 `StockCancellation` and its siblings). These schemas are pinned to OCF
 [`6d8c932`](https://github.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/tree/6d8c93227de64fc014fe0a215af208f4a5432542/schema).

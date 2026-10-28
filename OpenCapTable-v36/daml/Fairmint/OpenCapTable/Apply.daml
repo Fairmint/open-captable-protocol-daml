@@ -1,16 +1,13 @@
--- CapTable_Apply: writes new OCF records, stock security events, splits, vesting snapshots and shard pre-splits in one bounded batch.
+-- The create operations of CapTable_Update: new OCF records, stock security events, splits, vesting snapshots and shard pre-splits.
 module Fairmint.OpenCapTable.Apply
   ( ApplyOperation(..)
-  , ApplyResult(..)
-  , maxOperationsPerApply
   , maxLotsPerOperation
-  , apply
+  , applyOperation
   ) where
 
 import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_)
 import DA.List (dedup, head, last)
-import DA.Map (Map)
 import DA.Optional (fromOptional, isNone, isSome, optionalToList)
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.Book
@@ -27,10 +24,9 @@ import Fairmint.OpenCapTable.OCF.StockRepurchase (StockRepurchaseOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
 import Fairmint.OpenCapTable.References
 import Fairmint.OpenCapTable.State
-import Fairmint.OpenCapTable.Types.Core (Context)
 import Fairmint.OpenCapTable.VestingState
 
--- | One operation of a `CapTable_Apply` batch. Every record a stock event writes goes in its
+-- | One create of a `CapTable_Update` batch. Every record a stock event writes goes in its
 -- operation, so the event consumes its state and creates its outputs atomically.
 data ApplyOperation
   = -- | Any OCF record that is not one of the bundled stock events below, a hold record or the
@@ -70,39 +66,10 @@ data ApplyOperation
       prefix : Text
   deriving (Eq, Show)
 
-data ApplyResult = ApplyResult
-  with
-    -- The OCF records created, by object ID
-    records : Map Text OcfRecordCid
-    -- The stock states created, by security ID
-    states : Map Text (ContractId StockSecurity)
-    -- The epochs created, by stock class ID
-    epochs : Map Text (ContractId StockClassEpoch)
-    -- The ID shards created, by prefix
-    shards : Map Text (ContractId OcfIdShard)
-  deriving (Eq, Show)
-
-maxOperationsPerApply : Int
-maxOperationsPerApply = 500
 
 -- | Lots per hold placement, settlement or consolidation.
 maxLotsPerOperation : Int
 maxLotsPerOperation = 50
-
-apply : Context -> BookInputs -> [ApplyOperation] -> Update ApplyResult
-apply ctx inputs operations = do
-  when (null operations) (abort "CapTable_Apply needs at least one operation")
-  when (length operations > maxOperationsPerApply)
-    (abort ("CapTable_Apply takes at most " <> show maxOperationsPerApply <> " operations"))
-  b0 <- loadBook ctx inputs
-  b1 <- foldlA applyOperation b0 operations
-  checkRequirements b1
-  (_, result) <- flushBook b1
-  pure ApplyResult with
-    records = result.records
-    states = result.states
-    epochs = result.epochs
-    shards = result.shards
 
 applyOperation : Book -> ApplyOperation -> Update Book
 applyOperation b op = case op of
@@ -136,9 +103,8 @@ claimRecordIds d b0 = do
 writeStatelessRecord : OcfRecordData -> [Requirement] -> Book -> Update Book
 writeStatelessRecord d extra b0 = do
   b1 <- claimRecordIds d b0
-  b2 <- countPolymorphicReferences (polymorphicReferenceCount d) b1
-  (b3, _) <- addRecord d b2
-  pure (addRequirements (requirementsOf d <> extra) b3)
+  (b2, _) <- addRecord d b1
+  pure (addRequirements (requirementsOf d <> extra) b2)
 
 -- Writes the event's own record, its ID derived or claimed, with its references.
 writeEventRecord : StockSecurity -> Text -> OcfRecordData -> Book -> Update Book
@@ -149,7 +115,7 @@ writeEventRecord s id d b0 = do
 
 applyRecord : Book -> OcfRecordData -> Update Book
 applyRecord b d = case d of
-  OcfRecordDataIssuer _ -> abort "the issuer record is written when the cap table is created and edited by CapTable_Restate"
+  OcfRecordDataIssuer _ -> abort "the issuer record is written when the cap table is created and edited by RestateEdit"
   OcfRecordDataStockHold _ -> abort "holds are placed by CapTable_PlaceHolds"
   OcfRecordDataStockHoldCancellation _ -> abort "holds are canceled by CapTable_CancelHolds or CapTable_Settle"
   OcfRecordDataStockTransfer _ -> abort "write a stock transfer with ApplyStockTransfer"

@@ -2,7 +2,7 @@
  * OpenCapTable DAR path helpers. Published as `@fairmint/open-captable-protocol-daml-js/openCapTableDarPath` only (uses
  * Node `fs`; not re-exported from the package root so browser/Next bundles stay valid).
  *
- * The package ships two DARs: OpenCapTable-v35 (`OpenCapTable.dar`) and the reader interfaces it data-depends on
+ * The package ships two DARs: OpenCapTable-v36 (`OpenCapTable.dar`) and the reader interfaces it data-depends on
  * (`OpenCapTableApi.dar`, OpenCapTableApi-v01). The OpenCapTable DAR embeds the interfaces;
  * {@link getOpenCapTableDarPaths} lists both in upload order.
  *
@@ -116,7 +116,7 @@ export function getOpenCapTableApiDarPath(): string {
 }
 
 /**
- * The two packaged DARs in upload order: OpenCapTableApi-v01, then OpenCapTable-v35.
+ * The two packaged DARs in upload order: OpenCapTableApi-v01, then OpenCapTable-v36.
  *
  * @throws If any file is missing.
  */

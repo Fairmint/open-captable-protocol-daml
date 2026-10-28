@@ -13,7 +13,7 @@ const ROOT_DIR = path.join(__dirname, '..');
 const LIB_DIR = path.join(ROOT_DIR, 'lib');
 
 /**
- * Paths the merged lib must include: the OpenCapTable-v35 entry points, the hold pair, the sibling packages bundled by
+ * Paths the merged lib must include: the OpenCapTable-v36 entry points, the hold pair, the sibling packages bundled by
  * scripts/bundle-local-packages.ts, and the stdlib `DA.Set` that `OcfIdShard.claimed` uses.
  */
 const REQUIRED_RELATIVE_FILES = [
@@ -46,7 +46,7 @@ function assertRequiredFiles(): void {
   }
   for (const rel of FORBIDDEN_RELATIVE_DIRS) {
     if (fs.existsSync(path.join(LIB_DIR, rel))) {
-      throw new Error(`Unexpected lib/${rel} in merged lib (OpenCapTable-v35 does not depend on it)`);
+      throw new Error(`Unexpected lib/${rel} in merged lib (OpenCapTable-v36 does not depend on it)`);
     }
   }
 }

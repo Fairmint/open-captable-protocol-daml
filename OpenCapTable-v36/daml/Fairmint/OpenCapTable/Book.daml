@@ -1,4 +1,4 @@
--- The working set of one register write: the contracts it was given, what it changes in memory, and the counters behind the per-transaction caps.
+-- The working set of one register write: the contracts it was given and what it changes in memory.
 module Fairmint.OpenCapTable.Book
   ( BookInputs(..)
   , emptyInputs
@@ -8,10 +8,6 @@ module Fairmint.OpenCapTable.Book
   , ShardSlot(..)
   , RecordEntry(..)
   , BookResult(..)
-  , maxClaimsPerTransaction
-  , maxShardsCreatedPerTransaction
-  , maxTranchesPerTransaction
-  , maxPolymorphicReferencesPerTransaction
   , loadBook
   , fetchChecked
   -- states
@@ -37,9 +33,7 @@ module Fairmint.OpenCapTable.Book
   , claimId
   , releaseId
   , preSplitShard
-  -- counters and deferred checks
-  , countTranches
-  , countPolymorphicReferences
+  -- deferred checks
   , addRequirements
   , flushBook
   ) where
@@ -54,12 +48,12 @@ import qualified DA.Set as Set
 import qualified DA.Text as T
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
-import Fairmint.OpenCapTable.References (Requirement, checkRecordCaps, issuanceSecurityId, recordTranches)
+import Fairmint.OpenCapTable.References (Requirement, checkRecordCaps, issuanceSecurityId)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Core (Context(..))
 
 -- =============================================================================
--- INPUTS AND CAPS
+-- INPUTS
 -- =============================================================================
 
 -- | The existing contracts a write reads or changes. Operations name everything else by OCF ID:
@@ -80,21 +74,6 @@ data BookInputs = BookInputs
 
 emptyInputs : BookInputs
 emptyInputs = BookInputs with states = []; epochs = []; shards = []; records = []
-
-maxClaimsPerTransaction : Int
-maxClaimsPerTransaction = 500
-
-maxShardsCreatedPerTransaction : Int
-maxShardsCreatedPerTransaction = 4096
-
--- | Vesting tranches summed over the states and issuances a transaction reads or writes.
-maxTranchesPerTransaction : Int
-maxTranchesPerTransaction = 20000
-
--- | Polymorphic references (a document's related objects, a financing's issuances and
--- capitalization-definition targets) checked per transaction.
-maxPolymorphicReferencesPerTransaction : Int
-maxPolymorphicReferencesPerTransaction = 100
 
 -- =============================================================================
 -- WORKING SET
@@ -146,13 +125,8 @@ data Book = Book
     securities : Map Text Text
     -- object IDs of records created by this write, with their contract IDs
     created_records : Map Text OcfRecordCid
-    -- deferred reference requirements, checked after the last operation
+    -- deferred reference requirements, newest first, checked after the last operation
     requirements : [Requirement]
-    claims : Int
-    tranches : Int
-    polymorphic_references : Int
-    -- register contracts archived or created so far (restatements cap it)
-    contracts_touched : Int
   deriving (Eq, Show)
 
 -- | What a write created, for its result.
@@ -192,10 +166,6 @@ loadBook ctx inputs = do
         securities = Map.empty
         created_records = Map.empty
         requirements = []
-        claims = 0
-        tranches = 0
-        polymorphic_references = 0
-        contracts_touched = 0
   b1 <- foldlA loadState empty (dedup inputs.states)
   b2 <- foldlA loadEpoch b1 (dedup inputs.epochs)
   shards <- mapA (fetchChecked ctx "an ID shard") (dedup inputs.shards)
@@ -207,10 +177,9 @@ loadBook ctx inputs = do
       s <- fetchChecked ctx "a stock state" cid
       when (Map.member s.security_id b.states)
         (abort ("two active states for security " <> s.security_id))
-      let b' = b with
-            states = Map.insert s.security_id
-              (StateSlot with original = Some cid; archived = False; current = Some s; dirty = False) b.states
-      countTranches (stateTranches s) b'
+      pure b with
+        states = Map.insert s.security_id
+          (StateSlot with original = Some cid; archived = False; current = Some s; dirty = False) b.states
     loadEpoch b cid = do
       e <- fetchChecked ctx "a stock class epoch" cid
       when (Map.member e.stock_class_id b.epochs)
@@ -229,8 +198,7 @@ loadBook ctx inputs = do
       let objectId = recordIdOf ctx d
       when (Map.member objectId b.records)
         (abort ("two active records with object ID " <> objectId))
-      b' <- countTranches (recordTranches d) b
-      pure (indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b')
+      pure (indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b)
 
 recordIdOf : Context -> OcfRecordData -> Text
 recordIdOf ctx d = (recordView ctx d).object_id
@@ -242,11 +210,6 @@ indexRecord objectId entry b =
     securities = case issuanceSecurityId entry.ocf_data of
       Some sec -> Map.insert sec objectId b.securities
       None -> b.securities
-
-stateTranches : StockSecurity -> Int
-stateTranches s = case s.vesting of
-  StockVestingTranches ts -> length ts
-  _ -> 0
 
 -- =============================================================================
 -- STATES
@@ -271,9 +234,7 @@ consumeSlot sec b = case Map.lookup sec b.states of
         archive cid
         pure slot with archived = True
       _ -> pure slot
-    let touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0)
-        b' = b with contracts_touched = touched
-    pure (b', slot')
+    pure (b, slot')
   _ -> abort ("no active state for security " <> sec <> " in this write")
 
 -- | Consumes the security's state and records its successor.
@@ -289,14 +250,16 @@ endState sec b = do
   (b', slot) <- consumeSlot sec b
   pure b' with states = Map.insert sec (slot with current = None; dirty = False) b'.states
 
--- | Adds the state of a new security. A security ID that this write has already seen is refused.
+-- | Adds the state of a new security. A security with a state in this write is refused; one whose
+-- state this write ended takes the new state in the same slot, its original still archived.
 addState : StockSecurity -> Book -> Update Book
 addState s b = do
   unless (s.context == b.context) (abort "a new state must belong to this cap table")
-  when (Map.member s.security_id b.states)
-    (abort ("security " <> s.security_id <> " already has a state in this write"))
-  pure b with
-    states = Map.insert s.security_id (StateSlot with original = None; archived = False; current = Some s; dirty = True) b.states
+  slot <- case Map.lookup s.security_id b.states of
+    None -> pure StateSlot with original = None; archived = False; current = None; dirty = False
+    Some ended | isNone ended.current -> pure ended
+    Some _ -> abort ("security " <> s.security_id <> " already has a state in this write")
+  pure b with states = Map.insert s.security_id (slot with current = Some s; dirty = True) b.states
 
 -- =============================================================================
 -- EPOCHS
@@ -318,9 +281,7 @@ consumeEpochSlot cls b = case Map.lookup cls b.epochs of
         archive cid
         pure slot with archived = True
       _ -> pure slot
-    let touched = b.contracts_touched + (if slot'.archived && not slot.archived then 1 else 0)
-        b' = b with contracts_touched = touched
-    pure (b', slot')
+    pure (b, slot')
   _ -> abort ("no active epoch for stock class " <> cls <> " in this write")
 
 replaceEpoch : StockClassEpoch -> Book -> Update Book
@@ -328,12 +289,14 @@ replaceEpoch e b = do
   (b', slot) <- consumeEpochSlot e.stock_class_id b
   pure b' with epochs = Map.insert e.stock_class_id (slot with current = Some e; dirty = True) b'.epochs
 
+-- | Adds the epoch of a new stock class; one whose class this write deleted takes the slot.
 addEpoch : StockClassEpoch -> Book -> Update Book
 addEpoch e b = do
-  when (Map.member e.stock_class_id b.epochs)
-    (abort ("stock class " <> e.stock_class_id <> " already has an epoch in this write"))
-  pure b with
-    epochs = Map.insert e.stock_class_id (EpochSlot with original = None; archived = False; current = Some e; dirty = True) b.epochs
+  slot <- case Map.lookup e.stock_class_id b.epochs of
+    None -> pure EpochSlot with original = None; archived = False; current = None; dirty = False
+    Some ended | isNone ended.current -> pure ended
+    Some _ -> abort ("stock class " <> e.stock_class_id <> " already has an epoch in this write")
+  pure b with epochs = Map.insert e.stock_class_id (slot with current = Some e; dirty = True) b.epochs
 
 removeEpoch : Text -> Book -> Update Book
 removeEpoch cls b = do
@@ -369,12 +332,8 @@ addRecord d b = do
   forA_ (issuanceSecurityId d) \sec ->
     when (Map.member sec b.securities) (abort ("security ID already used: " <> sec))
   rcid <- createRecord b.context d
-  b' <- countTranches (recordTranches d) b
-  let b'' = indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b'
-  let b''' = b'' with
-        created_records = Map.insert objectId rcid b''.created_records
-        contracts_touched = b''.contracts_touched + 1
-  pure (b''', rcid)
+  let b' = indexRecord objectId (RecordEntry with cid = rcid; ocf_data = d) b
+  pure ((b' with created_records = Map.insert objectId rcid b'.created_records), rcid)
 
 -- | Archives a record the working set holds and drops it (a restatement's edit or delete).
 removeRecord : Text -> Book -> Update Book
@@ -387,7 +346,6 @@ removeRecord objectId b = do
       Some sec -> Map.delete sec b.securities
       None -> b.securities
     created_records = Map.delete objectId b.created_records
-    contracts_touched = b.contracts_touched + 1
 
 -- =============================================================================
 -- CLAIMED IDS AND SHARDS
@@ -401,8 +359,6 @@ claimId ns id b = do
   when (id == "") (abort "an empty ID cannot be claimed")
   when (isDerivedForm b.context id)
     (abort ("ID " <> id <> " has this cap table's derived form and cannot be claimed"))
-  when (b.claims >= maxClaimsPerTransaction)
-    (abort ("more than " <> show maxClaimsPerTransaction <> " claimed IDs in one transaction"))
   let hash = claimHash ns id
       bits = hashBitList hash
   (prefix, slot) <- coveringShard bits id b
@@ -414,7 +370,6 @@ claimId ns id b = do
   pure b1 with
     shards = foldl (\m (p, c) -> Map.insert p (ShardSlot with original = None; claimed = c) m)
       (Map.delete prefix b1.shards) parts
-    claims = b1.claims + 1
 
 -- | Releases the ID of a record a restatement deletes. Shards never merge.
 releaseId : IdNamespace -> Text -> Book -> Update Book
@@ -453,14 +408,13 @@ coveringFrom prefix rest shards = case Map.lookup prefix shards of
     [] -> None
     bit :: more -> coveringFrom (prefix <> bit) more shards
 
--- Archives a loaded shard the first time a write changes it, and counts it among the contracts the
--- write touches.
+-- Archives a loaded shard the first time a write changes it.
 archiveShardOriginal : ShardSlot -> Book -> Update Book
 archiveShardOriginal slot b = case slot.original of
   None -> pure b
   Some cid -> do
     archive cid
-    pure b with contracts_touched = b.contracts_touched + 1
+    pure b
 
 splitShard : Text -> Set.Set Text -> [(Text, Set.Set Text)]
 splitShard prefix claimed =
@@ -479,32 +433,18 @@ partitionByBit i claimed =
   in (Set.fromList (filter (\h -> bitOf h == "0") hashes), Set.fromList (filter (\h -> bitOf h == "1") hashes))
 
 -- =============================================================================
--- COUNTERS AND DEFERRED CHECKS
+-- DEFERRED CHECKS
 -- =============================================================================
 
-countTranches : Int -> Book -> Update Book
-countTranches n b = do
-  let total = b.tranches + n
-  when (total > maxTranchesPerTransaction)
-    (abort ("more than " <> show maxTranchesPerTransaction <> " vesting tranches read or written in one transaction"))
-  pure b with tranches = total
-
-countPolymorphicReferences : Int -> Book -> Update Book
-countPolymorphicReferences n b = do
-  let total = b.polymorphic_references + n
-  when (total > maxPolymorphicReferencesPerTransaction)
-    (abort ("more than " <> show maxPolymorphicReferencesPerTransaction <> " polymorphic references checked in one transaction"))
-  pure b with polymorphic_references = total
-
 addRequirements : [Requirement] -> Book -> Book
-addRequirements rs b = b with requirements = b.requirements <> rs
+addRequirements rs b = b with requirements = reverse rs <> b.requirements
 
 -- =============================================================================
 -- FLUSH
 -- =============================================================================
 
 -- | Creates the final version of every changed state, epoch and shard, once.
-flushBook : Book -> Update (Book, BookResult)
+flushBook : Book -> Update BookResult
 flushBook b = do
   states <- foldlA (\acc (sec, slot) -> case (slot.dirty, slot.current) of
       (True, Some s) -> do
@@ -517,18 +457,11 @@ flushBook b = do
         pure (Map.insert cls cid acc)
       _ -> pure acc) Map.empty (Map.toList b.epochs)
   let newShards = filter (\(_, slot) -> isNone slot.original) (Map.toList b.shards)
-  when (length newShards > maxShardsCreatedPerTransaction)
-    (abort ("more than " <> show maxShardsCreatedPerTransaction <> " ID shards created in one transaction"))
   shards <- foldlA (\acc (p, slot) -> do
       cid <- create OcfIdShard with context = b.context; prefix = p; claimed = slot.claimed
       pure (Map.insert p cid acc)) Map.empty newShards
-  let newTranches = sum (map (\(_, slot) -> if slot.dirty then optional 0 stateTranches slot.current else 0) (Map.toList b.states))
-  b' <- countTranches newTranches b
-  let touched = b'.contracts_touched + Map.size states + Map.size epochs + Map.size shards
-  let result = BookResult with
-        states
-        epochs
-        shards
-        records = b'.created_records
-  let b'' = b' with contracts_touched = touched
-  pure (b'', result)
+  pure BookResult with
+    states
+    epochs
+    shards
+    records = b.created_records

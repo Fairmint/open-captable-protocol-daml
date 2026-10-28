@@ -1,20 +1,22 @@
--- CapTable_Restate: mirrors corrections (edits and deletes) of OCF records and the stock states they affect, within fixed limits the writer is trusted inside.
+-- The correction operations of CapTable_Update: edits and deletes of OCF records and the stock states they affect.
 module Fairmint.OpenCapTable.Restate
   ( RestateOperation(..)
   , StateRestatement(..)
-  , RestateResult(..)
-  , maxContractsPerRestatement
-  , restate
+  , Progress(..)
+  , startProgress
+  , restateOne
+  , resolvePending
   ) where
 
-import DA.Action (foldlA, unless, when)
+import DA.Action (unless, when)
 import DA.Foldable (forA_)
 import DA.Map (Map)
+import DA.Optional (isSome)
 import qualified DA.Map as Map
 import qualified DA.Set as Set
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.Book
-import Fairmint.OpenCapTable.Events (checkRequirementIn, checkRequirements)
+import Fairmint.OpenCapTable.Events (checkRequirementIn)
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.References
@@ -59,24 +61,15 @@ data RestateOperation
     RestateEndState Text
   deriving (Eq, Show)
 
-data RestateResult = RestateResult
-  with
-    records : Map Text OcfRecordCid
-    states : Map Text (ContractId StockSecurity)
-    epochs : Map Text (ContractId StockClassEpoch)
-    shards : Map Text (ContractId OcfIdShard)
-  deriving (Eq, Show)
 
-maxContractsPerRestatement : Int
-maxContractsPerRestatement = 500
-
--- Checks that need the whole restatement, run after its last operation.
+-- Checks that need the whole write, run after its last operation.
 data Pending
   = PendingEnd with security_id : Text; origin_transaction_id : Text; derived_ids : Bool
   | PendingRecreate with security_id : Text
   | PendingIssuanceGone with object_id : Text; security_id : Text
   deriving (Eq, Show)
 
+-- | A write's progress through its operations.
 data Progress = Progress
   with
     -- the book as loaded, before the first operation
@@ -88,26 +81,18 @@ data Progress = Progress
     deleted : Map Text OcfRecordData
     pending : [Pending]
 
-restate : Context -> BookInputs -> [RestateOperation] -> Update RestateResult
-restate ctx inputs operations = do
-  when (null operations) (abort "CapTable_Restate needs at least one operation")
-  b0 <- loadBook ctx inputs
-  p <- foldlA restateOne (Progress with loaded = b0; book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
-  book <- foldlA (resolvePending p) p.book p.pending
-  checkRequirements book
-  (b1, result) <- flushBook book
-  when (b1.contracts_touched > maxContractsPerRestatement)
-    (abort ("CapTable_Restate touches at most " <> show maxContractsPerRestatement <> " contracts"))
-  pure RestateResult with
-    records = result.records
-    states = result.states
-    epochs = result.epochs
-    shards = result.shards
+-- | The progress of a write that has run no operation yet on the loaded book.
+startProgress : Book -> Progress
+startProgress b = Progress with loaded = b; book = b; touched = Set.empty; deleted = Map.empty; pending = []
 
+-- Marks a record edited or deleted. Each is corrected at most once per write, and never one the
+-- write created: a create carries the record's final data.
 touch : Text -> Progress -> Update Progress
 touch objectId p = do
   when (Set.member objectId p.touched)
-    (abort ("record " <> objectId <> " is edited or deleted more than once in one restatement"))
+    (abort ("record " <> objectId <> " is edited or deleted more than once in one write"))
+  when (Map.member objectId p.book.created_records)
+    (abort ("record " <> objectId <> " is created in this write; write its final data in the create"))
   pure p with touched = Set.insert objectId p.touched
 
 -- Records a package choice wrote (derived IDs), splits and holds are never restated.
@@ -159,16 +144,11 @@ restateOne p op = case op of
           Some s -> claimId IdNamespaceSecurity s b'
           None -> pure b'
       else pure b1
-    -- An edit checks only the references the old record did not make. It is charged for the
-    -- distinct polymorphic ones among them, or for the references its lists grow by, if more.
+    -- An edit checks only the references the old record did not make.
     let oldRequirements = Set.fromList (requirementsOf old.ocf_data)
         added = filter (\r -> not (Set.member r oldRequirements)) (requirementsOf d)
-        oldPolymorphic = Set.fromList (polymorphicRequirementsOf old.ocf_data)
-        addedPolymorphic = filter (\r -> not (Set.member r oldPolymorphic)) (polymorphicRequirementsOf d)
-        grown = polymorphicReferenceCount d - polymorphicReferenceCount old.ocf_data
-    b3 <- countPolymorphicReferences (max grown (length addedPolymorphic)) b2
-    (b4, _) <- addRecord d b3
-    pure p1 with book = addRequirements (added <> moved) b4
+    (b3, _) <- addRecord d b2
+    pure p1 with book = addRequirements (added <> moved) b3
   RestateDelete objectId -> do
     let ctx = p.book.context
     p1 <- touch objectId p
@@ -243,6 +223,14 @@ restateOne p op = case op of
         when (Map.member r.security_id b.states)
           (abort ("security " <> r.security_id <> " already has a state in this write"))
         when (n < 0) (abort "a state's seq is not negative")
+        -- A state is recreated only on an origin issuance the write still holds, and an origin the
+        -- write holds is the stock issuance of this security: an ID deleted and written again in
+        -- the update names another record.
+        case lookupRecordData r.origin_transaction_id b of
+          Some (OcfRecordDataStockIssuance iss) | iss.security_id == r.security_id -> pure ()
+          Some _ -> abort ("record " <> r.origin_transaction_id <> " is not the stock issuance of security " <> r.security_id)
+          None -> when (isSome (lookupRecord r.origin_transaction_id p.loaded))
+            (abort ("security " <> r.security_id <> "'s origin issuance " <> r.origin_transaction_id <> " is deleted in this write"))
         -- A recreated state names the issuance that carries its security, when the write has it.
         forA_ (Map.lookup r.security_id b.securities) \issuanceId ->
           unless (issuanceId == r.origin_transaction_id)
@@ -259,7 +247,7 @@ restateOne p op = case op of
     b' <- endState sec p.book
     pure p with book = b'; pending = (PendingEnd with security_id = sec; origin_transaction_id = s.origin_transaction_id; derived_ids = s.derived_ids) :: p.pending
 
--- Runs the checks that need the whole restatement, and releases the security IDs it may.
+-- Runs the checks that need the whole write, and releases the security IDs it may.
 resolvePending : Progress -> Book -> Pending -> Update Book
 resolvePending p book pending = case pending of
   PendingEnd with security_id; origin_transaction_id ->

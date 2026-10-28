@@ -12,9 +12,10 @@ import qualified DA.Text as T
 import DA.Time (convertRelTimeToMicroseconds, subTime)
 import Daml.Script
 
-import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.Apply hiding (applyOperation)
 import Fairmint.OpenCapTable.Book (BookInputs(..))
 import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Update (UpdateOperation(..))
 import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
 import Fairmint.OpenCapTable.Ids (IdNamespace(..), claimHash, hashBits)
 import Fairmint.OpenCapTable.OcfRecords
@@ -104,8 +105,8 @@ type ShardMap = Map Text (ContractId OcfIdShard)
 
 -- | Fills one class with `issuances` states in batches of 250 and then records a split. Every write
 -- passes exactly what it reads: the shards covering its IDs, the class's epoch and the referenced
--- records. Times the ledger submissions, an active-contract read of the stock states, the freeze,
--- the split, the unfreeze and one event that applies the split to its state.
+-- records. Times the ledger submissions, an active-contract read of the stock states, the split
+-- (frozen, recorded and unfrozen in one update) and one event that applies the split to its state.
 bench_book : BookBench -> Script [BenchStep]
 bench_book cfg = do
   env <- benchEnv cfg.run
@@ -120,7 +121,7 @@ bench_book cfg = do
       let ops = concatMap (\p -> concatMap (\k -> map (\sfx -> ApplyPreSplitShard with prefix = p <> sfx) (bitStrings k)) [0 .. cfg.presplit_bits - 1]) ps
           inputs = BookInputs with states = []; epochs = []; shards = map (at m) ps; records = []
       (r, step) <- timed ("presplit " <> show (length ops)) (submit env.transfer_agent do
-        exerciseCmd env.cap_table CapTable_Apply with inputs; operations = ops)
+        exerciseCmd env.cap_table CapTable_Update with batch_id = None; inputs; operations = map UpdateCreate ops)
       pure (mergeShards m ps r.shards, step :: acc))
     (shards0, []) (if cfg.presplit_bits > 0 then chunks 32 (Map.keys shards0) else [])
   let batch b = map (\i -> issuance ("S-" <> show b <> "-" <> show i) "SH-S" "CLS" 10.0 (addDays today (-2))) [1 .. 250]
@@ -129,29 +130,33 @@ bench_book cfg = do
           prefixes = dedup (concatMap (\iss -> [cover m (claimBits IdNamespaceObject iss.id), cover m (claimBits IdNamespaceSecurity iss.security_id)]) issued)
           inputs = BookInputs with states = []; epochs = [ep]; shards = map (at m) prefixes; records = [holder, cls]
       (r, step) <- timed ("batch " <> show b) (submit env.transfer_agent do
-        exerciseCmd env.cap_table CapTable_Apply with inputs; operations = map (ApplyRecord . OcfRecordDataStockIssuance) issued)
+        exerciseCmd env.cap_table CapTable_Update with batch_id = None; inputs; operations = map (UpdateCreate . ApplyRecord . OcfRecordDataStockIssuance) issued)
       pure (mergeShards m prefixes r.shards, fromOptional ep (Map.lookup "CLS" r.epochs), optional first Some (Map.lookup "S-1-1" r.states), step :: acc))
     (shards1, epoch, None, []) [1 .. cfg.issuances / 250]
   (states, readStep) <- timed "read stock states" (query @StockSecurity env.transfer_agent)
   let read = readStep with step = "read " <> show (length states) <> " stock states"
-  (frozen, s1) <- timed "freeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_FreezeClass with epoch = epoch')
-  let splitInputs = BookInputs with states = []; epochs = [frozen]; shards = [at shards2 (cover shards2 (claimBits IdNamespaceObject "SPLIT-1"))]; records = [cls]
-  (sr, s2) <- timed "split" (submit env.transfer_agent do
-    exerciseCmd env.cap_table CapTable_Apply with
-      inputs = splitInputs; operations = [ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS" 2.0 1.0 today))])
+  let splitInputs = BookInputs with states = []; epochs = [epoch']; shards = [at shards2 (cover shards2 (claimBits IdNamespaceObject "SPLIT-1"))]; records = [cls]
+  (sr, s1) <- timed "split" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Update with
+      batch_id = None
+      inputs = splitInputs
+      operations =
+        [ UpdateFreezeClass "CLS"
+        , UpdateCreate (ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS" 2.0 1.0 today)))
+        , UpdateUnfreezeClass "CLS"
+        ])
   let shards3 = mergeShards shards2 [cover shards2 (claimBits IdNamespaceObject "SPLIT-1")] sr.shards
-  Some splitEpoch <- pure (Map.lookup "CLS" sr.epochs)
-  (thawed, s3) <- timed "unfreeze" (submit env.transfer_agent do exerciseCmd env.cap_table CapTable_UnfreezeClass with epoch = splitEpoch)
+  Some thawed <- pure (Map.lookup "CLS" sr.epochs)
   -- The first event after the split applies it to its state.
   Some st <- pure firstState
   let acc = StockAcceptanceOcfData with id = "ACC-1"; date = today; security_id = "S-1-1"; comments = []
       accInputs = BookInputs with states = [st]; epochs = [thawed]; shards = [at shards3 (cover shards3 (claimBits IdNamespaceObject "ACC-1"))]; records = []
-  (ar, s4) <- timed "event applying the split" (submit env.transfer_agent do
-    exerciseCmd env.cap_table CapTable_Apply with inputs = accInputs; operations = [ApplyRecord (OcfRecordDataStockAcceptance acc)])
+  (ar, s2) <- timed "event applying the split" (submit env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Update with batch_id = None; inputs = accInputs; operations = [UpdateCreate (ApplyRecord (OcfRecordDataStockAcceptance acc))])
   Some after <- pure (Map.lookup "S-1-1" ar.states)
   Some s <- queryContractId env.transfer_agent after
   unless (s.quantity == 20.0) (fail ("the split was not applied: " <> show s.quantity))
-  pure (reverse presplits <> reverse batches <> [read, s1, s2, s3, s4])
+  pure (reverse presplits <> reverse batches <> [read, s1, s2])
 
 claimBits : IdNamespace -> Text -> Text
 claimBits ns id = hashBits (claimHash ns id)
