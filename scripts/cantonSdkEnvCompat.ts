@@ -1,7 +1,7 @@
 /**
  * Backfill `CANTON_{NETWORK}_{PROVIDER}_*` env vars from committed public topology when unset, matching
- * `canton/src/utils/cantonSdkEnvCompat.ts`. Enables `upload-dar` and other scripts without a local `.env` for
- * non-secret settings. Client secrets and passwords must still be supplied via env or secret store.
+ * `canton/src/utils/cantonSdkEnvCompat.ts`. Lets the ledger scripts run without a local `.env` for non-secret settings.
+ * Client secrets and passwords must still be supplied via env or secret store.
  */
 import type { CantonScriptNetwork, CantonScriptProvider } from './config/cantonPublic';
 import { getConfiguredCantonProviderEntries } from './config/cantonPublic';

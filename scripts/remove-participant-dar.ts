@@ -43,7 +43,7 @@ import { requireBackedUpDar } from '@fairmint/canton-dev-tools/daml';
 import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
-import { inspectDarPackageId } from './detect-factory-need';
+import { inspectDarPackageId } from './dar-package-id';
 import { getUploadOrder } from './packages';
 
 const ROOT = path.join(__dirname, '..');

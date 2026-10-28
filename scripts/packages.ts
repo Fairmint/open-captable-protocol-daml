@@ -1,12 +1,11 @@
 /**
- * Shared package configurations and CLI utilities. Single source of truth: daml.yaml files. Versions are read
- * dynamically from each package's daml.yaml.
+ * Shared package configurations. Single source of truth: daml.yaml files. Versions are read dynamically from each
+ * package's daml.yaml.
  */
 
 import * as fs from 'fs';
 import * as path from 'path';
 import * as yaml from 'yaml';
-import { isContractNetwork, type ContractNetwork } from './types';
 
 // =============================================================================
 // Package Configurations
@@ -26,12 +25,10 @@ export interface PackageConfig {
   /** Generated JS package metadata, if this package produces a generated package. */
   generated?: GeneratedPackageMetadata;
   /**
-   * Keys of this repository's packages that this package data-depends on, in upload order. Their DARs are uploaded (and
-   * their deployments tagged) before this package's.
+   * Keys of this repository's packages that this package data-depends on, in upload order. A participant must hold them
+   * before it can vet this package.
    */
   dependencies: string[];
-  /** Whether a `<name>-v<version>` release tag can name this package (dependencies release with their dependent). */
-  releasable: boolean;
 }
 
 export interface GeneratedPackageMetadata {
@@ -68,7 +65,6 @@ interface PackageDef {
   sourceDir: string;
   generated?: GeneratedPackageMetadata;
   dependencies?: readonly string[];
-  releasable?: boolean;
 }
 
 /**
@@ -85,7 +81,6 @@ const PACKAGE_DEFS = {
     sourceDir: 'OpenCapTable-v35',
     generated: { createIndex: true, publishNameSuffix: null },
     dependencies: ['api'],
-    releasable: true,
   },
 } as const satisfies Record<string, PackageDef>;
 
@@ -102,7 +97,6 @@ function buildPackageConfig(def: PackageDef): PackageConfig {
     buildDir: path.join('generated', 'build', metadata.name),
     generated: def.generated ? { ...def.generated } : undefined,
     dependencies: [...(def.dependencies ?? [])],
-    releasable: def.releasable ?? false,
   };
 }
 
@@ -123,8 +117,6 @@ function getPackages(): Record<PackageDefKey, PackageConfig> {
 export function getAllPackages(): PackageConfig[] {
   return Object.values(getPackages());
 }
-
-export type PackageKey = PackageDefKey;
 
 function resolvePackageKey(key: string): PackageDefKey | undefined {
   const lowerKey = key.toLowerCase();
@@ -158,11 +150,6 @@ export function requirePackageConfig(packageKey: string): PackageConfig {
     throw new Error(`Unknown package key: ${packageKey}`);
   }
   return pkg;
-}
-
-/** Get all package keys. */
-export function getPackageKeys(): PackageKey[] {
-  return [...(Object.keys(PACKAGE_DEFS) as PackageDefKey[])];
 }
 
 /**
@@ -238,106 +225,4 @@ export function getPublishableGeneratedPackages(rootPackageName: string): Publis
   return getGeneratedPackages(rootPackageName).filter(
     (pkg): pkg is PublishableGeneratedPackageConfig => pkg.publishedPackageName !== undefined
   );
-}
-
-// =============================================================================
-// CLI Argument Parsing
-// =============================================================================
-
-/** Parse --network or -n argument. */
-export function parseNetworkArg(args: string[] = process.argv.slice(2)): ContractNetwork | undefined {
-  const idx = args.findIndex((arg) => arg === '--network' || arg === '-n');
-  if (idx === -1 || idx === args.length - 1) return undefined;
-  const value = args[idx + 1].toLowerCase();
-  return isContractNetwork(value) ? value : undefined;
-}
-
-/** Parse --package or -p argument. */
-export function parsePackageArg(args: string[] = process.argv.slice(2)): string | undefined {
-  const idx = args.findIndex((arg) => arg === '--package' || arg === '-p');
-  if (idx === -1 || idx === args.length - 1) return undefined;
-  return args[idx + 1].toLowerCase();
-}
-
-/** Parse --version or -v argument. */
-export function parseVersionArg(args: string[] = process.argv.slice(2)): string | undefined {
-  const idx = args.findIndex((arg) => arg === '--version' || arg === '-v');
-  if (idx === -1 || idx === args.length - 1) return undefined;
-  return args[idx + 1];
-}
-
-/** Require network argument or exit with error. */
-export function requireNetwork(scriptName: string): ContractNetwork {
-  const network = parseNetworkArg();
-  if (!network) {
-    console.error(`❌ Missing --network argument`);
-    console.error(`Usage: tsx scripts/${scriptName} --network <devnet|mainnet>`);
-    process.exit(1);
-  }
-  return network;
-}
-
-/** Require package argument or exit with error. */
-export function requirePackage(scriptName: string): PackageConfig {
-  const packageKey = parsePackageArg();
-  if (!packageKey) {
-    printPackageUsage(scriptName, 'Missing --package argument');
-    process.exit(1);
-  }
-  const pkg = getPackage(packageKey);
-  if (!pkg) {
-    printPackageUsage(scriptName, `Unknown package: ${packageKey}`);
-    process.exit(1);
-  }
-  return pkg;
-}
-
-// =============================================================================
-// Usage Helpers
-// =============================================================================
-
-/** Print usage with available packages. */
-export function printPackageUsage(scriptName: string, errorMessage?: string): void {
-  if (errorMessage) {
-    console.error(`❌ ${errorMessage}`);
-    console.error('');
-  }
-  const needsNetwork = scriptName.includes('upload') || scriptName.includes('check-dar-deployment');
-  console.error(
-    needsNetwork
-      ? `Usage: tsx scripts/${scriptName} --package <sourceDir> --network <network>`
-      : `Usage: tsx scripts/${scriptName} --package <sourceDir> --version <version>`
-  );
-  console.error('');
-  console.error('Packages (multi-package.yaml source directories):');
-  const packages = getPackages();
-  for (const pkg of Object.values(packages)) {
-    console.error(`  ${pkg.sourceDir.padEnd(24)} → ${pkg.name} v${pkg.version}`);
-  }
-  if (needsNetwork) {
-    console.error('');
-    console.error('Networks: devnet, mainnet');
-  }
-}
-
-// =============================================================================
-// Template ID Utilities
-// =============================================================================
-
-/**
- * Build a DAML template ID dynamically from package config. Format: #<package-name>:<module>:<template>
- *
- * This ensures we always use the correct package version from daml.yaml (single source of truth), avoiding hardcoded
- * version references that become stale after upgrades.
- *
- * @param packageKey - Package key (e.g., 'ocp') or full name (e.g., 'OpenCapTable-v35')
- * @param module - Full module path (e.g., 'Fairmint.OpenCapTable.OcpFactory')
- * @param template - Template name (e.g., 'OcpFactory')
- */
-export function buildTemplateId(packageKey: string, module: string, template: string): string {
-  const pkg = getPackage(packageKey);
-  if (!pkg) {
-    throw new Error(`Unknown package: ${packageKey}. Valid keys: ${getPackageKeys().join(', ')}`);
-  }
-  return `#${pkg.name}:${module}:${template}`;
 }

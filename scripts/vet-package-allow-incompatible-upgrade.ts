@@ -3,8 +3,8 @@
  * Vet a package id on a participant using Canton's **force** flag that skips upgrade-compatibility checks between
  * vetted package lineages (`UPDATE_VETTED_PACKAGES_FORCE_FLAG_ALLOW_VET_INCOMPATIBLE_UPGRADES`).
  *
- * Use after `npm run upload-dar -- ... --no-vet` when the DAR is valid LF but not a valid upgrade of an already-vetted
- * package (e.g. CantonPayments built against splice-amulet 0.1.16 while `aca762f1…` was built against 0.1.17).
+ * Use for a DAR uploaded without vetting that is valid LF but not a valid upgrade of an already-vetted package (e.g.
+ * CantonPayments built against splice-amulet 0.1.16 while `aca762f1…` was built against 0.1.17).
  *
  * **Warning:** This is an operator-level escape hatch. Only use when you understand the topology consequences
  * (simultaneously vetted, upgrade-incompatible package lineages).

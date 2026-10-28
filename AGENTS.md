@@ -43,7 +43,8 @@ npm run backup-dar -- --package OpenCapTable-v35 --version <version-from-daml.ya
 ```
 
 Deployment preflight (writes `GITHUB_OUTPUT` when set). v35 deploys to DevNet only, and its
-dependency is uploaded and tagged first, so the release workflows check it first too:
+dependency is uploaded and tagged first, so the Fairmint/canton `deploy-ocp-ledger.yml` workflow
+(see the README's Deployment section) checks it first too:
 
 ```bash
 npm run check:dar-version-policy -- --deployment devnet --package OpenCapTableApi-v01
