@@ -16,7 +16,8 @@ contracts for Canton. It also publishes generated JavaScript bindings and the bu
 | `Test`                | Daml Script tests (not released)                                                                                                                                          |
 
 OpenCapTable-v36 data-depends on `OpenCapTableApi-v01`, embeds it in its DAR and has no Splice
-dependency. Its design is
+dependency. The interfaces' comments name OpenCapTable-v35, the line they shipped with; the package
+never changes, so read them as the current register line (v36). Its design is
 [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md).
 v36 deploys to DevNet only; MainNet is out of scope. Older majors stay in [`dars/`](dars) and in git
 history.

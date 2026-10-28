@@ -67,7 +67,8 @@ test_batch_lifecycle = do
   pure ()
 
 -- While a batch is open, the only write is a CapTable_Update that names it. Writes prepared against
--- the anchor before the batch began fail with it, and so does every other choice, until it ends.
+-- the anchor before the batch began fail with it, and so does every other choice but teardown, until
+-- it ends.
 test_batch_blocks_every_other_write : Script ()
 test_batch_blocks_every_other_write = do
   env <- standardBook
@@ -89,8 +90,6 @@ test_batch_blocks_every_other_write = do
   placeHoldsFails envB "CapTableStatusBatching" OcfHoldTypeRegisterSettlement "T-2" batchDay [lot2]
   cancelHoldsFails envB "CapTableStatusBatching" batchDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
   settleFails envB "CapTableStatusBatching" "T-1" batchDay buyer [SettleDraw draw]
-  expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
-    (exerciseCmd envB.cap_table CapTable_BeginTeardown)
   expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
     (exerciseCmd envB.cap_table CapTable_BeginBatch with batch_id = "B-2")
   expectSubmitFailure "is not the cap table's open batch" env.transfer_agent
@@ -160,3 +159,21 @@ test_batch_anchor_names_its_batch = do
   env <- setupEnv
   submitMustFail (actAs [env.issuer, env.system_operator, env.transfer_agent]) do
     createCmd CapTable with context = env.ctx; status = CapTableStatusBatching with batch_id = ""
+
+-- A batch that cannot be restored, because it recorded a split, is abandoned by tearing the book
+-- down from the batching anchor: its updates never become visible on an active book.
+test_batch_abandoned_by_teardown : Script ()
+test_batch_abandoned_by_teardown = do
+  env <- standardBook
+  envB <- beginBatch env "B-1"
+  _ <- batchUpdate envB "B-1"
+    [ UpdateFreezeClass "CLS-A"
+    , UpdateCreate (ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 3.0 1.0 (D.date 2025 D.Jan 10))))
+    , UpdateUnfreezeClass "CLS-A"
+    ]
+  batchUpdateFails envB "never restated" "B-1" [UpdateCorrect (RestateDelete "SPLIT-1")]
+  tearing <- submit env.transfer_agent do exerciseCmd envB.cap_table CapTable_BeginTeardown
+  Some anchor <- queryContractId env.transfer_agent tearing
+  anchor.status === CapTableStatusTearingDown
+  expectSubmitFailure "CapTableStatusTearingDown" env.transfer_agent
+    (exerciseCmd tearing CapTable_EndBatch with batch_id = "B-1")

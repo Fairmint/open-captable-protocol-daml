@@ -14,7 +14,8 @@ Keep repository guidance synchronized with the code:
   [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md)),
   `OpenCapTableApi-v01` (reader interfaces, never upgraded, so their views hold only builtin types),
   which v36 data-depends on and embeds, plus `Test`. v36 targets DevNet only; keep MainNet steps
-  gated off.
+  gated off. The Api package's comments still say OpenCapTable-v35 and stay byte-identical: never
+  edit them.
 - Treat `multi-package.yaml`, each package's `daml.yaml`, `package.json`, `daml-js-bundle.json`, and
   the remaining OCP-specific implementation in `scripts/` as the current source of truth. Shared
   DAML tooling lives in `@fairmint/canton-dev-tools`. Do not copy versions or dependency lists into
