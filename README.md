@@ -78,8 +78,9 @@ The ledger providers accept traffic only from allowlisted IPs, so the DARs are d
 [Deploy OCP to ledger](https://github.com/Fairmint/canton/blob/main/.github/workflows/deploy-ocp-ledger.yml)
 workflow of Fairmint/canton, from its allowlisted scripts box. Given an npm version, it:
 
-1. checks out this repository at that version's `v<version>` tag and runs the deployment preflight
-   of `npm run check:dar-version-policy` for each DAR, dependency first;
+1. checks out this repository at that version's `v<version>` tag, or at the commit on `main` its
+   `ocp_daml_ref` input names (for a version published without its tag), and runs the deployment
+   preflight of `npm run check:dar-version-policy` for each DAR, dependency first;
 2. uploads and vets the published DARs on both DevNet participants and makes sure the OCP factory
    exists;
 3. records each deployment as the annotated tag `dar-deploy/devnet/<package>/v<version>` on that
