@@ -5,6 +5,7 @@ module Fairmint.OpenCapTable.Restate
   , RestateResult(..)
   , maxContractsPerRestatement
   , restate
+  , restateBook
   ) where
 
 import DA.Action (foldlA, unless, when)
@@ -92,8 +93,7 @@ restate : Context -> BookInputs -> [RestateOperation] -> Update RestateResult
 restate ctx inputs operations = do
   when (null operations) (abort "CapTable_Restate needs at least one operation")
   b0 <- loadBook ctx inputs
-  p <- foldlA restateOne (Progress with loaded = b0; book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
-  book <- foldlA (resolvePending p) p.book p.pending
+  book <- restateBook b0 operations
   checkRequirements book
   (b1, result) <- flushBook book
   when (b1.contracts_touched > maxContractsPerRestatement)
@@ -103,6 +103,25 @@ restate ctx inputs operations = do
     states = result.states
     epochs = result.epochs
     shards = result.shards
+
+-- | Runs one restatement on a working set and the checks that need all of it. The caller checks
+-- the references it queues. A record this transaction created, in an earlier step of a
+-- `CapTable_Write`, is not restated: a write restates only records already on the ledger.
+restateBook : Book -> [RestateOperation] -> Update Book
+restateBook b0 operations = do
+  p <- foldlA restateNext (Progress with loaded = b0; book = b0; touched = Set.empty; deleted = Map.empty; pending = []) operations
+  foldlA (resolvePending p) p.book p.pending
+
+restateNext : Progress -> RestateOperation -> Update Progress
+restateNext p op = do
+  let target = case op of
+        RestateEdit d -> Some (recordView p.book.context d).object_id
+        RestateDelete objectId -> Some objectId
+        _ -> None
+  forA_ target \objectId ->
+    when (Map.member objectId p.book.created_records && not (Set.member objectId p.touched))
+      (abort ("record " <> objectId <> " was written earlier in this transaction; a write restates only records already on the ledger"))
+  restateOne p op
 
 touch : Text -> Progress -> Update Progress
 touch objectId p = do

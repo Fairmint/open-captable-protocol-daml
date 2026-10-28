@@ -1,0 +1,162 @@
+-- Batches: CapTable_BeginBatch consumes the anchor and recreates it batching, only CapTable_Writes that name the open batch run until CapTable_EndBatch, a split is recorded in a batch without freezing its class, and a batch the TA restores leaves the book as it was.
+module OpenCapTable.TestBookBatch where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.Holds hiding (placeHolds, cancelHolds, settle)
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
+import Fairmint.OpenCapTable.Write hiding (write)
+import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
+import OpenCapTable.DefinitionFixtures (expectNoRecord, expectRecord, expectRecords)
+import OpenCapTable.Harness
+import OpenCapTable.TestWrite (creates, renamed, sh)
+
+batchDay : Date
+batchDay = D.date 2025 D.Jun 2
+
+anchorOf : Env -> Script CapTable
+anchorOf env = do
+  found <- queryContractId env.transfer_agent env.cap_table
+  case found of
+    Some anchor -> pure anchor
+    None -> fail "the anchor is not active"
+
+acceptance : Text -> Text -> Date -> OcfRecordData
+acceptance id sec d = OcfRecordDataStockAcceptance StockAcceptanceOcfData with id; date = d; security_id = sec; comments = []
+
+-- A batch is one update written in several transactions: the anchor is recreated batching, each
+-- step names the batch, and ending it recreates the anchor active, with every step in place.
+test_batch_lifecycle : Script ()
+test_batch_lifecycle = do
+  env <- standardBook
+  envB <- beginBatch env "B-1"
+  -- The anchor was consumed and recreated batching.
+  None <- queryContractId env.transfer_agent env.cap_table
+  anchor <- anchorOf envB
+  (anchor.status, anchor.open_batch) === (CapTableStatusBatching, Some "B-1")
+  anchor.context === env.ctx
+  -- Steps of the batch, in several transactions.
+  _ <- writeSteps envB (Some "B-1") [creates [sh "SH-C"]]
+  _ <- writeSteps envB (Some "B-1") [WriteRestate [RestateEdit (renamed "SH-B" "Renamed")], creates [sh "SH-D"]]
+  envE <- endBatch envB "B-1"
+  None <- queryContractId env.transfer_agent envB.cap_table
+  anchor' <- anchorOf envE
+  (anchor'.status, anchor'.open_batch) === (CapTableStatusActive, None)
+  expectRecords envE [sh "SH-C", sh "SH-D", renamed "SH-B" "Renamed"]
+  -- The cap table takes every write again, and another batch may open.
+  _ <- applyRecords envE [sh "SH-E"]
+  _ <- restateOps envE [RestateDelete "SH-E"]
+  envB2 <- beginBatch envE "B-2"
+  _ <- endBatch envB2 "B-2"
+  pure ()
+
+-- While a batch is open, the only write is a CapTable_Write that names it. Writes prepared against
+-- the anchor before the batch began fail with it, and so does every other choice, until it ends.
+test_batch_blocks_every_other_write : Script ()
+test_batch_blocks_every_other_write = do
+  env <- standardBook
+  onDate batchDay
+  lot <- settlementLot env "S-A2" 10.0
+  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" batchDay [lot]
+  envB <- beginBatch env "B-1"
+  -- The anchor the writes were prepared against is gone.
+  inputs <- allInputs env
+  submitMustFail env.transfer_agent do
+    exerciseCmd env.cap_table CapTable_Apply with inputs; operations = [ApplyRecord (sh "SH-OLD")]
+  -- Every other write on the batching anchor fails.
+  applyRecordsFails envB "CapTableStatusBatching" [sh "SH-X"]
+  restateOpsFails envB "CapTableStatusBatching" [RestateEdit (renamed "SH-B" "Renamed")]
+  lot2 <- settlementLot envB "S-A1" 10.0
+  placeHoldsFails envB "CapTableStatusBatching" OcfHoldTypeRegisterSettlement "T-2" batchDay [lot2]
+  cancelHoldsFails envB "CapTableStatusBatching" batchDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
+  (epoch, _) <- epochOf envB "CLS-A"
+  expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
+    (exerciseCmd envB.cap_table CapTable_FreezeClass with epoch)
+  expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
+    (exerciseCmd envB.cap_table CapTable_BeginTeardown)
+  expectSubmitFailure "CapTableStatusBatching" env.transfer_agent
+    (exerciseCmd envB.cap_table CapTable_BeginBatch with batch_id = "B-2")
+  -- A write must name the open batch.
+  writeStepsFails envB "has an open batch" None [creates [sh "SH-X"]]
+  writeStepsFails envB "is not the cap table's open batch" (Some "B-2") [creates [sh "SH-X"]]
+  expectSubmitFailure "is not the cap table's open batch" env.transfer_agent
+    (exerciseCmd envB.cap_table CapTable_EndBatch with batch_id = "B-2")
+  expectNoRecord envB "SH-X"
+  -- Only the TA begins, writes in and ends a batch.
+  submitMustFail env.issuer do exerciseCmd envB.cap_table CapTable_EndBatch with batch_id = "B-1"
+  submitMustFail env.system_operator do exerciseCmd envB.cap_table CapTable_EndBatch with batch_id = "B-1"
+  inputsB <- allInputs envB
+  submitMustFail env.issuer do
+    exerciseCmd envB.cap_table CapTable_Write with batch_id = Some "B-1"; inputs = inputsB; steps = [creates [sh "SH-X"]]
+  -- After it ends, the hold is canceled as usual.
+  envE <- endBatch envB "B-1"
+  _ <- cancelHolds envE batchDay [CancelHold with security_id = "S-A2"; hold_id = h.hold_id; reason_text = "lifted"]
+  pure ()
+
+-- In a batch, a split is recorded without freezing its class: the batch keeps every class still.
+-- Later steps apply it as usual.
+test_batch_records_a_split_without_freezing_its_class : Script ()
+test_batch_records_a_split_without_freezing_its_class = do
+  env <- standardBook
+  let splitDay = D.date 2025 D.Jan 10
+      theSplit = OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 splitDay)
+  envB <- beginBatch env "B-1"
+  _ <- writeSteps envB (Some "B-1") [creates [theSplit]]
+  (_, e) <- epochOf envB "CLS-A"
+  (e.frozen, map (.split_id) e.splits) === (False, ["SPLIT-1"])
+  _ <- writeSteps envB (Some "B-1") [creates [acceptance "ACC-1" "S-A1" splitDay]]
+  s <- stateOf envB "S-A1"
+  (s.quantity, s.split_epoch) === (1200.0, 1)
+  -- A split and the events after it fit in one write too.
+  _ <- writeSteps envB (Some "B-1")
+    [creates [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 3.0 1.0 (D.addDays splitDay 1)), acceptance "ACC-2" "S-A2" (D.addDays splitDay 1)]]
+  s2 <- stateOf envB "S-A2"
+  (s2.quantity, s2.split_epoch) === (2400.0, 2)
+  envE <- endBatch envB "B-1"
+  -- Outside the batch, a split needs its class frozen again.
+  applyRecordsFails envE "must be frozen" [OcfRecordDataStockClassSplit (split "SPLIT-3" "CLS-A" 2.0 1.0 (D.addDays splitDay 2))]
+
+-- A batch the TA abandons is restored before it ends: the records its steps created are deleted and
+-- the records they edited are edited back, still in the batch, so readers never see the steps.
+test_batch_restored_before_it_ends : Script ()
+test_batch_restored_before_it_ends = do
+  env <- standardBook
+  envB <- beginBatch env "B-1"
+  _ <- writeSteps envB (Some "B-1") [creates [sh "SH-C"], WriteRestate [RestateEdit (renamed "SH-B" "Renamed")]]
+  _ <- writeSteps envB (Some "B-1") [WriteRestate [RestateDelete "SH-C", RestateEdit (sh "SH-B")]]
+  envE <- endBatch envB "B-1"
+  expectNoRecord envE "SH-C"
+  expectRecord envE (sh "SH-B")
+  -- The deleted record's ID is free again.
+  _ <- applyRecords envE [sh "SH-C"]
+  pure ()
+
+test_batch_ids : Script ()
+test_batch_ids = do
+  env <- standardBook
+  expectSubmitFailure "non-empty" env.transfer_agent (exerciseCmd env.cap_table CapTable_BeginBatch with batch_id = "")
+  expectSubmitFailure "has no open batch" env.transfer_agent (exerciseCmd env.cap_table CapTable_EndBatch with batch_id = "B-1")
+  submitMustFail env.issuer do exerciseCmd env.cap_table CapTable_BeginBatch with batch_id = "B-1"
+  envB <- beginBatch env "B-1"
+  envE <- endBatch envB "B-1"
+  -- An ended batch's writes fail.
+  writeStepsFails envE "has no open batch" (Some "B-1") [creates [sh "SH-X"]]
+  expectSubmitFailure "has no open batch" env.transfer_agent (exerciseCmd envE.cap_table CapTable_EndBatch with batch_id = "B-1")
+
+-- A batching anchor names its open batch, and no other anchor names one.
+test_batch_anchor_names_its_batch_exactly_while_batching : Script ()
+test_batch_anchor_names_its_batch_exactly_while_batching = do
+  env <- setupEnv
+  let parties = actAs [env.issuer, env.system_operator, env.transfer_agent]
+      anchor status openBatch = CapTable with context = env.ctx; status; open_batch = openBatch
+  submitMustFail parties do createCmd (anchor CapTableStatusBatching None)
+  submitMustFail parties do createCmd (anchor CapTableStatusBatching (Some ""))
+  submitMustFail parties do createCmd (anchor CapTableStatusActive (Some "B-1"))
+  submitMustFail parties do createCmd (anchor CapTableStatusTearingDown (Some "B-1"))
+  submitMustFail parties do createCmd (anchor CapTableStatusClosed (Some "B-1"))

@@ -1,0 +1,84 @@
+-- CapTable_Write: creates, stock events and corrections in one transaction, as steps that run in order on one working set, with references checked after the last step.
+module Fairmint.OpenCapTable.Write
+  ( WriteStep(..)
+  , WriteResult(..)
+  , write
+  ) where
+
+import DA.Action (foldlA, when)
+import DA.Foldable (forA_)
+import DA.Map (Map)
+import Fairmint.OpenCapTable.Apply (ApplyOperation, applyOperations, maxOperationsPerApply)
+import Fairmint.OpenCapTable.Book
+import Fairmint.OpenCapTable.Events (checkRequirements)
+import Fairmint.OpenCapTable.OcfRecords (OcfRecordCid)
+import Fairmint.OpenCapTable.Restate (RestateOperation, maxContractsPerRestatement, restateBook)
+import Fairmint.OpenCapTable.State
+import Fairmint.OpenCapTable.Types.Core (Context)
+
+-- | One step of a `CapTable_Write`. Each runs as the choice it names would, on the working set the
+-- steps before it left, so a correction can make room for a create (a deleted record's ID is
+-- claimed again) and a create can supply what a correction names.
+data WriteStep
+  = -- | Creates, stock events, splits, vesting snapshots and shard pre-splits, as `CapTable_Apply`
+    -- writes them
+    WriteApply [ApplyOperation]
+  | -- | One restatement: edits, deletes and stock states, as `CapTable_Restate` writes them
+    WriteRestate [RestateOperation]
+  deriving (Eq, Show)
+
+data WriteResult = WriteResult
+  with
+    -- The OCF records created, by object ID
+    records : Map Text OcfRecordCid
+    -- The stock states created, by security ID
+    states : Map Text (ContractId StockSecurity)
+    -- The epochs created, by stock class ID
+    epochs : Map Text (ContractId StockClassEpoch)
+    -- The ID shards created, by prefix
+    shards : Map Text (ContractId OcfIdShard)
+  deriving (Eq, Show)
+
+-- | Runs the steps on one working set, checks the references they queued against the result, and
+-- creates every changed contract once. The per-transaction caps hold over the whole write: at most
+-- 500 apply operations across its steps, and, when it restates, at most 500 contracts touched, as
+-- for one restatement. `inBatch` is whether the write runs in the cap table's open batch.
+write : Context -> Bool -> BookInputs -> [WriteStep] -> Update WriteResult
+write ctx inBatch inputs steps = do
+  when (null steps) (abort "CapTable_Write needs at least one step")
+  forA_ steps \step ->
+    when (stepLength step == 0) (abort "each step of a CapTable_Write needs at least one operation")
+  let applied = sum (map appliedOperations steps)
+  when (applied > maxOperationsPerApply)
+    (abort ("CapTable_Write takes at most " <> show maxOperationsPerApply <> " apply operations"))
+  b0 <- loadBook ctx inputs
+  book <- foldlA (runStep inBatch) b0 steps
+  checkRequirements book
+  (b1, result) <- flushBook book
+  when (any isRestatement steps && b1.contracts_touched > maxContractsPerRestatement)
+    (abort ("a CapTable_Write that restates touches at most " <> show maxContractsPerRestatement <> " contracts"))
+  pure WriteResult with
+    records = result.records
+    states = result.states
+    epochs = result.epochs
+    shards = result.shards
+
+runStep : Bool -> Book -> WriteStep -> Update Book
+runStep inBatch b step = case step of
+  WriteApply operations -> applyOperations inBatch b operations
+  WriteRestate operations -> restateBook b operations
+
+stepLength : WriteStep -> Int
+stepLength step = case step of
+  WriteApply operations -> length operations
+  WriteRestate operations -> length operations
+
+appliedOperations : WriteStep -> Int
+appliedOperations step = case step of
+  WriteApply operations -> length operations
+  WriteRestate _ -> 0
+
+isRestatement : WriteStep -> Bool
+isRestatement step = case step of
+  WriteApply _ -> False
+  WriteRestate _ -> True

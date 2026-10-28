@@ -1,0 +1,152 @@
+-- CapTable_Write outside a batch: creates, edits and deletes in one transaction, steps in order on one working set, references checked after the last step, the caps over the whole write, and a failure in any step writing nothing.
+module OpenCapTable.TestWrite where
+
+import DA.Assert ((===))
+import DA.List (sort)
+import qualified DA.Map as Map
+import Daml.Script
+
+import Fairmint.OpenCapTable.Apply hiding (apply)
+import Fairmint.OpenCapTable.CapTable
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate hiding (restate)
+import Fairmint.OpenCapTable.Write hiding (write)
+import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..))
+import OpenCapTable.DefinitionFixtures (expectNoRecord, expectRecord, expectRecords)
+import OpenCapTable.Harness
+
+sh : Text -> OcfRecordData
+sh = OcfRecordDataStakeholder . stakeholderData
+
+renamed : Text -> Text -> OcfRecordData
+renamed id name = OcfRecordDataStakeholder ((stakeholderData id) with
+  name = OcfName with legal_name = name; first_name = None; last_name = None)
+
+legendRecord : Text -> OcfRecordData
+legendRecord = OcfRecordDataStockLegendTemplate . legend
+
+creates : [OcfRecordData] -> WriteStep
+creates = WriteApply . map ApplyRecord
+
+-- A sync diff with a new record, an edit and a delete is one transaction: one write, one result,
+-- every change on the ledger together.
+test_write_mixed_creates_edits_and_deletes : Script ()
+test_write_mixed_creates_edits_and_deletes = do
+  env <- standardBook
+  _ <- applyRecords env [sh "SH-C"]
+  r <- writeSteps env None
+    [ creates [sh "SH-NEW"]
+    , WriteRestate [RestateEdit (renamed "SH-B" "Renamed"), RestateDelete "SH-C"]
+    ]
+  sort (Map.keys r.records) === ["SH-B", "SH-NEW"]
+  expectRecords env [sh "SH-NEW", renamed "SH-B" "Renamed"]
+  expectNoRecord env "SH-C"
+
+-- Steps run in order on one working set: a delete in an earlier step frees its ID for a create in a
+-- later one, in one transaction. In the other order the ID is still claimed.
+test_write_steps_run_in_order : Script ()
+test_write_steps_run_in_order = do
+  env <- standardBook
+  _ <- applyRecords env [sh "SH-C"]
+  writeStepsFails env "ID already used: SH-C" None
+    [creates [legendRecord "SH-C"], WriteRestate [RestateDelete "SH-C"]]
+  expectRecord env (sh "SH-C")
+  _ <- writeSteps env None
+    [WriteRestate [RestateDelete "SH-C"], creates [legendRecord "SH-C"]]
+  expectRecord env (legendRecord "SH-C")
+
+-- References are checked after the last step: a correction may name a record a later step creates,
+-- which a restatement alone refuses. A later step that removes what an earlier step names fails the
+-- whole write.
+test_write_references_checked_after_the_last_step : Script ()
+test_write_references_checked_after_the_last_step = do
+  env <- standardBook
+  let original = issuance "S-A1" "SH-A" "CLS-A" 600.0 d2024
+      withLegend = original with stock_legend_ids = ["LEG-1"]
+  restateOpsFails env "Stock issuance stock legend not found: LEG-1"
+    [RestateEdit (OcfRecordDataStockIssuance withLegend)]
+  _ <- writeSteps env None
+    [WriteRestate [RestateEdit (OcfRecordDataStockIssuance withLegend)], creates [legendRecord "LEG-1"]]
+  expectRecords env [OcfRecordDataStockIssuance withLegend, legendRecord "LEG-1"]
+  -- A new issuance names a legend that a later step deletes.
+  let named = (issuance "S-N" "SH-B" "CLS-A" 5.0 d2024) with stock_legend_ids = ["LEG-1"]
+  writeStepsFails env "Stock issuance stock legend not found: LEG-1" None
+    [ creates [OcfRecordDataStockIssuance named]
+    , WriteRestate [RestateEdit (OcfRecordDataStockIssuance original), RestateDelete "LEG-1"]
+    ]
+  expectNoRecord env "ISS-S-N"
+  expectRecord env (legendRecord "LEG-1")
+
+-- A failure in any step aborts the transaction: nothing an earlier step wrote is left behind.
+test_write_failure_in_any_step_writes_nothing : Script ()
+test_write_failure_in_any_step_writes_nothing = do
+  env <- standardBook
+  writeStepsFails env "is not in this write" None
+    [ creates [sh "SH-NEW"]
+    , WriteRestate [RestateEdit (renamed "SH-B" "Renamed")]
+    , WriteRestate [RestateEdit (renamed "SH-NONE" "Missing")]
+    ]
+  expectNoRecord env "SH-NEW"
+  expectRecord env (sh "SH-B")
+
+-- A write restates only records already on the ledger: not one an earlier step created, nor one an
+-- earlier restatement in the write replaced.
+test_write_restates_only_records_on_the_ledger : Script ()
+test_write_restates_only_records_on_the_ledger = do
+  env <- standardBook
+  writeStepsFails env "was written earlier in this transaction" None
+    [creates [sh "SH-NEW"], WriteRestate [RestateEdit (renamed "SH-NEW" "Renamed")]]
+  writeStepsFails env "was written earlier in this transaction" None
+    [creates [sh "SH-NEW"], WriteRestate [RestateDelete "SH-NEW"]]
+  writeStepsFails env "was written earlier in this transaction" None
+    [WriteRestate [RestateEdit (renamed "SH-B" "Once")], WriteRestate [RestateEdit (renamed "SH-B" "Twice")]]
+  -- Within one restatement the existing rule still names the repeat.
+  writeStepsFails env "more than once" None
+    [WriteRestate [RestateEdit (renamed "SH-B" "Once"), RestateEdit (renamed "SH-B" "Twice")]]
+  expectRecord env (sh "SH-B")
+
+test_write_shape : Script ()
+test_write_shape = do
+  env <- standardBook
+  writeStepsFails env "needs at least one step" None []
+  writeStepsFails env "needs at least one operation" None [WriteApply []]
+  writeStepsFails env "needs at least one operation" None [creates [sh "SH-NEW"], WriteRestate []]
+  -- Outside a batch a write names no batch, and only the TA writes.
+  writeStepsFails env "has no open batch" (Some "B-1") [creates [sh "SH-NEW"]]
+  inputs <- allInputs env
+  submitMustFail env.issuer do
+    exerciseCmd env.cap_table CapTable_Write with batch_id = None; inputs; steps = [creates [sh "SH-NEW"]]
+  expectNoRecord env "SH-NEW"
+  -- The anchor is exercised, not consumed.
+  r <- writeSteps env None [creates [sh "SH-NEW"]]
+  Map.keys r.records === ["SH-NEW"]
+  Some anchor <- queryContractId env.transfer_agent env.cap_table
+  anchor.status === CapTableStatusActive
+
+-- Outside a batch a split still needs its class frozen, by the split procedure.
+test_write_split_outside_a_batch_needs_a_frozen_class : Script ()
+test_write_split_outside_a_batch_needs_a_frozen_class = do
+  env <- standardBook
+  writeStepsFails env "must be frozen" None
+    [creates [OcfRecordDataStockClassSplit (split "SPLIT-1" "CLS-A" 2.0 1.0 d2024)]]
+
+-- The caps hold over the whole write: 500 apply operations across its steps, and a write that
+-- restates touches at most 500 contracts, creates included. An edit archives and recreates its
+-- record (2 contracts); a create adds a record and rewrites the shard its ID falls in.
+test_write_caps_over_the_whole_write : Script ()
+test_write_caps_over_the_whole_write = do
+  env <- setupEnv
+  let ids from to = map (\i -> "SH-" <> show i) [from .. to]
+  writeStepsFails env "CapTable_Write takes at most 500 apply operations" None
+    [creates (map sh (ids 1 250)), creates (map sh (ids 251 501))]
+  r <- writeSteps env None [creates (map sh (ids 1 250)), creates (map sh (ids 251 500))]
+  Map.size r.records === 500
+  let edits from to = WriteRestate (map (\i -> RestateEdit (renamed ("SH-" <> show i) ("E-" <> show i))) [from .. to])
+  -- 240 edits and one create: 480 + 1 + 2 contracts.
+  _ <- writeSteps env None [edits 1 240, creates [sh "SH-X"]]
+  expectRecords env [renamed "SH-1" "E-1", renamed "SH-240" "E-240", sh "SH-X"]
+  -- 200 edits and 101 creates: more than 500.
+  writeStepsFails env "a CapTable_Write that restates touches at most 500 contracts" None
+    [edits 241 440, creates (map sh (ids 1001 1101))]
+  expectRecord env (sh "SH-241")
+  expectNoRecord env "SH-1001"

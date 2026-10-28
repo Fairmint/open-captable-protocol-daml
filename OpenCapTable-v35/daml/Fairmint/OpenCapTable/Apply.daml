@@ -5,6 +5,7 @@ module Fairmint.OpenCapTable.Apply
   , maxOperationsPerApply
   , maxLotsPerOperation
   , apply
+  , applyOperations
   ) where
 
 import DA.Action (foldlA, unless, when)
@@ -95,7 +96,7 @@ apply ctx inputs operations = do
   when (length operations > maxOperationsPerApply)
     (abort ("CapTable_Apply takes at most " <> show maxOperationsPerApply <> " operations"))
   b0 <- loadBook ctx inputs
-  b1 <- foldlA applyOperation b0 operations
+  b1 <- applyOperations False b0 operations
   checkRequirements b1
   (_, result) <- flushBook b1
   pure ApplyResult with
@@ -104,9 +105,15 @@ apply ctx inputs operations = do
     epochs = result.epochs
     shards = result.shards
 
-applyOperation : Book -> ApplyOperation -> Update Book
-applyOperation b op = case op of
-  ApplyRecord d -> applyRecord b d
+-- | Runs operations on a working set, in order. `inBatch` is whether the cap table has an open
+-- batch, which keeps every class still while a split is recorded, as freezing its class does
+-- outside one. The caller checks the references the operations queue.
+applyOperations : Bool -> Book -> [ApplyOperation] -> Update Book
+applyOperations inBatch = foldlA (applyOperation inBatch)
+
+applyOperation : Bool -> Book -> ApplyOperation -> Update Book
+applyOperation inBatch b op = case op of
+  ApplyRecord d -> applyRecord inBatch b d
   ApplyStockTransfer with transfer; resulting; balance -> applyTransfer b transfer resulting balance
   ApplyStockCancellation with cancellation; balance ->
     applyReduction b (OcfRecordDataStockCancellation cancellation) cancellation.id cancellation.date
@@ -147,8 +154,8 @@ writeEventRecord s id d b0 = do
   (b2, _) <- addRecord d b1
   pure (addRequirements (requirementsOf d) b2)
 
-applyRecord : Book -> OcfRecordData -> Update Book
-applyRecord b d = case d of
+applyRecord : Bool -> Book -> OcfRecordData -> Update Book
+applyRecord inBatch b d = case d of
   OcfRecordDataIssuer _ -> abort "the issuer record is written when the cap table is created and edited by CapTable_Restate"
   OcfRecordDataStockHold _ -> abort "holds are placed by CapTable_PlaceHolds"
   OcfRecordDataStockHoldCancellation _ -> abort "holds are canceled by CapTable_CancelHolds or CapTable_Settle"
@@ -162,7 +169,7 @@ applyRecord b d = case d of
   OcfRecordDataStockClass cls -> do
     b' <- writeStatelessRecord d [] b
     addEpoch (StockClassEpoch with context = b.context; stock_class_id = cls.id; frozen = False; splits = []) b'
-  OcfRecordDataStockClassSplit sp -> applySplitRecord b sp
+  OcfRecordDataStockClassSplit sp -> applySplitRecord inBatch b sp
   OcfRecordDataStockAcceptance x -> do
     (s, _) <- beginEvent b x.security_id x.date False
     b' <- writeEventRecord s x.id d b
@@ -221,12 +228,14 @@ applyPrimaryIssuance b0 iss = do
   b1 <- writeStatelessRecord d [] b0
   addState (stateForIssuance b1 e iss.date iss) b1
 
--- A split touches no stock state: it is recorded on its class's frozen epoch, dated after the
--- class's latest split, and each state applies it at its next event.
-applySplitRecord : Book -> StockClassSplitOcfData -> Update Book
-applySplitRecord b0 sp = do
+-- A split touches no stock state: it is recorded on its class's frozen epoch, or in a batch, which
+-- keeps every class still; dated after the class's latest split; and each state applies it at its
+-- next event.
+applySplitRecord : Bool -> Book -> StockClassSplitOcfData -> Update Book
+applySplitRecord inBatch b0 sp = do
   e <- requireEpoch sp.stock_class_id b0
-  unless e.frozen (abort ("stock class " <> sp.stock_class_id <> " must be frozen to record a split"))
+  unless (e.frozen || inBatch)
+    (abort ("stock class " <> sp.stock_class_id <> " must be frozen to record a split, or the split written in a batch"))
   when (length e.splits >= maxSplitsPerClass)
     (abort ("stock class " <> sp.stock_class_id <> " already has " <> show maxSplitsPerClass <> " splits"))
   unless (null e.splits || sp.date > (last e.splits).date)
