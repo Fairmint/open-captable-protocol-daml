@@ -18,8 +18,8 @@ contracts for Canton. It also publishes generated JavaScript bindings and the bu
 OpenCapTable-v35 data-depends on `OpenCapTableApi-v01`, embeds it in its DAR and has no Splice
 dependency. Its design is
 [ADR-040](https://github.com/Fairmint/dev-docs/blob/main/adrs/ADR-040-OCP-v35-Unbounded-Cap-Table.md).
-v35 deploys to DevNet only; MainNet is out of scope, so the release workflows keep their MainNet
-steps gated off. Older majors stay in [`dars/`](dars) and in git history.
+v35 deploys to DevNet only; MainNet is out of scope. Older majors stay in [`dars/`](dars) and in git
+history.
 
 Two more directories belong to v35:
 
@@ -68,6 +68,26 @@ package-surface contract. `resolveOpenCapTableDarPath` checks `OPEN_CAP_TABLE_DA
 packaged DAR, then optional local-checkout paths; see its
 [source and options](scripts/npm-published-lib/openCapTableDarPath.ts) for exact resolution
 behavior.
+
+## Deployment
+
+Every push to `main` publishes the npm package ([`publish.yml`](.github/workflows/publish.yml)) and
+tags the commit `v<npm version>`. Publishing deploys nothing.
+
+The ledger providers accept traffic only from allowlisted IPs, so the DARs are deployed by the
+[Deploy OCP to ledger](https://github.com/Fairmint/canton/blob/main/.github/workflows/deploy-ocp-ledger.yml)
+workflow of Fairmint/canton, from its allowlisted scripts box. Given an npm version, it:
+
+1. checks out this repository at that version's `v<version>` tag and runs the deployment preflight
+   of `npm run check:dar-version-policy` for each DAR, dependency first;
+2. uploads and vets the published DARs on both DevNet participants and makes sure the OCP factory
+   exists;
+3. records each deployment as the annotated tag `dar-deploy/devnet/<package>/v<version>` on that
+   commit.
+
+Those tags are the deployment evidence the DAR version policy reads. `record_only` records them for
+DARs that are already deployed. Record a factory identity the workflow reports in
+[`generated/ocp-factory-contract-id.json`](generated/ocp-factory-contract-id.json).
 
 ## Public documentation
 

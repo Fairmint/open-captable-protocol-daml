@@ -40,10 +40,5 @@ export interface ContractIdJson {
   devnet?: NetworkContractData;
 }
 
-/** Valid network keys for contract ID files and factory scripts. */
+/** Canton networks the ledger scripts address. */
 export type ContractNetwork = 'mainnet' | 'devnet';
-
-/** Type guard for ContractNetwork. */
-export function isContractNetwork(value: string): value is ContractNetwork {
-  return value === 'mainnet' || value === 'devnet';
-}
