@@ -43,3 +43,7 @@ Keep repository guidance synchronized with the code:
   apiv2. `Test/daml/OpenCapTable/TestVectors.daml` is generated from it: edit the JSON, then run
   `npm run generate:test-vectors`. `npm run test:vectors` recomputes every vector in TypeScript and
   fails if the Daml file is out of step.
+
+## Repository instructions for every agent
+
+@AGENTS.md
