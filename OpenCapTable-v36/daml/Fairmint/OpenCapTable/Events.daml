@@ -1,6 +1,7 @@
 -- Steps shared by every event on a stock state: bringing the state to the event's date, resolving the IDs the event writes, and creating output issuances with their states.
 module Fairmint.OpenCapTable.Events
   ( beginEvent
+  , beginTerminalEvent
   , requireNoHolds
   , assertLedgerDate
   , resolveId
@@ -35,7 +36,8 @@ liftEither = either abort pure
 
 -- | Brings the security's current state to an event dated `d`: its class's epoch must be in the
 -- working set and not frozen, the event may not predate the state's last event (unless
--- `backdatable`: vesting starts and events), and every split dated after the state's last event
+-- `backdatable`: events that carry no quantity, and terminal events within the state's split epoch,
+-- `beginTerminalEvent`), and every split dated after the state's last event
 -- and on or before the event is applied. Returns the state and its epoch; the caller consumes the
 -- state through `replaceState` or `endState`.
 beginEvent : Book -> Text -> Date -> Bool -> Update (StockSecurity, StockClassEpoch)
@@ -48,6 +50,25 @@ beginEvent b sec d backdatable = do
       <> " (" <> show s.last_event_date <> ")"))
   s' <- liftEither (applySplits e.splits d s)
   pure (s', e)
+
+-- | Brings the security's state to a terminal event dated `d` (a transfer, cancellation,
+-- repurchase, conversion, reissuance, consolidation or retraction). OCF orders no transactions on a
+-- security, so a terminal event may be dated before the state's last event (a cancellation entered
+-- after a later acceptance or acceleration, say): it ends the state, so no later event reads the
+-- state at its date. Its quantity is in the units of its date's split epoch, though, so no split of
+-- the class may fall between the event and the state's last event; and it may not predate the
+-- security's issuance.
+beginTerminalEvent : Book -> Text -> Date -> Update (StockSecurity, StockClassEpoch)
+beginTerminalEvent b sec d = do
+  s <- requireState sec b
+  e <- requireEpoch s.stock_class_id b
+  when (d < s.issue_date)
+    (abort ("event dated " <> show d <> " precedes the issuance of security " <> sec
+      <> " (" <> show s.issue_date <> ")"))
+  when (d < s.last_event_date && splitsOnOrBefore e.splits d /= splitsOnOrBefore e.splits s.last_event_date)
+    (abort ("event dated " <> show d <> " precedes a split of stock class " <> s.stock_class_id
+      <> " that security " <> sec <> " has taken (its last event is " <> show s.last_event_date <> ")"))
+  beginEvent b sec d True
 
 -- | Terminal events other than a settlement hold's own draw are refused while any hold is open.
 requireNoHolds : StockSecurity -> Update ()
