@@ -1,4 +1,4 @@
--- Vesting terms, ported from v34's TestVestingTerms: writes, edits and deletes, every condition, trigger and period validator branch, and the condition-graph rules (known IDs, no self or duplicate edges, no cycles through next or relative edges).
+-- Vesting terms, ported from v34's TestVestingTerms: writes, edits and deletes, every condition, trigger and period validator branch, and the condition graph, of which the register checks only unique condition IDs and unique next edges (OCF's schema does not close it or forbid cycles).
 module OpenCapTable.TestVestingTerms where
 
 import qualified DA.Date as D
@@ -151,13 +151,14 @@ test_vesting_terms_all_optional_fields = do
       ]))
     (zip [1 .. 4 : Int] [OcfVestingDayOfMonth01, OcfVestingDayOfMonth29OrLastDayOfMonth, OcfVestingDayOfMonth30OrLastDayOfMonth, OcfVestingDayOfMonth31OrLastDayOfMonth])
 
--- v34 testVestingTerms_EditCannotCreateInvalidGraph.
+-- v34 testVestingTerms_EditCannotCreateInvalidGraph: an edit is validated as a create is (duplicate
+-- condition IDs are refused; an open graph is OCF-valid and accepted).
 test_vesting_terms_edit_is_validated : Script ()
 test_vesting_terms_edit_is_validated = do
   env <- setupEnv
   let valid = termsOf "VT_EDIT_GRAPH" [startCondition "start" ["next"], eventCondition "next" []]
   _ <- applyRecords env [OcfRecordDataVestingTerms valid]
-  let invalid = termsOf "VT_EDIT_GRAPH" [startCondition "start" ["missing"], eventCondition "next" []]
+  let invalid = termsOf "VT_EDIT_GRAPH" [startCondition "start" ["next"], eventCondition "start" []]
   assertMsg "the validator accepted the invalid edit" (not (validateVestingTermsOcfData invalid))
   restateOpsFails env "precondition" [RestateEdit (OcfRecordDataVestingTerms invalid)]
   restateOpsFails env "changes nothing" [RestateEdit (OcfRecordDataVestingTerms valid)]
@@ -170,9 +171,8 @@ test_vesting_terms_edit_is_validated = do
 test_vesting_terms_record_validation : Script ()
 test_vesting_terms_record_validation = do
   env <- setupEnv
-  no env allAtStart with name = ""
-  no env allAtStart with description = ""
-  no env allAtStart with comments = [""]
+  -- OCF sets no minimum length on the name or description, or on a comment
+  ok env (allAtStart with id = "VT_EMPTY_TEXT"; name = ""; description = ""; comments = [""])
   -- OCF minItems 1
   no env allAtStart with vesting_conditions = []
   applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataVestingTerms (allAtStart with id = "")]
@@ -184,37 +184,37 @@ test_vesting_terms_condition_validation = do
       start = startCondition "start" []
       portion n d = Some OcfVestingConditionPortion with numerator = n; denominator = d; remainder = None
   no env (terms (start with id = ""))
-  no env (terms (start with description = Some ""))
   -- Exactly one of portion and quantity
   no env (terms (start with portion = portion 1.0 4.0; quantity = Some 1.0))
   no env (terms (start with portion = None; quantity = None))
-  no env (terms (start with quantity = Some (-1.0)))
-  -- A portion with a non-negative numerator over a positive denominator (v34 testVestingTerms_ZeroDenominatorFails)
-  no env (terms (start with quantity = None; portion = portion 1.0 0.0))
-  no env (terms (start with quantity = None; portion = portion 1.0 (-4.0)))
-  no env (terms (start with quantity = None; portion = portion (-1.0) 4.0))
-  no env (terms (start with next_condition_ids = [""]))
-  -- The boundaries that pass: v34 testVestingTerms_ZeroPortionNumerator, a zero quantity, no description.
+  -- A portion's terms and a quantity are signed OCF Numerics the register never computes with
+  -- (v34 testVestingTerms_ZeroDenominatorFails no longer applies), and a description may be ""
   ok env (termsOf "VT_ZERO_NUM" [start with quantity = None; portion = portion 0.0 1.0])
   ok env (termsOf "VT_ZERO_QTY" [start with quantity = Some 0.0])
   ok env (termsOf "VT_NO_DESC" [start with description = None])
+  ok env (termsOf "VT_EMPTY_DESC" [start with description = Some ""])
+  ok env (termsOf "VT_NEGATIVE_QTY" [start with quantity = Some (-1.0)])
+  ok env (termsOf "VT_ZERO_DENOMINATOR" [start with quantity = None; portion = portion 1.0 0.0])
+  ok env (termsOf "VT_NEGATIVE_DENOMINATOR" [start with quantity = None; portion = portion 1.0 (-4.0)])
+  ok env (termsOf "VT_NEGATIVE_NUMERATOR" [start with quantity = None; portion = portion (-1.0) 4.0])
+  ok env (termsOf "VT_EMPTY_NEXT_ID" [start with next_condition_ids = [""]])
 
 test_vesting_terms_trigger_and_period_validation : Script ()
 test_vesting_terms_trigger_and_period_validation = do
   env <- setupEnv
   let terms period = termsOf "VT_PERIOD" [startCondition "start" ["rel"], condition "rel" (relativeTo "start" period) []]
       months n k cliff = OcfVestingPeriodMonths with length_ = n; occurrences = k; day_of_month = OcfVestingDayOfMonth01; cliff_installment = cliff
-  -- A relative trigger names an anchor.
-  no env (termsOf "VT_PERIOD" [startCondition "start" ["rel"], condition "rel" (relativeTo "" (days 30 1)) []])
-  -- A period of positive length, at least one occurrence and a non-negative cliff.
-  no env (terms (days 0 1))
+  -- A period of non-negative length (OCF minimum 0), at least one occurrence and a non-negative cliff.
   no env (terms (days 30 0))
   no env (terms (days (-30) 1))
   no env (terms (daysWithCliff 30 4 (Some (-1))))
-  no env (terms (months 0 4 None))
   no env (terms (months 1 0 None))
   no env (terms (months 1 4 (Some (-1))))
-  -- The boundaries that pass.
+  -- The boundaries that pass: a zero-length period (a condition that fires with its anchor) and an
+  -- empty anchor ID, a plain OCF string the register does not resolve.
+  ok env ((terms (days 0 1)) with id = "VT_DAYS_ZERO")
+  ok env ((terms (months 0 4 None)) with id = "VT_MONTHS_ZERO")
+  ok env (termsOf "VT_EMPTY_ANCHOR" [startCondition "start" ["rel"], condition "rel" (relativeTo "" (days 30 1)) []])
   ok env ((terms (daysWithCliff 1 1 (Some 0))) with id = "VT_DAYS_MIN")
   ok env ((terms (months 1 1 (Some 1))) with id = "VT_MONTHS_MIN")
   ok env (termsOf "VT_ABSOLUTE" [condition "on" (OcfVestingScheduleAbsoluteTrigger with date = D.date 2026 D.Jun 30) []])
@@ -223,31 +223,29 @@ test_vesting_terms_trigger_and_period_validation = do
 -- CONDITION GRAPH
 -- =============================================================================
 
--- v34 testVestingTerms_DuplicateConditionIdsFail, _DuplicateNextConditionIdsFail,
--- _MissingNextConditionIdFails, _MissingRelativeConditionIdFails, _RelativeConditionCannotReferenceSelf
--- and _NextConditionCannotReferenceSelf.
+-- v34 testVestingTerms_DuplicateConditionIdsFail and _DuplicateNextConditionIdsFail still hold
+-- (condition IDs are unique so each names one condition; OCF's next_condition_ids is uniqueItems).
+-- OCF's schema does not close the graph, so an edge to a missing condition or to itself is valid.
 test_vesting_terms_graph_ids_and_edges : Script ()
 test_vesting_terms_graph_ids_and_edges = do
   env <- setupEnv
   no env (termsOf "VT_DUP_COND" [startCondition "dup" [], eventCondition "dup" []])
   no env (termsOf "VT_DUP_NEXT" [startCondition "start" ["next", "next"], eventCondition "next" []])
-  no env (termsOf "VT_MISSING_NEXT" [startCondition "start" ["missing"]])
-  no env (termsOf "VT_MISSING_RELATIVE" [startCondition "start" ["relative"], relativeCondition "relative" "missing" []])
-  no env (termsOf "VT_SELF_RELATIVE" [relativeCondition "self" "self" []])
-  no env (termsOf "VT_SELF_NEXT" [eventCondition "self" ["self"]])
+  ok env (termsOf "VT_MISSING_NEXT" [startCondition "start" ["missing"]])
+  ok env (termsOf "VT_MISSING_RELATIVE" [startCondition "start" ["relative"], relativeCondition "relative" "missing" []])
+  ok env (termsOf "VT_SELF_RELATIVE" [relativeCondition "self" "self" []])
+  ok env (termsOf "VT_SELF_NEXT" [eventCondition "self" ["self"]])
 
--- v34 testVestingTerms_CyclicNextConditionsFail and _MutualRelativeConditionsWithoutRootFail, and
--- longer and mixed cycles (a relative condition depends on its anchor, as a next edge does).
+-- OCF's prose intends an acyclic graph but its schema does not require one, and the register never
+-- walks the graph: cycles are the SDK's to flag.
 test_vesting_terms_graph_cycles : Script ()
 test_vesting_terms_graph_cycles = do
   env <- setupEnv
-  no env (termsOf "VT_CYCLE" [startCondition "first" ["second"], eventCondition "second" ["first"]])
-  no env (termsOf "VT_CYCLE_RELATIVE" [relativeCondition "first" "second" [], relativeCondition "second" "first" []])
-  no env (termsOf "VT_CYCLE_3" [startCondition "a" ["b"], eventCondition "b" ["c"], eventCondition "c" ["a"]])
-  -- a -> b by next, b -> a because a is relative to b.
-  no env (termsOf "VT_CYCLE_MIXED" [relativeCondition "a" "b" ["b"], eventCondition "b" []])
-  -- A cycle away from the start is still a cycle.
-  no env (termsOf "VT_CYCLE_TAIL" [startCondition "start" ["x"], eventCondition "x" ["y"], eventCondition "y" ["x"]])
+  ok env (termsOf "VT_CYCLE" [startCondition "first" ["second"], eventCondition "second" ["first"]])
+  ok env (termsOf "VT_CYCLE_RELATIVE" [relativeCondition "first" "second" [], relativeCondition "second" "first" []])
+  ok env (termsOf "VT_CYCLE_3" [startCondition "a" ["b"], eventCondition "b" ["c"], eventCondition "c" ["a"]])
+  ok env (termsOf "VT_CYCLE_MIXED" [relativeCondition "a" "b" ["b"], eventCondition "b" []])
+  ok env (termsOf "VT_CYCLE_TAIL" [startCondition "start" ["x"], eventCondition "x" ["y"], eventCondition "y" ["x"]])
 
 -- v34 testVestingTerms_RelativeAnchorNeedNotBeDirectPredecessor, _RelativeAnchorNeedNotDominateAllPaths,
 -- _EventOnlyRootIsValid, _IndependentConditionBranchesAreValid, _ArrayOrderDoesNotDefineGraphRoot and

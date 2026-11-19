@@ -7,7 +7,9 @@ import Daml.Script
 
 import Fairmint.OpenCapTable.Ids
 import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Apply (ApplyOperation(..))
 import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..), validateStockAcceptanceOcfData)
+import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
 import OpenCapTable.Harness
 import OpenCapTable.StockHelpers
 
@@ -56,10 +58,11 @@ test_stock_acceptance_derived_id = do
 test_stock_acceptance_needs_a_stock_state : Script ()
 test_stock_acceptance_needs_a_stock_state = do
   env <- instrumentBook
-  applyRecordsFails env "no active state for security S-NONE" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-NONE" eventDate)]
-  -- A warrant's security has no stock state.
-  applyRecordsFails env "no active state for security W-1" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "W-1" eventDate)]
-  applyRecordsFails env "no active state for security  in this write" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "" eventDate)]
+  -- With no state in the write, the security must be a stock issuance whose lot a record in the
+  -- write shows ended; a warrant's acceptance is a warrant acceptance record.
+  applyRecordsFails env "Stock acceptance (no stock state in this write) security not found: S-NONE" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-NONE" eventDate)]
+  applyRecordsFails env "Stock acceptance (no stock state in this write) security W-1 is carried by a OcfObjectTypeTxWarrantIssuance" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "W-1" eventDate)]
+  applyRecordsFails env "precondition" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "" eventDate)]
   -- Two acceptances of one security in a batch: the second runs on the first's successor.
   _ <- applyRecords env
     [ OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" eventDate)
@@ -70,20 +73,44 @@ test_stock_acceptance_needs_a_stock_state = do
 test_stock_acceptance_date_order : Script ()
 test_stock_acceptance_date_order = do
   env <- standardBook
-  applyRecordsFails env "precedes the last event on security S-A1" [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" (D.date 2023 D.Dec 31))]
-  -- An acceptance on the issuance date is in order.
+  -- An acceptance carries no quantity, so it may be backdated, like a vesting start: OCF orders no
+  -- transactions on a security, and a late-entered acceptance is common in migrations.
+  _ <- applyRecords env [OcfRecordDataStockAcceptance (acceptance "ACC-0" "S-A1" (D.date 2023 D.Dec 31))]
+  (.last_event_date) <$> stateOf env "S-A1" >>= (=== d2024)
   _ <- applyRecords env [OcfRecordDataStockAcceptance (acceptance "ACC-1" "S-A1" d2024)]
   (.last_event_date) <$> stateOf env "S-A1" >>= (=== d2024)
+  (.seq) <$> stateOf env "S-A1" >>= (=== 2)
+
+-- An acceptance recorded after its lot ended (transferred, cancelled) is stored against the stock
+-- issuance when a record in the write shows the lot ended; without that evidence it is refused, as
+-- the ledger cannot tell an ended lot from one the writer left out.
+test_stock_acceptance_on_an_ended_lot : Script ()
+test_stock_acceptance_on_an_ended_lot = do
+  env <- standardBook
+  let cxl = StockCancellationOcfData with
+        id = "CXL-A1"; date = D.date 2024 D.Jun 1; quantity = 600.0; reason_text = ""; security_id = "S-A1"
+        comments = [""]; balance_security_id = None
+  _ <- applyOps env [ApplyStockCancellation with cancellation = cxl; balance = None]
+  hasState env "S-A1" >>= (=== False)
+  let late = acceptance "ACC-LATE" "S-A1" (D.date 2024 D.Feb 1)
+  -- The cancellation is among the write's inputs (every record of the book is), so the lot's end is shown.
+  _ <- applyRecords env [OcfRecordDataStockAcceptance late]
+  expectRecord env (OcfRecordDataStockAcceptance late)
+  -- Without the consuming record among the inputs, the ended lot cannot be told from a live one.
+  inputs <- allInputs env
+  cxlCid <- recordCidOf env "CXL-A1"
+  applyWithFails env (inputs with records = filter (/= cxlCid) inputs.records)
+    "no record here shows its lot ended"
+    [ApplyRecord (OcfRecordDataStockAcceptance (acceptance "ACC-LATE-2" "S-A1" (D.date 2024 D.Feb 2)))]
 
 test_stock_acceptance_validator : Script ()
 test_stock_acceptance_validator = do
   env <- standardBook
   let a = acceptance "ACC-1" "S-A1" eventDate
-  applyRecordsFails env "precondition" [OcfRecordDataStockAcceptance (a with comments = [""])]
   applyRecordsFails env "an empty ID cannot be claimed" [OcfRecordDataStockAcceptance (a with id = "")]
   (.seq) <$> stateOf env "S-A1" >>= (=== 0)
   expectTrue "the fixture" (validateStockAcceptanceOcfData a)
   expectTrue "comments" (validateStockAcceptanceOcfData a with comments = ["Signed"])
   expectFalse "empty id" (validateStockAcceptanceOcfData a with id = "")
   expectFalse "empty security_id" (validateStockAcceptanceOcfData a with security_id = "")
-  expectFalse "an empty comment" (validateStockAcceptanceOcfData a with comments = ["Signed", ""])
+  expectTrue "an empty comment" (validateStockAcceptanceOcfData a with comments = ["Signed", ""])

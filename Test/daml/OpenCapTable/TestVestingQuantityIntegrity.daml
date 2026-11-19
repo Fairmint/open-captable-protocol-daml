@@ -1,8 +1,9 @@
--- Vestings within the quantity: the stock, equity-compensation and warrant issuance validators (a warrant's quantity caps its vestings only when fixed or a maximum), the same rules enforced by each record's ensure on the ledger, and the per-security tranche cap.
+-- Vestings and the quantity: OCF ties no vestings total to the quantity, so no issuance validator checks it; a stock lot's state, which draws and accelerates its tranches, keeps them within its quantity and under the per-security tranche cap. A warrant's or grant's tranches form no state and are not capped.
 module OpenCapTable.TestVestingQuantityIntegrity where
 
 import DA.Assert ((===))
 import qualified DA.Date as D
+import DA.Foldable (forA_)
 import Daml.Script
 
 import Fairmint.OpenCapTable.OcfRecords
@@ -47,47 +48,29 @@ excessiveVestings = [tranche 60.0, tranche 50.0]
 
 test_vesting_quantity_stock_and_equity_compensation : Script ()
 test_vesting_quantity_stock_and_equity_compensation = do
-  expectTrue "stock exact vestings fit" (validateStockIssuanceOcfData (stockIssuance 100.0 exactVestings))
-  expectTrue "stock partial vestings fit" (validateStockIssuanceOcfData (stockIssuance 100.0 partialVestings))
-  expectFalse "stock excessive vestings" (validateStockIssuanceOcfData (stockIssuance 100.0 excessiveVestings))
-  expectTrue "equity-comp exact vestings fit" (validateEquityCompensationIssuanceOcfData (ecIssuance 100.0 exactVestings))
-  expectTrue "equity-comp partial vestings fit" (validateEquityCompensationIssuanceOcfData (ecIssuance 100.0 partialVestings))
-  expectFalse "equity-comp excessive vestings" (validateEquityCompensationIssuanceOcfData (ecIssuance 100.0 excessiveVestings))
+  forA_ [exactVestings, partialVestings, excessiveVestings] \vs -> do
+    expectTrue "stock vestings" (validateStockIssuanceOcfData (stockIssuance 100.0 vs))
+    expectTrue "equity-comp vestings" (validateEquityCompensationIssuanceOcfData (ecIssuance 100.0 vs))
 
 test_vesting_quantity_warrant_fixed_and_maximum_quantities : Script ()
 test_vesting_quantity_warrant_fixed_and_maximum_quantities = do
   let ok = validateWarrantIssuanceOcfData
-  expectTrue "fixed warrant exact vestings fit" (ok (wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentFixed) [tranche 100.0]))
-  expectFalse "fixed warrant excessive vestings" (ok (wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentFixed) [tranche 101.0]))
-  expectTrue "maximum warrant exact vestings fit" (ok (wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentMax) [tranche 100.0]))
-  expectFalse "maximum warrant excessive vestings" (ok (wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentMax) [tranche 101.0]))
-
-test_vesting_quantity_warrant_non_ceiling_quantities : Script ()
-test_vesting_quantity_warrant_non_ceiling_quantities = do
-  let validates source = validateWarrantIssuanceOcfData (wIssuance (Some 100.0) source [tranche 101.0])
-  expectTrue "a minimum warrant quantity is not a ceiling" (validates (Some OcfQuantitySourceTypeInstrumentMin))
-  expectTrue "a human-estimated warrant quantity is not a ceiling" (validates (Some OcfQuantitySourceTypeHumanEstimated))
-  expectTrue "a machine-estimated warrant quantity is not a ceiling" (validates (Some OcfQuantitySourceTypeMachineEstimated))
-  expectTrue "an unspecified warrant quantity is not a ceiling" (validates (Some OcfQuantitySourceTypeUnspecified))
-  expectTrue "an absent warrant quantity source is not a ceiling" (validates None)
-  expectTrue "an absent warrant quantity is not a ceiling"
-    (validateWarrantIssuanceOcfData (wIssuance None (Some OcfQuantitySourceTypeInstrumentFixed) [tranche 101.0]))
+  forA_ [None, Some OcfQuantitySourceTypeInstrumentFixed, Some OcfQuantitySourceTypeInstrumentMax, Some OcfQuantitySourceTypeInstrumentMin] \source -> do
+    expectTrue "warrant exact vestings" (ok (wIssuance (Some 100.0) source [tranche 100.0]))
+    expectTrue "warrant vestings over the quantity" (ok (wIssuance (Some 100.0) source [tranche 101.0]))
 
 -- =============================================================================
 -- ON THE LEDGER
 -- =============================================================================
 
+-- A stock lot's state refuses tranches over its quantity; a grant's or warrant's record is written.
 test_vesting_quantity_enforced_by_ensure : Script ()
 test_vesting_quantity_enforced_by_ensure = do
   env <- standardBook
   applyRecordsFails env "precondition" [OcfRecordDataStockIssuance (stockIssuance 100.0 excessiveVestings)]
-  applyRecordsFails env "precondition" [OcfRecordDataEquityCompensationIssuance (ecIssuance 100.0 excessiveVestings)]
-  applyRecordsFails env "precondition"
-    [OcfRecordDataWarrantIssuance (wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentFixed) [tranche 101.0])]
-  -- Within the quantity (or with no ceiling) each is written.
   let s = stockIssuance 100.0 partialVestings
-      e = ecIssuance 100.0 exactVestings
-      w = wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentMin) [tranche 101.0]
+      e = ecIssuance 100.0 excessiveVestings
+      w = wIssuance (Some 100.0) (Some OcfQuantitySourceTypeInstrumentFixed) [tranche 101.0]
   _ <- applyRecords env [OcfRecordDataStockIssuance s, OcfRecordDataEquityCompensationIssuance e, OcfRecordDataWarrantIssuance w]
   expectRecord env (OcfRecordDataStockIssuance s)
   expectRecord env (OcfRecordDataEquityCompensationIssuance e)
@@ -97,17 +80,32 @@ test_vesting_quantity_enforced_by_ensure = do
   st.vesting === StockVestingTranches partialVestings
   st.quantity === 100.0
 
--- At most 1500 explicit tranches per security.
+-- A stock lot's zero tranches vest nothing and are left off its state (OCF allows them). Present
+-- vestings govern ahead of vesting terms, so a schedule of only zero tranches leaves the lot with
+-- tranches covering none of its quantity: nothing has vested, on any date.
+test_vesting_quantity_zero_tranches : Script ()
+test_vesting_quantity_zero_tranches = do
+  env <- standardBook
+  let zeroAndReal = stockIssuance 100.0 [tranche 0.0, ((tranche 40.0) with date = D.date 2026 D.Jan 1), ((tranche 0.0) with date = D.date 2027 D.Jan 1)]
+      onlyZero = (issuance "SEC-ZERO" "SH-A" "CLS-A" 10.0 testDate) with id = "TX-ZERO"; vestings = [tranche 0.0, (tranche 0.0) with date = D.date 2026 D.Jan 1]
+  _ <- applyRecords env [OcfRecordDataStockIssuance zeroAndReal, OcfRecordDataStockIssuance onlyZero]
+  expectRecord env (OcfRecordDataStockIssuance zeroAndReal)
+  (.vesting) <$> stateOf env "SEC-STOCK" >>= (=== StockVestingTranches [(tranche 40.0) with date = D.date 2026 D.Jan 1])
+  zero <- stateOf env "SEC-ZERO"
+  zero.vesting === StockVestingTranches []
+  vestedAt zero (D.date 2099 D.Dec 31) === 0.0
+  fullyCovered zero === False
+-- At most 1500 explicit tranches per stock lot, its state's cap; a grant's or warrant's are uncapped.
 test_vesting_quantity_tranche_cap : Script ()
 test_vesting_quantity_tranche_cap = do
   env <- standardBook
   let tranches n = map (\i -> OcfVesting with date = D.addDays testDate i; amount = 1.0) [1 .. n]
   applyRecordsFails env "has 1501 vesting tranches; at most 1500"
     [OcfRecordDataStockIssuance (stockIssuance 2000.0 (tranches 1501))]
-  applyRecordsFails env "has 1501 vesting tranches; at most 1500"
-    [OcfRecordDataEquityCompensationIssuance (ecIssuance 2000.0 (tranches 1501))]
-  applyRecordsFails env "has 1501 vesting tranches; at most 1500"
-    [OcfRecordDataWarrantIssuance (wIssuance (Some 2000.0) None (tranches 1501))]
+  _ <- applyRecords env
+    [ OcfRecordDataEquityCompensationIssuance (ecIssuance 2000.0 (tranches 1501))
+    , OcfRecordDataWarrantIssuance (wIssuance (Some 2000.0) None (tranches 1501))
+    ]
   _ <- applyRecords env [OcfRecordDataStockIssuance (stockIssuance 2000.0 (tranches 1500))]
   st <- stateOf env "SEC-STOCK"
   case st.vesting of

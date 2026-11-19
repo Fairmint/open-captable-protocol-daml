@@ -8,7 +8,7 @@ module Fairmint.OpenCapTable.Apply
 import DA.Action (foldlA, unless, when)
 import DA.Foldable (forA_)
 import DA.List (dedup, head, last)
-import DA.Optional (fromOptional, isNone, isSome, optionalToList)
+import DA.Optional (fromOptional, optionalToList)
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..))
 import Fairmint.OpenCapTable.Book
 import Fairmint.OpenCapTable.Events
@@ -34,7 +34,8 @@ data ApplyOperation
     -- equity-compensation records, primary stock issuances (which create a state), stock classes
     -- (which create their epoch), splits (recorded on a frozen epoch), stock acceptances and
     -- retractions, and vesting records (an event on the security's state when the write holds
-    -- one, otherwise a warrant or equity-compensation record).
+    -- one, otherwise a record on a warrant, a grant or, for a start, an event, an acceleration or
+    -- an acceptance, a stock lot a record in the write shows ended).
     ApplyRecord OcfRecordData
   | ApplyStockTransfer with
       transfer : StockTransferOcfData
@@ -67,7 +68,8 @@ data ApplyOperation
   deriving (Eq, Show)
 
 
--- | Lots per hold placement, settlement or consolidation.
+-- | Lots per hold placement, settlement or consolidation: a transaction-size bound of the
+-- register's, not OCF validity (OCF sets no maxItems on a consolidation's securities).
 maxLotsPerOperation : Int
 maxLotsPerOperation = 50
 
@@ -129,12 +131,16 @@ applyRecord b d = case d of
     b' <- writeStatelessRecord d [] b
     addEpoch (StockClassEpoch with context = b.context; stock_class_id = cls.id; frozen = False; splits = []) b'
   OcfRecordDataStockClassSplit sp -> applySplitRecord b sp
-  OcfRecordDataStockAcceptance x -> do
-    (s, _) <- beginEvent b x.security_id x.date False
-    b' <- writeEventRecord s x.id d b
-    replaceState (successorAfter b.context s x.id) b'
+  -- An acceptance carries no quantity, so it may be backdated like a vesting record, and it may be
+  -- recorded on a lot that has since ended.
+  OcfRecordDataStockAcceptance x -> case lookupState x.security_id b of
+    Some _ -> do
+      (s, _) <- beginEvent b x.security_id x.date True
+      b' <- writeEventRecord s x.id d b
+      replaceState (successorAfter b.context s x.id) b'
+    None -> writeStatelessRecord d [statelessOrEnded "Stock acceptance (no stock state in this write)" [] x.security_id] b
   OcfRecordDataStockRetraction x -> do
-    (s, _) <- beginEvent b x.security_id x.date False
+    (s, _) <- beginTerminalEvent b x.security_id x.date
     requireNoHolds s
     b' <- writeEventRecord s x.id d b
     endState s.security_id b'
@@ -143,41 +149,49 @@ applyRecord b d = case d of
   OcfRecordDataVestingAcceleration x -> case lookupState x.security_id b of
     Some _ -> do
       (s, _) <- beginEvent b x.security_id x.date False
+      -- OCF's quantity is any Numeric and is stored as written; the lot accelerates only what can
+      -- still vest: nothing on a fully vested lot or for a quantity of zero or less, at most its
+      -- unvested quantity otherwise.
+      let applied unvested = max 0.0 (min x.quantity unvested)
       (vesting', accelerated') <- case s.vesting of
-        StockVestingNone -> abort ("security " <> s.security_id <> " is fully vested and cannot be accelerated")
+        StockVestingNone -> pure (s.vesting, s.accelerated_since_snapshot)
         StockVestingTranches ts -> do
-          ts' <- liftEither (accelerateTranches x.date x.quantity s ts)
-          pure (StockVestingTranches ts', s.accelerated_since_snapshot)
+          let q = applied (s.quantity - vestedAt s x.date)
+          if q <= 0.0 then pure (s.vesting, s.accelerated_since_snapshot)
+          else do
+            ts' <- liftEither (accelerateTranches x.date q s ts)
+            pure (StockVestingTranches ts', s.accelerated_since_snapshot)
         StockVestingOnTerms _ -> do
           -- The TA's snapshot stays the vested quantity until the next snapshot, which counts every
           -- acceleration recorded before it. The shares accelerated since the snapshot bound later
           -- accelerations, so together they never exceed the unvested quantity.
           let accelerated = fromOptional 0.0 s.accelerated_since_snapshot
-              unvested = s.quantity - vestedAt s x.date - accelerated
-          when (x.quantity > unvested)
-            (abort ("acceleration of " <> show x.quantity <> " on security " <> s.security_id
-              <> " exceeds its unvested quantity " <> show unvested))
-          pure (s.vesting, Some (accelerated + x.quantity))
+              q = applied (s.quantity - vestedAt s x.date - accelerated)
+          pure (s.vesting, if q <= 0.0 then s.accelerated_since_snapshot else Some (accelerated + q))
       b' <- writeEventRecord s x.id d b
       replaceState ((successorAfter b.context s x.id) with vesting = vesting'; accelerated_since_snapshot = accelerated') b'
-    None -> writeStatelessRecord d [nonStockVestingTarget x.security_id] b
+    -- With no state, a record on a warrant, a grant, or a stock lot a record in the write shows
+    -- ended, as for vesting starts and events (OCF allows an acceleration on any security). It
+    -- changes no vesting: no state remains to accelerate.
+    None -> writeStatelessRecord d [statelessOrEnded "Vesting record (no stock state in this write)" nonStockVestingTargets x.security_id] b
   _ -> writeStatelessRecord d [] b
 
-nonStockVestingTarget : Text -> Requirement
-nonStockVestingTarget sec = RequireSecurity with
-  label = "Vesting record (no stock state in this write)"
-  security_id = sec
-  object_types = [OcfObjectTypeTxWarrantIssuance, OcfObjectTypeTxEquityCompensationIssuance]
+nonStockVestingTargets : [OcfObjectType]
+nonStockVestingTargets = [OcfObjectTypeTxWarrantIssuance, OcfObjectTypeTxEquityCompensationIssuance]
 
--- Vesting starts and events carry no quantity and may be backdated: the one exception to
--- per-security date order. On a stock state they are non-terminal events.
+statelessOrEnded : Text -> [OcfObjectType] -> Text -> Requirement
+statelessOrEnded label types sec = RequireStatelessOrEnded with label; security_id = sec; stateless_types = types
+
+-- Vesting starts and events carry no quantity and may be backdated, as acceptances may. On a stock
+-- state they are non-terminal events; with no state they are records on a warrant, a grant, or a
+-- stock lot that a record in the write shows ended (OCF allows them on any security).
 applyVestingRecord : Book -> OcfRecordData -> Text -> Text -> Date -> Update Book
 applyVestingRecord b d id sec date = case lookupState sec b of
   Some _ -> do
     (s, _) <- beginEvent b sec date True
     b' <- writeEventRecord s id d b
     replaceState (successorAfter b.context s id) b'
-  None -> writeStatelessRecord d [nonStockVestingTarget sec] b
+  None -> writeStatelessRecord d [statelessOrEnded "Vesting record (no stock state in this write)" nonStockVestingTargets sec] b
 
 applyPrimaryIssuance : Book -> StockIssuanceOcfData -> Update Book
 applyPrimaryIssuance b0 iss = do
@@ -189,6 +203,14 @@ applyPrimaryIssuance b0 iss = do
 
 -- A split touches no stock state: it is recorded on its class's frozen epoch, dated after the
 -- class's latest split, and each state applies it at its next event.
+-- A register-ordering necessity, not an OCF rule (OCF allows two splits of a class on one date): a
+-- state's split epoch counts the class's splits dated on or before its last event, so a second split
+-- on a date some state has already counted one on could not be told apart from a split it has not
+-- seen, and the register cannot know whether an event on that date came before or after it. The
+-- writer records two same-day splits as one split of their combined ratio. A split dated on or
+-- before a state's last event leaves that state's epoch stale on purpose: whether its quantity was
+-- written before or after the split is ambiguous, so its next event fails closed until a
+-- restatement states it in the split's units (`applySplits`).
 applySplitRecord : Book -> StockClassSplitOcfData -> Update Book
 applySplitRecord b0 sp = do
   e <- requireEpoch sp.stock_class_id b0
@@ -224,9 +246,10 @@ applySnapshot b sec asOf vested = do
 -- =============================================================================
 
 -- The checks every partial or whole terminal event with an optional balance shares: the event
--- quantity fits, the balance exists exactly when shares remain and is named by the event, stays with
--- the source's stakeholder and class, holds exactly the remainder, and a partial event needs full
--- tranche cover.
+-- quantity fits, and the balance exists exactly when shares remain, is named by the event, stays in
+-- the source's class and holds exactly the remainder (the lot's quantity is conserved in its class's
+-- units). OCF ties a balance to its source in no other way: its holder and its vesting are its own
+-- record's. A whole event may name a balance security it does not write: OCF does not resolve it.
 checkBalance : StockSecurity -> Decimal -> Optional Text -> Optional StockIssuanceOcfData -> Update ()
 checkBalance s quantity namedBalance balance = do
   when (quantity > s.quantity)
@@ -238,15 +261,15 @@ checkBalance s quantity namedBalance balance = do
         (abort ("the event must name its balance security " <> bal.security_id))
       unless (bal.quantity == remaining)
         (abort ("balance " <> bal.security_id <> " must hold the remaining " <> show remaining))
-      unless (bal.stakeholder_id == s.stakeholder_id && bal.stock_class_id == s.stock_class_id)
-        (abort ("balance " <> bal.security_id <> " must stay with the source's stakeholder and class"))
-      unless (fullyCovered s)
-        (abort ("security " <> s.security_id <> " has tranches covering less than its quantity and takes no partial event"))
-      liftEither (checkBalanceVesting s (outputVesting bal))
+      unless (bal.stock_class_id == s.stock_class_id)
+        (abort ("balance " <> bal.security_id <> " must stay in the source's class"))
+    -- A ledger necessity, not OCF (whose `balance_security_id` is optional): the register keeps
+    -- each lot's quantity, so the shares a partial event leaves must go to a written balance lot.
+    -- An export that omits it needs the balance issuance OCF's traversal rules describe written
+    -- off-chain first (the SDK's to synthesize).
     (True, None) -> abort ("a partial event on security " <> s.security_id <> " needs a balance issuance")
     (False, Some _) -> abort ("an event on the whole of security " <> s.security_id <> " has no balance")
-    (False, None) ->
-      unless (isNone namedBalance) (abort "the event names a balance security but writes none")
+    (False, None) -> pure ()
 
 checkResultingIds : [Text] -> [StockIssuanceOcfData] -> Update ()
 checkResultingIds named resulting =
@@ -262,16 +285,14 @@ writeOutputs s d resulting balance b0 = do
 
 applyTransfer : Book -> StockTransferOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> Update Book
 applyTransfer b0 t resulting balance = do
-  (s, _) <- beginEvent b0 t.security_id t.date False
+  (s, _) <- beginTerminalEvent b0 t.security_id t.date
   requireNoHolds s
   checkResultingIds t.resulting_security_ids resulting
   checkBalance s t.quantity t.balance_security_id balance
-  unless (all (\r -> r.stock_class_id == s.stock_class_id) resulting)
-    (abort "a stock transfer's resulting securities stay in the source's class")
+  -- The transferred quantity is conserved; the resulting securities' class, like their holders and
+  -- vesting, is their own records' (OCF ties none of them to the source).
   unless (sum (map (.quantity) resulting) == t.quantity)
     (abort ("the resulting securities of transfer " <> t.id <> " must hold exactly its quantity " <> show t.quantity))
-  liftEither (checkOutputsVesting t.date ("transfer " <> t.id) [s] (map outputVesting (resulting <> optionalToList balance)))
-  liftEither (checkTransferVesting t.date ("transfer " <> t.id) s (map outputVesting resulting) (outputVesting <$> balance))
   b1 <- writeEventRecord s t.id (OcfRecordDataStockTransfer t) b0
   b2 <- endState s.security_id b1
   writeOutputs s t.date resulting balance b2
@@ -279,75 +300,62 @@ applyTransfer b0 t resulting balance = do
 -- Cancellations and repurchases retire part or all of a security and may leave a balance.
 applyReduction : Book -> OcfRecordData -> Text -> Date -> Text -> Decimal -> Optional Text -> Optional StockIssuanceOcfData -> Update Book
 applyReduction b0 d id date sec quantity namedBalance balance = do
-  (s, _) <- beginEvent b0 sec date False
+  (s, _) <- beginTerminalEvent b0 sec date
   requireNoHolds s
   checkBalance s quantity namedBalance balance
-  liftEither (checkOutputsVesting date ("event " <> id) [s] (map outputVesting (optionalToList balance)))
   b1 <- writeEventRecord s id d b0
   b2 <- endState s.security_id b1
   writeOutputs s date [] balance b2
 
 -- A conversion's arithmetic is the writer's, in the source's class as in any other (OCF ties no
 -- resulting quantity to quantity_converted): the ledger checks the converted quantity against the
--- source, the balance, and that same-class outputs never vest ahead of the source.
+-- source and the balance. A conversion may result in nothing on this register (OCF sets no
+-- minItems on its resulting securities).
 applyConversion : Book -> StockConversionOcfData -> [StockIssuanceOcfData] -> Optional StockIssuanceOcfData -> Update Book
 applyConversion b0 c resulting balance = do
-  (s, _) <- beginEvent b0 c.security_id c.date False
+  (s, _) <- beginTerminalEvent b0 c.security_id c.date
   requireNoHolds s
   checkResultingIds c.resulting_security_ids resulting
   checkBalance s c.quantity_converted c.balance_security_id balance
-  let sameClass = filter (\r -> r.stock_class_id == s.stock_class_id) resulting
-  liftEither (checkOutputsVesting c.date ("conversion " <> c.id) [s] (map outputVesting (sameClass <> optionalToList balance)))
   b1 <- writeEventRecord s c.id (OcfRecordDataStockConversion c) b0
   b2 <- endState s.security_id b1
   writeOutputs s c.date resulting balance b2
 
--- A reissuance retires the whole security. Into its own class it conserves the quantity; one that
--- names a split is same-class and yields the post-split quantity, the split having been applied to
--- the source first.
+-- A reissuance retires the whole security into resulting securities whose quantities are the
+-- writer's: OCF ties them to nothing, and a reissuance after a split may round fractional shares
+-- away. A split it names must exist; OCF ties it to no class or date.
+-- Deliberately left to the writer (owner decision): the register does not conserve quantity across
+-- a reissuance, not even within one class with no split named. The TA/issuer writer and the SDK's
+-- off-chain checks own that; do not add an on-chain sum check here.
 applyReissuance : Book -> StockReissuanceOcfData -> [StockIssuanceOcfData] -> Update Book
 applyReissuance b0 r resulting = do
-  (s, _) <- beginEvent b0 r.security_id r.date False
+  (s, _) <- beginTerminalEvent b0 r.security_id r.date
   requireNoHolds s
   checkResultingIds r.resulting_security_ids resulting
-  let allSameClass = all (\x -> x.stock_class_id == s.stock_class_id) resulting
-  when (isSome r.split_transaction_id && not allSameClass)
-    (abort ("reissuance " <> r.id <> " names a split, so its resulting securities stay in the source's class"))
-  when (allSameClass && sum (map (.quantity) resulting) /= s.quantity)
-    (abort ("same-class reissuance " <> r.id <> " must conserve the quantity " <> show s.quantity))
-  let sameClass = filter (\x -> x.stock_class_id == s.stock_class_id) resulting
-  liftEither (checkOutputsVesting r.date ("reissuance " <> r.id) [s] (map outputVesting sameClass))
   b1 <- writeEventRecord s r.id (OcfRecordDataStockReissuance r) b0
   let b1' = addRequirements
-        (map (\sp -> RequireSplitOfClass with label = "Stock reissuance " <> r.id; split_id = sp; stock_class_id = s.stock_class_id; on_or_before = r.date)
+        (map (\sp -> RequireObject with label = "Stock reissuance " <> r.id <> " split"; object_id = sp; object_types = [OcfObjectTypeTxStockClassSplit])
           (optionalToList r.split_transaction_id)) b1
   b2 <- endState s.security_id b1'
   writeOutputs s r.date resulting None b2
 
--- A consolidation retires up to 50 securities of one stakeholder and class into one resulting security
--- of that stakeholder and class that holds their sum. Its IDs derive from its first input.
+-- A consolidation retires up to 50 securities into one resulting security. OCF ties neither the
+-- inputs' nor the result's holder or class together; when all of them share one class, the result
+-- holds the inputs' sum (quantities are in that class's units). Its IDs derive from its first input.
 applyConsolidation : Book -> StockConsolidationOcfData -> StockIssuanceOcfData -> Update Book
 applyConsolidation b0 c resulting = do
   when (null c.security_ids) (abort "a consolidation needs at least one security")
   when (length c.security_ids > maxLotsPerOperation)
     (abort ("a consolidation takes at most " <> show maxLotsPerOperation <> " securities"))
   unless (dedup c.security_ids == c.security_ids) (abort "a consolidation names each security once")
-  sources <- mapA (\sec -> fst <$> beginEvent b0 sec c.date False) c.security_ids
+  sources <- mapA (\sec -> fst <$> beginTerminalEvent b0 sec c.date) c.security_ids
   forA_ sources requireNoHolds
   let first = head sources
-  unless (all (\s -> s.stock_class_id == first.stock_class_id) sources)
-    (abort "a consolidation's securities share one class")
-  unless (all (\s -> s.stakeholder_id == first.stakeholder_id) sources)
-    (abort "a consolidation's securities share one stakeholder")
   unless (resulting.security_id == c.resulting_security_id)
     (abort ("consolidation " <> c.id <> " must write its resulting security " <> c.resulting_security_id))
-  unless (resulting.stock_class_id == first.stock_class_id)
-    (abort "a consolidation's resulting security stays in its inputs' class")
-  unless (resulting.stakeholder_id == first.stakeholder_id)
-    (abort "a consolidation's resulting security stays with its inputs' stakeholder")
-  unless (resulting.quantity == sum (map (.quantity) sources))
-    (abort ("consolidation " <> c.id <> " must yield the sum of its inputs"))
-  liftEither (checkOutputsVesting c.date ("consolidation " <> c.id) sources [outputVesting resulting])
+  when (all (\s -> s.stock_class_id == resulting.stock_class_id) sources
+        && resulting.quantity /= sum (map (.quantity) sources))
+    (abort ("consolidation " <> c.id <> " within one class must yield the sum of its inputs"))
   b1 <- writeEventRecord first c.id (OcfRecordDataStockConsolidation c) b0
   b2 <- foldlA (\b s -> endState s.security_id b) b1 sources
   addOutputIssuance first c.date (DerivedRoleResultingIssuance, DerivedRoleResultingSecurity, 0) resulting b2

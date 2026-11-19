@@ -95,6 +95,12 @@ touch objectId p = do
     (abort ("record " <> objectId <> " is created in this write; write its final data in the create"))
   pure p with touched = Set.insert objectId p.touched
 
+-- Whether an edit changes only a split's comments.
+splitCommentsOnly : OcfRecordData -> OcfRecordData -> Bool
+splitCommentsOnly old new = case (old, new) of
+  (OcfRecordDataStockClassSplit o, OcfRecordDataStockClassSplit n) -> (o with comments = n.comments) == n
+  _ -> False
+
 -- Records a package choice wrote (derived IDs), splits and holds are never restated.
 refuseProtected : Context -> Text -> OcfRecordData -> Update ()
 refuseProtected ctx objectId d = do
@@ -113,7 +119,8 @@ restateOne p op = case op of
         objectId = (recordView ctx d).object_id
     p1 <- touch objectId p
     old <- requireRecord objectId p1.book
-    refuseProtected ctx objectId old.ocf_data
+    -- A split's comments may be corrected: they change nothing the epoch or a state holds.
+    unless (splitCommentsOnly old.ocf_data d) (refuseProtected ctx objectId old.ocf_data)
     unless (recordObjectType old.ocf_data == recordObjectType d)
       (abort ("an edit keeps record " <> objectId <> "'s type"))
     when (old.ocf_data == d) (abort ("edit of record " <> objectId <> " changes nothing"))
@@ -200,8 +207,12 @@ restateOne p op = case op of
           derived_ids = True
     case (lookupState r.security_id b, r.seq) of
       (Some old, None) -> do
-        when (r.last_event_date < old.last_event_date)
-          (abort ("a restatement never moves security " <> r.security_id <> "'s last event date back"))
+        -- The last event date may move back (a correction of a misdated event) when no split of
+        -- the class lies between the two dates, so the stated quantity's units do not change.
+        when (r.last_event_date < old.last_event_date
+              && (old.stock_class_id /= r.stock_class_id
+                  || splitsOnOrBefore e.splits r.last_event_date /= splitsOnOrBefore e.splits old.last_event_date))
+          (abort ("a restatement moves security " <> r.security_id <> "'s last event date back only within its class and split epoch"))
         unless (r.origin_transaction_id == old.origin_transaction_id)
           (abort ("a successor of security " <> r.security_id <> " keeps its origin transaction " <> old.origin_transaction_id))
         -- Moving a state out of a class changes a state in that class too.
@@ -290,18 +301,6 @@ recreates sec = any (\pending -> case pending of
 endedAt : Text -> Pending -> [Bool]
 endedAt sec pending = case pending of
   PendingEnd with security_id; derived_ids -> if security_id == sec then [derived_ids] else []
-  _ -> []
-
--- The securities a stock record consumed (ended).
-consumedSecurities : OcfRecordData -> [Text]
-consumedSecurities d = case d of
-  OcfRecordDataStockTransfer x -> [x.security_id]
-  OcfRecordDataStockCancellation x -> [x.security_id]
-  OcfRecordDataStockRepurchase x -> [x.security_id]
-  OcfRecordDataStockRetraction x -> [x.security_id]
-  OcfRecordDataStockConversion x -> [x.security_id]
-  OcfRecordDataStockReissuance x -> [x.security_id]
-  OcfRecordDataStockConsolidation x -> x.security_ids
   _ -> []
 
 -- The security a vesting record or a stock acceptance is on: checked against its state or issuance

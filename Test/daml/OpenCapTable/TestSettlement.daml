@@ -2,6 +2,7 @@
 module OpenCapTable.TestSettlement where
 
 import DA.Assert ((===))
+import DA.Foldable (forA_)
 import qualified DA.Date as D
 import DA.Optional (isNone)
 import Daml.Script
@@ -308,6 +309,33 @@ test_settlement_hold_keeps_full_cover = do
   restateOpsFails env "precondition" [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early]]
   _ <- restateOps env [RestateSetState (restatementOf s) with vesting = StockVestingTranches [early, (late with amount = 300.0), (OcfVesting with amount = 300.0; date = D.date 2027 D.Jun 1)]]
   pure ()
+
+-- An OCF-valid schedule of only zero tranches vests nothing, also when the issuance names vesting
+-- terms (present vestings govern): no settlement hold goes on the lot, no draw takes its shares,
+-- and a held lot cannot be restated onto such a schedule.
+test_settlement_all_zero_tranches_draw_nothing : Script ()
+test_settlement_all_zero_tranches_draw_nothing = do
+  env <- tradeBook
+  _ <- applyRecords env [OcfRecordDataVestingTerms vestingTerms4y]
+  let zero = OcfVesting with amount = 0.0; date = d2024
+  _ <- applyRecords env
+    [ OcfRecordDataStockIssuance ((issuance "S-Z" "SH-A" "CLS-A" 100.0 d2024) with vestings = [zero])
+    , OcfRecordDataStockIssuance ((issuance "S-ZT" "SH-A" "CLS-A" 100.0 d2024) with
+        vestings = [zero, zero with date = D.date 2025 D.Jan 1]; vesting_terms_id = Some "VT-4Y")
+    ]
+  forA_ ["S-Z", "S-ZT"] \sec -> do
+    s <- stateOf env sec
+    s.vesting === StockVestingTranches []
+    vestedAt s tradeDay === 0.0
+    lot <- settlementLot env sec 1.0
+    placeHoldsFails env "covering less than its quantity" OcfHoldTypeRegisterSettlement ("T-" <> sec) tradeDay [lot]
+    -- No hold is open on it, so no draw can name one; S-A1's hold does not reach it.
+    draw <- drawLot env "S-A1" 1.0 1.0 []
+    buyer <- buyerB env
+    settleFails env ("is not open on security " <> sec) "T-1" tradeDay buyer [SettleDraw draw with security_id = sec]
+  -- A lot that carries a settlement hold cannot be restated onto a schedule that vests nothing.
+  held <- stateOf env "S-A1"
+  restateOpsFails env "precondition" [RestateSetState (restatementOf held) with vesting = StockVestingTranches []]
 
 -- The shared floor function is exact far beyond 10^18: a 2,000,000,000-share lot with a cost
 -- basis of 3,000,000,000.00 USD keeps 2,999,999,998.50 USD on the balance of a one-share draw.

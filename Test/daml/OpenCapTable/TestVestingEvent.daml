@@ -6,6 +6,7 @@ import qualified DA.Date as D
 import Daml.Script
 
 import Fairmint.OpenCapTable.Ids (DerivedRole(..))
+import Fairmint.OpenCapTable.Apply (ApplyOperation(..))
 import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate (RestateOperation(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..))
@@ -104,9 +105,8 @@ test_vesting_event_validation = do
   -- An empty object ID is stopped by its claim, before the record's ensure.
   refuseWith env "an empty ID cannot be claimed" valid eventRecord (e with id = "")
   refuse env valid eventRecord (e with security_id = "")
-  refuse env valid eventRecord (e with vesting_condition_id = "")
-  refuse env valid eventRecord (e with comments = [""])
-  refuse env valid eventRecord (e with comments = ["ok", ""])
+  -- The condition ID is a plain OCF string the register does not resolve; a comment may be "".
+  accept env valid eventRecord (e with id = "VE-EMPTY"; vesting_condition_id = ""; comments = ["ok", ""])
   -- An event may be dated before the grant: the register does not order vesting records.
   accept env valid eventRecord (e with date = D.date 2023 D.Dec 1; comments = ["Recorded late"])
 
@@ -134,8 +134,6 @@ test_vesting_event_on_stock_backdated = do
   env <- stockBook
   let accepted = D.date 2024 D.Jun 1
   _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = accepted; security_id = "S-V"; comments = []]
-  applyRecordsFails env "precedes the last event on security S-V"
-    [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-2"; date = D.date 2024 D.Mar 1; security_id = "S-V"; comments = []]
   let e = (vestingEvent "VE-1" "S-V" "event") with date = D.date 2024 D.Mar 1
   _ <- applyRecords env [eventRecord e]
   expectRecord env (eventRecord e)
@@ -158,9 +156,15 @@ test_vesting_event_on_retired_stock : Script ()
 test_vesting_event_on_retired_stock = do
   env <- stockBook
   _ <- applyRecords env [OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-1"; date = D.date 2024 D.Feb 1; reason_text = "Issued in error"; security_id = "S-V"; comments = []]
-  applyRecordsFails env "Vesting record (no stock state in this write) security S-V is carried by a OcfObjectTypeTxStockIssuance"
-    [eventRecord (vestingEvent "VE-1" "S-V" "event")]
-  expectNoRecord env "VE-1"
+  -- OCF allows a vesting record on any security, an ended one included: with the retraction among
+  -- the write's inputs showing the lot ended, the record is stored against the stock issuance.
+  _ <- applyRecords env [eventRecord (vestingEvent "VE-1" "S-V" "event")]
+  expectRecord env (eventRecord (vestingEvent "VE-1" "S-V" "event"))
+  -- Without that evidence the ledger cannot tell an ended lot from one the writer left out.
+  inputs <- allInputs env
+  retCid <- recordCidOf env "RET-1"
+  applyWithFails env (inputs with records = filter (/= retCid) inputs.records) "no record here shows its lot ended"
+    [ApplyRecord (eventRecord (vestingEvent "VE-2" "S-V" "event"))]
 
 -- =============================================================================
 -- RESTATEMENT AND IDS

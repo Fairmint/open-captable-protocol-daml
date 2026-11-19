@@ -60,7 +60,6 @@ test_stock_reissuance_after_split = do
         reason_text = Some "Stock split adjustment"
         split_transaction_id = Some "TX_STOCK_CLASS_SPLIT_1"
       o = out "STOCK-ISS-REISSUANCE-2" "SSEC-002-SPLIT" d 50000.0
-  applyOpsFails env "same-class reissuance TX_STOCK_REISSUANCE_2 must conserve the quantity 50000.0" [reissue r [o with quantity = 25000.0]]
   _ <- applyOps env [reissue r [o]]
   expectRecord env (OcfRecordDataStockReissuance r)
   s <- stateOf env "SSEC-002-SPLIT"
@@ -76,7 +75,6 @@ test_stock_reissuance_multiple_resulting = do
         reason_text = Some "Legend removal and certificate split per holder request"
       oa = out "STOCK-ISS-REISSUANCE-3A" "SSEC-003-FREE-A" d 50000.0
       ob = out "STOCK-ISS-REISSUANCE-3B" "SSEC-003-FREE-B" d 50000.0
-  applyOpsFails env "must conserve the quantity 100000.0" [reissue r [oa, ob with quantity = 49999.0]]
   applyOpsFails env "the resulting issuances must be the event's resulting securities, in order" [reissue r [ob, oa]]
   _ <- applyOps env [reissue r [oa, ob]]
   expectRecord env (OcfRecordDataStockReissuance r)
@@ -97,8 +95,8 @@ test_stock_reissuance_retires_source = do
     ]
   hasState env "SSEC-REISSUANCE-BALANCE" >>= (=== True)
 
--- Into another class the arithmetic is the writer's; a reissuance that names a split stays in the
--- source's class.
+-- Into another class the arithmetic is the writer's, even for a reissuance that names a split: OCF
+-- ties its split to no class.
 test_stock_reissuance_into_another_class : Script ()
 test_stock_reissuance_into_another_class = do
   env <- reissuanceBook "SSEC-X" 100.0
@@ -107,9 +105,7 @@ test_stock_reissuance_into_another_class = do
   let d = D.date 2025 D.Jul 1
       r = mkReissuance "REISS-X" "SSEC-X" d ["SSEC-X-B"]
       o = (out "ISS-X-B" "SSEC-X-B" d 80.0) with stock_class_id = "CLS-B"
-  applyOpsFails env "reissuance REISS-X names a split, so its resulting securities stay in the source's class"
-    [reissue (r with split_transaction_id = Some "SPLIT-A") [o]]
-  _ <- applyOps env [reissue r [o]]
+  _ <- applyOps env [reissue (r with split_transaction_id = Some "SPLIT-A") [o]]
   s <- stateOf env "SSEC-X-B"
   s.stock_class_id === "CLS-B"
   s.quantity === 80.0
@@ -123,13 +119,30 @@ test_stock_reissuance_split_reference = do
   let d = D.date 2025 D.Jul 1
       r = mkReissuance "REISS-S" "SSEC-S" d ["SSEC-S-R"]
       o = out "ISS-S-R" "SSEC-S-R" d 100.0
-  applyOpsFails env "Stock reissuance REISS-S split SPLIT-B is of stock class CLS-B, not CLS-A"
-    [reissue (r with split_transaction_id = Some "SPLIT-B") [o]]
-  applyOpsFails env "Stock reissuance REISS-S split SPLIT-A-LATE is dated after the reissuance"
-    [reissue (r with split_transaction_id = Some "SPLIT-A-LATE") [o]]
-  applyOpsFails env "Stock reissuance REISS-S split transaction not found: SH-B"
+  -- The split must exist as a split record; OCF ties it to no class or date, so a split of another
+  -- class or dated later is accepted.
+  applyOpsFails env "Stock reissuance REISS-S split not found: SPLIT-NONE"
+    [reissue (r with split_transaction_id = Some "SPLIT-NONE") [o]]
+  applyOpsFails env "Stock reissuance REISS-S split SH-B is a OcfObjectTypeStakeholder"
     [reissue (r with split_transaction_id = Some "SH-B") [o]]
   hasState env "SSEC-S" >>= (=== True)
+  _ <- applyOps env [reissue (r with split_transaction_id = Some "SPLIT-B") [o]]
+  expectRecord env (OcfRecordDataStockReissuance (r with split_transaction_id = Some "SPLIT-B"))
+
+-- A reissuance's quantities are the writer's: one that rounds fractional shares away after a
+-- split (cash in lieu), or results in nothing on this register, is accepted.
+test_stock_reissuance_quantities_are_the_writers : Script ()
+test_stock_reissuance_quantities_are_the_writers = do
+  env <- reissuanceBook "SSEC-Q" 100.0
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "SSEC-Q2" "SH-A" "CLS-A" 10.0 (D.date 2024 D.Jan 1)) with id = "ISS-SSEC-Q2")]
+  let d = D.date 2025 D.Sep 1
+      r = mkReissuance "REISS-Q" "SSEC-Q" d ["SSEC-Q-R"]
+  _ <- applyOps env [reissue r [out "ISS-Q-R" "SSEC-Q-R" d 99.0]]
+  (.quantity) <$> stateOf env "SSEC-Q-R" >>= (=== 99.0)
+  let none = mkReissuance "REISS-NONE" "SSEC-Q2" d []
+  expectTrue "no resulting securities" (validateStockReissuanceOcfData none)
+  _ <- applyOps env [reissue none []]
+  hasState env "SSEC-Q2" >>= (=== False)
 
 test_stock_reissuance_validator : Script ()
 test_stock_reissuance_validator = do
@@ -137,13 +150,10 @@ test_stock_reissuance_validator = do
   let d = D.date 2025 D.Sep 1
       r = mkReissuance "REISS-V" "SSEC-V" d ["SSEC-V-R"]
       o = out "ISS-V-R" "SSEC-V-R" d 100.0
-  applyOpsFails env "precondition" [reissue (r with reason_text = Some "") [o]]
-  applyOpsFails env "precondition" [reissue (r with comments = [""]) [o]]
   -- The record's ensure runs before the split reference is checked.
   applyOpsFails env "precondition" [reissue (r with split_transaction_id = Some "") [o]]
   applyOpsFails env "precondition" [reissue (r with resulting_security_ids = [""]) [o with security_id = ""]]
   -- With no resulting securities nothing conserves the quantity.
-  applyOpsFails env "must conserve the quantity 100.0" [reissue (r with resulting_security_ids = []) []]
   applyOpsFails env "an empty ID cannot be claimed" [reissue (r with id = "") [o]]
   hasState env "SSEC-V" >>= (=== True)
   let ok = validateStockReissuanceOcfData
@@ -151,8 +161,5 @@ test_stock_reissuance_validator = do
   expectTrue "a reason and a split" (ok r with reason_text = Some "Split"; split_transaction_id = Some "SPLIT-1")
   expectFalse "empty id" (ok r with id = "")
   expectFalse "empty security_id" (ok r with security_id = "")
-  expectFalse "an empty reason_text" (ok r with reason_text = Some "")
   expectFalse "an empty split_transaction_id" (ok r with split_transaction_id = Some "")
-  expectFalse "an empty comment" (ok r with comments = [""])
   expectFalse "an empty resulting security ID" (ok r with resulting_security_ids = [""])
-  expectFalse "no resulting securities" (ok r with resulting_security_ids = [])

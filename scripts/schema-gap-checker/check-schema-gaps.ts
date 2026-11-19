@@ -63,7 +63,6 @@ const GLOBAL_ALLOWLIST = new Set(['object_type']);
 const PER_TYPE_ALLOWLIST: Record<string, Set<string>> = {
   StakeholderOcfData: new Set(['current_relationship']),
   StockPlanOcfData: new Set(['stock_class_id']),
-  EquityCompensationIssuanceOcfData: new Set(['option_grant_type']),
 };
 
 /** Enum values a DAML enum deliberately omits (writers normalize them), and the values it appends after OCF's. */
