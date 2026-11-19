@@ -8,7 +8,6 @@ module Fairmint.OpenCapTable.Events
   , successorAfter
   , stateForIssuance
   , vestingOfIssuance
-  , outputVesting
   , addOutputIssuance
   , checkRequirements
   , checkRequirementIn
@@ -19,7 +18,7 @@ import DA.Action (unless, when)
 import DA.Date (addDays)
 import DA.Foldable (forA_)
 import DA.List (dedup)
-import DA.Optional (isSome)
+import qualified DA.Map as Map
 import DA.Time (isLedgerTimeGE, isLedgerTimeLT, time)
 import Fairmint.OpenCapTable.Book
 import Fairmint.OpenCapTable.Ids
@@ -29,7 +28,7 @@ import Fairmint.OpenCapTable.References
 import Fairmint.OpenCapTable.Splits (applySplits)
 import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Core (Context)
-import Fairmint.OpenCapTable.VestingState (OutputVesting(..), sortTranches)
+import Fairmint.OpenCapTable.VestingState (sortTranches)
 
 liftEither : Either Text a -> Update a
 liftEither = either abort pure
@@ -84,17 +83,13 @@ successorAfter ctx s id = (successor s) with
   derived_ids = s.derived_ids || id == deriveId ctx s.security_id s.seq DerivedRoleEvent 0
 
 -- | How an issuance's security vests: explicit tranches first (OCF reads `vestings` ahead of
--- `vesting_terms_id`), else its vesting terms, else fully vested.
+-- `vesting_terms_id`), else its vesting terms, else fully vested. A zero tranche vests nothing, so
+-- the state leaves it out (OCF allows it, and a schedule may list placeholders); a negative tranche
+-- stays and the state refuses it, as tranches that can unvest cannot be drawn or accelerated.
 vestingOfIssuance : StockIssuanceOcfData -> StockVesting
-vestingOfIssuance iss
-  | not (null iss.vestings) = StockVestingTranches (sortTranches iss.vestings)
-  | otherwise = optional StockVestingNone StockVestingOnTerms iss.vesting_terms_id
-
-outputVesting : StockIssuanceOcfData -> OutputVesting
-outputVesting iss = OutputVesting with
-  quantity = iss.quantity
-  vestings = iss.vestings
-  on_terms = null iss.vestings && isSome iss.vesting_terms_id
+vestingOfIssuance iss = case filter (\t -> t.amount /= 0.0) iss.vestings of
+  [] -> optional StockVestingNone StockVestingOnTerms iss.vesting_terms_id
+  ts -> StockVestingTranches (sortTranches ts)
 
 -- | The new state of a security an issuance creates. Its quantity is in the units of the event
 -- date `eventDate` (a primary issuance's own date), so it starts at that date's split epoch.
@@ -117,21 +112,23 @@ stateForIssuance b e eventDate iss = StockSecurity with
   accelerated_since_snapshot = None
   derived_ids = False
 
--- | Writes an output issuance of an event on source state `src` dated `d`: the issuance is dated
--- `d`, because its new state starts at the event's date and split epoch and its quantity is in the
--- event's units; resolves its object and security IDs against the derived ones for the roles,
--- creates the record and the new security's state (its class's epoch must be in the working set
--- and not frozen), and queues the issuance's own references.
+-- | Writes an output issuance of an event on source state `src` dated `d`: resolves its object and
+-- security IDs against the derived ones for the roles, creates the record and the new security's
+-- state (its class's epoch must be in the working set and not frozen), and queues the issuance's
+-- own references. OCF does not tie the issuance's date to the event's, but its quantity is in the
+-- units of the event's split epoch, so no split of its class may fall between the two dates; its
+-- state's last event is the later of them.
 addOutputIssuance : StockSecurity -> Date -> (DerivedRole, DerivedRole, Int) -> StockIssuanceOcfData -> Book -> Update Book
 addOutputIssuance src d (issuanceRole, securityRole, index) iss b0 = do
-  unless (iss.date == d)
-    (abort ("output issuance " <> iss.id <> " is dated " <> show iss.date <> ", not on its event's date " <> show d))
   b1 <- resolveId IdNamespaceObject src issuanceRole index iss.id b0
   b2 <- resolveId IdNamespaceSecurity src securityRole index iss.security_id b1
   e <- requireEpoch iss.stock_class_id b2
   when e.frozen (abort ("stock class " <> iss.stock_class_id <> " is frozen for a split"))
+  unless (splitsOnOrBefore e.splits iss.date == splitsOnOrBefore e.splits d)
+    (abort ("output issuance " <> iss.id <> " is dated " <> show iss.date <> " and its event " <> show d
+      <> ", with a split of stock class " <> iss.stock_class_id <> " between them"))
   (b3, _) <- addRecord (OcfRecordDataStockIssuance iss) b2
-  b4 <- addState (stateForIssuance b3 e d iss) b3
+  b4 <- addState (stateForIssuance b3 e (max d iss.date) iss) b3
   pure (addRequirements (requirementsOf (OcfRecordDataStockIssuance iss)) b4)
 
 -- | Evaluates every deferred requirement against the final working set.
@@ -146,4 +143,4 @@ bookLookups : Book -> Lookups
 bookLookups b = Lookups with
   record = (`lookupRecordData` b)
   security = (`lookupSecurity` b)
-  epoch_splits = \cls -> (.splits) <$> lookupEpoch cls b
+  consumed = \sec -> any (\e -> sec `elem` consumedSecurities e.ocf_data) (Map.values b.records)

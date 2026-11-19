@@ -69,7 +69,7 @@ test_stock_conversion_partial_with_balance = do
       r = common "TX_STOCK_CONVERSION_2_RESULT" "SSEC-COMMON-002" d 30000.0
       b = preferred "TX_STOCK_CONVERSION_2_BALANCE" "SSEC-PREF-002-REMAIN" d 20000.0
   -- The balance stays in the source's class.
-  applyOpsFails env "must stay with the source's stakeholder and class" [convert c [r] (Some (b with stock_class_id = "CLS-A"))]
+  applyOpsFails env "must stay in the source's class" [convert c [r] (Some (b with stock_class_id = "CLS-A"))]
   applyOpsFails env "needs a balance issuance" [convert c [r] None]
   _ <- applyOps env [convert c [r] (Some b)]
   expectRecord env (OcfRecordDataStockConversion c)
@@ -102,8 +102,8 @@ test_stock_conversion_overdraw_refused = do
     [convert (mkConversion "TX_STOCK_CONVERSION_OVERDRAW" "SSEC-CONVERSION-OVERDRAW" d 101.0 ["SSEC-CONVERSION-RESULT"] None) [common "R-1" "SSEC-CONVERSION-RESULT" d 101.0] None]
   (.quantity) <$> stateOf env "SSEC-CONVERSION-OVERDRAW" >>= (=== 100.0)
 
--- Same-class outputs never vest ahead of the source; another class's units differ, so outputs
--- there are the writer's arithmetic.
+-- How a conversion's outputs vest is their own records': OCF links it to the source in no way, so a
+-- same-class output may vest ahead of the source (the SDK may warn), and so may one in another class.
 test_stock_conversion_vesting_of_outputs : Script ()
 test_stock_conversion_vesting_of_outputs = do
   env <- standardBook
@@ -114,12 +114,32 @@ test_stock_conversion_vesting_of_outputs = do
     , OcfRecordDataStockIssuance ((issuance "S-V" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)
     ]
   let c = mkConversion "CONV-V" "S-V" d 100.0 ["S-V-C"] None
-  applyOpsFails env "more than the 50.0 their source has vested"
-    [convert c [common "ISS-S-V-C" "S-V-C" d 100.0] None]
   _ <- applyOps env [convert c [(common "ISS-S-V-C" "S-V-C" d 100.0) with stock_class_id = "CLS-B"] None]
   s <- stateOf env "S-V-C"
   s.stock_class_id === "CLS-B"
   s.vesting === StockVestingNone
+
+test_stock_conversion_same_class_output_vests_ahead : Script ()
+test_stock_conversion_same_class_output_vests_ahead = do
+  env <- standardBook
+  let tranches = [(OcfVesting with amount = 50.0; date = d2024), (OcfVesting with amount = 50.0; date = D.date 2026 D.Jan 1)]
+      d = D.date 2025 D.Jan 1
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-V" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)]
+  let c = mkConversion "CONV-V" "S-V" d 100.0 ["S-V-C"] None
+  _ <- applyOps env [convert c [(common "ISS-S-V-C" "S-V-C" d 100.0) with stock_class_id = "CLS-A"] None]
+  s <- stateOf env "S-V-C"
+  s.vesting === StockVestingNone
+
+-- OCF's Conversion sets no minItems on its results: a conversion into securities not on this
+-- register retires the source and writes nothing.
+test_stock_conversion_into_nothing : Script ()
+test_stock_conversion_into_nothing = do
+  env <- conversionBook "SSEC-PREF" 100.0
+  let c = mkConversion "CONV-NONE" "SSEC-PREF" (D.date 2025 D.Oct 15) 100.0 [] None
+  expectTrue "no resulting securities" (validateStockConversionOcfData c)
+  _ <- applyOps env [convert c [] None]
+  expectRecord env (OcfRecordDataStockConversion c)
+  hasState env "SSEC-PREF" >>= (=== False)
 
 test_stock_conversion_validator : Script ()
 test_stock_conversion_validator = do
@@ -127,9 +147,7 @@ test_stock_conversion_validator = do
   let d = D.date 2025 D.Oct 15
       c = mkConversion "CONV-1" "SSEC-PREF" d 100.0 ["SSEC-C"] None
       r = common "ISS-C" "SSEC-C" d 100.0
-  applyOpsFails env "precondition" [convert (c with comments = [""]) [r] None]
-  -- With no resulting securities the record's ensure refuses the conversion.
-  applyOpsFails env "precondition" [convert (c with resulting_security_ids = []) [] None]
+  -- An empty resulting security ID is refused by the record's ensure.
   applyOpsFails env "precondition" [convert (c with resulting_security_ids = [""]) [r with security_id = ""] None]
   applyOpsFails env "precondition"
     [convert (c with quantity_converted = 0.0; balance_security_id = Some "SSEC-B") [r] (Some (preferred "ISS-B" "SSEC-B" d 100.0))]
@@ -145,6 +163,4 @@ test_stock_conversion_validator = do
   expectFalse "zero quantity_converted" (ok c with quantity_converted = 0.0)
   expectFalse "negative quantity_converted" (ok c with quantity_converted = -1.0)
   expectFalse "an empty balance_security_id" (ok c with balance_security_id = Some "")
-  expectFalse "an empty comment" (ok c with comments = [""])
   expectFalse "an empty resulting security ID" (ok c with resulting_security_ids = ["SSEC-C", ""])
-  expectFalse "no resulting securities" (ok c with resulting_security_ids = [])

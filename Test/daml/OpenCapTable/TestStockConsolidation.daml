@@ -116,16 +116,11 @@ test_stock_consolidation_rules = do
   let d = D.date 2025 D.Aug 1
       c = mkConsolidation "CONS-1" d ["SSEC-A", "SSEC-B"] "SSEC-ALL"
       r = result "ISS-ALL" "SSEC-ALL" d 30.0
-  applyOpsFails env "consolidation CONS-1 must yield the sum of its inputs" [consolidate c (r with quantity = 29.0)]
+  -- Within one class, the result holds the inputs' sum.
+  applyOpsFails env "consolidation CONS-1 within one class must yield the sum of its inputs" [consolidate c (r with quantity = 29.0)]
   applyOpsFails env "a consolidation names each security once" [consolidate (c with security_ids = ["SSEC-A", "SSEC-A"]) (r with quantity = 20.0)]
-  applyOpsFails env "a consolidation's securities share one class" [consolidate (c with security_ids = ["SSEC-A", "SSEC-C"]) (r with quantity = 15.0)]
   applyOpsFails env "consolidation CONS-1 must write its resulting security SSEC-ALL" [consolidate c (r with security_id = "SSEC-OTHER")]
-  applyOpsFails env "a consolidation's resulting security stays in its inputs' class" [consolidate c (r with stock_class_id = "CLS-B")]
-  -- A consolidation merges one holder's positions: the inputs share a stakeholder, and the result keeps it.
   _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "SSEC-D" "SH-B" "CLS-A" 5.0 issued) with id = "ISS-SSEC-D")]
-  applyOpsFails env "a consolidation's securities share one stakeholder" [consolidate (c with security_ids = ["SSEC-A", "SSEC-D"]) (r with quantity = 15.0)]
-  applyOpsFails env "a consolidation's securities share one stakeholder" [consolidate (c with security_ids = ["SSEC-A", "SSEC-D"]) (r with quantity = 15.0; stakeholder_id = "SH-B")]
-  applyOpsFails env "a consolidation's resulting security stays with its inputs' stakeholder" [consolidate c (r with stakeholder_id = "SH-B")]
   applyOpsFails env "no active state for security SSEC-NONE" [consolidate (c with security_ids = ["SSEC-A", "SSEC-NONE"]) r]
   applyOpsFails env "a consolidation needs at least one security" [consolidate (c with security_ids = []) r]
   applyOpsFails env "a consolidation takes at most 50 securities"
@@ -136,14 +131,36 @@ test_stock_consolidation_rules = do
   hasState env "SSEC-B" >>= (=== True)
   hasState env "SSEC-D" >>= (=== True)
 
+-- OCF ties a consolidation's inputs and result to no common holder or class: lots of two holders,
+-- or of two classes (whose quantities are the writer's arithmetic), consolidate into one result.
+test_stock_consolidation_across_holders_and_classes : Script ()
+test_stock_consolidation_across_holders_and_classes = do
+  env <- consolidationBook [("SSEC-A", 10.0), ("SSEC-B", 20.0)]
+  _ <- applyRecords env
+    [ OcfRecordDataStockClass (stockClass "CLS-B")
+    , OcfRecordDataStockIssuance ((issuance "SSEC-C" "SH-A" "CLS-B" 5.0 issued) with id = "ISS-SSEC-C")
+    , OcfRecordDataStockIssuance ((issuance "SSEC-D" "SH-B" "CLS-A" 5.0 issued) with id = "ISS-SSEC-D")
+    ]
+  let d = D.date 2025 D.Aug 1
+  -- Two holders' lots into a result held by a third party, in the inputs' class.
+  _ <- applyOps env [consolidate (mkConsolidation "CONS-H" d ["SSEC-A", "SSEC-D"] "SSEC-HD")
+        ((result "ISS-HD" "SSEC-HD" d 15.0) with stakeholder_id = "SH-B")]
+  (.stakeholder_id) <$> stateOf env "SSEC-HD" >>= (=== "SH-B")
+  -- Lots of two classes into a result whose quantity is the writer's.
+  _ <- applyOps env [consolidate (mkConsolidation "CONS-C" d ["SSEC-B", "SSEC-C"] "SSEC-BC")
+        ((result "ISS-BC" "SSEC-BC" d 22.5) with stock_class_id = "CLS-B")]
+  s <- stateOf env "SSEC-BC"
+  s.stock_class_id === "CLS-B"
+  s.quantity === 22.5
+  hasState env "SSEC-A" >>= (=== False)
+  hasState env "SSEC-C" >>= (=== False)
+
 test_stock_consolidation_validator : Script ()
 test_stock_consolidation_validator = do
   env <- consolidationBook [("SSEC-A", 10.0), ("SSEC-B", 20.0)]
   let d = D.date 2025 D.Aug 1
       c = mkConsolidation "CONS-1" d ["SSEC-A", "SSEC-B"] "SSEC-ALL"
       r = result "ISS-ALL" "SSEC-ALL" d 30.0
-  applyOpsFails env "precondition" [consolidate (c with reason_text = Some "") r]
-  applyOpsFails env "precondition" [consolidate (c with comments = [""]) r]
   applyOpsFails env "precondition" [consolidate (c with resulting_security_id = "") (r with security_id = "")]
   applyOpsFails env "no active state for security  in this write" [consolidate (c with security_ids = ["SSEC-A", ""]) r]
   applyOpsFails env "an empty ID cannot be claimed" [consolidate (c with id = "") r]
@@ -152,7 +169,5 @@ test_stock_consolidation_validator = do
   expectTrue "a reason" (ok c with reason_text = Some "Cleanup")
   expectFalse "empty id" (ok c with id = "")
   expectFalse "empty resulting_security_id" (ok c with resulting_security_id = "")
-  expectFalse "an empty reason_text" (ok c with reason_text = Some "")
-  expectFalse "an empty comment" (ok c with comments = [""])
   expectFalse "an empty security ID" (ok c with security_ids = ["SSEC-A", ""])
   expectFalse "no securities" (ok c with security_ids = [])

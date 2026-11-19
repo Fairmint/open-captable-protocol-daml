@@ -128,28 +128,15 @@ test_convertible_conversion_capitalization_references = do
   env <- safeBook
   let c = conversion "TX_CONV_CONVERSION_MISSING_CAP_REF" "CONV-SEC" ["S-OUT"]
       out = stockOut "S-OUT" "CLS-A" 100.0
-      withCap d = [cv (c with capitalization_definition = Some d), out]
-      label = "Convertible conversion capitalization definition"
-  applyRecordsFails env (label <> " included security security not found: SEC-MISSING-CAP-REF")
-    (withCap (capDefinition ["SEC-MISSING-CAP-REF"] [] [] []))
-  applyRecordsFails env (label <> " excluded security security not found: SEC-MISSING-CAP-REF")
-    (withCap (capDefinition [] ["SEC-MISSING-CAP-REF"] [] []))
-  -- A security ID, not an issuance's object ID.
-  applyRecordsFails env (label <> " included security security not found: ISS-S-A1")
-    (withCap (capDefinition ["ISS-S-A1"] [] [] []))
-  applyRecordsFails env (label <> " stock class not found: SC-MISSING-CAP-REF")
-    (withCap (capDefinition [] [] ["SC-MISSING-CAP-REF"] []))
-  applyRecordsFails env (label <> " stock class SH-B is a OcfObjectTypeStakeholder, not one of [OcfObjectTypeStockClass]")
-    (withCap (capDefinition [] [] ["SH-B"] []))
-  applyRecordsFails env (label <> " stock plan not found: SP-MISSING-CAP-REF")
-    (withCap (capDefinition [] [] [] ["SP-MISSING-CAP-REF"]))
-  applyRecordsFails env (label <> " stock plan CLS-A is a OcfObjectTypeStockClass, not one of [OcfObjectTypeStockPlan]")
-    (withCap (capDefinition [] [] [] ["CLS-A"]))
-  -- Definitions written later in the same batch satisfy them.
-  let c' = c with capitalization_definition = Some (capDefinition ["S-NEW"] [] ["CLS-NEW"] ["SP-NEW"])
+  -- A capitalization definition's IDs are plain OCF strings the register never reads, so it does
+  -- not resolve them: securities, classes and plans not on the register, or of another type, or "".
+  let unresolved = c with capitalization_definition = Some (capDefinition ["SEC-MISSING-CAP-REF", "ISS-S-A1", ""] ["SEC-MISSING-CAP-REF"] ["SC-MISSING-CAP-REF", "SH-B"] ["SP-MISSING-CAP-REF", "CLS-A"])
+  _ <- applyRecords env [cv unresolved, out]
+  expectRecord env (cv unresolved)
+  -- Definitions written in the same batch are accepted as well.
+  let c' = c with id = "TX_CONV_CONVERSION_CAP_REF_2"; capitalization_definition = Some (capDefinition ["S-NEW"] [] ["CLS-NEW"] ["SP-NEW"])
   _ <- applyRecords env
     [ cv c'
-    , out
     , OcfRecordDataStockIssuance (issuance "S-NEW" "SH-B" "CLS-A" 5.0 d2024)
     , OcfRecordDataStockClass (stockClass "CLS-NEW")
     , OcfRecordDataStockPlan (stockPlan "SP-NEW" ["CLS-NEW"])
@@ -188,13 +175,15 @@ test_convertible_conversion_references = do
   applyRecordsFails env "Convertible conversion trigger not found: TRIGGER-NONE" [out, cv c with trigger_id = "TRIGGER-NONE"]
   applyRecordsFails env ("Convertible conversion trigger not found: " <> convertibleTriggerId) [out, cv c with trigger_id = convertibleTriggerId]
   applyRecordsFails env ("Convertible conversion trigger not found: " <> warrantTriggerId) [out, cv c with trigger_id = warrantTriggerId]
-  -- The resulting securities must be stock issuances, the balance a convertible.
+  -- The resulting securities must exist, as issuances of any type (a note may convert into a
+  -- SAFE), and the balance must be a convertible.
   applyRecordsFails env "Convertible conversion resulting security security not found: S-OUT" [cv c]
-  applyRecordsFails env "Convertible conversion resulting security security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance"
-    [cv c with resulting_security_ids = ["C-1"]]
   applyRecordsFails env "Convertible conversion balance security not found: C-REST" [out, cv c with balance_security_id = Some "C-REST"]
   applyRecordsFails env "Convertible conversion balance security S-A1 is carried by a OcfObjectTypeTxStockIssuance"
     [out, cv c with balance_security_id = Some "S-A1"]
+  let rollover = (conversion "CV-ROLL" "CONV-SEC" ["C-1"])
+  _ <- applyRecords env [cv rollover]
+  expectRecord env (cv rollover)
   -- C-1's own trigger serves its own conversion.
   let c1 = (conversion "CV-C1" "C-1" ["S-C1"]) with trigger_id = convertibleTriggerId
   _ <- applyRecords env [cv c1, stockOut "S-C1" "CLS-A" 10.0]
@@ -212,50 +201,47 @@ test_convertible_conversion_validator = do
   expectValid "empty capitalization definition" (validateConvertibleConversionOcfData base with capitalization_definition = Some (capDefinition [] [] [] []))
   rejects "empty id" "an empty ID cannot be claimed" base with id = ""
   rejects "empty security_id" "precondition" base with security_id = ""
-  rejects "empty trigger_id" "precondition" base with trigger_id = ""
-  rejects "empty reason" "precondition" base with reason_text = ""
-  rejects "empty comment" "precondition" base with comments = [""]
-  rejects "no resulting securities" "precondition" base with resulting_security_ids = []
   rejects "empty resulting security" "precondition" base with resulting_security_ids = ["S-OUT", ""]
   rejects "empty balance security" "precondition" base with balance_security_id = Some ""
-  rejects "zero quantity converted" "precondition" base with quantity_converted = Some 0.0
-  rejects "negative quantity converted" "precondition" base with quantity_converted = Some (-1.0)
-  rejects "empty included security" "precondition" base with capitalization_definition = Some (capDefinition [""] [] [] [])
-  rejects "empty excluded security" "precondition" base with capitalization_definition = Some (capDefinition [] [""] [] [])
-  rejects "empty stock class" "precondition" base with capitalization_definition = Some (capDefinition [] [] [""] [])
-  rejects "empty stock plan" "precondition" base with capitalization_definition = Some (capDefinition [] [] [] [""])
+  -- OCF-valid: an empty trigger ID (it must still name a trigger), a zero or negative converted
+  -- quantity, empty capitalization IDs, no resulting securities, and empty free text.
+  expectValid "empty trigger_id" (validateConvertibleConversionOcfData base with trigger_id = "")
+  applyRecordsFails env "Convertible conversion trigger not found: " [cv base with trigger_id = ""]
+  let ocfValid = base with
+        resulting_security_ids = []
+        quantity_converted = Some (-1.0)
+        capitalization_definition = Some (capDefinition [""] [""] [""] [""])
+        reason_text = ""
+        comments = [""]
+  expectValid "OCF edge cases" (validateConvertibleConversionOcfData ocfValid)
+  _ <- applyRecords env [cv ocfValid]
+  expectRecord env (cv ocfValid)
+  expectValid "zero quantity converted" (validateConvertibleConversionOcfData base with quantity_converted = Some 0.0)
 
--- A capitalization definition's securities, classes and plans are checked, however many one
--- update names.
+-- A capitalization definition's IDs are stored, not resolved, however many one update names.
 test_convertible_conversion_polymorphic_references : Script ()
 test_convertible_conversion_polymorphic_references = do
   env <- safeBook
-  let refs n = Some (capDefinition (replicate n "S-A1") [] [] [])
+  let refs n = Some (capDefinition ("S-MISSING" :: replicate (n - 1) "S-A1") [] [] [])
       c = conversion "CV-P" "CONV-SEC" ["S-OUT"]
       out = stockOut "S-OUT" "CLS-A" 100.0
-  applyRecordsFails env "not found: S-MISSING"
-    [cv (c with capitalization_definition = Some (capDefinition ("S-MISSING" :: replicate 50 "S-A1") [] [] [])), out]
   _ <- applyRecords env [cv (c with capitalization_definition = refs 600), out]
   expectRecord env (cv c with capitalization_definition = refs 600)
 
--- A conversion stores at most 1000 capitalization references.
+-- OCF sets no maxItems on a capitalization definition and the register resolves none of its IDs, so
+-- a fully diluted definition of more than 1000 IDs is stored.
 test_convertible_conversion_stored_reference_cap : Script ()
 test_convertible_conversion_stored_reference_cap = do
   env <- safeBook
   let withRefs n = cv ((conversion "CV-S" "CONV-SEC" ["S-OUT"]) with capitalization_definition = Some (capDefinition [] [] (replicate n "CLS-A") []))
   _ <- applyRecords env [withRefs 100, stockOut "S-OUT" "CLS-A" 100.0]
-  _ <- restateOps env [RestateEdit (withRefs 1000)]
-  expectRecord env (withRefs 1000)
-  restateOpsFails env "OcfObjectTypeTxConvertibleConversion has 1001 capitalization definition references; at most 1000" [RestateEdit (withRefs 1001)]
-  expectRecord env (withRefs 1000)
+  _ <- restateOps env [RestateEdit (withRefs 1001)]
+  expectRecord env (withRefs 1001)
 
 test_convertible_conversion_edit_and_delete : Script ()
 test_convertible_conversion_edit_and_delete = do
   env <- safeBook
   let c = conversion "CV-1" "CONV-SEC" ["S-OUT"]
   _ <- applyRecords env [cv c, stockOut "S-OUT" "CLS-A" 100.0]
-  restateOpsFails env "precondition" [RestateEdit (cv c with resulting_security_ids = [])]
   restateOpsFails env "Convertible conversion trigger not found: TRIGGER-NONE" [RestateEdit (cv c with trigger_id = "TRIGGER-NONE")]
-  restateOpsFails env "Convertible conversion capitalization definition stock plan not found: SP-NONE"
-    [RestateEdit (cv c with capitalization_definition = Some (capDefinition [] [] [] ["SP-NONE"]))]
   checkEditAndDelete env (cv c) (cv c with quantity_converted = Some 50000.0; comments = ["Corrected"])

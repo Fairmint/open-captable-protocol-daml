@@ -72,14 +72,14 @@ test_events_transfer_conservation = do
     [go (mkTransfer "TR-1" "S-A1" 100.0 ["S-B1"] (Some "S-X")) [out "S-B1" "SH-B" 100.0] (Some (out "S-A1-R" "SH-A" 500.0))]
   applyOpsFails env "in order"
     [go (mkTransfer "TR-1" "S-A1" 100.0 ["S-B1"] (Some "S-A1-R")) [out "S-B2" "SH-B" 100.0] (Some (out "S-A1-R" "SH-A" 500.0))]
-  applyOpsFails env "stay with the source's stakeholder"
-    [go (mkTransfer "TR-1" "S-A1" 100.0 ["S-B1"] (Some "S-A1-R")) [out "S-B1" "SH-B" 100.0] (Some (out "S-A1-R" "SH-B" 500.0))]
+  applyOpsFails env "stay in the source's class"
+    [go (mkTransfer "TR-1" "S-A1" 100.0 ["S-B1"] (Some "S-A1-R")) [out "S-B1" "SH-B" 100.0] (Some ((out "S-A1-R" "SH-A" 500.0) with stock_class_id = "CLS-X"))]
   applyOpsFails env "exceeds"
     [go (mkTransfer "TR-1" "S-A1" 700.0 ["S-B1"] None) [out "S-B1" "SH-B" 700.0] None]
 
--- An output issuance is dated on its event: its state starts at the event's date and split epoch,
--- in the event's units, so an earlier date would put its origin record before a split the state
--- already applied, and before the source was consumed.
+-- OCF does not tie an output issuance's date to its event's, but the output's quantity is in the
+-- event's split units, so its date may differ only when no split of its class lies between the two:
+-- its state then starts at the later date.
 test_events_outputs_dated_on_their_event : Script ()
 test_events_outputs_dated_on_their_event = do
   env <- standardBook
@@ -93,31 +93,32 @@ test_events_outputs_dated_on_their_event = do
       consolidation = StockConsolidationOcfData with
         id = "CO-1"; date = eventDay; security_ids = ["S-A1", "S-A2"]; resulting_security_id = "S-A-C"
         comments = []; reason_text = None
-  -- S-A1 holds 1,200 post-split shares on the event date.
-  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
+      splitBetween = "with a split of stock class CLS-A between them"
+  -- S-A1 holds 1,200 post-split shares on the event date; an output dated before the split is in
+  -- other units.
+  applyOpsFails env splitBetween [ApplyStockTransfer with
     transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = before]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
-  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
-    transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = after]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
-  applyOpsFails env "not on its event's date" [ApplyStockTransfer with
+  applyOpsFails env splitBetween [ApplyStockTransfer with
     transfer; resulting = [out "S-B1" "SH-B" 200.0]; balance = Some ((out "S-A1-R" "SH-A" 1000.0) with date = before)]
-  applyOpsFails env "not on its event's date" [ApplyStockCancellation with
+  applyOpsFails env splitBetween [ApplyStockCancellation with
     cancellation; balance = Some ((out "S-A1-R" "SH-A" 1000.0) with date = before)]
-  applyOpsFails env "not on its event's date" [ApplyStockConsolidation with
+  applyOpsFails env splitBetween [ApplyStockConsolidation with
     consolidation; resulting_issuance = (out "S-A-C" "SH-A" 2000.0) with date = before]
-  -- A later-dated output stays refused when a later event in the same write moves its state on.
-  applyOpsFails env "not on its event's date"
+  -- Dated a day after the event (a certificate issued after the transfer is approved), with no split
+  -- between, the transfer commits; a later event in the same write runs on the output's state.
+  _ <- applyOps env
     [ ApplyStockTransfer with
         transfer; resulting = [(out "S-B1" "SH-B" 200.0) with date = after]; balance = Some (out "S-A1-R" "SH-A" 1000.0)
     , ApplyRecord (OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = after; security_id = "S-B1"; comments = []) ]
-  -- Dated on the event, the transfer commits.
-  _ <- applyOps env [ApplyStockTransfer with
-    transfer; resulting = [out "S-B1" "SH-B" 200.0]; balance = Some (out "S-A1-R" "SH-A" 1000.0)]
   b <- stateOf env "S-B1"
-  (b.issue_date, b.last_event_date, b.split_epoch, b.quantity) === (eventDay, eventDay, 1, 200.0)
+  (b.issue_date, b.last_event_date, b.split_epoch, b.quantity, b.seq) === (after, after, 1, 200.0, 1)
+  r <- stateOf env "S-A1-R"
+  (r.issue_date, r.last_event_date, r.split_epoch) === (eventDay, eventDay, 1)
 
 -- A whole transfer of a lot on vesting terms may keep the terms on its resulting issuance. The new
 -- security has no snapshot, so it counts as unvested until the TA records one, in the same batch
--- here; its outputs still never vest ahead of the source.
+-- here. A resulting issuance with no vesting (fully vested) is OCF-valid too: how outputs vest is
+-- their own records'.
 test_events_whole_transfer_from_terms_lot : Script ()
 test_events_whole_transfer_from_terms_lot = do
   env <- standardBook
@@ -126,8 +127,6 @@ test_events_whole_transfer_from_terms_lot = do
   _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V1"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
   let day = D.date 2025 D.Mar 3
       t = (mkTransfer "TR-W" "S-V1" 100.0 ["S-V1-B"] None) with date = day
-  applyOpsFails env "more than the 40.0"
-    [ApplyStockTransfer with transfer = t; resulting = [issuance "S-V1-B" "SH-B" "CLS-A" 100.0 day]; balance = None]
   _ <- applyOps env
     [ ApplyStockTransfer with
         transfer = t
@@ -138,15 +137,18 @@ test_events_whole_transfer_from_terms_lot = do
   b.vesting === StockVestingOnTerms "VT-4Y"
   vestedAt b day === 40.0
 
+-- OCF ties a transfer's resulting securities to the source's class in no way (a transfer that comes
+-- with a reclassification): the transferred quantity is conserved, the class is the record's.
 test_events_transfer_needs_resulting_class : Script ()
 test_events_transfer_needs_resulting_class = do
   env <- standardBook
   _ <- applyRecords env [OcfRecordDataStockClass (stockClass "CLS-B")]
-  applyOpsFails env "stay in the source's class"
+  _ <- applyOps env
     [ApplyStockTransfer with
         transfer = mkTransfer "TR-1" "S-A1" 600.0 ["S-B1"] None
         resulting = [(out "S-B1" "SH-B" 600.0) with stock_class_id = "CLS-B"]
         balance = None]
+  (.stock_class_id) <$> stateOf env "S-B1" >>= (=== "CLS-B")
 
 test_events_double_spend_refused : Script ()
 test_events_double_spend_refused = do
@@ -185,9 +187,15 @@ test_events_date_order = do
   env <- standardBook
   let acc d = OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-" <> show d; date = d; security_id = "S-A1"; comments = []
   _ <- applyRecords env [acc (D.date 2024 D.Jun 1)]
-  applyRecordsFails env "precedes the last event" [acc (D.date 2024 D.May 1)]
+  -- A terminal event keeps the security's date order (its quantity is in the units of the state's
+  -- last event); an acceptance, which carries no quantity, may be backdated.
+  let cxl = StockCancellationOcfData with
+        id = "CXL-EARLY"; date = D.date 2024 D.May 1; quantity = 600.0; reason_text = "x"; security_id = "S-A1"
+        comments = []; balance_security_id = None
+  applyOpsFails env "precedes the last event" [ApplyStockCancellation with cancellation = cxl; balance = None]
+  _ <- applyRecords env [acc (D.date 2024 D.May 1)]
   s <- stateOf env "S-A1"
-  s.seq === 1
+  s.seq === 2
   s.last_event_date === D.date 2024 D.Jun 1
 
 test_events_cancellation_and_repurchase : Script ()
@@ -208,9 +216,17 @@ test_events_retraction_and_events_after_it : Script ()
 test_events_retraction_and_events_after_it = do
   env <- standardBook
   _ <- applyRecords env [OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-1"; date = eventDay; reason_text = "x"; security_id = "S-A2"; comments = []]
-  -- An event on a retired security fails: its state is gone.
-  applyRecordsFails env "no active state for security S-A2"
-    [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = eventDay; security_id = "S-A2"; comments = []]
+  -- A terminal event on a retired security fails: its state is gone.
+  applyOpsFails env "no active state for security S-A2"
+    [ApplyStockCancellation with
+      cancellation = StockCancellationOcfData with
+        id = "CXL-1"; date = eventDay; quantity = 400.0; reason_text = "x"; security_id = "S-A2"
+        comments = []; balance_security_id = None
+      balance = None]
+  -- An acceptance carries no quantity: the retraction among the inputs shows the lot ended, so it is
+  -- stored against the stock issuance.
+  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-1"; date = eventDay; security_id = "S-A2"; comments = []]
+  hasRecord env "ACC-1" >>= (=== True)
 
 test_events_conversion_to_other_class : Script ()
 test_events_conversion_to_other_class = do
@@ -225,15 +241,16 @@ test_events_conversion_to_other_class = do
   s.stock_class_id === "CLS-B"
   s.quantity === 800.0
 
+-- OCF ties a reissuance's resulting quantities to nothing (a split cleanup may round fractional
+-- shares away for cash in lieu), so the register does not require them to conserve the source's.
 test_events_reissuance_same_class_conserves : Script ()
 test_events_reissuance_same_class_conserves = do
   env <- standardBook
   let r = StockReissuanceOcfData with
         id = "REISS-1"; date = eventDay; security_id = "S-A2"; comments = []
         resulting_security_ids = ["S-A2-X", "S-A2-Y"]; reason_text = None; split_transaction_id = None
-  applyOpsFails env "must conserve the quantity" [ApplyStockReissuance with reissuance = r; resulting = [out "S-A2-X" "SH-A" 100.0, out "S-A2-Y" "SH-A" 100.0]]
-  _ <- applyOps env [ApplyStockReissuance with reissuance = r; resulting = [out "S-A2-X" "SH-A" 100.0, out "S-A2-Y" "SH-A" 300.0]]
-  (.quantity) <$> stateOf env "S-A2-Y" >>= (=== 300.0)
+  _ <- applyOps env [ApplyStockReissuance with reissuance = r; resulting = [out "S-A2-X" "SH-A" 100.0, out "S-A2-Y" "SH-A" 299.0]]
+  (.quantity) <$> stateOf env "S-A2-Y" >>= (=== 299.0)
 
 test_events_consolidation : Script ()
 test_events_consolidation = do
@@ -248,6 +265,8 @@ test_events_consolidation = do
   hasState env "S-A2" >>= (=== False)
   (.quantity) <$> stateOf env "S-A-ALL" >>= (=== 1000.0)
 
+-- Lots of two classes may be consolidated (OCF ties them to no class); their quantities are in two
+-- classes' units, so the result's quantity is the writer's.
 test_events_consolidation_one_class : Script ()
 test_events_consolidation_one_class = do
   env <- standardBook
@@ -255,9 +274,11 @@ test_events_consolidation_one_class = do
   let c = StockConsolidationOcfData with
         id = "CONS-1"; date = eventDay; resulting_security_id = "S-ALL"; comments = []
         security_ids = ["S-A1", "S-B1"]; reason_text = None
-  applyOpsFails env "share one class" [ApplyStockConsolidation with consolidation = c; resulting_issuance = out "S-ALL" "SH-A" 605.0]
+  _ <- applyOps env [ApplyStockConsolidation with consolidation = c; resulting_issuance = out "S-ALL" "SH-A" 602.5]
+  (.quantity) <$> stateOf env "S-ALL" >>= (=== 602.5)
 
--- Outputs never vest ahead of their source: unvested shares move with their tranches.
+-- How a transfer's outputs vest is their own records': OCF links it to the source in no way, so an
+-- output may vest ahead of the source and a balance may carry no tranches (the SDK may warn).
 test_events_transfer_conserves_vesting : Script ()
 test_events_transfer_conserves_vesting = do
   env <- standardBook
@@ -268,21 +289,12 @@ test_events_transfer_conserves_vesting = do
   let t = mkTransfer "TR-V" "S-V" 60.0 ["S-V-B"] (Some "S-V-R")
       buyer vs = (out "S-V-B" "SH-B" 60.0) with vestings = vs
       balance vs = (out "S-V-R" "SH-A" 40.0) with vestings = vs
-  -- A fully vested buyer lot would vest 60 + 20 = 80 by the event, but only 50 has.
-  applyOpsFails env "more than the 50.0"
-    [ApplyStockTransfer with transfer = t; resulting = [buyer []]; balance = Some (balance [(OcfVesting with amount = 20.0; date = t1), (OcfVesting with amount = 20.0; date = t2)])]
-  -- A balance of a tranche lot must carry explicit vestings summing to its quantity.
-  applyOpsFails env "explicit vestings that sum"
-    [ApplyStockTransfer with transfer = t; resulting = [buyer [(OcfVesting with amount = 30.0; date = t1), (OcfVesting with amount = 30.0; date = t2)]]; balance = Some (balance [])]
-  _ <- applyOps env
-    [ApplyStockTransfer with
-        transfer = t
-        resulting = [buyer [(OcfVesting with amount = 30.0; date = t1), (OcfVesting with amount = 30.0; date = t2)]]
-        balance = Some (balance [(OcfVesting with amount = 20.0; date = t1), (OcfVesting with amount = 20.0; date = t2)])]
-  pure ()
+  _ <- applyOps env [ApplyStockTransfer with transfer = t; resulting = [buyer []]; balance = Some (balance [])]
+  (.vesting) <$> stateOf env "S-V-B" >>= (=== StockVestingNone)
+  (.vesting) <$> stateOf env "S-V-R" >>= (=== StockVestingNone)
 
--- A free transfer conserves each date's vested amount: it splits tranches, never moves vested
--- shares to later dates, and never replaces tranches with vesting terms.
+-- A transfer's outputs may vest on any schedule, vesting terms included: OCF does not tie them to
+-- the source's.
 test_events_transfer_keeps_each_dates_vesting : Script ()
 test_events_transfer_keeps_each_dates_vesting = do
   env <- standardBook
@@ -293,25 +305,23 @@ test_events_transfer_keeps_each_dates_vesting = do
   let t = mkTransfer "TR-V" "S-V" 60.0 ["S-V-B"] (Some "S-V-R")
       buyer vs = (out "S-V-B" "SH-B" 60.0) with vestings = vs
       balance vs = (out "S-V-R" "SH-A" 40.0) with vestings = vs
-  applyOpsFails env "but security S-V has vested 50.0"
+  _ <- applyRecords env [OcfRecordDataVestingTerms vestingTerms4y]
+  _ <- applyOps env
     [ApplyStockTransfer with
         transfer = t
-        resulting = [buyer [(OcfVesting with amount = 30.0; date = t1), (OcfVesting with amount = 30.0; date = t2)]]
+        resulting = [(buyer []) with vesting_terms_id = Some "VT-4Y"]
         balance = Some (balance [(OcfVesting with amount = 40.0; date = t2)])]
-  applyOpsFails env "replaces them with vesting terms"
-    [ApplyStockTransfer with
-        transfer = t
-        resulting = [(buyer []) with vesting_terms_id = Some "VT-1"]
-        balance = Some (balance [(OcfVesting with amount = 20.0; date = t1), (OcfVesting with amount = 20.0; date = t2)])]
-  -- A fully vested lot stays fully vested.
-  applyOpsFails env "but security S-A2 has vested 400.0"
+  (.vesting) <$> stateOf env "S-V-B" >>= (=== StockVestingOnTerms "VT-4Y")
+  -- A fully vested lot's output may vest later.
+  _ <- applyOps env
     [ApplyStockTransfer with
         transfer = mkTransfer "TR-F" "S-A2" 400.0 ["S-A2-B"] None
         resulting = [(out "S-A2-B" "SH-B" 400.0) with vestings = [OcfVesting with amount = 400.0; date = D.date 2030 D.Jan 1]]
         balance = None]
+  (.vesting) <$> stateOf env "S-A2-B" >>= (=== StockVestingTranches [OcfVesting with amount = 400.0; date = D.date 2030 D.Jan 1])
 
--- From a lot on vesting terms, the balance's tranches dated on or before the transfer equal the
--- vested shares it keeps: the snapshot's 40 less the 30 the resulting issuance takes vested.
+-- From a lot on vesting terms, a balance may keep the terms or carry any tranches (OCF ties neither
+-- to the source).
 test_events_transfer_from_terms_lot_keeps_vested : Script ()
 test_events_transfer_from_terms_lot_keeps_vested = do
   env <- standardBook
@@ -322,15 +332,14 @@ test_events_transfer_from_terms_lot_keeps_vested = do
       t = (mkTransfer "TR-T" "S-V1" 30.0 ["S-V1-B"] (Some "S-V1-R")) with date = day
       resulting = issuance "S-V1-B" "SH-B" "CLS-A" 30.0 day
       balance vs = (issuance "S-V1-R" "SH-A" "CLS-A" 70.0 day) with vestings = vs
-  applyOpsFails env "but keeps 10.0 vested shares"
-    [ApplyStockTransfer with transfer = t; resulting = [resulting]; balance = Some (balance [OcfVesting with amount = 70.0; date = D.date 2027 D.Jan 1])]
   _ <- applyOps env
     [ApplyStockTransfer with
         transfer = t
         resulting = [resulting]
-        balance = Some (balance [(OcfVesting with amount = 10.0; date = D.date 2025 D.Mar 1), (OcfVesting with amount = 60.0; date = D.date 2027 D.Jan 1)])]
+        balance = Some ((balance []) with vesting_terms_id = Some "VT-4Y")]
   rest <- stateOf env "S-V1-R"
   rest.quantity === 70.0
+  rest.vesting === StockVestingOnTerms "VT-4Y"
 
 -- An output may take a claimed object ID and a derived security ID; deleting it releases only
 -- what was claimed.
@@ -346,15 +355,18 @@ test_events_output_with_claimed_object_and_derived_security = do
   hasRecord env "ISS-R1" >>= (=== False)
 
 
+-- OCF does not require a lot's tranches to cover its quantity (the uncovered shares count as
+-- unvested), and such a lot takes partial events like any other.
 test_events_partial_cover_takes_no_partial_event : Script ()
 test_events_partial_cover_takes_no_partial_event = do
   env <- standardBook
   _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-P" "SH-A" "CLS-A" 100.0 d2024) with vestings = [(OcfVesting with amount = 50.0; date = d2024)])]
-  applyOpsFails env "covering less than its quantity"
+  _ <- applyOps env
     [ApplyStockTransfer with
         transfer = mkTransfer "TR-P" "S-P" 10.0 ["S-P-B"] (Some "S-P-R")
         resulting = [(out "S-P-B" "SH-B" 10.0) with vestings = [(OcfVesting with amount = 10.0; date = d2024)]]
         balance = Some ((out "S-P-R" "SH-A" 90.0) with vestings = [(OcfVesting with amount = 40.0; date = d2024), (OcfVesting with amount = 50.0; date = D.date 2030 D.Jan 1)])]
+  (.quantity) <$> stateOf env "S-P-R" >>= (=== 90.0)
 
 test_events_vesting_records_on_stock : Script ()
 test_events_vesting_records_on_stock = do
@@ -371,14 +383,23 @@ test_events_vesting_records_on_stock = do
     , OcfVesting with amount = 20.0; date = later
     , OcfVesting with amount = 30.0; date = D.date 2026 D.Jan 1
     ]
-  applyRecordsFails env "unvested quantity" [OcfRecordDataVestingAcceleration VestingAccelerationOcfData with
+  -- OCF's quantity is any Numeric: the record is stored as written, and the lot accelerates only
+  -- what can still vest (30 here), nothing when it is fully vested.
+  _ <- applyRecords env [OcfRecordDataVestingAcceleration VestingAccelerationOcfData with
     id = "ACC-2"; date = later; quantity = 31.0; reason_text = "x"; security_id = "S-T"; comments = []]
-  -- A fully vested security cannot be accelerated.
-  applyRecordsFails env "fully vested" [OcfRecordDataVestingAcceleration VestingAccelerationOcfData with
+  s2 <- stateOf env "S-T"
+  s2.vesting === StockVestingTranches
+    [ OcfVesting with amount = 50.0; date = d2024
+    , OcfVesting with amount = 50.0; date = later
+    ]
+  _ <- applyRecords env [OcfRecordDataVestingAcceleration VestingAccelerationOcfData with
     id = "ACC-3"; date = later; quantity = 1.0; reason_text = "x"; security_id = "S-A1"; comments = []]
-  -- A vesting start on a security without vesting terms is refused (it names no condition).
-  applyRecordsFails env "has no vesting terms" [OcfRecordDataVestingStart VestingStartOcfData with
+  (.vesting) <$> stateOf env "S-A1" >>= (=== StockVestingNone)
+  -- A vesting start names a condition the register does not resolve, so a security without
+  -- vesting terms takes one (OCF's vesting_condition_id is a plain string).
+  _ <- applyRecords env [OcfRecordDataVestingStart VestingStartOcfData with
     id = "VS-1"; date = d2024; security_id = "S-T"; vesting_condition_id = "VC-1"; comments = []]
+  hasRecord env "VS-1" >>= (=== True)
 
 test_events_snapshots : Script ()
 test_events_snapshots = do

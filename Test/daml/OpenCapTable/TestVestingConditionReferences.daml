@@ -1,7 +1,8 @@
--- Vesting condition references, ported from v34's TestVestingTransactionConditionReferences: a vesting start or event names a condition of its security's vesting terms with the matching trigger, checked when written (at the batch's end); vesting terms' internal condition references; and, new in v36, terms edited or deleted later are not re-checked.
+-- Vesting condition references, ported from v34's TestVestingTransactionConditionReferences. OCF's vesting_condition_id is a plain string ("should have" a start or event trigger is description, not schema) and the register never reads the condition, so it no longer resolves it: a start or event naming a missing condition, a condition of another trigger type, or a security without vesting terms is OCF-valid and written. Its security is still checked (its state, or a grant's or warrant's issuance). Vesting terms' internal references are not closed by OCF's schema either.
 module OpenCapTable.TestVestingConditionReferences where
 
 import qualified DA.Date as D
+import DA.Foldable (mapA_)
 import Daml.Script
 
 import Fairmint.OpenCapTable.OcfRecords
@@ -75,15 +76,14 @@ test_vesting_condition_missing = do
     , termsRecord (termsWith "VT_EVENT_MISSING" "event" OcfVestingEventTrigger)
     , grant "SEC-VESTING-EVENT-MISSING" (Some "VT_EVENT_MISSING")
     ]
-  applyRecordsFails env "Vesting start VS_START_MISSING references missing vesting condition missing for security SEC-VESTING-START-MISSING"
-    [startRecord (vestingStart "VS_START_MISSING" "SEC-VESTING-START-MISSING" "missing")]
-  applyRecordsFails env "Vesting event VE_EVENT_MISSING references missing vesting condition missing for security SEC-VESTING-EVENT-MISSING"
-    [eventRecord (vestingEvent "VE_EVENT_MISSING" "SEC-VESTING-EVENT-MISSING" "missing")]
-  -- A condition of other terms does not count: only the security's own terms are read.
-  applyRecordsFails env "Vesting start VS-OTHER references missing vesting condition start for security SEC-VESTING-EVENT-MISSING"
-    [startRecord (vestingStart "VS-OTHER" "SEC-VESTING-EVENT-MISSING" "start")]
-  expectNoRecord env "VS_START_MISSING"
-  expectNoRecord env "VE_EVENT_MISSING"
+  let records =
+        [ startRecord (vestingStart "VS_START_MISSING" "SEC-VESTING-START-MISSING" "missing")
+        , eventRecord (vestingEvent "VE_EVENT_MISSING" "SEC-VESTING-EVENT-MISSING" "missing")
+        -- A condition of other terms.
+        , startRecord (vestingStart "VS-OTHER" "SEC-VESTING-EVENT-MISSING" "start")
+        ]
+  _ <- applyRecords env records
+  mapA_ (expectRecord env) records
 
 test_vesting_condition_wrong_trigger : Script ()
 test_vesting_condition_wrong_trigger = do
@@ -93,86 +93,90 @@ test_vesting_condition_wrong_trigger = do
     , termsRecord (termsWith "VT_EVENT_WRONG_TRIGGER" "start" OcfVestingStartTrigger)
     , grant "SEC-VESTING-EVENT-WRONG-TRIGGER" (Some "VT_EVENT_WRONG_TRIGGER")
     ]
-  applyRecordsFails env "Vesting start VS_START_WRONG_TRIGGER references vesting condition event with the wrong trigger type"
-    [startRecord (vestingStart "VS_START_WRONG_TRIGGER" "SEC-VESTING-START-WRONG-TRIGGER" "event")]
-  applyRecordsFails env "Vesting event VE_EVENT_WRONG_TRIGGER references vesting condition start with the wrong trigger type"
-    [eventRecord (vestingEvent "VE_EVENT_WRONG_TRIGGER" "SEC-VESTING-EVENT-WRONG-TRIGGER" "start")]
+  let records =
+        [ startRecord (vestingStart "VS_START_WRONG_TRIGGER" "SEC-VESTING-START-WRONG-TRIGGER" "event")
+        , eventRecord (vestingEvent "VE_EVENT_WRONG_TRIGGER" "SEC-VESTING-EVENT-WRONG-TRIGGER" "start")
+        ]
+  _ <- applyRecords env records
+  mapA_ (expectRecord env) records
 
--- Scheduled conditions (absolute or relative) are neither a start nor an event.
+-- Scheduled conditions (absolute or relative) are neither a start nor an event, and are accepted.
 test_vesting_condition_schedule_triggers : Script ()
 test_vesting_condition_schedule_triggers = do
   env <- ecBookWith [termsRecord allTriggers, grant "EC-1" (Some "VT-ALL")]
-  applyRecordsFails env "Vesting start VS-1 references vesting condition absolute with the wrong trigger type" [startRecord (vestingStart "VS-1" "EC-1" "absolute")]
-  applyRecordsFails env "Vesting start VS-1 references vesting condition monthly with the wrong trigger type" [startRecord (vestingStart "VS-1" "EC-1" "monthly")]
-  applyRecordsFails env "Vesting event VE-1 references vesting condition absolute with the wrong trigger type" [eventRecord (vestingEvent "VE-1" "EC-1" "absolute")]
-  applyRecordsFails env "Vesting event VE-1 references vesting condition monthly with the wrong trigger type" [eventRecord (vestingEvent "VE-1" "EC-1" "monthly")]
-  -- The start and event conditions of the same terms are accepted.
-  _ <- applyRecords env [startRecord (vestingStart "VS-1" "EC-1" "start"), eventRecord (vestingEvent "VE-1" "EC-1" "event")]
-  expectRecord env (startRecord (vestingStart "VS-1" "EC-1" "start"))
-  expectRecord env (eventRecord (vestingEvent "VE-1" "EC-1" "event"))
+  let records =
+        [ startRecord (vestingStart "VS-1" "EC-1" "absolute")
+        , startRecord (vestingStart "VS-2" "EC-1" "monthly")
+        , eventRecord (vestingEvent "VE-1" "EC-1" "absolute")
+        , eventRecord (vestingEvent "VE-2" "EC-1" "monthly")
+        , startRecord (vestingStart "VS-3" "EC-1" "start")
+        , eventRecord (vestingEvent "VE-3" "EC-1" "event")
+        ]
+  _ <- applyRecords env records
+  mapA_ (expectRecord env) records
 
+-- A security without vesting terms (fully vested, or vesting by explicit tranches) takes a start or
+-- event too: OCF's sample vesting starts include one on a grant with tranches and one on a warrant
+-- with no vesting.
 test_vesting_condition_security_without_terms : Script ()
 test_vesting_condition_security_without_terms = do
   env <- ecBookWith [grant "SEC-VESTING-NO-TERMS" None]
-  applyRecordsFails env "Vesting start VS_NO_TERMS: security SEC-VESTING-NO-TERMS has no vesting terms"
-    [startRecord (vestingStart "VS_NO_TERMS" "SEC-VESTING-NO-TERMS" "start")]
-  applyRecordsFails env "Vesting event VE_NO_TERMS: security SEC-VESTING-NO-TERMS has no vesting terms"
-    [eventRecord (vestingEvent "VE_NO_TERMS" "SEC-VESTING-NO-TERMS" "event")]
-  -- Explicit tranches are not vesting terms.
   _ <- applyRecords env [ecRecord ((option "EC-TR" "SH-A" 100.0) with vestings = [OcfVesting with date = D.date 2025 D.Jan 1; amount = 100.0])]
-  applyRecordsFails env "Vesting start VS-TR: security EC-TR has no vesting terms" [startRecord (vestingStart "VS-TR" "EC-TR" "start")]
+  let records =
+        [ startRecord (vestingStart "VS_NO_TERMS" "SEC-VESTING-NO-TERMS" "start")
+        , eventRecord (vestingEvent "VE_NO_TERMS" "SEC-VESTING-NO-TERMS" "event")
+        , startRecord (vestingStart "VS-TR" "EC-TR" "start")
+        ]
+  _ <- applyRecords env records
+  mapA_ (expectRecord env) records
 
+-- The security is still checked: a grant's or warrant's issuance, or a stock lot's state.
 test_vesting_condition_security_reference : Script ()
 test_vesting_condition_security_reference = do
   env <- ecBookWith [OcfRecordDataConvertibleIssuance (convertible "C-1" "SH-A"), termsRecord allTriggers]
-  applyRecordsFails env "Vesting start VS-1: security not found: EC-MISSING" [startRecord (vestingStart "VS-1" "EC-MISSING" "start")]
-  applyRecordsFails env "Vesting event VE-1: security not found: EC-MISSING" [eventRecord (vestingEvent "VE-1" "EC-MISSING" "event")]
-  -- A convertible has no vesting terms to name.
-  applyRecordsFails env "Vesting start VS-1: security C-1 cannot vest" [startRecord (vestingStart "VS-1" "C-1" "start")]
-  applyRecordsFails env "Vesting event VE-1: security C-1 cannot vest" [eventRecord (vestingEvent "VE-1" "C-1" "event")]
-  -- Every issuance type that vests reads its own terms: warrants and stock as well as grants.
+  let label = "Vesting record (no stock state in this write)"
+  applyRecordsFails env (label <> " security not found: EC-MISSING") [startRecord (vestingStart "VS-1" "EC-MISSING" "start")]
+  applyRecordsFails env (label <> " security not found: EC-MISSING") [eventRecord (vestingEvent "VE-1" "EC-MISSING" "event")]
+  -- A convertible does not vest.
+  applyRecordsFails env (label <> " security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance") [startRecord (vestingStart "VS-1" "C-1" "start")]
+  applyRecordsFails env (label <> " security C-1 is carried by a OcfObjectTypeTxConvertibleIssuance") [eventRecord (vestingEvent "VE-1" "C-1" "event")]
+  -- Warrants and stock as well as grants.
   _ <- applyRecords env
     [ OcfRecordDataWarrantIssuance ((warrant "W-1" "SH-A") with vesting_terms_id = Some "VT-ALL")
     , OcfRecordDataStockIssuance (stockOnTerms "S-V" "VT-ALL")
     ]
-  applyRecordsFails env "Vesting event VE-W references vesting condition start with the wrong trigger type" [eventRecord (vestingEvent "VE-W" "W-1" "start")]
-  applyRecordsFails env "Vesting start VS-S references missing vesting condition other for security S-V" [startRecord (vestingStart "VS-S" "S-V" "other")]
-  _ <- applyRecords env [eventRecord (vestingEvent "VE-W" "W-1" "event"), startRecord (vestingStart "VS-S" "S-V" "start")]
-  expectRecord env (eventRecord (vestingEvent "VE-W" "W-1" "event"))
-  expectRecord env (startRecord (vestingStart "VS-S" "S-V" "start"))
+  _ <- applyRecords env [eventRecord (vestingEvent "VE-W" "W-1" "start"), startRecord (vestingStart "VS-S" "S-V" "other")]
+  expectRecord env (eventRecord (vestingEvent "VE-W" "W-1" "start"))
+  expectRecord env (startRecord (vestingStart "VS-S" "S-V" "other"))
 
 -- =============================================================================
 -- VESTING TERMS' OWN CONDITION REFERENCES
 -- =============================================================================
 
+-- OCF's schema does not close the condition graph: a next or relative condition that is not in the
+-- terms is accepted (the SDK checks the graph).
 test_vesting_terms_missing_next_condition : Script ()
 test_vesting_terms_missing_next_condition = do
   env <- ecBook
   let t = terms "VT_MISSING_NEXT_CONDITION" [condition "start" OcfVestingStartTrigger ["missing-next"]]
-  assertMsg "the validator accepted a missing next condition" (not (validateVestingTermsOcfData t))
-  applyRecordsFails env "precondition" [termsRecord t]
-  -- Naming a condition that exists is valid.
-  let ok = terms "VT_NEXT" [condition "start" OcfVestingStartTrigger ["next"], eventCondition "next"]
-  assertMsg "the validator refused a known next condition" (validateVestingTermsOcfData ok)
-  _ <- applyRecords env [termsRecord ok]
-  expectRecord env (termsRecord ok)
+  assertMsg "the validator refused a missing next condition" (validateVestingTermsOcfData t)
+  _ <- applyRecords env [termsRecord t]
+  expectRecord env (termsRecord t)
 
 test_vesting_terms_missing_relative_condition : Script ()
 test_vesting_terms_missing_relative_condition = do
   env <- ecBook
   let t = terms "VT_MISSING_RELATIVE_CONDITION" [condition "relative" (monthly "missing-relative") []]
-  assertMsg "the validator accepted a missing relative condition" (not (validateVestingTermsOcfData t))
-  applyRecordsFails env "precondition" [termsRecord t]
-  _ <- applyRecords env [termsRecord allTriggers]
-  expectRecord env (termsRecord allTriggers)
+  assertMsg "the validator refused a missing relative condition" (validateVestingTermsOcfData t)
+  _ <- applyRecords env [termsRecord t, termsRecord allTriggers]
+  expectRecord env (termsRecord t)
 
 -- =============================================================================
 -- LATER EDITS AND DELETES
 -- =============================================================================
 
--- v34 refused an edit of vesting terms that removed a condition a start referenced. v36 checks
--- references when a record is written: the edit succeeds (the SDK refuses it), and a later start
--- naming the removed condition is refused.
+-- v34 refused an edit of vesting terms that removed a condition a start referenced. v36 does not
+-- resolve the condition at all: the terms and the start edit freely (the SDK checks the reference).
 test_vesting_terms_edit_not_rechecked : Script ()
 test_vesting_terms_edit_not_rechecked = do
   env <- ecBook
@@ -186,16 +190,10 @@ test_vesting_terms_edit_not_rechecked = do
   _ <- restateOps env [RestateEdit (termsRecord edited)]
   expectRecord env (termsRecord edited)
   expectRecord env (startRecord s)
-  -- An edit of the start that keeps its condition is not re-checked either.
-  _ <- restateOps env [RestateEdit (startRecord (s with comments = ["Annotated"]))]
-  expectRecord env (startRecord (s with comments = ["Annotated"]))
-  -- An edit that names another condition is checked.
-  restateOpsFails env "Vesting start VS_EDIT_REFERENCED references missing vesting condition other"
-    [RestateEdit (startRecord (s with vesting_condition_id = "other"))]
-  _ <- restateOps env [RestateEdit (startRecord (s with vesting_condition_id = "replacement-start"))]
-  -- A new record naming the removed condition is refused.
-  applyRecordsFails env "Vesting start VS-NEW references missing vesting condition start for security SEC-VESTING-EDIT-REMOVES-CONDITION"
-    [startRecord (vestingStart "VS-NEW" "SEC-VESTING-EDIT-REMOVES-CONDITION" "start")]
+  _ <- restateOps env [RestateEdit (startRecord (s with vesting_condition_id = "other"))]
+  expectRecord env (startRecord (s with vesting_condition_id = "other"))
+  _ <- applyRecords env [startRecord (vestingStart "VS-NEW" "SEC-VESTING-EDIT-REMOVES-CONDITION" "start")]
+  expectRecord env (startRecord (vestingStart "VS-NEW" "SEC-VESTING-EDIT-REMOVES-CONDITION" "start"))
 
 test_vesting_terms_delete_not_rechecked : Script ()
 test_vesting_terms_delete_not_rechecked = do
@@ -204,4 +202,6 @@ test_vesting_terms_delete_not_rechecked = do
   _ <- applyRecords env [startRecord s]
   _ <- restateOps env [RestateDelete "VT-EC-1"]
   expectRecord env (startRecord s)
-  applyRecordsFails env "Vesting event VE-1: vesting terms not found: VT-EC-1" [eventRecord (vestingEvent "VE-1" "EC-1" "start")]
+  -- With its terms deleted, the grant still takes a vesting event (the condition is not resolved).
+  _ <- applyRecords env [eventRecord (vestingEvent "VE-1" "EC-1" "start")]
+  expectRecord env (eventRecord (vestingEvent "VE-1" "EC-1" "start"))

@@ -10,6 +10,7 @@ import Fairmint.OpenCapTable.OcfRecords
 import Fairmint.OpenCapTable.Restate (RestateOperation(..))
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
+import Fairmint.OpenCapTable.State (StockVesting(..))
 import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..), validateStockCancellationOcfData)
 import Fairmint.OpenCapTable.OCF.StockIssuance (StockIssuanceOcfData(..))
 import OpenCapTable.Harness
@@ -87,14 +88,24 @@ test_stock_cancellation_balance_rules = do
     [cancel (partial with balance_security_id = None) (Some (balanceOf "SEC-1-R" (jan 2) 60.0))]
   applyOpsFails env "balance SEC-1-R must hold the remaining 60.0"
     [cancel partial (Some (balanceOf "SEC-1-R" (jan 2) 59.0))]
-  applyOpsFails env "must stay with the source's stakeholder and class"
-    [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with stakeholder_id = "SH-B"))]
-  applyOpsFails env "names a balance security but writes none"
-    [cancel (mkCancellation "CXL-1" (jan 2) 100.0 (Some "SEC-1-R")) None]
-  -- A fully vested source leaves a fully vested balance.
-  applyOpsFails env "the balance of fully vested security SEC-1 must carry no vesting"
-    [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with vestings = [OcfVesting with date = jan 2; amount = 60.0]))]
+  applyOpsFails env "must stay in the source's class"
+    [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with stock_class_id = "CLS-OTHER"))]
   hasState env "SEC-1" >>= (=== True)
+  -- OCF ties a balance to its source only by holding the remainder: its holder (a successor entity,
+  -- a corrected holder) and its vesting are its own record's.
+  _ <- applyOps env [cancel partial (Some ((balanceOf "SEC-1-R" (jan 2) 60.0) with
+        stakeholder_id = "SH-B"; vestings = [OcfVesting with date = jan 2; amount = 60.0]))]
+  b <- stateOf env "SEC-1-R"
+  b.stakeholder_id === "SH-B"
+  b.vesting === StockVestingTranches [OcfVesting with date = jan 2; amount = 60.0]
+
+-- A whole cancellation may name a balance security it does not write: OCF does not resolve it.
+test_stock_cancellation_whole_names_unwritten_balance : Script ()
+test_stock_cancellation_whole_names_unwritten_balance = do
+  env <- cancellationBook
+  _ <- applyOps env [cancel (mkCancellation "CXL-1" (jan 2) 100.0 (Some "SEC-1-R")) None]
+  hasState env "SEC-1" >>= (=== False)
+  hasState env "SEC-1-R" >>= (=== False)
 
 -- v34 summed the batch's reductions of one source. In v36 the first event consumes the state, so a
 -- second event on the same security in the batch finds no state.
@@ -222,8 +233,6 @@ test_stock_cancellation_ensure_refuses_invalid_data : Script ()
 test_stock_cancellation_ensure_refuses_invalid_data = do
   env <- cancellationBook
   let whole = mkCancellation "CXL-1" (jan 2) 100.0 None
-  applyOpsFails env "precondition" [cancel (whole with reason_text = "") None]
-  applyOpsFails env "precondition" [cancel (whole with comments = [""]) None]
   -- A zero quantity leaves the whole security as the balance, which the record's ensure refuses.
   applyOpsFails env "precondition" [cancel (mkCancellation "CXL-1" (jan 2) 0.0 (Some "SEC-1-R")) (Some (balanceOf "SEC-1-R" (jan 2) 100.0))]
   applyOpsFails env "precondition" [cancel (mkCancellation "CXL-1" (jan 2) 10.0 (Some "")) (Some (balanceOf "" (jan 2) 90.0))]
@@ -241,6 +250,4 @@ test_stock_cancellation_validator_branches = do
   expectFalse "empty security_id" (ok c with security_id = "")
   expectFalse "zero quantity" (ok c with quantity = 0.0)
   expectFalse "negative quantity" (ok c with quantity = -1.0)
-  expectFalse "empty reason_text" (ok c with reason_text = "")
-  expectFalse "an empty comment" (ok c with comments = [""])
   expectFalse "an empty balance_security_id" (ok c with balance_security_id = Some "")

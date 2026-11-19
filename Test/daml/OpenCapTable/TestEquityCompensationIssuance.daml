@@ -63,6 +63,7 @@ test_ec_issuance_all_optionals = do
     early_exercisable = Some True
     exercise_price = Some (usd 2.5)
     expiration_date = Some (D.date 2034 D.Feb 1)
+    option_grant_type = None
     stock_class_id = Some "CLS-A"
     stock_plan_id = Some "PLAN-1"
     stockholder_approval_date = Some (D.date 2024 D.Jan 20)
@@ -122,29 +123,32 @@ test_ec_issuance_required_text = do
   -- An empty object or security ID is stopped by its claim, before the record's ensure.
   refuseWith env "an empty ID cannot be claimed" valid ecRecord (g with id = "")
   refuseWith env "an empty ID cannot be claimed" valid ecRecord (g with security_id = "")
-  refuse env valid ecRecord (g with custom_id = "")
   refuse env valid ecRecord (g with stakeholder_id = "")
+  -- OCF sets no minimum length on the custom ID, a comment, an exemption or the consideration.
+  accept env valid ecRecord (g with
+    custom_id = ""; comments = [""]; consideration_text = Some ""
+    security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = ""])
 
 test_ec_issuance_array_elements : Script ()
 test_ec_issuance_array_elements = do
   env <- ecBook
   let g = option "EC-A" "SH-A" 100.0
-  refuse env valid ecRecord (g with comments = ["ok", ""])
-  refuse env valid ecRecord (g with security_law_exemptions = [OcfSecurityExemption with description = ""; jurisdiction = "US"])
-  refuse env valid ecRecord (g with security_law_exemptions = [OcfSecurityExemption with description = "Rule 701"; jurisdiction = ""])
-  refuse env valid ecRecord (g with vestings = [tranche 0.0])
-  refuse env valid ecRecord (g with vestings = [tranche (-1.0)])
-  -- Tranches never sum to more than the quantity.
-  refuse env valid ecRecord (g with vestings = [tranche 60.0, tranche 41.0])
-  refuse env valid ecRecord (g with termination_exercise_windows = [window (-1)])
-  -- The boundaries: tranches summing to the quantity, and a zero-length window.
+  -- A grant forms no register state, and OCF's tranche amounts and window periods carry no sign,
+  -- nor does OCF tie the tranches' total to the quantity: zero and negative tranches, tranches over
+  -- the quantity (a rounding over-allocation) and a negative window are all valid.
   accept env valid ecRecord (g with vestings = [tranche 60.0, tranche 40.0]; termination_exercise_windows = [window 0])
+  forA_ (zip [1 .. 4 : Int]
+      [ g with vestings = [tranche 0.0]
+      , g with vestings = [tranche (-1.0)]
+      , g with vestings = [tranche 60.0, tranche 41.0]
+      , g with termination_exercise_windows = [window (-1)]
+      ]) \(n, x) ->
+    accept env valid ecRecord (x with id = x.id <> "-" <> show n; security_id = x.security_id <> "-" <> show n)
 
 test_ec_issuance_optional_text_not_empty : Script ()
 test_ec_issuance_optional_text_not_empty = do
   env <- ecBook
   let g = option "EC-T" "SH-A" 100.0
-  refuse env valid ecRecord (g with consideration_text = Some "")
   refuse env valid ecRecord (g with stock_plan_id = Some "")
   refuse env valid ecRecord (g with stock_class_id = Some "")
   refuse env valid ecRecord (g with vesting_terms_id = Some "")
@@ -153,31 +157,29 @@ test_ec_issuance_money : Script ()
 test_ec_issuance_money = do
   env <- ecBook
   let g = option "EC-M" "SH-A" 100.0
-  refuse env valid ecRecord (g with exercise_price = Some (usd (-0.01)))
   refuse env valid ecRecord (g with exercise_price = Some (OcfMonetary with amount = 1.0; currency = "US"))
   refuse env valid ecRecord (g with exercise_price = Some (OcfMonetary with amount = 1.0; currency = ""))
-  refuse env valid ecRecord (g with base_price = Some (usd (-1.0)))
   refuse env valid ecRecord (g with base_price = Some (OcfMonetary with amount = 1.0; currency = "USDX"))
-  -- A zero price is a price.
+  -- A zero price is a price, and OCF's amounts are signed.
   accept env valid ecRecord (g with exercise_price = Some (usd 0.0))
+  accept env valid ecRecord (g with id = "ECI-EC-M-NEG"; security_id = "EC-M-NEG"; exercise_price = Some (usd (-0.01)))
 
--- v36 dates are Dates: the grant expires on or after its date.
+-- OCF orders no expiration date against the grant date: a backdated or lapsed grant is valid.
 test_ec_issuance_expiration_date : Script ()
 test_ec_issuance_expiration_date = do
   env <- ecBook
   let g = option "EC-E" "SH-A" 100.0
-  refuse env valid ecRecord (g with expiration_date = Some (D.date 2023 D.Dec 31))
-  accept env valid ecRecord (g with expiration_date = Some d2024)
+  accept env valid ecRecord (g with expiration_date = Some (D.date 2023 D.Dec 31))
+  accept env valid ecRecord (g with id = "ECI-EC-E2"; security_id = "EC-E2"; expiration_date = Some d2024)
 
--- The register caps a record's tranches; the cap is not OCF validity, so the validator has none.
+-- OCF sets no maxItems on vestings, and a grant's tranches form no state, so the register caps
+-- them no more (daily vesting over five years is about 1826 tranches).
 test_ec_issuance_tranche_cap : Script ()
 test_ec_issuance_tranche_cap = do
   env <- ecBook
   let tranches n = map (\i -> OcfVesting with date = D.addDays d2024 i; amount = 1.0) [1 .. n]
       g = option "EC-CAP" "SH-A" 2000.0
-  assertMsg "the validator caps tranches" (valid (g with vestings = tranches 1501))
-  applyRecordsFails env "1501 vesting tranches; at most 1500" [ecRecord (g with vestings = tranches 1501)]
-  accept env valid ecRecord (g with vestings = tranches 1500)
+  accept env valid ecRecord (g with vestings = tranches 1501)
 
 -- =============================================================================
 -- REFERENCES
@@ -189,11 +191,10 @@ test_ec_issuance_missing_references = do
   let g = option "EC-M" "SH-A" 100.0
   applyRecordsFails env "Equity compensation stakeholder not found: SH-X" [ecRecord (g with stakeholder_id = "SH-X")]
   applyRecordsFails env "Equity compensation stock class not found: SC_MISSING" [ecRecord (g with stock_class_id = Some "SC_MISSING")]
-  applyRecordsFails env "Equity compensation stock plan not found: PLAN_MISSING" [ecRecord (g with stock_plan_id = Some "PLAN_MISSING")]
-  applyRecordsFails env "Equity compensation stock plan not found: PLAN_MISSING"
-    [ecRecord (g with stock_plan_id = Some "PLAN_MISSING"; stock_class_id = Some "CLS-A")]
   applyRecordsFails env "Equity compensation vesting terms not found: VT_MISSING" [ecRecord (g with vesting_terms_id = Some "VT_MISSING")]
   expectNoRecord env "ECI-EC-M"
+  -- The plan is a plain OCF string the register never reads, so it is not resolved.
+  accept env valid ecRecord (g with stock_plan_id = Some "PLAN_MISSING"; stock_class_id = Some "CLS-A")
 
 test_ec_issuance_references_have_their_types : Script ()
 test_ec_issuance_references_have_their_types = do
@@ -201,10 +202,7 @@ test_ec_issuance_references_have_their_types = do
   let g = option "EC-W" "SH-A" 100.0
   applyRecordsFails env "Equity compensation stakeholder CLS-A is a OcfObjectTypeStockClass" [ecRecord (g with stakeholder_id = "CLS-A")]
   applyRecordsFails env "Equity compensation stock class PLAN-1 is a OcfObjectTypeStockPlan" [ecRecord (g with stock_class_id = Some "PLAN-1")]
-  applyRecordsFails env "Equity compensation stock plan SH-A is a OcfObjectTypeStakeholder" [ecRecord (g with stock_plan_id = Some "SH-A")]
   applyRecordsFails env "Equity compensation vesting terms PLAN-1 is a OcfObjectTypeStockPlan" [ecRecord (g with vesting_terms_id = Some "PLAN-1")]
-  -- With a class, the plan must be a stock plan that includes it.
-  applyRecordsFails env "Equity compensation stock plan not found: SH-A" [ecRecord (g with stock_plan_id = Some "SH-A"; stock_class_id = Some "CLS-A")]
 
 -- References are checked after the batch's last operation, so a grant may come before the
 -- definitions it names.
@@ -228,13 +226,11 @@ test_ec_issuance_plan_must_include_class : Script ()
 test_ec_issuance_plan_must_include_class = do
   env <- ecBookWith [OcfRecordDataStockClass (stockClass "CLS-B"), OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])]
   let g = (option "EC-P" "SH-A" 100.0) with stock_class_id = Some "CLS-A"
-  applyRecordsFails env "Equity compensation stock plan PLAN-B does not include stock class CLS-A"
-    [ecRecord (g with stock_plan_id = Some "PLAN-B")]
-  -- Also against a plan written later in the same batch.
-  applyRecordsFails env "Equity compensation stock plan PLAN-C does not include stock class CLS-A"
-    [ecRecord (g with stock_plan_id = Some "PLAN-C"), OcfRecordDataStockPlan (stockPlan "PLAN-C" ["CLS-B"])]
+  -- OCF ties no grant's class to its plan's classes (a re-classed plan, a historical grant): a plan
+  -- that does not list the class is accepted.
+  accept env valid ecRecord (g with stock_plan_id = Some "PLAN-B")
   _ <- applyRecords env [OcfRecordDataStockPlan (stockPlan "PLAN-AB" ["CLS-A", "CLS-B"])]
-  accept env valid ecRecord (g with stock_plan_id = Some "PLAN-AB")
+  accept env valid ecRecord (g with id = "ECI-EC-P2"; security_id = "EC-P2"; stock_plan_id = Some "PLAN-AB")
 
 -- A restatement checks the references an edit adds.
 test_ec_issuance_edit_checks_added_references : Script ()
@@ -242,9 +238,6 @@ test_ec_issuance_edit_checks_added_references = do
   env <- ecBookWith [OcfRecordDataStockClass (stockClass "CLS-B"), OcfRecordDataStockPlan (stockPlan "PLAN-B" ["CLS-B"])]
   let g = option "EC-ED" "SH-A" 100.0
   _ <- applyRecords env [ecRecord g]
-  restateOpsFails env "Equity compensation stock plan not found: PLAN_MISSING" [RestateEdit (ecRecord (g with stock_plan_id = Some "PLAN_MISSING"))]
-  restateOpsFails env "Equity compensation stock plan PLAN-B does not include stock class CLS-A"
-    [RestateEdit (ecRecord (g with stock_class_id = Some "CLS-A"; stock_plan_id = Some "PLAN-B"))]
   restateOpsFails env "Equity compensation stakeholder not found: SH-X" [RestateEdit (ecRecord (g with stakeholder_id = "SH-X"))]
   restateOpsFails env "Equity compensation vesting terms not found: VT-B" [RestateEdit (ecRecord (g with vesting_terms_id = Some "VT-B"))]
   -- Once the book holds them, the same edit succeeds.

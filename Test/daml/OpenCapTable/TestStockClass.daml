@@ -3,7 +3,7 @@ module OpenCapTable.TestStockClass where
 
 import DA.Assert ((===))
 import qualified DA.Date as D
-import DA.Foldable (mapA_)
+import DA.Foldable (forA_, mapA_)
 import DA.List (sort)
 import qualified DA.Map as Map
 import Daml.Script
@@ -144,21 +144,10 @@ test_stock_class_validation = do
       yes = accept env validateStockClassOcfData OcfRecordDataStockClass
       base = fullPreferred "SC_V" "SC_COMMON"
       right = ratioRightTo (Some "SC_COMMON")
-  no base with name = ""
-  no base with default_id_prefix = ""
-  no base with initial_shares_authorized = OcfInitialSharesNumeric (-1.0)
-  no base with votes_per_share = -1.0
-  no base with seniority = -0.5
   no base with par_value = Some (OcfMonetary with amount = 0.0001; currency = "US")
-  no base with par_value = Some (OcfMonetary with amount = -0.0001; currency = "USD")
   no base with price_per_share = Some (OcfMonetary with amount = 1.0; currency = "")
-  no base with liquidation_preference_multiple = Some (-1.0)
-  no base with participation_cap_multiple = Some (-1.0)
-  no base with comments = [""]
-  -- The conversion right: a valid ratio mechanism and a non-empty target when one is named.
-  no base with conversion_rights = [(right with conversion_mechanism = ratioMechanism 1.0 0.0 OcfRoundingTypeNormal)]
-  no base with conversion_rights = [(right with conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with ratio = (OcfRatio with numerator = 1.0; denominator = 0.0)))]
-  no base with conversion_rights = [(right with conversion_mechanism = ratioMechanism (-1.0) 1.0 OcfRoundingTypeNormal)]
+  -- The conversion right: a valid price and a non-empty target when one is named. Its ratio is
+  -- only stored, so OCF's signed Numerics (zero, negative) are accepted.
   no base with conversion_rights = [(right with conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with conversion_price = (OcfMonetary with amount = 1.0; currency = "DOLLARS")))]
   no base with conversion_rights = [right, (right with converts_to_stock_class_id = Some "")]
   -- The boundaries that pass.
@@ -172,6 +161,24 @@ test_stock_class_validation = do
     par_value = Some (usd 0.0)
   yes base with id = "SC_V2"; initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesUnlimited
   yes base with id = "SC_V3"; initial_shares_authorized = OcfInitialSharesEnum OcfAuthorizedSharesNotApplicable
+  -- OCF's Numerics are signed and its names free text with no minimum length: v34's ranges and
+  -- non-empty checks are gone (seniority, in particular, is any ordering value).
+  yes base with
+    id = "SC_V5"
+    name = ""
+    default_id_prefix = ""
+    comments = [""]
+    initial_shares_authorized = OcfInitialSharesNumeric (-1.0)
+    votes_per_share = -1.0
+    seniority = -0.5
+    liquidation_preference_multiple = Some (-1.0)
+    participation_cap_multiple = Some (-1.0)
+    par_value = Some (usd (-0.0001))
+    price_per_share = Some (usd (-1.0))
+    conversion_rights =
+      [ (right with conversion_mechanism = ratioMechanism 1.0 0.0 OcfRoundingTypeNormal)
+      , (right with conversion_mechanism = ratioMechanism (-1.0) 1.0 OcfRoundingTypeNormal)
+      ]
   -- Several rights, every rounding type, and a right into a future round with no target class.
   yes base with
     id = "SC_V4"
@@ -194,24 +201,23 @@ test_stock_class_conversion_right_references = do
   let converts = preferredInto "SC_PREFERRED_CONVERTS" "SC_COMMON_TARGET"
   _ <- applyRecords env [OcfRecordDataStockClass converts, OcfRecordDataStockClass (stockClass "SC_COMMON_TARGET")]
   expectRecords env [OcfRecordDataStockClass converts, OcfRecordDataStockClass (stockClass "SC_COMMON_TARGET")]
-  -- A missing target, or a target that is not a stock class, is refused.
-  applyRecordsFails env "Stock class SC_PREFERRED_MISSING conversion target not found: SC_MISSING_TARGET"
-    [OcfRecordDataStockClass (preferredInto "SC_PREFERRED_MISSING" "SC_MISSING_TARGET")]
-  applyRecordsFails env "Stock class SC_PREFERRED_SH conversion target SH-1 is a OcfObjectTypeStakeholder"
-    [OcfRecordDataStockClass (preferredInto "SC_PREFERRED_SH" "SH-1")]
-  -- Every right is checked, not only the first.
-  applyRecordsFails env "conversion target not found: SC_MISSING_SECOND"
-    [OcfRecordDataStockClass ((preferredInto "SC_PREFERRED_TWO" "SC_COMMON") with
-       conversion_rights = [ratioRightTo (Some "SC_COMMON"), ratioRightTo (Some "SC_MISSING_SECOND")])]
+  -- A target is a plain OCF string the register stores and never resolves: a class not (yet) on
+  -- the register is accepted.
+  let unresolved =
+        [ OcfRecordDataStockClass (preferredInto "SC_PREFERRED_MISSING" "SC_MISSING_TARGET")
+        , OcfRecordDataStockClass (preferredInto "SC_PREFERRED_SH" "SH-1")
+        , OcfRecordDataStockClass ((preferredInto "SC_PREFERRED_TWO" "SC_COMMON") with
+            conversion_rights = [ratioRightTo (Some "SC_COMMON"), ratioRightTo (Some "SC_MISSING_SECOND")])
+        ]
+  _ <- applyRecords env unresolved
+  expectRecords env unresolved
   -- A right with no target class makes no reference.
   let futureRound = (stockClass "SC_FUTURE") with conversion_rights = [(ratioRightTo None) with converts_to_future_round = Some True]
   _ <- applyRecords env [OcfRecordDataStockClass futureRound]
   expectRecord env (OcfRecordDataStockClass futureRound)
-  -- An edit's new target is checked: missing refused, existing accepted.
+  -- An edit may name any target.
   let plain = stockClass "SC_PREFERRED_EDIT_TARGET"
   _ <- applyRecords env [OcfRecordDataStockClass plain]
-  restateOpsFails env "Stock class SC_PREFERRED_EDIT_TARGET conversion target not found: SC_MISSING_EDIT_TARGET"
-    [RestateEdit (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_MISSING_EDIT_TARGET"))]
   expectRecord env (OcfRecordDataStockClass plain)
   _ <- restateOps env [RestateEdit (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_COMMON"))]
   expectRecord env (OcfRecordDataStockClass (preferredInto "SC_PREFERRED_EDIT_TARGET" "SC_COMMON"))
@@ -257,9 +263,7 @@ test_stock_class_authorized_shares_adjustment_validation_and_reference = do
   let no = refuse env validateStockClassAuthorizedSharesAdjustmentOcfData OcfRecordDataStockClassAuthorizedSharesAdjustment
       base = classAdjustment "TX_SC_BAD" "SC_COMMON" 100.0
       write = OcfRecordDataStockClassAuthorizedSharesAdjustment
-  no base with new_shares_authorized = -1.0
   no base with stock_class_id = ""
-  no base with comments = [""]
   applyRecordsFails env "Stock class authorized shares adjustment not found: SC_NONE" [write (base with stock_class_id = "SC_NONE")]
   applyRecordsFails env "Stock class authorized shares adjustment SH-1 is a OcfObjectTypeStakeholder" [write (base with stock_class_id = "SH-1")]
   _ <- applyRecords env [write (base with stock_class_id = "SC_LATER"), OcfRecordDataStockClass (stockClass "SC_LATER")]
@@ -298,26 +302,29 @@ test_stock_class_conversion_ratio_adjustment_validation = do
   let no = refuse env validateStockClassConversionRatioAdjustmentOcfData OcfRecordDataStockClassConversionRatioAdjustment
       base = ratioAdjustment "TX_RATIO_BAD" "SC_SERIES_A" (ratioMechanism 1.0 1.25 OcfRoundingTypeNormal)
   no base with stock_class_id = ""
-  no base with comments = [""]
-  no base with new_ratio_conversion_mechanism = ratioMechanism 1.0 0.0 OcfRoundingTypeNormal
-  no base with new_ratio_conversion_mechanism = ratioMechanism (-0.01) 1.0 OcfRoundingTypeNormal
-  no base with new_ratio_conversion_mechanism = ((ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with ratio = (OcfRatio with numerator = 1.0; denominator = -1.0))
+  -- The new ratio is only stored, so OCF's signed Numerics are accepted.
+  forA_ (zip [1 .. 3 : Int]
+      [ ratioMechanism 1.0 0.0 OcfRoundingTypeNormal
+      , ratioMechanism (-0.01) 1.0 OcfRoundingTypeNormal
+      , (ratioMechanism 1.0 1.0 OcfRoundingTypeNormal) with ratio = (OcfRatio with numerator = 1.0; denominator = -1.0)
+      ]) \(n, m) ->
+    accept env validateStockClassConversionRatioAdjustmentOcfData OcfRecordDataStockClassConversionRatioAdjustment
+      (base with id = "TX_RATIO_SIGNED_" <> show n; new_ratio_conversion_mechanism = m; comments = [""])
 
--- v34 testStockClassConversionRatioAdjustmentRequiresRatioRight, and the class reference.
+-- v34 testStockClassConversionRatioAdjustmentRequiresRatioRight no longer holds: OCF requires only
+-- the class reference ("a class that has a ratio mechanism" is description), so an adjustment of a
+-- class with no conversion right is accepted (OCF's own sample adjusts its COMMON class).
 test_stock_class_conversion_ratio_adjustment_needs_a_ratio_right : Script ()
 test_stock_class_conversion_ratio_adjustment_needs_a_ratio_right = do
   env <- bookWith classRecords
   let adj cls = OcfRecordDataStockClassConversionRatioAdjustment (ratioAdjustment "TX_RATIO_ADJ" cls (ratioMechanism 1.0 1.25 OcfRoundingTypeNormal))
-  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ targets a stock class without a ratio conversion right: SC_COMMON" [adj "SC_COMMON"]
-  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ target not found: SC_NONE" [adj "SC_NONE"]
-  applyRecordsFails env "Stock class conversion ratio adjustment TX_RATIO_ADJ target not found: SH-1" [adj "SH-1"]
-  -- The class and its right may come later in the same batch.
-  _ <- applyRecords env [adj "SC_SERIES_X", OcfRecordDataStockClass (preferredInto "SC_SERIES_X" "SC_COMMON")]
+  applyRecordsFails env "Stock class conversion ratio adjustment not found: SC_NONE" [adj "SC_NONE"]
+  applyRecordsFails env "Stock class conversion ratio adjustment SH-1 is a OcfObjectTypeStakeholder" [adj "SH-1"]
+  -- A class without a conversion right, written in the same batch or already recorded.
+  _ <- applyRecords env [adj "SC_SERIES_X", OcfRecordDataStockClass (stockClass "SC_SERIES_X")]
   expectRecord env (adj "SC_SERIES_X")
-  -- An edit onto a class without a right is refused.
-  restateOpsFails env "without a ratio conversion right: SC_COMMON" [RestateEdit (adj "SC_COMMON")]
-  _ <- restateOps env [RestateEdit (adj "SC_SERIES_A")]
-  expectRecord env (adj "SC_SERIES_A")
+  _ <- restateOps env [RestateEdit (adj "SC_COMMON")]
+  expectRecord env (adj "SC_COMMON")
 
 -- KNOWN BUG (OCF pattern gap, shared with v34): OCF's CurrencyCode is `^[A-Z]{3}$`, but
 -- validateOcfMonetary checks only the length, so a lowercase currency such as "usd" is accepted

@@ -18,6 +18,7 @@ import Fairmint.OpenCapTable.OCF.Stakeholder (OcfName(..))
 import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
 import OpenCapTable.Harness
+import OpenCapTable.StockHelpers (recordSplit)
 
 restatementOf : StockSecurity -> StateRestatement
 restatementOf s = StateRestatement with
@@ -171,11 +172,25 @@ test_restate_recreate_needs_consuming_record_delete = do
   s.seq === 5
   s.quantity === 400.0
 
+-- A restatement may move a state's last event date back, to correct a misdated event, when no split
+-- of its class lies between the two dates (the stated quantity's units stay the same); across a split
+-- it may not. The state's own invariants still hold (it never predates its issuance).
 test_restate_never_moves_last_event_back : Script ()
 test_restate_never_moves_last_event_back = do
   env <- standardBook
+  let acc d id = OcfRecordDataStockAcceptance StockAcceptanceOcfData with id; date = d; security_id = "S-A1"; comments = []
+  _ <- applyRecords env [acc (D.date 2025 D.Jun 1) "ACC-WRONG-YEAR"]
   s <- stateOf env "S-A1"
-  restateOpsFails env "last event date back" [RestateSetState (restatementOf s) with last_event_date = D.addDays s.last_event_date (-1)]
+  s.last_event_date === D.date 2025 D.Jun 1
+  restateOpsFails env "precondition" [RestateSetState (restatementOf s) with last_event_date = D.addDays s.issue_date (-1)]
+  _ <- restateOps env [RestateSetState (restatementOf s) with last_event_date = D.date 2024 D.Jun 1]
+  (.last_event_date) <$> stateOf env "S-A1" >>= (=== D.date 2024 D.Jun 1)
+  -- With a split recorded in between, the date stays.
+  _ <- applyRecords env [acc (D.date 2025 D.Jun 1) "ACC-AGAIN"]
+  s2 <- stateOf env "S-A1"
+  recordSplit env "SPLIT-BETWEEN" "CLS-A" 2.0 1.0 (D.date 2024 D.Sep 1)
+  restateOpsFails env "last event date back only within its class and split epoch"
+    [RestateSetState (restatementOf s2) with last_event_date = D.date 2024 D.Jun 1]
 
 -- Deleting a stock issuance must show its lot is gone: its state ends in the same restatement, or
 -- the record that consumed it is among the inputs. Otherwise a reissue could give the security a

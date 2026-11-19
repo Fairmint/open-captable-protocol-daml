@@ -142,11 +142,6 @@ test_vesting_acceleration_validation = do
   -- An empty object ID is stopped by its claim, before the record's ensure.
   refuseWith env "an empty ID cannot be claimed" valid accelerationRecord (a with id = "")
   refuse env valid accelerationRecord (a with security_id = "")
-  refuse env valid accelerationRecord (a with quantity = 0.0)
-  refuse env valid accelerationRecord (a with quantity = -1.0)
-  refuse env valid accelerationRecord (a with reason_text = "")
-  refuse env valid accelerationRecord (a with comments = [""])
-  refuse env valid accelerationRecord (a with comments = ["ok", ""])
 
 -- =============================================================================
 -- STOCK
@@ -175,14 +170,18 @@ test_vesting_acceleration_on_stock_tranches = do
   let mid = D.date 2024 D.Jun 1
   _ <- applyRecords env [accelerationRecord ((acceleration "ACC-3" "S-T3" 30.0) with date = mid)]
   trancheState env "S-T3" >>= (=== [tranche 25.0 d2024, tranche 30.0 mid, tranche 20.0 d2026, tranche 25.0 d2027])
-  -- At most the unvested quantity at the acceleration date: 100 - 55 on 2024-06-01.
-  applyRecordsFails env "acceleration of 46.0 on security S-T3 must be positive and at most its unvested quantity 45.0"
-    [accelerationRecord ((acceleration "ACC-4" "S-T3" 46.0) with date = mid)]
-  -- Exactly the unvested quantity vests everything.
-  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-4" "S-T3" 45.0) with date = mid)]
+  -- OCF's quantity is any Numeric: the record keeps it as written, and the lot accelerates at most
+  -- its unvested quantity at the acceleration date (100 - 55 on 2024-06-01), vesting everything.
+  let a4 = (acceleration "ACC-4" "S-T3" 46.0) with date = mid
+  _ <- applyRecords env [accelerationRecord a4]
+  expectRecord env (accelerationRecord a4)
   trancheState env "S-T3" >>= (=== [tranche 25.0 d2024, tranche 75.0 mid])
-  -- A zero quantity is refused by the tranche arithmetic, before the record's ensure.
-  applyRecordsFails env "must be positive and at most its unvested quantity" [accelerationRecord ((acceleration "ACC-5" "S-T1" 0.0) with date = d2025)]
+  -- A zero or negative quantity is recorded and accelerates nothing.
+  _ <- applyRecords env
+    [ accelerationRecord ((acceleration "ACC-5" "S-T1" 0.0) with date = d2025)
+    , accelerationRecord ((acceleration "ACC-6" "S-T1" (-5.0)) with date = d2025)
+    ]
+  trancheState env "S-T1" >>= (=== [tranche 60.0 d2024, tranche 40.0 d2026])
 
 -- On vesting terms the TA's snapshot says what has vested; the acceleration is bounded by the rest
 -- and leaves the state's vesting to the TA's next snapshot.
@@ -197,11 +196,9 @@ test_vesting_acceleration_on_stock_on_terms = do
   _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
   let day = D.date 2025 D.Jun 1
       a = (acceleration "ACC-1" "S-V" 60.0) with date = day
-  applyRecordsFails env "acceleration of 61.0 on security S-V exceeds its unvested quantity 60.0" [accelerationRecord (a with quantity = 61.0)]
-  -- A zero quantity passes the bound and is refused by the record's ensure.
-  applyRecordsFails env "precondition" [accelerationRecord (a with quantity = 0.0)]
-  _ <- applyRecords env [accelerationRecord a]
-  expectRecord env (accelerationRecord a)
+  -- 61 is recorded as written; the lot accelerates its unvested 60.
+  _ <- applyRecords env [accelerationRecord (a with quantity = 61.0)]
+  expectRecord env (accelerationRecord (a with quantity = 61.0))
   s <- stateOf env "S-V"
   s.vesting === StockVestingOnTerms "VT-S"
   -- The TA's snapshot stays the vested quantity; the accelerated 60 bound later accelerations.
@@ -209,15 +206,19 @@ test_vesting_acceleration_on_stock_on_terms = do
   s.accelerated_since_snapshot === Some 60.0
   s.last_event_date === day
   -- Without a snapshot nothing has vested, so the whole lot may accelerate.
-  applyRecordsFails env "exceeds its unvested quantity 100.0" [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.5) with date = day)]
-  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.0) with date = day)]
-  (.vesting) <$> stateOf env "S-V2" >>= (=== StockVestingOnTerms "VT-S")
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V2" 100.5) with date = day)]
+  s2 <- stateOf env "S-V2"
+  s2.vesting === StockVestingOnTerms "VT-S"
+  s2.accelerated_since_snapshot === Some 100.0
 
 test_vesting_acceleration_fully_vested_stock : Script ()
 test_vesting_acceleration_fully_vested_stock = do
   env <- standardBook
-  applyRecordsFails env "security S-A1 is fully vested and cannot be accelerated" [accelerationRecord (acceleration "ACC-1" "S-A1" 1.0)]
-  expectNoRecord env "ACC-1"
+  -- OCF-valid on any security: on a fully vested lot it is recorded and changes no vesting.
+  _ <- applyRecords env [accelerationRecord (acceleration "ACC-1" "S-A1" 1.0)]
+  expectRecord env (accelerationRecord (acceleration "ACC-1" "S-A1" 1.0))
+  s <- stateOf env "S-A1"
+  (s.vesting, s.seq) === (StockVestingNone, 1)
 
 -- Unlike vesting starts and events, an acceleration keeps per-security date order.
 test_vesting_acceleration_on_stock_not_backdated : Script ()
@@ -246,7 +247,6 @@ test_vesting_acceleration_restate = do
   let a = acceleration "ACC-1" "EC-1" 10.0
   _ <- applyRecords env [accelerationRecord a]
   restateOpsFails env "changes nothing" [RestateEdit (accelerationRecord a)]
-  restateOpsFails env "precondition" [RestateEdit (accelerationRecord (a with quantity = 0.0))]
   let a' = a with quantity = 12.0; reason_text = "Corrected per board minutes"
   _ <- restateOps env [RestateEdit (accelerationRecord a')]
   expectRecord env (accelerationRecord a')
@@ -297,7 +297,9 @@ test_vesting_acceleration_on_terms_cumulative = do
   _ <- applyOps env [ApplyVestingSnapshot with security_id = "S-V"; as_of = D.date 2025 D.Mar 1; vested = 40.0]
   let day = D.date 2025 D.Jun 1
   _ <- applyRecords env [accelerationRecord ((acceleration "ACC-1" "S-V" 60.0) with date = day)]
-  applyRecordsFails env "exceeds its unvested quantity" [accelerationRecord ((acceleration "ACC-2" "S-V" 60.0) with date = day)]
+  -- Nothing is left to accelerate: a second acceleration is recorded and changes nothing.
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V" 60.0) with date = day)]
+  (.accelerated_since_snapshot) <$> stateOf env "S-V" >>= (=== Some 60.0)
 
 -- An acceleration never raises the vested quantity: the TA's 70 stands in either order, and a hold
 -- above it is refused. A snapshot counts the accelerations recorded before it, so the next snapshot
@@ -387,8 +389,9 @@ test_vesting_acceleration_restate_states_count = do
     [ RestateEdit (accelerationRecord (acc2 with quantity = 25.0))
     , RestateSetState ((restatementOf s) with accelerated_since_snapshot = Some 25.0)
     ]
-  applyRecordsFails env "exceeds its unvested quantity 5.0" [accelerationRecord ((acceleration "ACC-3" "S-V" 6.0) with date = mar)]
-  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-3" "S-V" 5.0) with date = mar)]
+  -- The unvested 5 bounds what a later acceleration applies.
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-3" "S-V" 6.0) with date = mar)]
+  (.accelerated_since_snapshot) <$> stateOf env "S-V" >>= (=== Some 30.0)
   -- Only a lot on vesting terms counts accelerations.
   s <- stateOf env "S-V"
   restateOpsFails env "precondition" [RestateSetState ((restatementOf s) with vesting = StockVestingNone; snapshot = None)]
@@ -413,6 +416,5 @@ test_vesting_acceleration_restate_across_split = do
   s <- stateOf env "S-V"
   (s.split_epoch, s.quantity, s.accelerated_since_snapshot) === (1, 10.0, Some 9.0)
   let day = D.date 2025 D.Mar 2
-  applyRecordsFails env "exceeds its unvested quantity 1.0" [accelerationRecord ((acceleration "ACC-2" "S-V" 2.0) with date = day)]
-  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V" 1.0) with date = day)]
-  pure ()
+  _ <- applyRecords env [accelerationRecord ((acceleration "ACC-2" "S-V" 2.0) with date = day)]
+  (.accelerated_since_snapshot) <$> stateOf env "S-V" >>= (=== Some 10.0)

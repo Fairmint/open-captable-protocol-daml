@@ -2,6 +2,7 @@
 module OpenCapTable.TestDocument where
 
 import DA.Assert ((===))
+import DA.Foldable (mapA_)
 import qualified DA.Map as Map
 import qualified DA.Text as T
 import Daml.Script
@@ -83,31 +84,35 @@ test_document_validation = do
   no base with md5 = sampleMd5 <> "0"
   no base with md5 = "0123456789abcdef0123456789abcdeg"
   no base with md5 = ""
-  -- OCF oneOf: exactly one of path and uri, each non-empty
+  -- OCF oneOf: exactly one of path and uri
   no base with uri = Some "https://example.com/doc.pdf"
   no base with path = None
-  no base with path = Some ""
-  no base with path = None; uri = Some ""
-  no base with comments = [""]
-  no base with related_objects = [issuerRef, ref OcfObjectTypeStakeholder ""]
+  -- Each is a plain OCF string, so a present "" is valid, and so are an empty comment and an
+  -- empty related object ID (the register does not resolve related objects)
+  accept env validateDocumentOcfData OcfRecordDataDocument (base with id = "DOC_EMPTY_PATH"; path = Some ""; comments = [""])
+  accept env validateDocumentOcfData OcfRecordDataDocument (base with id = "DOC_EMPTY_URI"; path = None; uri = Some "")
+  accept env validateDocumentOcfData OcfRecordDataDocument
+    (base with id = "DOC_EMPTY_REF"; related_objects = [issuerRef, ref OcfObjectTypeStakeholder ""])
 
--- v34 testDocumentRelatedIssuerReferenceMustExist, testDocumentRelatedObjectCreatedInSameBatchSucceeds
--- and testDocumentEditMissingRelatedObjectFails.
+-- OCF has no referential integrity and the register never reads a document's related objects, so
+-- it does not resolve them: an object not (yet) on the register, or recorded under another type, is
+-- accepted (a partial export imports; the SDK checks references).
 test_document_related_object_references : Script ()
 test_document_related_object_references = do
   env <- bookWith documentRecords
   let doc id related = OcfRecordDataDocument (documentData id related)
-  applyRecordsFails env "Document related object not found: ISSUER_MISSING" [doc "DOC_BAD_ISSUER_REF" [ref OcfObjectTypeIssuer "ISSUER_MISSING"]]
-  -- The reference names the type, and the record must have it.
-  applyRecordsFails env "Document related object SH-1 is a OcfObjectTypeStakeholder" [doc "DOC_WRONG_TYPE" [ref OcfObjectTypeStockClass "SH-1"]]
-  -- Every reference is checked.
-  applyRecordsFails env "Document related object not found: SC_SECOND" [doc "DOC_TWO" [issuerRef, ref OcfObjectTypeStockClass "SC_SECOND"]]
+      unresolved =
+        [ doc "DOC_BAD_ISSUER_REF" [ref OcfObjectTypeIssuer "ISSUER_MISSING"]
+        , doc "DOC_WRONG_TYPE" [ref OcfObjectTypeStockClass "SH-1"]
+        , doc "DOC_TWO" [issuerRef, ref OcfObjectTypeStockClass "SC_SECOND"]
+        ]
+  _ <- applyRecords env unresolved
+  mapA_ (expectRecord env) unresolved
   -- The object may come later in the same batch.
   _ <- applyRecords env [doc "DOC_STOCK_CLASS_REF" [ref OcfObjectTypeStockClass "SC_DOC_REF"], OcfRecordDataStockClass (stockClass "SC_DOC_REF")]
   expectRecord env (doc "DOC_STOCK_CLASS_REF" [ref OcfObjectTypeStockClass "SC_DOC_REF"])
-  -- An edit's added reference is checked.
+  -- An edit may add any reference.
   _ <- applyRecords env [doc "DOC_EDIT_REF" []]
-  restateOpsFails env "Document related object not found: SC_MISSING_FOR_DOC" [RestateEdit (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_MISSING_FOR_DOC"])]
   _ <- restateOps env [RestateEdit (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_COMMON", ref OcfObjectTypeStakeholder "SH-1"])]
   expectRecord env (doc "DOC_EDIT_REF" [ref OcfObjectTypeStockClass "SC_COMMON", ref OcfObjectTypeStakeholder "SH-1"])
 
@@ -133,10 +138,8 @@ test_document_relates_to_any_record_type = do
     , OcfRecordDataFinancing financing
     ]
   accept env validateDocumentOcfData OcfRecordDataDocument (documentData "DOC_ANY" related)
-  applyRecordsFails env "Document related object not found: FINANCING_MISSING" [OcfRecordDataDocument (documentData "DOC_FIN" [ref OcfObjectTypeFinancing "FINANCING_MISSING"])]
-  -- References are by object ID, never by security ID.
-  applyRecordsFails env "Document related object not found: SEC_DOC_PLAN_SECURITY"
-    [OcfRecordDataDocument (documentData "DOC_SEC" [ref OcfObjectTypeTxEquityCompensationIssuance "SEC_DOC_PLAN_SECURITY"])]
+  -- A reference to a record not on the register is stored as written.
+  accept env validateDocumentOcfData OcfRecordDataDocument (documentData "DOC_FIN" [ref OcfObjectTypeFinancing "FINANCING_MISSING"])
 
 -- One update checks every reference its documents make, with no count cap.
 test_document_references_per_update : Script ()
@@ -151,12 +154,10 @@ test_document_references_per_update = do
   _ <- restateOps env [RestateEdit (doc "DOC_BIG" 1)]
   expectRecord env (doc "DOC_BIG" 1)
 
--- A document stores at most 1000 references. The register checks the cap on every record
--- it writes (TestFinancing.test_financing_reference_caps drives that path to the cap on the
--- ledger); a 1000-reference document trace is too large for the script service, so the document
--- branch is checked directly.
+-- OCF sets no maxItems on a document's related objects and the register resolves none of them, so it
+-- caps none (a 1001-reference document trace is too large for the script service, so the cap check
+-- is called directly).
 test_document_references_stored_cap : Script ()
 test_document_references_stored_cap = do
   let doc n = OcfRecordDataDocument (documentData "DOC_BIG" (replicate n issuerRef))
-  checkRecordCaps (doc 1000) === Right ()
-  checkRecordCaps (doc 1001) === Left "OcfObjectTypeDocument has 1001 document related objects; at most 1000"
+  checkRecordCaps (doc 1001) === Right ()

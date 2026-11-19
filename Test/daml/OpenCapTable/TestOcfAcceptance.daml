@@ -1,0 +1,92 @@
+-- OCF-valid data the register accepts that v36 0.0.1 refused, beside the few checks it keeps where it computes: negative amounts (OCF's own sample transfer), the deprecated option grant type, a split's comments corrected in place, and the sign checks a settlement makes on the prices it computes with.
+module OpenCapTable.TestOcfAcceptance where
+
+import DA.Assert ((===))
+import qualified DA.Date as D
+import Daml.Script
+
+import Fairmint.OpenCapTable.Holds (DrawLot(..), SettleBuyer(..), SettleLot(..))
+import Fairmint.OpenCapTable.OcfRecords
+import Fairmint.OpenCapTable.Restate (RestateOperation(..))
+import Fairmint.OpenCapTable.Types.Monetary (OcfMonetary(..))
+import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..), OcfRatio(..))
+import Fairmint.OpenCapTable.Types.Vesting (OcfCompensationType(..), OcfOptionType(..))
+import Fairmint.OpenCapTable.OCF.ConvertibleTransfer (ConvertibleTransferOcfData(..), validateConvertibleTransferOcfData)
+import OpenCapTable.Harness
+import OpenCapTable.StockHelpers
+
+-- OCF's own samples (Transactions.ocf.json at the pinned commit) transfer a convertible for a
+-- negative amount: OCF's Monetary amount is a signed Numeric.
+test_ocf_negative_convertible_transfer_amount : Script ()
+test_ocf_negative_convertible_transfer_amount = do
+  env <- instrumentBook
+  let t = ConvertibleTransferOcfData with
+        id = "CT-NEG"
+        amount = OcfMonetary with amount = -867.53; currency = "USD"
+        date = D.date 2025 D.Sep 8
+        security_id = "CV-1"
+        comments = [""]
+        resulting_security_ids = ["CV-1-OUT"]
+        balance_security_id = None
+        consideration_text = Some ""
+  expectTrue "a negative amount" (validateConvertibleTransferOcfData t)
+  _ <- applyRecords env
+    [ OcfRecordDataConvertibleIssuance (convertibleIssuance "CV-1-OUT" "SH-B")
+    , OcfRecordDataConvertibleTransfer t
+    ]
+  expectRecord env (OcfRecordDataConvertibleTransfer t)
+
+-- The deprecated option_grant_type is stored as written: OCF ties it to compensation_type in no way,
+-- and INTL has no compensation type of its own.
+test_ocf_option_grant_type_stored : Script ()
+test_ocf_option_grant_type_stored = do
+  env <- standardBook
+  let intl = (equityCompensationIssuance "EC-INTL" "SH-A") with
+        compensation_type = OcfCompensationTypeOption
+        exercise_price = Some (usd 1.0)
+        option_grant_type = Some OcfOptionTypeIntl
+      rsuNso = (equityCompensationIssuance "EC-RSU-NSO" "SH-A") with option_grant_type = Some OcfOptionTypeNso
+  _ <- applyRecords env [OcfRecordDataEquityCompensationIssuance intl, OcfRecordDataEquityCompensationIssuance rsuNso]
+  expectRecord env (OcfRecordDataEquityCompensationIssuance intl)
+  expectRecord env (OcfRecordDataEquityCompensationIssuance rsuNso)
+
+-- A split's comments change nothing the class's epoch or a lot holds, so they may be corrected in
+-- place; its date, ratio and class may not (a correction of those rebuilds the book).
+test_ocf_split_comments_restated : Script ()
+test_ocf_split_comments_restated = do
+  env <- standardBook
+  let d = D.date 2025 D.Feb 1
+  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 d
+  let sp = split "SPLIT-1" "CLS-A" 2.0 1.0 d
+  _ <- restateOps env [RestateEdit (OcfRecordDataStockClassSplit (sp with comments = ["Board approval 2025-01-15", ""]))]
+  expectRecord env (OcfRecordDataStockClassSplit (sp with comments = ["Board approval 2025-01-15", ""]))
+  restateOpsFails env "split SPLIT-1 is never restated"
+    [RestateEdit (OcfRecordDataStockClassSplit (sp with split_ratio = OcfRatio with numerator = 3.0; denominator = 1.0))]
+  restateOpsFails env "split SPLIT-1 is never restated" [RestateEdit (OcfRecordDataStockClassSplit (sp with date = D.addDays d 1))]
+  restateOpsFails env "split SPLIT-1 is never restated" [RestateDelete "SPLIT-1"]
+
+-- A settlement computes with the share price and pro-rates the origin's cost basis, so it checks
+-- their signs itself; the OCF records may carry any sign.
+test_ocf_settlement_checks_the_prices_it_computes_with : Script ()
+test_ocf_settlement_checks_the_prices_it_computes_with = do
+  env <- standardBook
+  let tradeDay = D.date 2025 D.Jun 2
+  _ <- applyRecords env [OcfRecordDataStockIssuance ((issuance "S-N" "SH-A" "CLS-A" 100.0 d2024) with cost_basis = Some (usd (-5.0)))]
+  onDate tradeDay
+  lot <- settlementLot env "S-N" 100.0
+  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-N" tradeDay [lot]
+  s <- stateOf env "S-N"
+  origin <- issuanceCidOf env s.origin_transaction_id
+  holdId <- case s.holds of
+    [h] -> pure h.hold_id
+    _ -> fail "expected one hold"
+  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
+  let draw q price = DrawLot with
+        security_id = "S-N"; hold_id = holdId; quantity = q; custom_id = "BUY-S-N"
+        share_price = usd price; buyer_cost_basis = usd (price * q); balance_cost_basis = None
+        balance_vestings = []; origin_issuance = origin
+  settleFails env "has a negative cost basis" "T-N" tradeDay buyer [SettleDraw (draw 60.0 2.0)]
+  settleFails env "has a negative share price" "T-N" tradeDay buyer [SettleDraw (draw 100.0 (-2.0))]
+  -- A whole draw pro-rates nothing, so the origin's negative cost basis is no obstacle.
+  _ <- settle env "T-N" tradeDay buyer [SettleDraw (draw 100.0 2.0)]
+  hasState env "S-N" >>= (=== False)

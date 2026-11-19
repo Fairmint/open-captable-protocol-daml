@@ -1,14 +1,10 @@
 -- OCF VESTING_TERMS record: the graph of vesting conditions and triggers that a security's vesting follows.
 module Fairmint.OpenCapTable.OCF.VestingTerms where
 
-import qualified DA.Map as Map
-import qualified DA.Optional as Optional
 import qualified DA.Set as Set
 import Fairmint.OpenCapTable.Types.ObjectType (OcfObjectType(..), ocfObjectTypeValue)
 import Fairmint.OpenCapTableApi.OcfObject (OcfObject, OcfObjectView(..))
 import Fairmint.OpenCapTable.Types.Core (Context, validateContext)
-import Fairmint.OpenCapTable.Types.Validation (validateNonEmptyStringsArray)
-import Fairmint.Shared.TypeHelpers (validateOptionalText)
 
 template VestingTerms
   with
@@ -57,8 +53,6 @@ data VestingTermsOcfData = VestingTermsOcfData
 validateVestingTermsOcfData : VestingTermsOcfData -> Bool
 validateVestingTermsOcfData d =
   d.id /= "" &&
-  d.name /= "" && d.description /= "" &&
-  validateNonEmptyStringsArray d.comments &&
   not (null d.vesting_conditions) &&
   all validateOcfVestingCondition d.vesting_conditions &&
   validateOcfVestingConditionGraph d.vesting_conditions
@@ -131,10 +125,10 @@ validateOcfVestingPeriod : OcfVestingPeriod -> Bool
 validateOcfVestingPeriod p =
   case p of
     OcfVestingPeriodDays{length_=periodLength, occurrences, cliff_installment} ->
-      periodLength > 0 && occurrences >= 1 && (case cliff_installment of None -> True; Some ci -> ci >= 0)
+      periodLength >= 0 && occurrences >= 1 && (case cliff_installment of None -> True; Some ci -> ci >= 0)
     OcfVestingPeriodMonths{length_=periodLength, occurrences, day_of_month, cliff_installment} ->
       let _ = day_of_month in -- enum validated by type
-      periodLength > 0 && occurrences >= 1 && (case cliff_installment of None -> True; Some ci -> ci >= 0)
+      periodLength >= 0 && occurrences >= 1 && (case cliff_installment of None -> True; Some ci -> ci >= 0)
 
 -- Primitive - Vesting Condition Trigger Type and specific triggers
 -- OCF (primitive): https://raw.githubusercontent.com/Open-Cap-Table-Coalition/Open-Cap-Format-OCF/6d8c93227de64fc014fe0a215af208f4a5432542/schema/primitives/types/vesting/VestingConditionTrigger.schema.json
@@ -164,8 +158,8 @@ validateOcfVestingTrigger t =
   case t of
     OcfVestingStartTrigger -> True
     OcfVestingScheduleAbsoluteTrigger{date} -> let _ = date in True
-    OcfVestingScheduleRelativeTrigger{period, relative_to_condition_id} ->
-      relative_to_condition_id /= "" && validateOcfVestingPeriod period
+    -- `relative_to_condition_id` is a plain OCF string: the register does not resolve it
+    OcfVestingScheduleRelativeTrigger{period} -> validateOcfVestingPeriod period
     OcfVestingEventTrigger -> True
 
 -- Type - Vesting Condition Portion
@@ -188,11 +182,6 @@ data OcfVestingConditionPortion = OcfVestingConditionPortion
     -- false), to the security's whole quantity
     remainder : Optional Bool
   deriving (Eq, Show)
-
-validateOcfVestingConditionPortion : OcfVestingConditionPortion -> Bool
-validateOcfVestingConditionPortion p =
-  -- OCF Numeric allows zero. Keep denominator strictly positive to avoid invalid ratios.
-  p.numerator >= (0.0) && p.denominator > (0.0)
 
 -- Type - Vesting Condition
 -- Describes condition/trigger to be satisfied for vesting to occur
@@ -225,23 +214,22 @@ data OcfVestingCondition = OcfVestingCondition
     quantity : Optional Decimal
   deriving (Eq, Show)
 
--- Exactly one of portion or quantity present; if quantity present, it may be >= 0
--- Per OCF schema, `quantity` uses Numeric with no minimum, so zero is allowed.
+-- OCF's oneOf: exactly one of portion or quantity. Their numbers are signed OCF Numerics, which the
+-- register stores and never computes with, so a zero denominator or a negative quantity is valid.
 validateExactlyOnePortionOrQuantity : Optional OcfVestingConditionPortion -> Optional Decimal -> Bool
 validateExactlyOnePortionOrQuantity portion quantity =
   case (portion, quantity) of
     (Some _, None) -> True
-    (None, Some q) -> q >= (0.0)
+    (None, Some _) -> True
     _ -> False
 
+-- OCF: `id` has minLength 1 and `next_condition_ids` is uniqueItems.
 validateOcfVestingCondition : OcfVestingCondition -> Bool
 validateOcfVestingCondition c =
   c.id /= "" &&
-  validateOptionalText c.description &&
   validateExactlyOnePortionOrQuantity c.portion c.quantity &&
-  optional True validateOcfVestingConditionPortion c.portion &&
   validateOcfVestingTrigger c.trigger &&
-  validateNonEmptyStringsArray c.next_condition_ids
+  not (hasDuplicateTexts c.next_condition_ids)
 
 vestingConditionIds : [OcfVestingCondition] -> [Text]
 vestingConditionIds conditions = map (\condition -> condition.id) conditions
@@ -255,88 +243,9 @@ hasDuplicateTextsSeen seen remaining = case remaining of
   text :: rest ->
     Set.member text seen || hasDuplicateTextsSeen (Set.insert text seen) rest
 
-conditionEdgeIds : Map.Map Text [Text] -> Text -> [Text]
-conditionEdgeIds edges conditionId =
-  Optional.fromOptional [] (Map.lookup conditionId edges)
-
-vestingTriggerReferencesKnownCondition : [Text] -> OcfVestingCondition -> Bool
-vestingTriggerReferencesKnownCondition conditionIds condition = case condition.trigger of
-  OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
-    relative_to_condition_id /= condition.id &&
-    relative_to_condition_id `elem` conditionIds
-  _ -> True
-
-vestingConditionReferencesKnownConditions : [Text] -> OcfVestingCondition -> Bool
-vestingConditionReferencesKnownConditions conditionIds condition =
-  not (hasDuplicateTexts condition.next_condition_ids) &&
-  condition.id `notElem` condition.next_condition_ids &&
-  all (`elem` conditionIds) condition.next_condition_ids &&
-  vestingTriggerReferencesKnownCondition conditionIds condition
-
-addDependentEdge : Text -> Text -> Map.Map Text [Text] -> Map.Map Text [Text]
-addDependentEdge fromConditionId toConditionId edges =
-  let conditionEdges = Optional.fromOptional [] (Map.lookup fromConditionId edges)
-      updatedEdges =
-        if toConditionId `elem` conditionEdges
-          then conditionEdges
-          else toConditionId :: conditionEdges
-  in Map.insert fromConditionId updatedEdges edges
-
-vestingConditionEdges : [OcfVestingCondition] -> Map.Map Text [Text]
-vestingConditionEdges conditions =
-  let baseEdges = Map.fromList (map (\condition -> (condition.id, condition.next_condition_ids)) conditions)
-  in foldl addRelativeEdge baseEdges conditions
-  where
-    addRelativeEdge : Map.Map Text [Text] -> OcfVestingCondition -> Map.Map Text [Text]
-    addRelativeEdge edges condition = case condition.trigger of
-      OcfVestingScheduleRelativeTrigger{relative_to_condition_id} ->
-        addDependentEdge relative_to_condition_id condition.id edges
-      _ -> edges
-
-data CycleCheckResult = CycleCheckResult with
-    has_cycle : Bool
-    checked : Set.Set Text
-  deriving (Eq, Show)
-
-vestingConditionCycleCheck :
-  Map.Map Text [Text] ->
-  Set.Set Text ->
-  Set.Set Text ->
-  Text ->
-  CycleCheckResult
-vestingConditionCycleCheck edges visiting checked conditionId
-  | Set.member conditionId visiting = CycleCheckResult with has_cycle = True; checked = checked
-  | Set.member conditionId checked = CycleCheckResult with has_cycle = False; checked = checked
-  | otherwise =
-      let result =
-            foldl
-              (\current nextId ->
-                if current.has_cycle
-                  then current
-                  else vestingConditionCycleCheck edges (Set.insert conditionId visiting) current.checked nextId)
-              (CycleCheckResult with has_cycle = False; checked = checked)
-              (conditionEdgeIds edges conditionId)
-      in
-        if result.has_cycle
-          then result
-          else result with checked = Set.insert conditionId result.checked
-
-vestingConditionGraphHasCycle : Map.Map Text [Text] -> [Text] -> Bool
-vestingConditionGraphHasCycle edges conditionIds =
-  let result =
-        foldl
-          (\current conditionId ->
-            if current.has_cycle
-              then current
-              else vestingConditionCycleCheck edges Set.empty current.checked conditionId)
-          (CycleCheckResult with has_cycle = False; checked = Set.empty)
-          conditionIds
-  in result.has_cycle
-
+-- Condition IDs are unique within the terms, so a condition ID names one condition. OCF's prose
+-- intends the conditions to form a graph closed under `next_condition_ids` and
+-- `relative_to_condition_id` and free of cycles, but its schema does not require it and the register
+-- never walks the graph, so closure, self-references and cycles are left to the SDK.
 validateOcfVestingConditionGraph : [OcfVestingCondition] -> Bool
-validateOcfVestingConditionGraph conditions =
-  let conditionIds = vestingConditionIds conditions
-      edges = vestingConditionEdges conditions
-  in not (hasDuplicateTexts conditionIds) &&
-     all (vestingConditionReferencesKnownConditions conditionIds) conditions &&
-     not (vestingConditionGraphHasCycle edges conditionIds)
+validateOcfVestingConditionGraph conditions = not (hasDuplicateTexts (vestingConditionIds conditions))
