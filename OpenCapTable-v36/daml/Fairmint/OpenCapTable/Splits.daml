@@ -2,7 +2,7 @@
 module Fairmint.OpenCapTable.Splits
   ( applySplits
   , scaleTranches
-  , splitsDatedIn
+  , uncountedSplits
   ) where
 
 import Fairmint.OpenCapTable.Numeric (scaleByRatio)
@@ -11,28 +11,38 @@ import Fairmint.OpenCapTable.Types.Stock (OcfRatio)
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 
 -- | Brings a state to an event dated `d`. A split touches no stock state when it is recorded;
--- each state applies it at its next event instead. The state's `split_epoch` must equal the number
--- of the class's splits dated on or before its `last_event_date` (a stale one fails closed); then
--- every split dated after its last event and on or before `d` is applied in date order, scaling
--- the quantity, the tranches (cumulatively) and the snapshot with the shared floor function. Hold
--- quantities are never scaled: a split voids a settlement hold instead (its split epoch falls
--- behind). The result is dated max(d, last_event_date): vesting starts and events may be backdated.
+-- each state applies it at its next event instead. The state's `split_epoch` counts the class's
+-- splits it has applied, always a prefix of the class's list (splits are appended in date order and
+-- never removed), and its quantity is in their units. The state catches up on every split it has
+-- not counted that is dated on or before max(d, last_event_date), in the order recorded: a split
+-- dated after its last event, a second split on a date it has already counted one on, and a split
+-- recorded after its last event but dated on or before it (its quantity was written before the
+-- split existed). Each split is applied once, by its place in the list, never by a date comparison
+-- with the state's last event, scaling the quantity, the tranches (cumulatively) and the snapshot
+-- with the shared floor function. Afterwards the epoch is the number of the class's splits dated on
+-- or before the state's last event, which the date checks of terminal events, output issuances,
+-- draws and restatements rely on. Hold quantities are never scaled: a split voids a settlement hold
+-- instead (its split epoch falls behind). The result is dated max(d, last_event_date): vesting
+-- starts and events may be backdated.
 applySplits : [RecordedSplit] -> Date -> StockSecurity -> Either Text StockSecurity
 applySplits splits d s = do
-  let expected = splitsOnOrBefore splits s.last_event_date
-  if s.split_epoch /= expected
-    then Left ("stale split epoch on security " <> s.security_id <> ": " <> show s.split_epoch
-      <> ", the class has " <> show expected <> " splits dated on or before " <> show s.last_event_date)
-    else pure ()
   let newLast = max d s.last_event_date
-  scaled <- foldl (\acc sp -> acc >>= applyOne sp) (Right s) (splitsDatedIn s.last_event_date newLast splits)
+      target = splitsOnOrBefore splits newLast
+  -- Unreachable while splits are append-only and dated in order; kept so that a state never
+  -- reads as having applied a split its class does not date on or before its last event.
+  if s.split_epoch > target
+    then Left ("split epoch " <> show s.split_epoch <> " of security " <> s.security_id <> " is ahead of the "
+      <> show target <> " splits of its class dated on or before " <> show newLast)
+    else pure ()
+  scaled <- foldl (\acc sp -> acc >>= applyOne sp) (Right s) (uncountedSplits s.split_epoch target splits)
   pure scaled with
     last_event_date = newLast
-    split_epoch = splitsOnOrBefore splits newLast
+    split_epoch = target
 
--- | The splits dated after `from` and on or before `to`, in date order.
-splitsDatedIn : Date -> Date -> [RecordedSplit] -> [RecordedSplit]
-splitsDatedIn from to = filter (\sp -> sp.date > from && sp.date <= to)
+-- | The splits a state at `epoch` has not counted, up to the class's first `target`, in the order
+-- recorded.
+uncountedSplits : Int -> Int -> [RecordedSplit] -> [RecordedSplit]
+uncountedSplits epoch target = take (target - epoch) . drop epoch
 
 applyOne : RecordedSplit -> StockSecurity -> Either Text StockSecurity
 applyOne sp s = do
