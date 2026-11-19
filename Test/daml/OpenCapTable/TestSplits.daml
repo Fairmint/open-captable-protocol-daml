@@ -13,7 +13,6 @@ import Fairmint.OpenCapTable.State
 import Fairmint.OpenCapTable.Types.Stock (OcfHoldType(..))
 import Fairmint.OpenCapTable.Types.Vesting (OcfVesting(..))
 import Fairmint.OpenCapTable.OCF.StockAcceptance (StockAcceptanceOcfData(..))
-import Fairmint.OpenCapTable.OCF.StockCancellation (StockCancellationOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockReissuance (StockReissuanceOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockRetraction (StockRetractionOcfData(..))
 import Fairmint.OpenCapTable.OCF.StockTransfer (StockTransferOcfData(..))
@@ -68,17 +67,13 @@ test_splits_dates_strictly_increase = do
   env <- standardBook
   recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
   freeze env "CLS-A"
-  -- A split dated before the latest one would apply out of order to states that applied it; two on
-  -- one date (OCF allows them) apply in the order recorded.
-  applyRecordsFails env "dated on or after the class's latest recorded split" [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 2.0 1.0 (D.addDays splitDay (-1)))]
-  _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 3.0 1.0 splitDay)]
-  _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-3" "CLS-A" 3.0 1.0 (D.addDays splitDay 1))]
+  -- A register-ordering necessity, not an OCF rule: two splits on one date are recorded as one of
+  -- their combined ratio, and none is dated before the latest.
+  applyRecordsFails env "dated after the class's latest recorded split" [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 3.0 1.0 splitDay)]
+  applyRecordsFails env "dated after the class's latest recorded split" [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 2.0 1.0 (D.addDays splitDay (-1)))]
+  _ <- applyRecords env [OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 3.0 1.0 (D.addDays splitDay 1))]
   (_, e) <- epochOf env "CLS-A"
-  map (.split_id) e.splits === ["SPLIT-1", "SPLIT-2", "SPLIT-3"]
-  unfreeze env "CLS-A"
-  -- A lot applies both same-day splits at its next event: 400 x 2 x 3.
-  _ <- applyRecords env [OcfRecordDataStockAcceptance StockAcceptanceOcfData with id = "ACC-SAME-DAY"; date = splitDay; security_id = "S-A2"; comments = []]
-  (.quantity) <$> stateOf env "S-A2" >>= (=== 2400.0)
+  map (.split_id) e.splits === ["SPLIT-1", "SPLIT-2"]
 
 -- A split touches no state; each state applies it at its next event, dated on or after it.
 test_splits_applied_lazily : Script ()
@@ -176,13 +171,12 @@ test_splits_void_settlement_holds = do
   _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-2" laterDay [lot'']
   pure ()
 
--- A split recorded on or before a lot's last event (here, the day its holds were placed) is one the
--- lot has not counted, so the lot counts it at its next event, a hold cancellation included: the
--- stopped lot's stop is lifted in the split's units. A restatement in the split's units brings a
--- held lot current too, carrying its holds; its settlement hold is then void, as any split voids
--- one, and the TA cancels it.
-test_splits_held_lot_counts_a_split_on_its_last_event_date : Script ()
-test_splits_held_lot_counts_a_split_on_its_last_event_date = do
+-- A split recorded on or before a lot's last event, which the SDK's split check should refuse,
+-- leaves the lot's split epoch stale, so every event on it fails closed, its hold cancellations
+-- included. A restatement in the split's units brings a held lot current; its settlement hold is
+-- then void, and the TA cancels it and lifts the stop as on any lot.
+test_splits_stale_held_lot_is_restated : Script ()
+test_splits_stale_held_lot_is_restated = do
   env <- standardBook
   let holdDay = D.date 2025 D.Jan 5
       laterDay = D.date 2025 D.Jan 12
@@ -191,19 +185,25 @@ test_splits_held_lot_counts_a_split_on_its_last_event_date = do
   [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" holdDay [lot]
   [stop] <- placeHolds env OcfHoldTypeStopTransfer "CASE-1" holdDay [stopLot "S-A2"]
   recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 holdDay
-  _ <- cancelHolds env holdDay [CancelHold with security_id = "S-A2"; hold_id = stop.hold_id; reason_text = "order lifted"]
-  s2 <- stateOf env "S-A2"
-  (s2.split_epoch, s2.quantity, s2.holds) === (1, 800.0, [])
+  cancelHoldsFails env "stale split epoch on security S-A1" holdDay
+    [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-1"]
   s1 <- stateOf env "S-A1"
-  s1.split_epoch === 0
-  _ <- restateOps env [RestateSetState ((restatementOf s1) with quantity = s1.quantity * 2.0)]
+  s2 <- stateOf env "S-A2"
+  _ <- restateOps env
+    [ RestateSetState ((restatementOf s1) with quantity = s1.quantity * 2.0)
+    , RestateSetState ((restatementOf s2) with quantity = s2.quantity * 2.0)
+    ]
   s1' <- stateOf env "S-A1"
   (s1'.split_epoch, s1'.quantity, map (.hold_id) s1'.holds) === (1, s1.quantity * 2.0, [h.hold_id])
   onDate laterDay
   draw <- drawLot env "S-A1" 100.0 1.0 []
   buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
   settleFails env "voided hold" "T-1" laterDay buyer [SettleDraw draw]
-  _ <- cancelHolds env laterDay [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-1"]
+  _ <- cancelHolds env laterDay
+    [ CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-1"
+    , CancelHold with security_id = "S-A2"; hold_id = stop.hold_id; reason_text = "order lifted"
+    ]
+  (.holds) <$> stateOf env "S-A2" >>= (=== [])
   lot' <- settlementLot env "S-A1" 200.0
   _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-2" laterDay [lot']
   pure ()
@@ -287,145 +287,80 @@ test_splits_bound_backdated_terminal_events = do
   recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
   _ <- applyRecords env [acceptance "ACC-AFTER" "S-A2" (D.addDays splitDay 10)]
   let ret d = OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-S-A2"; date = d; reason_text = ""; security_id = "S-A2"; comments = []
-  applyRecordsFails env "precedes a split of stock class CLS-A dated on or before the last event on security S-A2" [ret (D.addDays splitDay (-1))]
+  applyRecordsFails env "precedes a split of stock class CLS-A that security S-A2 has taken" [ret (D.addDays splitDay (-1))]
   -- After the split, before the lot's last event: the same split epoch.
   _ <- applyRecords env [ret (D.addDays splitDay 1)]
   hasState env "S-A2" >>= (=== False)
 
 -- =============================================================================
--- SPLITS A LOT HAS NOT COUNTED
+-- SPLITS DATED ON OR BEFORE A LOT'S LAST EVENT (Bugbot 4631023287)
 -- =============================================================================
 
--- Two splits on one date with an event on a lot between them: the lot counted the first at that
--- event and counts the second at its next one. A lot catches up on every split of its class it has
--- not counted, by its split epoch, so each applies exactly once, in the order recorded, and a later
--- transfer moves the lot in the units of both.
-test_splits_same_date_split_after_an_event_on_that_date : Script ()
-test_splits_same_date_split_after_an_event_on_that_date = do
+-- Bugbot's first sequence: a split on D, an event on a lot on D, then a second split on D. The second
+-- split is refused, so no lot that counted the first can miss it; the writer records one split of
+-- the combined ratio instead.
+test_splits_second_split_on_one_date_refused_after_an_event : Script ()
+test_splits_second_split_on_one_date_refused_after_an_event = do
   env <- standardBook
-  let later = D.addDays splitDay 2
   recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
   _ <- applyRecords env [acceptance "ACC-1" "S-A1" splitDay]
   s1 <- stateOf env "S-A1"
-  (s1.quantity, s1.split_epoch, s1.last_event_date) === (1200.0, 1, splitDay)
-  recordSplit env "SPLIT-2" "CLS-A" 3.0 1.0 splitDay
-  let t = StockTransferOcfData with
-        id = "TR-1"; date = later; security_id = "S-A1"; quantity = 1000.0
-        resulting_security_ids = ["S-A1-T"]; balance_security_id = Some "S-A1-B"
-        comments = []; consideration_text = None
-      out q = (issuance "S-A1-T" "SH-B" "CLS-A" q later) with id = "ISS-S-A1-T"
-      bal q = (issuance "S-A1-B" "SH-A" "CLS-A" q later) with id = "ISS-S-A1-B"
-  -- 600 x 2 x 3 = 3600: a balance in the units of the first split only is refused.
-  applyOpsFails env "balance S-A1-B must hold the remaining 2600.0"
-    [ApplyStockTransfer with transfer = t; resulting = [out 1000.0]; balance = Some (bal 200.0)]
-  _ <- applyOps env [ApplyStockTransfer with transfer = t; resulting = [out 1000.0]; balance = Some (bal 2600.0)]
-  hasState env "S-A1" >>= (=== False)
-  b <- stateOf env "S-A1-B"
-  (b.quantity, b.split_epoch) === (2600.0, 2)
-  -- Counted once: a later event applies neither split again.
-  _ <- applyRecords env [acceptance "ACC-B" "S-A1-B" (D.addDays later 1)]
-  (.quantity) <$> stateOf env "S-A1-B" >>= (=== 2600.0)
-  -- A lot with no event between the two splits applies both at once, to the same units.
-  _ <- applyRecords env [acceptance "ACC-2" "S-A2" later]
-  s2 <- stateOf env "S-A2"
-  (s2.quantity, s2.split_epoch) === (2400.0, 2)
+  (s1.quantity, s1.split_epoch) === (1200.0, 1)
+  updateOpsFails env "split SPLIT-2 must be dated after the class's latest recorded split"
+    [ UpdateFreezeClass "CLS-A"
+    , UpdateCreate (ApplyRecord (OcfRecordDataStockClassSplit (split "SPLIT-2" "CLS-A" 3.0 1.0 splitDay)))
+    , UpdateUnfreezeClass "CLS-A"
+    ]
+  -- The lot keeps moving in the first split's units.
+  _ <- applyRecords env [acceptance "ACC-2" "S-A1" (D.addDays splitDay 1)]
+  (.quantity) <$> stateOf env "S-A1" >>= (=== 1200.0)
 
--- A split dated on a lot's last event date, recorded after that event: the lot's quantity was
--- written before the split existed, so the lot counts the split at its next event, a cancellation
--- or a hold placement as much as any other.
-test_splits_split_dated_on_a_lots_last_event_date : Script ()
-test_splits_split_dated_on_a_lots_last_event_date = do
-  env <- standardBook
-  let later = D.addDays splitDay 1
-  _ <- applyRecords env [acceptance "ACC-1" "S-A1" splitDay, acceptance "ACC-2" "S-A2" splitDay]
-  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
-  -- Recording the split touches no state.
-  s1 <- stateOf env "S-A1"
-  (s1.quantity, s1.split_epoch) === (600.0, 0)
-  let c q balance = StockCancellationOcfData with
-        id = "CXL-1"; date = later; security_id = "S-A1"; quantity = q; reason_text = "Forfeit"
-        balance_security_id = balance; comments = []
-  applyOpsFails env "event quantity 1201.0 exceeds the 1200.0 of security S-A1"
-    [ApplyStockCancellation with cancellation = c 1201.0 None; balance = None]
-  _ <- applyOps env [ApplyStockCancellation with
-    cancellation = c 200.0 (Some "S-A1-B")
-    balance = Some ((issuance "S-A1-B" "SH-A" "CLS-A" 1000.0 later) with id = "ISS-S-A1-B")]
-  b <- stateOf env "S-A1-B"
-  (b.quantity, b.split_epoch) === (1000.0, 1)
-  onDate later
-  lot <- settlementLot env "S-A2" 800.0
-  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" later [lot]
-  s2 <- stateOf env "S-A2"
-  (s2.quantity, s2.split_epoch, map (.split_epoch) s2.holds) === (800.0, 1, [1])
-
--- A settlement hold placed between two splits on one date counted the first: the second voids it,
--- as any split does. The lot is never stuck: the TA cancels the void hold, which counts the second
--- split, and places a new one in its units.
-test_splits_same_date_split_voids_a_hold_placed_between : Script ()
-test_splits_same_date_split_voids_a_hold_placed_between = do
+-- Bugbot's second sequence: a lot whose last event is on D, then a split dated D. Whether the lot's
+-- quantity was written before or after the split is ambiguous, so by design its next event fails
+-- closed, a transfer and a hold placement included, until a restatement states it in the split's
+-- units; then it moves again.
+test_splits_split_on_a_lots_last_event_date_fails_closed : Script ()
+test_splits_split_on_a_lots_last_event_date_fails_closed = do
   env <- standardBook
   let later = D.addDays splitDay 2
+  _ <- applyRecords env [acceptance "ACC-1" "S-A1" splitDay]
   recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
-  onDate splitDay
-  lot <- settlementLot env "S-A1" 1200.0
-  [h] <- placeHolds env OcfHoldTypeRegisterSettlement "T-1" splitDay [lot]
-  recordSplit env "SPLIT-2" "CLS-A" 3.0 1.0 splitDay
+  let t = StockTransferOcfData with
+        id = "TR-1"; date = later; security_id = "S-A1"; quantity = 1200.0
+        resulting_security_ids = ["S-A1-T"]; balance_security_id = None
+        comments = []; consideration_text = None
+      xfer = ApplyStockTransfer with
+        transfer = t; resulting = [(issuance "S-A1-T" "SH-B" "CLS-A" 1200.0 later) with id = "ISS-S-A1-T"]; balance = None
+  applyOpsFails env "stale split epoch on security S-A1: 0, the class has 1 splits dated on or before 2025-01-10" [xfer]
   onDate later
-  draw <- drawLot env "S-A1" 1200.0 1.0 []
-  buyer <- SettleBuyerExisting <$> stakeholderCidOf env "SH-B"
-  settleFails env "voided hold" "T-1" later buyer [SettleDraw draw]
-  _ <- cancelHolds env later [CancelHold with security_id = "S-A1"; hold_id = h.hold_id; reason_text = "voided by SPLIT-2"]
-  s <- stateOf env "S-A1"
-  (s.quantity, s.split_epoch, s.holds) === (3600.0, 2, [])
-  lot' <- settlementLot env "S-A1" 3600.0
-  _ <- placeHolds env OcfHoldTypeRegisterSettlement "T-2" later [lot']
-  pure ()
+  lot <- settlementLot env "S-A1" 100.0
+  placeHoldsFails env "stale split epoch on security S-A1" OcfHoldTypeRegisterSettlement "T-1" later [lot]
+  s1 <- stateOf env "S-A1"
+  _ <- restateOps env [RestateSetState ((restatementOf s1) with quantity = 1200.0)]
+  _ <- applyOps env [xfer]
+  hasState env "S-A1" >>= (=== False)
+  t' <- stateOf env "S-A1-T"
+  (t'.quantity, t'.split_epoch) === (1200.0, 1)
 
--- A terminal event is still refused across a split epoch after the lot catches up: a split dated
--- before the lot's last event (and after the class's latest split) is one the lot has not counted,
--- and a terminal event dated before it would be in other units.
-test_splits_catch_up_keeps_backdated_terminal_events_in_epoch : Script ()
-test_splits_catch_up_keeps_backdated_terminal_events_in_epoch = do
+-- A split recorded after a lot's issuance but dated before it: the writer most likely entered the
+-- issuance in post-split units, and the register cannot tell. Applying the split would double-scale
+-- the lot (100 to 200), so its next event fails closed until a restatement states its quantity.
+test_splits_backdated_split_before_issuance_fails_closed : Script ()
+test_splits_backdated_split_before_issuance_fails_closed = do
   env <- standardBook
-  recordSplit env "SPLIT-1" "CLS-A" 2.0 1.0 splitDay
-  _ <- applyRecords env [acceptance "ACC-AFTER" "S-A2" (D.addDays splitDay 10)]
-  recordSplit env "SPLIT-2" "CLS-A" 3.0 1.0 (D.addDays splitDay 5)
-  let ret d = OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-S-A2"; date = d; reason_text = ""; security_id = "S-A2"; comments = []
-      c q = StockCancellationOcfData with
-        id = "CXL-S-A2"; date = D.addDays splitDay 6; security_id = "S-A2"; quantity = q; reason_text = "Forfeit"
-        balance_security_id = None; comments = []
-  applyRecordsFails env "precedes a split of stock class CLS-A dated on or before the last event on security S-A2" [ret (D.addDays splitDay 3)]
-  -- After both splits, before the lot's last event: 400 x 2 x 3.
-  applyOpsFails env "event quantity 2401.0 exceeds the 2400.0 of security S-A2"
-    [ApplyStockCancellation with cancellation = c 2401.0; balance = None]
-  _ <- applyOps env [ApplyStockCancellation with cancellation = c 2400.0; balance = None]
-  hasState env "S-A2" >>= (=== False)
-
--- Vesting tranches scale exactly once per split, in the order recorded, whether a lot counts two
--- same-date splits at one event or at two: flooring makes the order matter (1:3 then 3:1 floors).
-test_splits_same_date_splits_scale_tranches_once_in_order : Script ()
-test_splits_same_date_splits_scale_tranches_once_in_order = do
-  env <- standardBook
-  let tranches = [(OcfVesting with amount = 40.0; date = D.date 2024 D.Jun 1), (OcfVesting with amount = 60.0; date = D.date 2025 D.Jun 1)]
-      later = D.addDays splitDay 2
-  _ <- applyRecords env
-    [ OcfRecordDataStockIssuance ((issuance "S-X" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)
-    , OcfRecordDataStockIssuance ((issuance "S-Y" "SH-A" "CLS-A" 100.0 d2024) with vestings = tranches)
-    ]
-  recordSplit env "SPLIT-1" "CLS-A" 1.0 3.0 splitDay
-  _ <- applyRecords env [acceptance "ACC-X1" "S-X" splitDay]
-  x1 <- stateOf env "S-X"
-  x1.quantity === 33.3333333333
-  recordSplit env "SPLIT-2" "CLS-A" 3.0 1.0 splitDay
-  _ <- applyRecords env [acceptance "ACC-X2" "S-X" later, acceptance "ACC-Y" "S-Y" later]
-  x <- stateOf env "S-X"
-  y <- stateOf env "S-Y"
-  let expected = StockVestingTranches
-        [ OcfVesting with amount = 39.9999999999; date = D.date 2024 D.Jun 1
-        , OcfVesting with amount = 60.0; date = D.date 2025 D.Jun 1
-        ]
-  (x.quantity, x.split_epoch, x.vesting) === (99.9999999999, 2, expected)
-  (y.quantity, y.split_epoch, y.vesting) === (x.quantity, x.split_epoch, x.vesting)
-  _ <- applyRecords env [acceptance "ACC-X3" "S-X" (D.addDays later 1)]
-  x' <- stateOf env "S-X"
-  (x'.quantity, x'.vesting) === (x.quantity, x.vesting)
+  let issued = D.date 2025 D.Jan 10
+  _ <- applyRecords env [OcfRecordDataStockIssuance (issuance "S-L" "SH-A" "CLS-A" 100.0 issued)]
+  recordSplit env "SPLIT-BACK" "CLS-A" 2.0 1.0 (D.date 2025 D.Jan 5)
+  applyRecordsFails env "stale split epoch on security S-L: 0, the class has 1 splits dated on or before 2025-01-10"
+    [acceptance "ACC-L" "S-L" (D.addDays issued 1)]
+  -- A terminal event does not get round it: the lot cannot be dated before its issuance, and from
+  -- its issuance on its epoch is stale.
+  let ret d = OcfRecordDataStockRetraction StockRetractionOcfData with id = "RET-S-L"; date = d; reason_text = ""; security_id = "S-L"; comments = []
+  applyRecordsFails env "stale split epoch on security S-L" [ret issued]
+  s <- stateOf env "S-L"
+  (s.quantity, s.split_epoch) === (100.0, 0)
+  -- The writer restates the lot in post-split units (here, as entered), and it moves again.
+  _ <- restateOps env [RestateSetState (restatementOf s)]
+  _ <- applyRecords env [acceptance "ACC-L" "S-L" (D.addDays issued 1)]
+  s' <- stateOf env "S-L"
+  (s'.quantity, s'.split_epoch) === (100.0, 1)
