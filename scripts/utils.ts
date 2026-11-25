@@ -1,4 +1,4 @@
-import type { ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
+import type { AuthConfig, ClientConfig, ProviderType } from '@fairmint/canton-node-sdk';
 import {
   CantonRuntime,
   EnvLoader,
@@ -120,7 +120,17 @@ export function createValidatorApiClient(network: ContractNetwork, providerType:
   const username = envLoader.getApiUsername('VALIDATOR_API', network, providerType);
   const password = envLoader.getApiPassword('VALIDATOR_API', network, providerType);
 
-  if (!apiUrl || !clientId || (!clientSecret && !(username && password)) || !authUrl) {
+  if (!apiUrl || !clientId || !authUrl) {
+    throw new Error('Missing required environment configuration for ValidatorApiClient');
+  }
+
+  // `AuthConfig` is a union keyed on `grantType`: a password grant needs both username and password.
+  let auth: AuthConfig;
+  if (clientSecret) {
+    auth = { grantType: 'client_credentials', clientId, clientSecret };
+  } else if (username && password) {
+    auth = { grantType: 'password', clientId, username, password };
+  } else {
     throw new Error('Missing required environment configuration for ValidatorApiClient');
   }
 
@@ -131,13 +141,7 @@ export function createValidatorApiClient(network: ContractNetwork, providerType:
     apis: {
       VALIDATOR_API: {
         apiUrl,
-        auth: {
-          grantType: clientSecret ? 'client_credentials' : 'password',
-          clientId,
-          clientSecret,
-          username,
-          password,
-        },
+        auth,
         partyId,
         userId,
       },
